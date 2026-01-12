@@ -38,7 +38,7 @@ std::string getAlgorithmName(CompressionAlgorithm algo) {
         case CompressionAlgorithm::LZ4:      return "LZ4";
         case CompressionAlgorithm::SNAPPY:   return "Snappy";
         case CompressionAlgorithm::DEFLATE:  return "Deflate";
-        case CompressionAlgorithm::GZIP:     return "Gzip";
+        case CompressionAlgorithm::GDEFLATE: return "Gdeflate";
         case CompressionAlgorithm::ZSTD:     return "Zstd";
         case CompressionAlgorithm::ANS:      return "ANS";
         case CompressionAlgorithm::CASCADED: return "Cascaded";
@@ -54,7 +54,7 @@ CompressionAlgorithm parseCompressionAlgorithm(const std::string& algo_str) {
     if (lower == "lz4")       return CompressionAlgorithm::LZ4;
     if (lower == "snappy")    return CompressionAlgorithm::SNAPPY;
     if (lower == "deflate")   return CompressionAlgorithm::DEFLATE;
-    if (lower == "gzip")      return CompressionAlgorithm::GZIP;
+    if (lower == "gdeflate")  return CompressionAlgorithm::GDEFLATE;
     if (lower == "zstd")      return CompressionAlgorithm::ZSTD;
     if (lower == "ans")       return CompressionAlgorithm::ANS;
     if (lower == "cascaded")  return CompressionAlgorithm::CASCADED;
@@ -75,7 +75,9 @@ std::unique_ptr<nvcomp::nvcompManagerBase> createCompressionManager(
     switch (algo) {
         case CompressionAlgorithm::LZ4: {
             nvcompBatchedLZ4CompressOpts_t opts = nvcompBatchedLZ4CompressDefaultOpts;
-            opts.data_type = NVCOMP_TYPE_CHAR;
+            // * - NVCOMP_TYPE_(U)CHAR: 1-byte, generic data type
+            // * - NVCOMP_TYPE_FLOAT16: 2-byte floating-point data type. Applicable to all half-precision data formats.
+            opts.data_type = NVCOMP_TYPE_CHAR; 
             return std::make_unique<nvcomp::LZ4Manager>(
                 chunk_size, opts, nvcompBatchedLZ4DecompressDefaultOpts, stream);
         }
@@ -90,12 +92,11 @@ std::unique_ptr<nvcomp::nvcompManagerBase> createCompressionManager(
         
         case CompressionAlgorithm::DEFLATE: {
             nvcompBatchedDeflateCompressOpts_t opts = nvcompBatchedDeflateCompressDefaultOpts;
-            opts.algorithm = 0; // High throughput mode
             return std::make_unique<nvcomp::DeflateManager>(
                 chunk_size, opts, nvcompBatchedDeflateDecompressDefaultOpts, stream);
         }
         
-        case CompressionAlgorithm::GZIP: {
+        case CompressionAlgorithm::GDEFLATE: {
             return std::make_unique<nvcomp::GdeflateManager>(
                 chunk_size,
                 nvcompBatchedGdeflateCompressDefaultOpts,

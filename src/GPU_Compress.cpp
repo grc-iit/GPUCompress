@@ -6,7 +6,6 @@
  * 2. Compresses data on GPU using dynamically selected nvcomp algorithm
  * 3. Writes compressed data back to file using GDS
  */
-
 #include <fcntl.h>
 #include <iostream>
 #include <stdio.h>
@@ -82,7 +81,6 @@ int main(int argc, char* argv[]) {
     printf("Algorithm: %s\n\n", getAlgorithmName(algo).c_str());
 
     // ========== Step 1: Open input file for reading ==========
-    // nvtxRangePushA("Open Input File");
     
     int fd_input = open(input_file, O_RDONLY | O_DIRECT);
     if (fd_input == -1) {
@@ -103,23 +101,12 @@ int main(int argc, char* argv[]) {
     printf("Input file: %s\n", input_file);
     printf("File size: %lu bytes (%.2f MB)\n", file_size, file_size / (1024.0 * 1024.0));
     
-    // nvtxRangePop();
-
     // ========== Step 2: Initialize GPU ==========
-    // nvtxRangePushA("GPU Initialization");
     
-    cudaDeviceProp deviceProp;
-    CUDA_CHECK(cudaGetDeviceProperties(&deviceProp, 0));
-    int smcount = deviceProp.multiProcessorCount;
-    printf("GPU: %s (%d SMs)\n", deviceProp.name, smcount);
-
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
     
-    // nvtxRangePop();
-
     // ========== Step 3: Allocate GPU memory for input data ==========
-    // nvtxRangePushA("Allocate GPU Memory");
     
     // Align to 4KB for GDS optimal performance
     size_t aligned_input_size = ((file_size + 4095) / 4096) * 4096;
@@ -129,10 +116,7 @@ int main(int argc, char* argv[]) {
     printf("\nAllocated %lu bytes (%.2f MB) on GPU for input\n", 
            aligned_input_size, aligned_input_size / (1024.0 * 1024.0));
     
-    // nvtxRangePop();
-
     // ========== Step 4: Initialize GDS (cuFile) ==========
-    // nvtxRangePushA("GDS Setup");
     
     CUfileError_t status = cuFileDriverOpen();
     if (status.err != CU_FILE_SUCCESS) {
@@ -170,10 +154,7 @@ int main(int argc, char* argv[]) {
         printf("✓ Input buffer registered\n");
     }
     
-    // nvtxRangePop();
-
     // ========== Step 5: Read data from file to GPU using GDS ==========
-    // nvtxRangePushA("GDS Read");
     
     printf("\n--- Reading data from file to GPU via GDS ---\n");
     ssize_t bytes_read = cuFileRead(cf_handle_in, d_input, aligned_input_size, 0, 0);
@@ -188,10 +169,7 @@ int main(int argc, char* argv[]) {
     }
     printf("✓ Read %ld bytes directly to GPU (bypassed CPU!)\n", bytes_read);
     
-    // nvtxRangePop();
-
     // ========== Step 6: Setup compression ==========
-    // nvtxRangePushA("Compression Setup");
     
     printf("\n--- Setting up %s compression ---\n", getAlgorithmName(algo).c_str());
     
@@ -214,10 +192,8 @@ int main(int argc, char* argv[]) {
     printf("Aligned compressed size: %lu bytes (%.2f MB)\n",
            aligned_compressed_size, aligned_compressed_size / (1024.0 * 1024.0));
     
-    // nvtxRangePop();
 
     // ========== Step 7: Compress data on GPU ==========
-    // nvtxRangePushA("GPU Compression");
     
     printf("\n--- Compressing data on GPU ---\n");
     compressor->compress(d_input, d_compressed, comp_config);
@@ -230,10 +206,7 @@ int main(int argc, char* argv[]) {
     printf("  Compression ratio: %.2fx\n", (double)file_size / compressed_size);
     printf("  Aligned for GDS write: %lu bytes\n", final_aligned_size);
     
-    // nvtxRangePop();
-
     // ========== Step 8: Open output file and write compressed data ==========
-    // nvtxRangePushA("GDS Write");
     
     printf("\n--- Writing compressed data via GDS ---\n");
     

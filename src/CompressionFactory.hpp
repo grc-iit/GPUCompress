@@ -21,7 +21,7 @@ enum class CompressionAlgorithm {
     LZ4,
     SNAPPY,
     DEFLATE,
-    GZIP,
+    GDEFLATE,
     ZSTD,
     ANS,
     CASCADED,
