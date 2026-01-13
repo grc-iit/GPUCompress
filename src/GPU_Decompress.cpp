@@ -19,7 +19,6 @@
 
 #include <cuda_runtime.h>
 #include <cufile.h>
-// #include <nvtx3/nvToolsExt.h>  // Commented out - profiling disabled
 
 // nvCOMP base
 #include "nvcomp.hpp"
