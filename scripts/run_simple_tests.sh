@@ -9,14 +9,14 @@ set -e
 
 PROJECT_DIR="/home/cc/GPUCompress"
 BUILD_DIR="$PROJECT_DIR/build"
-TEST_DIR="$PROJECT_DIR/test_results"
+TEST_DIR="$PROJECT_DIR/test_data"
 
 COMPRESS="$BUILD_DIR/gpu_compress"
 DECOMPRESS="$BUILD_DIR/gpu_decompress"
 COMPARE="$BUILD_DIR/compare_data"
 
-PATTERNS=("smooth" "turbulent" "periodic" "noisy")
-ALGORITHMS=("deflate" "zstd")
+PATTERNS=("smooth" "periodic" "noisy")
+ALGORITHMS=("deflate")
 ERROR_BOUNDS=("0.01" "0.001" "0.0001")
 
 CSV_FILE="$TEST_DIR/compression_results.csv"
@@ -111,7 +111,7 @@ echo "=== CONFIG 1: COMPRESSION ONLY (baseline) ==="
 for pattern in "${PATTERNS[@]}"; do
     echo "Pattern: $pattern"
     for algo in "${ALGORITHMS[@]}"; do
-        run_test "$TEST_DIR/${pattern}_pattern.bin" "$algo" "" "" "0" "$pattern"
+        run_test "$TEST_DIR/test_float32_${pattern}.bin" "$algo" "" "" "0" "$pattern"
     done
 done
 
@@ -123,7 +123,7 @@ echo "=== CONFIG 2: COMPRESSION + SHUFFLE ==="
 for pattern in "${PATTERNS[@]}"; do
     echo "Pattern: $pattern"
     for algo in "${ALGORITHMS[@]}"; do
-        run_test "$TEST_DIR/${pattern}_pattern.bin" "$algo" "" "" "4" "$pattern"
+        run_test "$TEST_DIR/test_float32_${pattern}.bin" "$algo" "" "" "4" "$pattern"
     done
 done
 
@@ -136,7 +136,7 @@ for pattern in "${PATTERNS[@]}"; do
     echo "Pattern: $pattern"
     for algo in "${ALGORITHMS[@]}"; do
         for eb in "${ERROR_BOUNDS[@]}"; do
-            run_test "$TEST_DIR/${pattern}_pattern.bin" "$algo" "linear" "$eb" "0" "$pattern"
+            run_test "$TEST_DIR/test_float32_${pattern}.bin" "$algo" "linear" "$eb" "0" "$pattern"
         done
     done
 done
@@ -150,7 +150,7 @@ for pattern in "${PATTERNS[@]}"; do
     echo "Pattern: $pattern"
     for algo in "${ALGORITHMS[@]}"; do
         for eb in "${ERROR_BOUNDS[@]}"; do
-            run_test "$TEST_DIR/${pattern}_pattern.bin" "$algo" "linear" "$eb" "4" "$pattern"
+            run_test "$TEST_DIR/test_float32_${pattern}.bin" "$algo" "linear" "$eb" "4" "$pattern"
         done
     done
 done

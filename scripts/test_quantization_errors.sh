@@ -2,6 +2,10 @@
 # Quantization Error Analysis Test Script
 # Focuses on quantization-based compression and verifies error bounds
 # Prints detailed comparisons of original vs restored values
+#
+# Usage: ./test_quantization_errors.sh <input_file> [error_bound]
+#   input_file:  Path to binary file containing float32 data
+#   error_bound: Optional error bound (default: 0.01)
 
 set -e
 
@@ -12,12 +16,34 @@ TEST_DIR="$PROJECT_DIR/test_results"
 COMPRESS="$BUILD_DIR/gpu_compress"
 DECOMPRESS="$BUILD_DIR/gpu_decompress"
 
-PATTERNS=("smooth" "turbulent" "periodic" "noisy")
+# Parse arguments
+if [ $# -lt 1 ]; then
+    echo "Usage: $0 <input_file> [error_bound]"
+    echo ""
+    echo "Arguments:"
+    echo "  input_file   Path to binary file containing float32 data"
+    echo "  error_bound  Optional error bound (default: 0.01)"
+    echo ""
+    echo "Example:"
+    echo "  $0 data.bin 0.001"
+    exit 1
+fi
+
+INPUT_FILE="$1"
+ERROR_BOUND="${2:-0.01}"
+
+if [ ! -f "$INPUT_FILE" ]; then
+    echo "Error: Input file '$INPUT_FILE' not found"
+    exit 1
+fi
+
 ALGORITHMS=("deflate" "zstd")
-ERROR_BOUNDS=("0.01" "0.001" "0.0001")
 
 echo "========================================================"
 echo "    Quantization Error Analysis Test Suite"
+echo "========================================================"
+echo "Input file:  $INPUT_FILE"
+echo "Error bound: $ERROR_BOUND"
 echo "========================================================"
 
 run_quantization_test() {
@@ -25,9 +51,8 @@ run_quantization_test() {
     local algorithm="$2"
     local error_bound="$3"
     local shuffle_size="$4"
-    local pattern="$5"
 
-    local test_name="${pattern}_${algorithm}_eb${error_bound}"
+    local test_name="${algorithm}_eb${error_bound}"
     [ "$shuffle_size" != "0" ] && test_name="${test_name}_shuffle"
 
     local compressed_file="$TEST_DIR/${test_name}.compressed"
@@ -36,7 +61,6 @@ run_quantization_test() {
     echo ""
     echo "============================================================"
     echo "Test: $test_name"
-    echo "  Pattern:     $pattern"
     echo "  Algorithm:   $algorithm"
     echo "  Error Bound: $error_bound"
     echo "  Shuffle:     $([ "$shuffle_size" = "0" ] && echo "disabled" || echo "enabled ($shuffle_size bytes)")"
@@ -174,58 +198,9 @@ PYEOF
 }
 
 # =============================================================================
-# Generate test data if needed
-# =============================================================================
-generate_test_data() {
-    echo ""
-    echo "Checking for test data..."
-
-    local need_generation=false
-    for pattern in "${PATTERNS[@]}"; do
-        if [ ! -f "$TEST_DIR/${pattern}_pattern.bin" ]; then
-            need_generation=true
-            break
-        fi
-    done
-
-    if [ "$need_generation" = true ]; then
-        echo "Generating test data patterns..."
-        mkdir -p "$TEST_DIR"
-
-        python3 << 'PYEOF'
-import struct
-import math
-import os
-
-test_dir = "/home/cc/GPUCompress/test_results"
-os.makedirs(test_dir, exist_ok=True)
-
-num_elements = 100000  # 100K floats = 400KB each
-
-patterns = {
-    "smooth": lambda i: math.sin(i * 0.001) * 1000 + i * 0.01,
-    "turbulent": lambda i: math.sin(i * 0.1) * math.cos(i * 0.07) * 500 + (i % 100) * 0.5,
-    "periodic": lambda i: math.sin(i * 0.05) * 100 + math.sin(i * 0.13) * 50,
-    "noisy": lambda i: math.sin(i * 0.01) * 100 + ((i * 17) % 37 - 18) * 0.5,
-}
-
-for name, func in patterns.items():
-    data = [func(i) for i in range(num_elements)]
-    filepath = os.path.join(test_dir, f"{name}_pattern.bin")
-    with open(filepath, "wb") as f:
-        f.write(struct.pack(f'{len(data)}f', *data))
-    print(f"  Created {name}_pattern.bin: {len(data)} floats, range [{min(data):.2f}, {max(data):.2f}]")
-PYEOF
-    else
-        echo "Test data already exists."
-    fi
-}
-
-# =============================================================================
 # Main test execution
 # =============================================================================
 mkdir -p "$TEST_DIR"
-generate_test_data
 
 total_tests=0
 passed_tests=0
@@ -236,20 +211,16 @@ failed_tests=0
 # -----------------------------------------------------------------------------
 echo ""
 echo "###########################################################"
-echo "#  QUANTIZATION TESTS (without shuffle)                   #"
+echo "#  QUANTIZATION TEST (without shuffle)                    #"
 echo "###########################################################"
 
-for pattern in "${PATTERNS[@]}"; do
-    for algo in "${ALGORITHMS[@]}"; do
-        for eb in "${ERROR_BOUNDS[@]}"; do
-            total_tests=$((total_tests + 1))
-            if run_quantization_test "$TEST_DIR/${pattern}_pattern.bin" "$algo" "$eb" "0" "$pattern"; then
-                passed_tests=$((passed_tests + 1))
-            else
-                failed_tests=$((failed_tests + 1))
-            fi
-        done
-    done
+for algo in "${ALGORITHMS[@]}"; do
+    total_tests=$((total_tests + 1))
+    if run_quantization_test "$INPUT_FILE" "$algo" "$ERROR_BOUND" "0"; then
+        passed_tests=$((passed_tests + 1))
+    else
+        failed_tests=$((failed_tests + 1))
+    fi
 done
 
 # -----------------------------------------------------------------------------
@@ -257,20 +228,16 @@ done
 # -----------------------------------------------------------------------------
 echo ""
 echo "###########################################################"
-echo "#  QUANTIZATION TESTS (with shuffle)                      #"
+echo "#  QUANTIZATION TEST (with shuffle)                       #"
 echo "###########################################################"
 
-for pattern in "${PATTERNS[@]}"; do
-    for algo in "${ALGORITHMS[@]}"; do
-        for eb in "${ERROR_BOUNDS[@]}"; do
-            total_tests=$((total_tests + 1))
-            if run_quantization_test "$TEST_DIR/${pattern}_pattern.bin" "$algo" "$eb" "4" "$pattern"; then
-                passed_tests=$((passed_tests + 1))
-            else
-                failed_tests=$((failed_tests + 1))
-            fi
-        done
-    done
+for algo in "${ALGORITHMS[@]}"; do
+    total_tests=$((total_tests + 1))
+    if run_quantization_test "$INPUT_FILE" "$algo" "$ERROR_BOUND" "4"; then
+        passed_tests=$((passed_tests + 1))
+    else
+        failed_tests=$((failed_tests + 1))
+    fi
 done
 
 # =============================================================================
