@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# Testing
+test_output/
+test_*.py
+*.h5
+
+# Large generated preset files
+config/presets_small.yaml
+config/presets_medium.yaml
+config/presets_large.yaml
+config/presets_ultra.yaml
+config/presets_extreme.yaml
+config/presets_filtered.yaml
+config/presets_targeted.yaml
+
+# IDE
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated datasets
+datasets/
+*.hdf5
