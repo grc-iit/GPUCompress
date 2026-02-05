@@ -75,47 +75,55 @@ std::unique_ptr<nvcomp::nvcompManagerBase> createCompressionManager(
 
     switch (algo) {
         case CompressionAlgorithm::LZ4: {
-            nvcompBatchedLZ4Opts_t opts = nvcompBatchedLZ4DefaultOpts;
+            nvcompBatchedLZ4CompressOpts_t opts = nvcompBatchedLZ4CompressDefaultOpts;
             opts.data_type = NVCOMP_TYPE_CHAR;
-            return std::make_unique<nvcomp::LZ4Manager>(chunk_size, opts, stream);
+            return std::make_unique<nvcomp::LZ4Manager>(
+                chunk_size, opts, nvcompBatchedLZ4DecompressDefaultOpts, stream);
         }
 
         case CompressionAlgorithm::SNAPPY: {
             return std::make_unique<nvcomp::SnappyManager>(
-                chunk_size, nvcompBatchedSnappyDefaultOpts, stream);
+                chunk_size, nvcompBatchedSnappyCompressDefaultOpts,
+                nvcompBatchedSnappyDecompressDefaultOpts, stream);
         }
 
         case CompressionAlgorithm::DEFLATE: {
-            nvcompBatchedDeflateOpts_t opts = nvcompBatchedDeflateDefaultOpts;
-            return std::make_unique<nvcomp::DeflateManager>(chunk_size, opts, stream);
+            nvcompBatchedDeflateCompressOpts_t opts = nvcompBatchedDeflateCompressDefaultOpts;
+            return std::make_unique<nvcomp::DeflateManager>(
+                chunk_size, opts, nvcompBatchedDeflateDecompressDefaultOpts, stream);
         }
 
         case CompressionAlgorithm::GDEFLATE: {
             return std::make_unique<nvcomp::GdeflateManager>(
-                chunk_size, nvcompBatchedGdeflateDefaultOpts, stream);
+                chunk_size, nvcompBatchedGdeflateCompressDefaultOpts,
+                nvcompBatchedGdeflateDecompressDefaultOpts, stream);
         }
 
         case CompressionAlgorithm::ZSTD: {
             return std::make_unique<nvcomp::ZstdManager>(
-                chunk_size, nvcompBatchedZstdDefaultOpts, stream);
+                chunk_size, nvcompBatchedZstdCompressDefaultOpts,
+                nvcompBatchedZstdDecompressDefaultOpts, stream);
         }
 
         case CompressionAlgorithm::ANS: {
             return std::make_unique<nvcomp::ANSManager>(
-                chunk_size, nvcompBatchedANSDefaultOpts, stream);
+                chunk_size, nvcompBatchedANSCompressDefaultOpts,
+                nvcompBatchedANSDecompressDefaultOpts, stream);
         }
 
         case CompressionAlgorithm::CASCADED: {
-            nvcompBatchedCascadedOpts_t opts = nvcompBatchedCascadedDefaultOpts;
+            nvcompBatchedCascadedCompressOpts_t opts = nvcompBatchedCascadedCompressDefaultOpts;
             opts.type = NVCOMP_TYPE_LONGLONG; // Good for floating-point/scientific data
-            return std::make_unique<nvcomp::CascadedManager>(chunk_size, opts, stream);
+            return std::make_unique<nvcomp::CascadedManager>(
+                chunk_size, opts, nvcompBatchedCascadedDecompressDefaultOpts, stream);
         }
 
         case CompressionAlgorithm::BITCOMP: {
-            nvcompBatchedBitcompFormatOpts opts = nvcompBatchedBitcompDefaultOpts;
+            nvcompBatchedBitcompCompressOpts_t opts = nvcompBatchedBitcompCompressDefaultOpts;
             opts.data_type = NVCOMP_TYPE_LONGLONG; // Good for scientific data
-            opts.algorithm_type = 0; // Default algorithm
-            return std::make_unique<nvcomp::BitcompManager>(chunk_size, opts, stream);
+            opts.algorithm = 0; // Default algorithm
+            return std::make_unique<nvcomp::BitcompManager>(
+                chunk_size, opts, nvcompBatchedBitcompDecompressDefaultOpts, stream);
         }
 
         default:
