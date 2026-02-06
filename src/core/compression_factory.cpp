@@ -5,7 +5,7 @@
  * Supports multiple compression algorithms with default configurations
  */
 
-#include "CompressionFactory.hpp"
+#include "core/compression_factory.hpp"
 
 #include <algorithm>
 #include <cctype>

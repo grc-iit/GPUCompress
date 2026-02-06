@@ -7,7 +7,7 @@
  * Supports float32 and float64 with adaptive output precision.
  */
 
-#include "quantization.cuh"
+#include "preprocessing/quantization.cuh"
 #include <cuda_runtime.h>
 #include <cub/cub.cuh>
 #include <cfloat>

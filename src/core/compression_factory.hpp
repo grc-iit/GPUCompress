@@ -5,8 +5,8 @@
  * Provides a clean interface for algorithm selection and configuration
  */
 
-#ifndef COMPRESSION_FACTORY_HPP
-#define COMPRESSION_FACTORY_HPP
+#ifndef CORE_COMPRESSION_FACTORY_HPP
+#define CORE_COMPRESSION_FACTORY_HPP
 
 #include <memory>
 #include <string>
@@ -50,5 +50,5 @@ std::shared_ptr<nvcomp::nvcompManagerBase> createDecompressionManager(
     cudaStream_t stream
 );
 
-#endif // COMPRESSION_FACTORY_HPP
+#endif // CORE_COMPRESSION_FACTORY_HPP
 

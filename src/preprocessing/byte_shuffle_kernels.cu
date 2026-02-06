@@ -9,7 +9,7 @@
  * Strategy: Outer loop parallelization over byte positions
  */
 
-#include "byte_shuffle.cuh"
+#include "preprocessing/byte_shuffle.cuh"
 #include <cstring>
 #include <vector>
 

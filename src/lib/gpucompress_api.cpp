@@ -13,11 +13,11 @@
 #include <cstdio>
 
 #include "gpucompress.h"
-#include "gpucompress_internal.hpp"
-#include "CompressionFactory.hpp"
-#include "compression_header.h"
-#include "byte_shuffle.cuh"
-#include "quantization.cuh"
+#include "internal.hpp"
+#include "core/compression_factory.hpp"
+#include "core/compression_header.h"
+#include "preprocessing/byte_shuffle.cuh"
+#include "preprocessing/quantization.cuh"
 
 #include "nvcomp.hpp"
 #include "nvcomp/nvcompManagerFactory.hpp"

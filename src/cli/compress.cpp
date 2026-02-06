@@ -26,17 +26,17 @@
 #include "nvcomp/nvcompManagerFactory.hpp"
 
 // Compression factory for algorithm selection
-#include "CompressionFactory.hpp"
+#include "core/compression_factory.hpp"
 
 // Byte shuffle for preprocessing
-#include "byte_shuffle.cuh"
-#include "util.h"
+#include "preprocessing/byte_shuffle.cuh"
+#include "core/util.h"
 
 // Compression header for metadata
-#include "compression_header.h"
+#include "core/compression_header.h"
 
 // Quantization for lossy preprocessing
-#include "quantization.cuh"
+#include "preprocessing/quantization.cuh"
 
 using namespace nvcomp;
 

@@ -33,9 +33,9 @@
 #include <chrono>
 
 // Include GPUCompress headers
-#include "../../src/quantization.cuh"
-#include "../../src/byte_shuffle.cuh"
-#include "../../src/compression_header.h"
+#include "../../src/preprocessing/quantization.cuh"
+#include "../../src/preprocessing/byte_shuffle.cuh"
+#include "../../src/core/compression_header.h"
 
 // ============================================================================
 // Test Framework Macros and Utilities

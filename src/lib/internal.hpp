@@ -1,13 +1,13 @@
 /**
- * @file gpucompress_internal.hpp
+ * @file internal.hpp
  * @brief Internal C++ interface for GPUCompress library
  *
  * This header provides internal C++ utilities used by the library.
  * Not part of the public API.
  */
 
-#ifndef GPUCOMPRESS_INTERNAL_HPP
-#define GPUCOMPRESS_INTERNAL_HPP
+#ifndef INTERNAL_HPP
+#define INTERNAL_HPP
 
 #include <cuda_runtime.h>
 #include <memory>
@@ -15,8 +15,8 @@
 #include <atomic>
 
 #include "gpucompress.h"
-#include "CompressionFactory.hpp"
-#include "compression_header.h"
+#include "core/compression_factory.hpp"
+#include "core/compression_header.h"
 
 namespace gpucompress {
 
@@ -236,4 +236,4 @@ int getBestActionGPU(int state, cudaStream_t stream);
 
 } // namespace gpucompress
 
-#endif /* GPUCOMPRESS_INTERNAL_HPP */
+#endif /* INTERNAL_HPP */

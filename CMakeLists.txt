@@ -43,13 +43,13 @@ link_directories(
 # Core Sources (reusable across targets)
 # ============================================================
 set(FACTORY_SOURCES
-    src/CompressionFactory.cpp
-    src/CompressionFactory.hpp
+    src/core/compression_factory.cpp
+    src/core/compression_factory.hpp
 )
 
 set(PREPROCESSING_SOURCES
-    src/byte_shuffle_kernels.cu
-    src/quantization_kernels.cu
+    src/preprocessing/byte_shuffle_kernels.cu
+    src/preprocessing/quantization_kernels.cu
 )
 
 set(LIB_SOURCES
@@ -60,9 +60,9 @@ set(LIB_SOURCES
 
 # Set language property for .cpp files that use CUDA
 set_source_files_properties(
-    src/CompressionFactory.cpp
-    src/GPU_Compress.cpp
-    src/GPU_Decompress.cpp
+    src/core/compression_factory.cpp
+    src/cli/compress.cpp
+    src/cli/decompress.cpp
     src/lib/gpucompress_api.cpp
     PROPERTIES LANGUAGE CUDA
 )
@@ -144,7 +144,7 @@ endif()
 # Executable 1: GPU Compress (with verification)
 # ============================================================
 add_executable(gpu_compress
-    src/GPU_Compress.cpp
+    src/cli/compress.cpp
     ${PREPROCESSING_SOURCES}
     ${FACTORY_SOURCES}
 )
@@ -164,7 +164,7 @@ set_target_properties(gpu_compress PROPERTIES
 # Executable 2: GPU Decompress
 # ============================================================
 add_executable(gpu_decompress
-    src/GPU_Decompress.cpp
+    src/cli/decompress.cpp
     ${PREPROCESSING_SOURCES}
     ${FACTORY_SOURCES}
 )
