@@ -12,12 +12,60 @@ Key controls:
   - fill_mode:    Value pattern within bins (5 types)
   - bin_width:    Bin value range in normalized [0,1] space
 
-Usage:
-    python generator.py generate -p normal --perturbation 0.0 -o low.bin
-    python generator.py batch -o datasets/ --mode training
-    python generator.py batch -o datasets/ --mode comprehensive -s 1MB
-    python generator.py stats -o stats.csv --threads 4
-    python generator.py info datasets/some_file.bin
+Commands:
+  generate   Generate a single synthetic dataset
+  batch      Generate dataset collection for benchmarking
+  stats      Generate statistics CSV (no files saved)
+  info       Display file information and statistics
+
+generate -- Create a single dataset file
+  -p, --palette TEXT       Bin weight distribution [uniform|normal|gamma|
+                           exponential|bimodal|grayscott|high_entropy]
+                           (default: uniform)
+  --perturbation FLOAT     Spatial locality: 0.0=long runs, 1.0=random
+                           (default: 0.5)
+  -f, --fill-mode TEXT     Value pattern within bins [constant|linear|
+                           quadratic|sinusoidal|random] (default: random)
+  -w, --bin-width FLOAT    Absolute bin width in value space (default: 1.0)
+  -d, --dtype TEXT         Data type [float32|uint8|int32] (default: float32)
+  -s, --size TEXT          Dataset size, e.g. 4MB, 1GB (default: 4MB)
+  --seed INT               Random seed
+  -o, --output PATH        Output file path (.bin or .h5)  [required]
+  -q, --quiet              Suppress output
+
+batch -- Generate full dataset collection
+  -o, --output-dir PATH    Output directory (default: datasets)
+  -s, --size TEXT          Size per dataset (default: 4MB)
+  -m, --mode TEXT          Batch mode [training|comprehensive]
+                           (default: training)
+                             training:      7 palettes x 7 widths x 8 perts
+                                            x 4 fills = 1568 per dtype
+                             comprehensive: 7 palettes x 7 widths x 8 perts
+                                            x 5 fills = 1960 per dtype
+  -d, --dtypes TEXT        Comma-separated dtypes (default: float32 for
+                           training, all 3 for comprehensive)
+  -r, --repeats INT        Repeats per combo with different seeds (default: 1)
+  --format TEXT            Output format [bin|h5] (default: bin)
+  -t, --threads INT        Worker processes (default: CPU count)
+  -q, --quiet              Suppress output
+
+stats -- Compute statistics CSV without saving data files
+  -o, --output PATH        Output CSV path (default: compression_stats.csv)
+  -t, --threads INT        Thread count (default: 1)
+  -m, --mode TEXT          Config mode [comprehensive|training]
+                           (default: comprehensive)
+  -v, --verbose            Print progress
+
+info -- Display file information and statistics
+  FILENAME                 Path to .bin or .h5 file
+
+Examples:
+  python generator.py generate -p normal --perturbation 0.0 -o low.bin
+  python generator.py generate -p high_entropy -f random -s 1MB -o he.bin
+  python generator.py batch -o training_data/ --mode training -t 8
+  python generator.py batch -o datasets/ --mode comprehensive -s 1MB -t 16
+  python generator.py stats -o stats.csv -t 4 -v
+  python generator.py info training_data/float32_normal_w100_p0_const.bin
 """
 
 import click
@@ -26,9 +74,10 @@ import os
 import sys
 import csv
 import math
+import random as _stdlib_random
 from typing import Tuple, Dict, Any, Union, List
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import threading
 
 
@@ -57,7 +106,7 @@ COMPREHENSIVE_BIN_WIDTHS = [0.1, 0.25, 0.5, 1.0, 4.0, 16.0, 64.0]
 COMPREHENSIVE_PERTURBATIONS = [0.0, 0.05, 0.1, 0.2, 0.325, 0.5, 0.75, 0.9]
 
 TRAINING_BIN_WIDTHS = [0.1, 0.12, 0.15, 0.25, 0.5, 1.0, 16.0]
-TRAINING_PERTURBATIONS = [0.0, 0.325, 0.95, 1.0]
+TRAINING_PERTURBATIONS = [0.0, 0.1, 0.2, 0.325, 0.5, 0.75, 0.95, 1.0]
 TRAINING_FILL_MODES = ['constant', 'linear', 'quadratic', 'random']
 
 
@@ -207,6 +256,9 @@ def generate(
 ) -> np.ndarray:
     """Generate data using palette-based 32-bin system.
 
+    Matches newScript.cc GenerateBinnedData: burst-based sampling with
+    perturbation-controlled spatial locality, vectorized for performance.
+
     Args:
         shape: Output array shape (int or tuple)
         palette: Bin weight distribution name
@@ -223,7 +275,7 @@ def generate(
     if isinstance(shape, int):
         shape = (shape,)
     num_elements = int(np.prod(shape))
-    rng = np.random.RandomState(seed)
+    np_rng = np.random.RandomState(seed)
 
     if palette not in _WEIGHT_FUNCS:
         raise ValueError(f"Unknown palette: {palette}. Available: {PALETTES}")
@@ -244,55 +296,95 @@ def generate(
     targets = (weights * num_elements).astype(int)
     targets[-1] = num_elements - targets[:-1].sum()
 
-    data = np.empty(num_elements, dtype=np.float64)
-    counts = np.zeros(N_BINS, dtype=int)
-    active_bins = [i for i in range(N_BINS) if targets[i] > 0]
+    # === Phase 1: Plan burst sequence (matches newScript.cc GenerateBinnedData) ===
+    # Lightweight Python loop — only integer math, no numpy per iteration.
+    # Uses stdlib random for fast scalar randrange vs numpy's per-call overhead.
+    py_rng = _stdlib_random.Random(seed)
+    burst_bins = []
+    burst_sizes = []
+    counts = [0] * N_BINS
+    tgt = targets.tolist()
+    active = [i for i in range(N_BINS) if tgt[i] > 0]
     pos = 0
 
-    while pos < num_elements and active_bins:
-        bin_idx = active_bins[rng.randint(len(active_bins))]
-        remaining = targets[bin_idx] - counts[bin_idx]
-
-        burst = max(1, int(remaining * (1.0 - perturbation)))
-        burst = min(burst, remaining, num_elements - pos)
-
-        b_lo, b_hi = float(bin_lo[bin_idx]), float(bin_hi[bin_idx])
-        mid = (b_lo + b_hi) / 2
-
-        if fill_mode == 'constant':
-            data[pos:pos + burst] = b_lo
-        elif fill_mode == 'linear':
-            if burst > 1:
-                data[pos:pos + burst] = np.linspace(b_lo, b_hi, burst)
-            else:
-                data[pos] = mid
-        elif fill_mode == 'quadratic':
-            if burst > 1:
-                t = np.arange(burst, dtype=np.float64) / (burst - 1)
-                phase = t - 0.5
-                a = 4.0 * ((b_hi - b_lo) / 4.0) / 0.25
-                vals = mid + a * phase * phase - (b_hi - b_lo) / 4.0
-                data[pos:pos + burst] = np.clip(
-                    vals, min(b_lo, b_hi), max(b_lo, b_hi))
-            else:
-                data[pos] = mid
-        elif fill_mode == 'sinusoidal':
-            if burst > 1:
-                t = np.arange(burst) / burst
-                data[pos:pos + burst] = (
-                    mid + (b_hi - b_lo) / 2 * np.sin(2 * np.pi * t))
-            else:
-                data[pos] = mid
-        else:  # random
-            if b_lo == b_hi:
-                data[pos:pos + burst] = b_lo
-            else:
-                data[pos:pos + burst] = rng.uniform(b_lo, b_hi, burst)
-
+    while pos < num_elements and active:
+        pick = py_rng.randrange(len(active))
+        bi = active[pick]
+        rem = tgt[bi] - counts[bi]
+        burst = max(1, int(rem * (1.0 - perturbation)))
+        burst = min(burst, rem, num_elements - pos)
+        burst_bins.append(bi)
+        burst_sizes.append(burst)
         pos += burst
-        counts[bin_idx] += burst
-        if counts[bin_idx] >= targets[bin_idx]:
-            active_bins.remove(bin_idx)
+        counts[bi] += burst
+        if counts[bi] >= tgt[bi]:
+            # O(1) removal: swap with last and pop
+            active[pick] = active[-1]
+            active.pop()
+
+    if not burst_bins:
+        np_dtype = _TYPE_CONFIG[dtype]['np_dtype']
+        return np.zeros(num_elements, dtype=np_dtype).reshape(shape)
+
+    # === Phase 2: Build per-element bin index array (vectorized) ===
+    bp_bins = np.array(burst_bins, dtype=np.int32)
+    bp_sizes = np.array(burst_sizes, dtype=np.int64)
+    bin_idx = np.repeat(bp_bins, bp_sizes)
+
+    lo = bin_lo[bin_idx]
+    hi = bin_hi[bin_idx]
+    mid = (lo + hi) * 0.5
+
+    # === Phase 3: Fill values by fill_mode (fully vectorized) ===
+    data = np.empty(num_elements, dtype=np.float64)
+
+    if fill_mode == 'constant':
+        data[:] = lo
+
+    elif fill_mode == 'random':
+        same = (lo == hi)
+        data[same] = lo[same]
+        diff_mask = ~same
+        n_diff = diff_mask.sum()
+        if n_diff > 0:
+            data[diff_mask] = (lo[diff_mask]
+                               + np_rng.random_sample(n_diff)
+                               * (hi[diff_mask] - lo[diff_mask]))
+
+    else:
+        # linear, quadratic, sinusoidal need within-burst position
+        cum = np.cumsum(bp_sizes)
+        starts = np.empty(len(bp_sizes), dtype=np.int64)
+        starts[0] = 0
+        if len(bp_sizes) > 1:
+            starts[1:] = cum[:-1]
+        offsets = np.repeat(starts, bp_sizes)
+        within = (np.arange(num_elements, dtype=np.float64) - offsets)
+        sizes_f = np.repeat(bp_sizes.astype(np.float64), bp_sizes)
+        single = (sizes_f == 1.0)
+
+        if fill_mode == 'linear':
+            # t = j / (burst_size - 1), matching newScript.cc LINEAR
+            t = within / np.maximum(sizes_f - 1.0, 1.0)
+            data[:] = np.where(single, mid, lo + t * (hi - lo))
+
+        elif fill_mode == 'quadratic':
+            # Parabola matching newScript.cc QUADRATIC
+            t = within / np.maximum(sizes_f - 1.0, 1.0)
+            phase = t - 0.5
+            span = hi - lo
+            a = 4.0 * (span / 4.0) / 0.25
+            vals = mid + a * phase * phase - span / 4.0
+            data[:] = np.where(single, mid,
+                               np.clip(vals, np.minimum(lo, hi),
+                                       np.maximum(lo, hi)))
+
+        elif fill_mode == 'sinusoidal':
+            # t = j / burst_size (NOT burst_size-1), matching newScript.cc SINUSOIDAL
+            t = within / np.maximum(sizes_f, 1.0)
+            data[:] = np.where(single, mid,
+                               mid + (hi - lo) * 0.5
+                               * np.sin(2.0 * np.pi * t))
 
     np_dtype = _TYPE_CONFIG[dtype]['np_dtype']
     clamp = _TYPE_CONFIG[dtype]['clamp']
@@ -535,17 +627,20 @@ def cmd_generate(palette, perturbation, fill_mode, bin_width, dtype, size,
 @click.option('--format', 'fmt', type=click.Choice(['bin', 'h5']), default='bin',
               help='Output format')
 @click.option('--quiet', '-q', is_flag=True, help='Suppress output')
-def batch(output_dir, size, mode, dtypes, repeats, fmt, quiet):
+@click.option('--threads', '-t', type=int, default=None,
+              help='Worker processes for parallel generation (default: CPU count)')
+def batch(output_dir, size, mode, dtypes, repeats, fmt, quiet, threads):
     """Generate dataset collection for benchmarking.
 
     \b
     Modes (matching newScript.cc):
-      training:       7 palettes x 7 widths x 4 perturbations x 4 fills = 784 per dtype
+      training:       7 palettes x 7 widths x 8 perturbations x 4 fills = 1568 per dtype
       comprehensive:  7 palettes x 7 widths x 8 perturbations x 5 fills = 1960 per dtype
     """
     os.makedirs(output_dir, exist_ok=True)
 
     size_bytes = parse_size(size)
+    n_workers = threads or os.cpu_count() or 4
 
     if dtypes:
         dtype_list = [d.strip() for d in dtypes.split(',')]
@@ -585,15 +680,14 @@ def batch(output_dir, size, mode, dtypes, repeats, fmt, quiet):
         click.echo(f"  Bin widths:    {bin_widths}")
         click.echo(f"  Perturbations: {perturbations}")
         click.echo(f"  Fill modes:    {fill_modes}")
+        click.echo(f"  Workers:       {n_workers}")
         click.echo(f"  Output:        {output_dir}/\n")
 
-    file_num = 0
+    # Build work items
+    work_items = []
     for i, (dt, pal, bw, pert, fm) in enumerate(combos):
         for r in range(repeats):
-            file_num += 1
             seed = i * repeats + r + 1
-
-            # Encode bin_width*100, perturbation*1000 for unique filenames
             w_enc = int(round(bw * 100))
             p_enc = int(round(pert * 1000))
             base = f"{dt}_{pal}_w{w_enc}_p{p_enc}_{fill_mode_short(fm)}"
@@ -601,24 +695,33 @@ def batch(output_dir, size, mode, dtypes, repeats, fmt, quiet):
                 name = f"{base}_s{seed}"
             else:
                 name = base
-
             filepath = os.path.join(output_dir, f"{name}.{fmt}")
-
             dtype_bytes = np.dtype(_TYPE_CONFIG[dt]['np_dtype']).itemsize
             num_elements = size_bytes // dtype_bytes
+            work_items.append((filepath, num_elements, pal, pert, fm, bw, dt, seed))
 
-            data = generate(
-                shape=(num_elements,), palette=pal, perturbation=pert,
-                fill_mode=fm, bin_width=bw, dtype=dt, seed=seed
-            )
+    # Generate files in parallel
+    import time
+    start_time = time.monotonic()
+    completed = 0
 
-            _save(filepath, data, pal, pert, fm, bw)
-
+    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        futures = {executor.submit(_generate_one_file, *item): item
+                   for item in work_items}
+        for future in as_completed(futures):
+            name, ent = future.result()
+            completed += 1
             if not quiet:
-                ent = calculate_byte_entropy(data)
-                click.echo(f"  [{file_num}/{total}] {name:.<65} entropy={ent:.4f}")
+                elapsed = time.monotonic() - start_time
+                rate = completed / elapsed if elapsed > 0 else 0
+                eta = (total - completed) / rate if rate > 0 else 0
+                click.echo(f"\r  [{completed}/{total}] {completed*100.0/total:.1f}% "
+                           f"({rate:.1f} files/s, ETA {eta:.0f}s) "
+                           f"last: {name}", nl=False)
 
-    click.echo(f"\nGenerated {total} files in {output_dir}/")
+    if not quiet:
+        elapsed = time.monotonic() - start_time
+        click.echo(f"\n\nGenerated {total} files in {output_dir}/ ({elapsed:.1f}s)")
 
 
 @cli.command()
@@ -803,6 +906,17 @@ def _save(filepath: str, data: np.ndarray,
         )
     else:
         write_binary(filepath, data)
+
+
+def _generate_one_file(filepath, num_elements, palette, perturbation,
+                       fill_mode, bin_width, dtype, seed):
+    """Generate and save a single dataset file. Used by parallel batch."""
+    data = generate(
+        shape=(num_elements,), palette=palette, perturbation=perturbation,
+        fill_mode=fill_mode, bin_width=bin_width, dtype=dtype, seed=seed
+    )
+    _save(filepath, data, palette, perturbation, fill_mode, bin_width)
+    return os.path.basename(filepath), calculate_byte_entropy(data)
 
 
 def _fmt_size(size_bytes: int) -> str:

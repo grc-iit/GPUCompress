@@ -76,7 +76,7 @@ static const char* CSV_HEADER =
     "compression_throughput_mbps,decompression_throughput_mbps,"
     "psnr_db,max_error,rmse,"
     "entropy,mad,first_derivative,"
-    "lib_throughput_mbps,success\n";
+    "lib_throughput_mbps,exact_match,success\n";
 
 // ============================================================
 // Structures
@@ -130,6 +130,7 @@ struct BenchmarkRow {
     double mad;
     double first_derivative;
     double lib_throughput_mbps;
+    std::string exact_match;
     bool success;
 };
 
@@ -471,6 +472,7 @@ static std::string format_row(const BenchmarkRow& r) {
         << fmt_double(r.mad, 6) << ","
         << fmt_double(r.first_derivative, 6) << ","
         << fmt_double(r.lib_throughput_mbps, 2) << ","
+        << r.exact_match << ","
         << (r.success ? "True" : "False") << "\n";
     return oss.str();
 }
@@ -568,6 +570,7 @@ static std::vector<BenchmarkRow> benchmark_file(
             row.max_error_str = "";
             row.rmse_str = "";
             row.lib_throughput_mbps = 0.0;
+            row.exact_match = "";
             row.success = false;
             rows.push_back(row);
             continue;
@@ -594,8 +597,9 @@ static std::vector<BenchmarkRow> benchmark_file(
             ? (static_cast<double>(input_size) / (1024.0 * 1024.0)) / (decomp_time / 1000.0)
             : 0.0;
 
-        // Quality metrics
+        // Quality metrics and data integrity
         if (rc_d == 0 && cfg.quant_label == "linear") {
+            // Lossy: compute quality metrics
             const float* decomp_data = reinterpret_cast<const float*>(decomp_buf.data());
             size_t decomp_elements = decomp_size / sizeof(float);
             if (decomp_elements == num_elements) {
@@ -607,20 +611,40 @@ static std::vector<BenchmarkRow> benchmark_file(
                 }
                 row.max_error_str = fmt_double(qm.max_error, 6);
                 row.rmse_str = fmt_double(qm.rmse, 6);
+                // Lossy compression: check if result happens to be exact
+                row.exact_match = (decomp_size == input_size &&
+                    memcmp(raw.data(), decomp_buf.data(), input_size) == 0)
+                    ? "True" : "False";
             } else {
                 row.psnr_db = "";
                 row.max_error_str = "";
                 row.rmse_str = "";
+                row.exact_match = "False";
             }
         } else if (rc_d == 0) {
-            // Lossless
-            row.psnr_db = "inf";
-            row.max_error_str = fmt_double(0.0, 1);
-            row.rmse_str = fmt_double(0.0, 1);
+            // Lossless: verify data integrity via memcmp
+            bool match = (decomp_size == input_size &&
+                memcmp(raw.data(), decomp_buf.data(), input_size) == 0);
+            row.exact_match = match ? "True" : "False";
+            if (match) {
+                row.psnr_db = "inf";
+                row.max_error_str = fmt_double(0.0, 1);
+                row.rmse_str = fmt_double(0.0, 1);
+            } else {
+                // Decompressed data does not match original
+                row.psnr_db = "";
+                row.max_error_str = "";
+                row.rmse_str = "";
+                row.success = false;
+                rows.push_back(row);
+                continue;
+            }
         } else {
+            // Decompression failed
             row.psnr_db = "";
             row.max_error_str = "";
             row.rmse_str = "";
+            row.exact_match = "";
         }
 
         row.compressed_size = compressed_size;
