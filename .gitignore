@@ -7,4 +7,4 @@ cufile.log
 .venv
 test_data/*.csv
 __pycache__/
-
+*.csv
