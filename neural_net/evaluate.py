@@ -6,16 +6,19 @@ For each file in the validation set:
 2. Rank by predicted compression_ratio (and other criteria)
 3. Compare predicted ranking to actual ranking
 4. Report top-1, top-3 accuracy and regret
+
+Usage:
+    python neural_net/evaluate.py --data-dir syntheticGeneration/training_data/ --lib-path build/libgpucompress.so
 """
 
 import sys
+import argparse
 import numpy as np
 import torch
-import pandas as pd
 from pathlib import Path
 from typing import Dict
 
-from data import load_and_prepare, inverse_transform_outputs, ALGORITHM_NAMES
+from data import inverse_transform_outputs, ALGORITHM_NAMES
 from model import CompressionPredictor
 
 
@@ -53,14 +56,6 @@ def evaluate_ranking(model, data: Dict, device: torch.device,
     top3_correct = 0
     total_groups = 0
     regrets = []
-
-    # Map ranking column to output index
-    rank_col_map = {
-        'compression_ratio': 'ratio_log',
-        'compression_time_ms': 'comp_time_log',
-        'decompression_time_ms': 'decomp_time_log',
-        'psnr_db': 'psnr_clamped',
-    }
 
     # For ratio and psnr: higher is better. For time: lower is better.
     higher_is_better = rank_by in ('compression_ratio', 'psnr_db')
@@ -142,7 +137,7 @@ def evaluate_ranking(model, data: Dict, device: torch.device,
 
     # ---- Report ----
     print(f"\n{'=' * 65}")
-    print(f"RANKING EVALUATION — rank by: {rank_by}")
+    print(f"RANKING EVALUATION -- rank by: {rank_by}")
     print(f"{'=' * 65}")
     print(f"  Total (file, error_bound) groups: {total_groups}")
     print(f"  Top-1 accuracy: {top1_correct}/{total_groups} = {100*top1_correct/total_groups:.1f}%")
@@ -223,21 +218,33 @@ def show_sample_predictions(model, data: Dict, device: torch.device, n_samples: 
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        description='Evaluate compression predictor ranking accuracy')
+    parser.add_argument('--data-dir', type=str, required=True,
+                        help='Directory containing .bin files for benchmarking')
+    parser.add_argument('--lib-path', type=str, default=None,
+                        help='Path to libgpucompress.so')
+    parser.add_argument('--max-files', type=int, default=None,
+                        help='Max .bin files to process')
+    parser.add_argument('--weights', type=str, default=None,
+                        help='Path to model.pt (default: neural_net/weights/model.pt)')
+    args = parser.parse_args()
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    weights_path = Path(__file__).parent / 'weights' / 'model.pt'
-    if not weights_path.exists():
-        print("No trained model found. Run train.py first.")
+    weights_path = args.weights or str(Path(__file__).parent / 'weights' / 'model.pt')
+    if not Path(weights_path).exists():
+        print(f"No trained model found at {weights_path}. Run train.py first.")
         sys.exit(1)
 
-    csv_path = Path(__file__).parent.parent / 'benchmark_results.csv'
-
     # Load model
-    model, checkpoint = load_trained_model(str(weights_path), device)
+    model, checkpoint = load_trained_model(weights_path, device)
     print(f"Loaded model from {weights_path} (epoch {checkpoint['best_epoch']})")
 
-    # Load data (same split)
-    data = load_and_prepare(str(csv_path))
+    # Load data from binary files
+    from binary_data import load_and_prepare_from_binary
+    data = load_and_prepare_from_binary(
+        args.data_dir, lib_path=args.lib_path, max_files=args.max_files)
 
     # Evaluate ranking for different criteria
     for criterion in ['compression_ratio', 'compression_time_ms', 'psnr_db']:

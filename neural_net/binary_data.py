@@ -4,7 +4,7 @@ Binary data loader with on-the-fly GPU benchmarking.
 Reads raw .bin files (float32 arrays), computes stats on GPU via
 libgpucompress.so, and benchmarks all 64 compression configs per file.
 
-Replaces the CSV-based pipeline with direct binary-file ingestion.
+Primary data source for NN training.
 """
 
 import time
@@ -18,7 +18,7 @@ from gpucompress_ctypes import (
     ALGO_ZSTD, ALGO_ANS, ALGO_CASCADED, ALGO_BITCOMP, ALGO_NAMES,
     HEADER_SIZE,
 )
-from data import ALGORITHM_NAMES, CONTINUOUS_FEATURES, OUTPUT_COLUMNS
+from data import encode_and_split
 
 # ============================================================
 # Benchmark configuration space (64 configs)
@@ -55,17 +55,18 @@ def _compute_psnr(original: bytes, decompressed: bytes) -> float:
     return 10.0 * np.log10((data_range ** 2) / mse)
 
 
-def load_and_prepare_from_binary(
+def benchmark_binary_files(
     data_dir: str,
     lib_path: str = None,
-    val_fraction: float = 0.2,
-    seed: int = 42,
     max_files: int = None,
-) -> Dict:
+) -> pd.DataFrame:
     """
-    Load .bin files, benchmark all configs on GPU, and prepare training data.
+    Benchmark .bin files against all 64 compression configs on GPU.
 
-    Returns the same dict format as data.load_and_prepare().
+    Returns a raw DataFrame with columns matching the benchmark format:
+        file, algorithm, quantization, shuffle, error_bound, original_size,
+        entropy, mad, first_derivative, compression_ratio,
+        compression_time_ms, decompression_time_ms, psnr_db, success
     """
     data_path = Path(data_dir)
     bin_files = sorted(data_path.glob('*.bin'))
@@ -104,7 +105,6 @@ def load_and_prepare_from_binary(
             print(f"    {'-' * 82}")
 
             # Benchmark all 64 configs
-            file_config_idx = 0
             for algo in ALGORITHMS:
                 algo_name = ALGO_NAMES[algo]
                 for shuffle in SHUFFLE_OPTIONS:
@@ -113,7 +113,6 @@ def load_and_prepare_from_binary(
                             algo=algo, shuffle=shuffle,
                             quantize=quantize, error_bound=error_bound)
 
-                        file_config_idx += 1
                         try:
                             # Compress
                             t0 = time.perf_counter()
@@ -168,7 +167,6 @@ def load_and_prepare_from_binary(
                                   f"{'---':>9}  {'---':>7}  "
                                   f"{'FAIL':>6}")
 
-                            # Compression/decompression failed for this config
                             rows.append({
                                 'file': bin_file.name,
                                 'algorithm': algo_name,
@@ -196,122 +194,23 @@ def load_and_prepare_from_binary(
     elapsed = time.time() - t_start
     print(f"\nBenchmarking completed in {elapsed:.1f}s ({len(rows)} rows)")
 
-    # Build DataFrame and apply same encoding as data.py
-    df = pd.DataFrame(rows)
-    return _encode_and_split(df, val_fraction, seed)
+    return pd.DataFrame(rows)
 
 
-def _encode_and_split(df: pd.DataFrame, val_fraction: float,
-                      seed: int) -> Dict:
-    """Apply the same feature encoding and split logic as data.load_and_prepare()."""
+def load_and_prepare_from_binary(
+    data_dir: str,
+    lib_path: str = None,
+    val_fraction: float = 0.2,
+    seed: int = 42,
+    max_files: int = None,
+) -> Dict:
+    """
+    Load .bin files, benchmark all configs on GPU, and prepare training data.
 
-    # Filter failures
-    df = df[df['success'] == True].copy()
-    print(f"  After filtering failures: {len(df)} rows")
-
-    # Algorithm: one-hot
-    for alg in ALGORITHM_NAMES:
-        df[f'alg_{alg}'] = (df['algorithm'] == alg).astype(np.float32)
-
-    # Quantization: binary
-    df['quant_enc'] = (df['quantization'] == 'linear').astype(np.float32)
-
-    # Shuffle: binary
-    df['shuffle_enc'] = (df['shuffle'] > 0).astype(np.float32)
-
-    # Error bound: log-scale
-    df['error_bound_enc'] = np.log10(
-        df['error_bound'].clip(lower=1e-7)).astype(np.float32)
-
-    # Data size: log2
-    df['data_size_enc'] = np.log2(
-        df['original_size'].clip(lower=1)).astype(np.float32)
-
-    # Output transforms
-    df['comp_time_log'] = np.log1p(
-        df['compression_time_ms'].clip(lower=0)).astype(np.float32)
-    df['decomp_time_log'] = np.log1p(
-        df['decompression_time_ms'].clip(lower=0)).astype(np.float32)
-    df['ratio_log'] = np.log1p(
-        df['compression_ratio'].clip(lower=0)).astype(np.float32)
-    df['psnr_clamped'] = df['psnr_db'].replace(
-        [np.inf, -np.inf], 120.0).clip(upper=120.0).astype(np.float32)
-
-    # Split by file
-    files = sorted(df['file'].unique())
-    rng = np.random.RandomState(seed)
-    rng.shuffle(files)
-
-    split_idx = int(len(files) * (1 - val_fraction))
-    train_files = set(files[:split_idx])
-    val_files = set(files[split_idx:])
-
-    df_train = df[df['file'].isin(train_files)].copy()
-    df_val = df[df['file'].isin(val_files)].copy()
-
-    print(f"  Train: {len(df_train)} rows ({len(train_files)} files)")
-    print(f"  Val:   {len(df_val)} rows ({len(val_files)} files)")
-
-    # Build feature matrix
-    algo_cols = [f'alg_{a}' for a in ALGORITHM_NAMES]
-    feature_cols = algo_cols + ['quant_enc', 'shuffle_enc',
-                                'error_bound_enc', 'data_size_enc',
-                                'entropy', 'mad', 'first_derivative']
-
-    output_cols = ['comp_time_log', 'decomp_time_log', 'ratio_log', 'psnr_clamped']
-
-    # Normalization (same logic as data.py)
-    train_X_raw = df_train[feature_cols].values.astype(np.float32)
-    val_X_raw = df_val[feature_cols].values.astype(np.float32)
-
-    continuous_indices = [feature_cols.index(c) for c in CONTINUOUS_FEATURES]
-    means = np.zeros(len(feature_cols), dtype=np.float32)
-    stds = np.ones(len(feature_cols), dtype=np.float32)
-
-    for idx in continuous_indices:
-        means[idx] = train_X_raw[:, idx].mean()
-        stds[idx] = train_X_raw[:, idx].std()
-        if stds[idx] < 1e-8:
-            stds[idx] = 1.0
-
-    x_mins = train_X_raw.min(axis=0).astype(np.float32)
-    x_maxs = train_X_raw.max(axis=0).astype(np.float32)
-
-    train_X = (train_X_raw - means) / stds
-    val_X = (val_X_raw - means) / stds
-
-    train_Y_raw = df_train[output_cols].values.astype(np.float32)
-    val_Y_raw = df_val[output_cols].values.astype(np.float32)
-
-    y_means = train_Y_raw.mean(axis=0)
-    y_stds = train_Y_raw.std(axis=0)
-    y_stds[y_stds < 1e-8] = 1.0
-
-    train_Y = (train_Y_raw - y_means) / y_stds
-    val_Y = (val_Y_raw - y_means) / y_stds
-
-    print(f"\n  Feature matrix: {train_X.shape[1]} input features")
-    print(f"  Features: {feature_cols}")
-    print(f"  Outputs: {output_cols}")
-
-    return {
-        'train_X': train_X,
-        'train_Y': train_Y,
-        'val_X': val_X,
-        'val_Y': val_Y,
-        'val_Y_raw': val_Y_raw,
-        'feature_names': feature_cols,
-        'output_names': OUTPUT_COLUMNS,
-        'output_cols_internal': output_cols,
-        'x_means': means,
-        'x_stds': stds,
-        'x_mins': x_mins,
-        'x_maxs': x_maxs,
-        'y_means': y_means,
-        'y_stds': y_stds,
-        'df_val': df_val,
-        'df_train': df_train,
-    }
+    Returns the same dict format as data.encode_and_split().
+    """
+    df = benchmark_binary_files(data_dir, lib_path=lib_path, max_files=max_files)
+    return encode_and_split(df, val_fraction, seed)
 
 
 if __name__ == '__main__':

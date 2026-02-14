@@ -549,7 +549,7 @@ NNRankCriterion getNNRankCriterion() {
  * @param stream              CUDA stream
  * @param out_predicted_ratio [out] Nullable, predicted compression ratio for winner
  * @param out_top_actions     [out] Nullable, all 32 action IDs sorted by rank
- * @return Best action ID (0-31), or 0 on error
+ * @return Best action ID (0-31), or -1 on error
  */
 int runNNInference(
     double entropy,
@@ -562,7 +562,7 @@ int runNNInference(
     int* out_top_actions
 ) {
     if (!g_nn_loaded || d_nn_weights == nullptr) {
-        return 0;  // Default: LZ4, no preprocessing
+        return -1;  // Error: NN not loaded
     }
 
     // Allocate device outputs: action + optional predicted_ratio + optional top_actions
@@ -572,13 +572,13 @@ int runNNInference(
     int h_action = 0;
 
     cudaError_t err = cudaMalloc(&d_action, sizeof(int));
-    if (err != cudaSuccess) return 0;
+    if (err != cudaSuccess) return -1;
 
     if (out_predicted_ratio) {
         err = cudaMalloc(&d_predicted_ratio, sizeof(float));
         if (err != cudaSuccess) {
             cudaFree(d_action);
-            return 0;
+            return -1;
         }
     }
 
@@ -587,7 +587,7 @@ int runNNInference(
         if (err != cudaSuccess) {
             cudaFree(d_action);
             if (d_predicted_ratio) cudaFree(d_predicted_ratio);
-            return 0;
+            return -1;
         }
     }
 
@@ -607,7 +607,7 @@ int runNNInference(
         cudaFree(d_action);
         if (d_predicted_ratio) cudaFree(d_predicted_ratio);
         if (d_top_actions) cudaFree(d_top_actions);
-        return 0;
+        return -1;
     }
 
     if (d_predicted_ratio) {
@@ -617,7 +617,7 @@ int runNNInference(
             cudaFree(d_action);
             cudaFree(d_predicted_ratio);
             if (d_top_actions) cudaFree(d_top_actions);
-            return 0;
+            return -1;
         }
     }
 
@@ -629,7 +629,7 @@ int runNNInference(
             cudaFree(d_action);
             if (d_predicted_ratio) cudaFree(d_predicted_ratio);
             cudaFree(d_top_actions);
-            return 0;
+            return -1;
         }
     }
 
@@ -639,7 +639,7 @@ int runNNInference(
     if (d_predicted_ratio) cudaFree(d_predicted_ratio);
     if (d_top_actions) cudaFree(d_top_actions);
 
-    if (err != cudaSuccess) return 0;
+    if (err != cudaSuccess) return -1;
 
     return h_action;
 }

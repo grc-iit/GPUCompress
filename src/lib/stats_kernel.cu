@@ -676,6 +676,9 @@ int runAutoStatsNNPipeline(
         input_size, error_bound, stream,
         out_predicted_ratio, out_top_actions
     );
+    if (action < 0) {
+        return -1;
+    }
 
     // Write outputs
     *out_action = action;

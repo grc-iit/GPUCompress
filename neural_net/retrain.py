@@ -3,20 +3,21 @@ Retrain the compression predictor using original benchmark data + experience dat
 
 Usage:
     python neural_net/retrain.py \
-        --original benchmark_results.csv \
+        --data-dir syntheticGeneration/training_data/ \
+        --lib-path build/libgpucompress.so \
         --experience experiences.csv \
         --output neural_net/weights/model.nnwt
 
-The experience CSV is produced by the active learning system (Level 1/2).
+The experience CSV is produced by the C++ active learning system (Level 1/2).
 Its columns are:
     entropy, mad, first_derivative, original_size, error_bound,
     algorithm, quantization, shuffle, compression_ratio, compression_time_ms
 
 This script:
-1. Loads original benchmark CSV
-2. Loads experience CSV(s)
-3. Converts experience rows to match benchmark format
-4. Combines and retrains the model from scratch
+1. Benchmarks original .bin files on GPU (no CSV needed)
+2. Loads experience CSV(s) from active learning
+3. Merges into a single DataFrame
+4. Encodes, normalizes, and trains from scratch
 5. Exports new .nnwt weights
 """
 
@@ -29,13 +30,13 @@ from pathlib import Path
 # Ensure the neural_net directory is importable
 sys.path.insert(0, str(Path(__file__).parent))
 
-from data import load_and_prepare, ALGORITHM_NAMES, OUTPUT_COLUMNS
-from train import train_model
+from data import encode_and_split, ALGORITHM_NAMES, OUTPUT_COLUMNS
+from train import train_model_with_data
 from export_weights import export_weights
 
 
-def prepare_experience_data(experience_paths: list) -> pd.DataFrame:
-    """Load and convert experience CSV(s) to benchmark format."""
+def prepare_experience_data(experience_paths: list, original_df: pd.DataFrame) -> pd.DataFrame:
+    """Load experience CSV(s) and convert to benchmark DataFrame format."""
 
     frames = []
     for path in experience_paths:
@@ -61,60 +62,33 @@ def prepare_experience_data(experience_paths: list) -> pd.DataFrame:
     result['compression_ratio'] = exp['compression_ratio']
     result['compression_time_ms'] = exp['compression_time_ms']
 
-    # Add columns expected by data.py but not available from experience
+    # Fill columns not available from experience buffer
     result['success'] = True
     result['file'] = ['experience_' + str(i) for i in range(len(result))]
-    result['decompression_time_ms'] = np.nan
-    result['psnr_db'] = np.nan
+
+    # Decompression time: use median from original benchmark data
+    decomp_median = original_df['decompression_time_ms'].median()
+    result['decompression_time_ms'] = decomp_median
+
+    # PSNR: 120.0 for lossless, median from original for lossy
+    psnr_median = original_df['psnr_db'].replace([np.inf], 120.0).median()
+    lossless_mask = result['error_bound'] <= 0
+    result['psnr_db'] = np.where(lossless_mask, 120.0, psnr_median)
 
     return result
-
-
-def combine_data(original_path: str, experience_paths: list) -> str:
-    """Combine original benchmark data with experience data into a temp CSV."""
-
-    print(f"\nLoading original data from {original_path}...")
-    original = pd.read_csv(original_path)
-    print(f"  Original: {len(original)} rows")
-
-    print(f"\nLoading experience data...")
-    experience = prepare_experience_data(experience_paths)
-    print(f"  Experience: {len(experience)} rows")
-
-    if len(experience) == 0:
-        print("  No experience data found, training on original only")
-        return original_path
-
-    # Combine
-    combined = pd.concat([original, experience], ignore_index=True)
-
-    # Handle NaN outputs from experience rows:
-    # Fill decompression_time_ms with median from original data
-    decomp_median = original['decompression_time_ms'].median()
-    combined['decompression_time_ms'] = combined['decompression_time_ms'].fillna(decomp_median)
-
-    # Fill psnr_db: for lossless (error_bound <= 0), use 120 (inf equivalent)
-    # For lossy, use median from original
-    psnr_median = original['psnr_db'].replace([np.inf], 120.0).median()
-    lossless_mask = combined['error_bound'] <= 0
-    combined.loc[lossless_mask & combined['psnr_db'].isna(), 'psnr_db'] = 120.0
-    combined['psnr_db'] = combined['psnr_db'].fillna(psnr_median)
-
-    # Write combined CSV to temp file
-    combined_path = str(Path(original_path).parent / 'combined_retrain.csv')
-    combined.to_csv(combined_path, index=False)
-    print(f"\n  Combined: {len(combined)} rows -> {combined_path}")
-
-    return combined_path
 
 
 def main():
     parser = argparse.ArgumentParser(
         description='Retrain compression predictor with experience data')
-    parser.add_argument('--original', required=True,
-                        help='Path to original benchmark_results.csv')
+    parser.add_argument('--data-dir', type=str, required=True,
+                        help='Directory containing .bin files for original benchmarking')
+    parser.add_argument('--lib-path', type=str, default=None,
+                        help='Path to libgpucompress.so')
+    parser.add_argument('--max-files', type=int, default=None,
+                        help='Max .bin files to process')
     parser.add_argument('--experience', required=True, nargs='+',
-                        help='Path(s) to experience CSV file(s)')
+                        help='Path(s) to experience CSV file(s) from active learning')
     parser.add_argument('--output', default=None,
                         help='Output .nnwt path (default: neural_net/weights/model.nnwt)')
     parser.add_argument('--epochs', type=int, default=200,
@@ -127,17 +101,40 @@ def main():
     if args.output is None:
         args.output = str(Path(__file__).parent / 'weights' / 'model.nnwt')
 
-    # Step 1: Combine data
-    combined_csv = combine_data(args.original, args.experience)
+    # Step 1: Benchmark original binary files
+    print("=" * 65)
+    print("BENCHMARKING ORIGINAL DATA")
+    print("=" * 65)
+    from binary_data import benchmark_binary_files
+    original_df = benchmark_binary_files(
+        args.data_dir, lib_path=args.lib_path, max_files=args.max_files)
+    print(f"  Original: {len(original_df)} rows")
 
-    # Step 2: Train model
+    # Step 2: Load experience data
+    print(f"\n{'=' * 65}")
+    print("LOADING EXPERIENCE DATA")
+    print("=" * 65)
+    experience_df = prepare_experience_data(args.experience, original_df)
+    print(f"  Experience: {len(experience_df)} rows")
+
+    # Step 3: Combine and encode
+    if len(experience_df) > 0:
+        combined = pd.concat([original_df, experience_df], ignore_index=True)
+        print(f"\n  Combined: {len(combined)} rows")
+    else:
+        print("  No experience data, training on original only")
+        combined = original_df
+
+    data = encode_and_split(combined)
+
+    # Step 4: Train model
     print("\n" + "=" * 65)
     print("TRAINING")
     print("=" * 65)
-    model, data = train_model(combined_csv, epochs=args.epochs,
-                               patience=args.patience)
+    model, data = train_model_with_data(data, epochs=args.epochs,
+                                         patience=args.patience)
 
-    # Step 3: Export weights
+    # Step 5: Export weights
     print("\n" + "=" * 65)
     print("EXPORTING WEIGHTS")
     print("=" * 65)

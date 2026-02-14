@@ -1,14 +1,13 @@
 """
 Data pipeline for compression performance prediction.
 
-Loads benchmark_results.csv, encodes features, normalizes,
-and splits into train/validation sets by file.
+Shared constants, feature encoding, normalization, and train/val splitting.
+Used by binary_data.py (primary), evaluate.py, and retrain.py.
 """
 
 import numpy as np
 import pandas as pd
-from pathlib import Path
-from typing import Tuple, Dict
+from typing import Dict
 
 # ============================================================
 # Constants
@@ -26,22 +25,23 @@ OUTPUT_COLUMNS = ['compression_time_ms', 'decompression_time_ms',
 CONTINUOUS_FEATURES = ['error_bound_enc', 'data_size_enc', 'entropy', 'mad', 'first_derivative']
 
 
-def load_and_prepare(csv_path: str, val_fraction: float = 0.2,
+def encode_and_split(df: pd.DataFrame, val_fraction: float = 0.2,
                      seed: int = 42) -> Dict:
     """
-    Load CSV, encode features, normalize, and split by file.
+    Encode features, normalize, and split a benchmark DataFrame by file.
+
+    Expected DataFrame columns:
+        file, algorithm, quantization, shuffle, error_bound, original_size,
+        entropy, mad, first_derivative, compression_time_ms,
+        decompression_time_ms, compression_ratio, psnr_db, success
 
     Returns dict with:
         train_X, train_Y, val_X, val_Y: numpy arrays
-        feature_names: list of feature names
-        output_names: list of output names
-        scalers: dict with normalization parameters for inference
-        df_val: validation dataframe (for ranking evaluation)
+        feature_names, output_names: lists
+        x_means, x_stds, x_mins, x_maxs: input normalization
+        y_means, y_stds: output normalization
+        df_val, df_train: DataFrames (for ranking evaluation)
     """
-    print(f"Loading {csv_path}...")
-    df = pd.read_csv(csv_path)
-    print(f"  Loaded {len(df)} rows, {df['file'].nunique()} unique files")
-
     # ---- Filter ----
     df = df[df['success'] == True].copy()
     print(f"  After filtering failures: {len(df)} rows")
@@ -114,7 +114,7 @@ def load_and_prepare(csv_path: str, val_fraction: float = 0.2,
         means[idx] = train_X_raw[:, idx].mean()
         stds[idx] = train_X_raw[:, idx].std()
         if stds[idx] < 1e-8:
-            stds[idx] = 1.0  # Avoid division by zero (e.g. constant data_size)
+            stds[idx] = 1.0  # Avoid division by zero
 
     # Compute per-feature min/max from training set (raw, for OOD detection)
     x_mins = train_X_raw.min(axis=0).astype(np.float32)
@@ -138,7 +138,6 @@ def load_and_prepare(csv_path: str, val_fraction: float = 0.2,
     print(f"\n  Feature matrix: {train_X.shape[1]} input features")
     print(f"  Features: {feature_cols}")
     print(f"  Outputs: {output_cols}")
-    print(f"  Continuous features standardized: {CONTINUOUS_FEATURES}")
 
     return {
         'train_X': train_X,
@@ -177,12 +176,3 @@ def inverse_transform_outputs(Y_norm: np.ndarray, y_means: np.ndarray,
         'compression_ratio': np.expm1(Y_raw[:, 2]),
         'psnr_db': Y_raw[:, 3],                          # was clamped, not logged
     }
-
-
-if __name__ == '__main__':
-    csv_path = Path(__file__).parent.parent / 'benchmark_results.csv'
-    data = load_and_prepare(str(csv_path))
-    print(f"\nTrain X shape: {data['train_X'].shape}")
-    print(f"Train Y shape: {data['train_Y'].shape}")
-    print(f"Val X shape:   {data['val_X'].shape}")
-    print(f"Val Y shape:   {data['val_Y'].shape}")

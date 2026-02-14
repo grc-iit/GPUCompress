@@ -153,7 +153,7 @@ python neural_net/train.py --data-dir data/ --lib-path build/libgpucompress.so
 │      │       ├── _compute_psnr() for lossy configs (120 dB for lossless)
 │      │       └── Record: (file, algo, quant, shuffle, eb, stats, ratio, times, psnr)
 │      │
-│      └── _encode_and_split(df)
+│      └── encode_and_split(df)                          [neural_net/data.py]
 │          ├── One-hot encode algorithm (8 features)
 │          ├── Binary encode quant, shuffle (2 features)
 │          ├── Log-transform error_bound, data_size (2 features)
@@ -249,16 +249,14 @@ The NN must predict which of these 32 gives the best compression ratio (or speed
 
 ## 3. Data Pipeline (Python)
 
-There are two data pipelines:
+The data pipeline has two stages:
 
-| Pipeline | File | Input | When to use |
-|----------|------|-------|-------------|
-| CSV-based | `neural_net/data.py` | Pre-generated `benchmark_results.csv` | When you already have benchmark results |
-| Binary (on-the-fly) | `neural_net/binary_data.py` | Raw `.bin` files + `libgpucompress.so` | Train directly from data files, no CSV needed |
+| Stage | File | Role |
+|-------|------|------|
+| Benchmarking | `neural_net/binary_data.py` | Load raw `.bin` files, benchmark all 64 configs on GPU, return raw DataFrame |
+| Encoding | `neural_net/data.py` | Encode features, normalize, train/val split — shared by all scripts |
 
-Both produce the same dict format consumed by `train.py`.
-
-### 3.0 Binary Data Pipeline (recommended)
+### 3.0 Binary Data Pipeline
 
 **File: `neural_net/binary_data.py`**
 
@@ -285,18 +283,18 @@ For each file, it:
 1. Reads raw bytes
 2. Calls `gpucompress_compute_stats()` on GPU → entropy, MAD, first_derivative
 3. For each of 64 configs: compress, decompress, time both, compute PSNR for lossy configs
-4. Builds a DataFrame, applies the same feature encoding as `data.py`, splits by file
+4. Builds a DataFrame, passes it to `encode_and_split()` from `data.py` for feature encoding and train/val splitting
 
 **Python ctypes wrapper:** `neural_net/gpucompress_ctypes.py` wraps `libgpucompress.so`:
 - Mirrors C structs (`gpucompress_config_t`, `gpucompress_stats_t`)
 - Context-managed `GPUCompressLib` class (init/cleanup via `__enter__`/`__exit__`)
 - Methods: `compute_stats()`, `compress()`, `decompress()`, `make_config()`
 
-### 3.1 CSV Data Pipeline (legacy)
+### 3.1 Shared Encoding Module
 
 **File: `neural_net/data.py`**
 
-The benchmark CSV contains ~100K rows. Each row records one (file, config) pair with measured results.
+Provides `encode_and_split(df)` — the shared function used by `binary_data.py`, `retrain.py`, and `evaluate.py` to encode a raw benchmark DataFrame into normalized training arrays. Also provides constants (`ALGORITHM_NAMES`, `OUTPUT_COLUMNS`) and `inverse_transform_outputs()` for converting predictions back to original scale.
 
 ### 3.2 Input Feature Encoding (15 features)
 
@@ -397,11 +395,8 @@ class CompressionPredictor(nn.Module):
 **File: `neural_net/train.py`**
 
 ```bash
-# Train from binary files (recommended — no CSV step needed)
+# Train from binary data files
 python neural_net/train.py --data-dir syntheticGeneration/training_data/ --lib-path build/libgpucompress.so
-
-# Train from CSV (legacy)
-python neural_net/train.py --csv benchmark_results.csv
 
 # With options
 python neural_net/train.py --data-dir syntheticGeneration/training_data/ \
@@ -410,7 +405,7 @@ python neural_net/train.py --data-dir syntheticGeneration/training_data/ \
     --epochs 200 --batch-size 512 --lr 1e-3 --patience 20 --hidden-dim 128
 ```
 
-The `--data-dir` path calls `binary_data.load_and_prepare_from_binary()` which benchmarks all 64 configs per file on GPU. The `--csv` path uses the legacy `data.load_and_prepare()`.
+The `--data-dir` flag is required. It calls `binary_data.load_and_prepare_from_binary()` which benchmarks all 64 configs per file on GPU, then passes the DataFrame to `data.encode_and_split()` for feature encoding and train/val splitting.
 
 ### Training configuration:
 - **Loss**: MSE on standardized outputs
@@ -636,7 +631,7 @@ This function:
 2. Launches the kernel: `nnInferenceKernel<<<1, 32, 0, stream>>>(...)`
 3. Copies results back to host
 4. Frees device memory
-5. Returns the best action ID (0-31)
+5. Returns the best action ID (0-31), or -1 on error
 
 ---
 
@@ -875,16 +870,17 @@ gpucompress_reload_nn("/path/to/new_model.nnwt");
 
 ```bash
 python neural_net/retrain.py \
-    --original benchmark_results.csv \
+    --data-dir syntheticGeneration/training_data/ \
+    --lib-path build/libgpucompress.so \
     --experience experiences.csv \
     --output neural_net/weights/model.nnwt
 ```
 
 The retrain script:
-1. Loads the original benchmark CSV
-2. Loads experience CSV(s) and converts them to benchmark format
+1. Benchmarks original `.bin` files on GPU via `benchmark_binary_files()`
+2. Loads experience CSV(s) from C++ active learning and converts them to benchmark format
 3. Fills missing columns (`decompression_time_ms`, `psnr_db`) with medians from original data
-4. Combines into one dataset and trains from scratch
+4. Combines into one dataset, encodes via `encode_and_split()`, and trains from scratch
 5. Exports new `.nnwt` weights
 
 After retraining, hot-load the new model:
@@ -901,13 +897,13 @@ gpucompress_reload_nn("neural_net/weights/model.nnwt");
 
 | File | Purpose |
 |------|---------|
-| `neural_net/data.py` | Load CSV, encode features, normalize, split, compute bounds (legacy) |
-| `neural_net/binary_data.py` | Load `.bin` files, benchmark on GPU, encode features (recommended) |
+| `neural_net/data.py` | Shared feature encoding, normalization, train/val splitting, inverse transforms |
+| `neural_net/binary_data.py` | Load `.bin` files, benchmark all 64 configs on GPU, return raw DataFrame |
 | `neural_net/gpucompress_ctypes.py` | Python ctypes wrapper for `libgpucompress.so` |
 | `neural_net/model.py` | PyTorch model definition (15→128→128→4) |
-| `neural_net/train.py` | Training loop with `--data-dir` and `--csv` paths, save `model.pt` |
+| `neural_net/train.py` | Training loop with `--data-dir`, save `model.pt` |
 | `neural_net/export_weights.py` | Convert `model.pt` → `model.nnwt` binary |
-| `neural_net/retrain.py` | Combine original + experience data, retrain, export |
+| `neural_net/retrain.py` | Combine original binary benchmarks + experience data, retrain, export |
 
 ### C/CUDA (inference side)
 
@@ -935,8 +931,7 @@ gpucompress_reload_nn("neural_net/weights/model.nnwt");
 ### Initial training
 
 ```bash
-# Option A: Train directly from binary data files (recommended)
-# No CSV step needed — benchmarks all 64 configs on GPU automatically
+# Train from binary data files (benchmarks all 64 configs on GPU automatically)
 cd GPUCompress
 cmake --build build                    # Build libgpucompress.so first
 python neural_net/train.py \
@@ -945,11 +940,7 @@ python neural_net/train.py \
 #    Benchmarks 1,568 files × 64 configs on GPU
 #    Produces: neural_net/weights/model.pt
 
-# Option B: Train from pre-generated CSV (legacy)
-python neural_net/train.py --csv benchmark_results.csv
-#    Produces: neural_net/weights/model.pt
-
-# Export to binary (same for both options)
+# Export to binary
 cd neural_net
 python export_weights.py
 #    Produces: neural_net/weights/model.nnwt
@@ -999,7 +990,8 @@ gpucompress_disable_active_learning();
 ```bash
 # Retrain with accumulated experience
 python neural_net/retrain.py \
-    --original benchmark_results.csv \
+    --data-dir syntheticGeneration/training_data/ \
+    --lib-path build/libgpucompress.so \
     --experience /tmp/experiences.csv \
     --output neural_net/weights/model.nnwt
 ```

@@ -2,11 +2,8 @@
 Training script for compression performance predictor.
 
 Usage:
-    # Train from binary files (new)
+    # Train from binary files (default)
     python neural_net/train.py --data-dir syntheticGeneration/training_data/ --lib-path build/libgpucompress.so
-
-    # Train from CSV (existing, still works)
-    python neural_net/train.py --csv benchmark_results.csv
 
     # Export weights (unchanged)
     python neural_net/export_weights.py
@@ -20,16 +17,8 @@ import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
 from pathlib import Path
 
-from data import load_and_prepare, inverse_transform_outputs
+from data import inverse_transform_outputs
 from model import CompressionPredictor
-
-
-def train_model(csv_path: str, epochs: int = 200, batch_size: int = 512,
-                lr: float = 1e-3, patience: int = 20, hidden_dim: int = 128):
-    """Train from CSV file (backward compatible)."""
-    data = load_and_prepare(csv_path)
-    return train_model_with_data(data, epochs=epochs, batch_size=batch_size,
-                                 lr=lr, patience=patience, hidden_dim=hidden_dim)
 
 
 def train_model_with_data(data: dict, epochs: int = 200, batch_size: int = 512,
@@ -60,7 +49,7 @@ def train_model_with_data(data: dict, epochs: int = 200, batch_size: int = 512,
     model = CompressionPredictor(input_dim=input_dim, hidden_dim=hidden_dim,
                                   output_dim=output_dim).to(device)
 
-    print(f"\nModel: {input_dim} → {hidden_dim} → {hidden_dim} → {output_dim}")
+    print(f"\nModel: {input_dim} -> {hidden_dim} -> {hidden_dim} -> {output_dim}")
     print(f"Parameters: {model.count_parameters():,}")
 
     # ---- Training setup ----
@@ -211,15 +200,12 @@ def train_model_with_data(data: dict, epochs: int = 200, batch_size: int = 512,
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='Train compression performance predictor')
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument('--csv', type=str, default=None,
-                       help='Path to benchmark_results.csv')
-    group.add_argument('--data-dir', type=str, default=None,
-                       help='Directory containing .bin files for on-the-fly benchmarking')
+    parser.add_argument('--data-dir', type=str, required=True,
+                        help='Directory containing .bin files for on-the-fly benchmarking')
     parser.add_argument('--lib-path', type=str, default=None,
-                        help='Path to libgpucompress.so (used with --data-dir)')
+                        help='Path to libgpucompress.so')
     parser.add_argument('--max-files', type=int, default=None,
-                        help='Max .bin files to process (used with --data-dir)')
+                        help='Max .bin files to process')
     parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--batch-size', type=int, default=512)
     parser.add_argument('--lr', type=float, default=1e-3)
@@ -227,16 +213,9 @@ if __name__ == '__main__':
     parser.add_argument('--hidden-dim', type=int, default=128)
     args = parser.parse_args()
 
-    if args.data_dir is not None:
-        from binary_data import load_and_prepare_from_binary
-        data = load_and_prepare_from_binary(
-            args.data_dir, lib_path=args.lib_path, max_files=args.max_files)
-        model, data = train_model_with_data(
-            data, epochs=args.epochs, batch_size=args.batch_size,
-            lr=args.lr, patience=args.patience, hidden_dim=args.hidden_dim)
-    else:
-        csv_path = args.csv or str(
-            Path(__file__).parent.parent / 'benchmark_results.csv')
-        model, data = train_model(
-            csv_path, epochs=args.epochs, batch_size=args.batch_size,
-            lr=args.lr, patience=args.patience, hidden_dim=args.hidden_dim)
+    from binary_data import load_and_prepare_from_binary
+    data = load_and_prepare_from_binary(
+        args.data_dir, lib_path=args.lib_path, max_files=args.max_files)
+    model, data = train_model_with_data(
+        data, epochs=args.epochs, batch_size=args.batch_size,
+        lr=args.lr, patience=args.patience, hidden_dim=args.hidden_dim)

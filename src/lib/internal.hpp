@@ -382,7 +382,7 @@ bool isInputOOD(double entropy, double mad, double deriv,
  * @param stream              CUDA stream
  * @param out_predicted_ratio [out] Nullable, predicted compression ratio for winner
  * @param out_top_actions     [out] Nullable, all 32 action IDs sorted by rank
- * @return Best action ID (0-31)
+ * @return Best action ID (0-31), or -1 on error
  */
 int runNNInference(
     double entropy,
