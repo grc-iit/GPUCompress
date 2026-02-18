@@ -28,6 +28,25 @@ SHUF_STYLES = {0: {"label": "No Shuffle", "hatch": None, "alpha": 0.75},
                4: {"label": "Shuffle(4)", "hatch": "//", "alpha": 0.55}}
 
 
+def boxplot_stats(values):
+    """Compute the same stats matplotlib boxplot renders: whiskers, Q1, median, Q3."""
+    vals = pd.Series(values).dropna()
+    if vals.empty:
+        return dict(whisker_lo=None, q1=None, median=None, q3=None, whisker_hi=None, n=0)
+    q1, med, q3 = vals.quantile(0.25), vals.median(), vals.quantile(0.75)
+    iqr = q3 - q1
+    lo = vals[vals >= q1 - 1.5 * iqr].min()
+    hi = vals[vals <= q3 + 1.5 * iqr].max()
+    return dict(whisker_lo=round(lo, 4), q1=round(q1, 4), median=round(med, 4),
+                q3=round(q3, 4), whisker_hi=round(hi, 4), n=len(vals))
+
+
+def save_csv(rows, output_dir, name):
+    path = os.path.join(output_dir, name)
+    pd.DataFrame(rows).to_csv(path, index=False)
+    print(f"  Saved: {path}")
+
+
 def load_data(csv_path):
     df = pd.read_csv(csv_path)
     df = df[df["success"] == True].copy()
@@ -103,6 +122,8 @@ def fig_compression_ratio(df, algos, output_dir):
     fig.suptitle("Compression Ratio — Shuffle Tradeoff: Helps Lossless, Hurts Lossy",
                  fontsize=16, fontweight="bold")
 
+    csv_rows = []
+
     for i, (qtype, eb, subtitle) in enumerate(configs):
         ax = axes[i]
         if qtype == "none":
@@ -133,6 +154,7 @@ def fig_compression_ratio(df, algos, output_dir):
                         bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.8))
 
             # Speedup label above the pair
+            speedup = None
             if med_ns > 0 and med_s > 0:
                 speedup = med_s / med_ns
                 sp_color = "#2e7d32" if speedup >= 1.0 else "#c62828"
@@ -142,6 +164,19 @@ def fig_compression_ratio(df, algos, output_dir):
                 ax.annotate(sp_label, (center, ymax), textcoords="offset points",
                             xytext=(0, 8), ha="center", fontsize=9, fontweight="bold",
                             color=sp_color)
+
+            for shuf_val, prefix in [(0, "no_shuffle"), (4, "shuffle4")]:
+                sub = sub_ns if shuf_val == 0 else sub_s
+                stats = boxplot_stats(sub["compression_ratio"])
+                csv_rows.append({
+                    "config": subtitle, "algorithm": a, "shuffle": shuf_val,
+                    "whisker_lo": stats["whisker_lo"], "q1": stats["q1"],
+                    "median": stats["median"], "q3": stats["q3"],
+                    "whisker_hi": stats["whisker_hi"], "n": stats["n"],
+                    "shuffle_speedup": round(speedup, 4) if speedup else None,
+                })
+
+    save_csv(csv_rows, output_dir, "1_compression_ratio.csv")
 
     plt.tight_layout(rect=[0, 0, 1, 0.93])
     return save_fig(fig, output_dir, "1_compression_ratio.png")
@@ -158,6 +193,7 @@ def _throughput_2x2(df, algos, metric, ylabel, title, output_dir, filename):
     axes = axes.flatten()
     fig.suptitle(title, fontsize=16, fontweight="bold")
 
+    csv_rows = []
     for i, (qtype, eb, subtitle) in enumerate(configs):
         ax = axes[i]
         if qtype == "none":
@@ -166,6 +202,20 @@ def _throughput_2x2(df, algos, metric, ylabel, title, output_dir, filename):
             df_sub = df[(df["quantization"] == "linear") & (np.isclose(df["error_bound"], eb))]
         paired_boxplot(ax, df_sub, algos, metric, ylabel)
         ax.set_title(subtitle, fontsize=13)
+
+        for a in algos:
+            for shuf in [0, 4]:
+                sub = df_sub[(df_sub["algorithm"] == a) & (df_sub["shuffle"] == shuf)]
+                stats = boxplot_stats(sub[metric])
+                csv_rows.append({
+                    "config": subtitle, "algorithm": a, "shuffle": shuf,
+                    "whisker_lo": stats["whisker_lo"], "q1": stats["q1"],
+                    "median": stats["median"], "q3": stats["q3"],
+                    "whisker_hi": stats["whisker_hi"], "n": stats["n"],
+                })
+
+    csv_name = filename.replace(".png", ".csv")
+    save_csv(csv_rows, output_dir, csv_name)
 
     plt.tight_layout(rect=[0, 0, 1, 0.93])
     return save_fig(fig, output_dir, filename)
@@ -193,11 +243,11 @@ def fig_ratio_by_quantization(df, algos, output_dir):
     quant_colors = {"Lossless": "#4A90D9", "eb=0.001": "#F5A623", "eb=0.01": "#7ED321", "eb=0.1": "#D0021B"}
 
     n_algos = len(algos)
-    # 8 bars per algo: 4 quant × 2 shuffle, with a small gap between quant pairs
     bar_w = 0.09
-    pair_gap = 0.02  # gap between no-shuffle and shuffle within same quant
-    group_gap = 0.06  # gap between different quant levels
+    pair_gap = 0.02
+    group_gap = 0.06
 
+    csv_rows = []
     for qi, (eb_str, qlabel) in enumerate(quant_levels):
         color = quant_colors[qlabel]
         for si, (shuf, sinfo) in enumerate(SHUF_STYLES.items()):
@@ -208,20 +258,26 @@ def fig_ratio_by_quantization(df, algos, output_dir):
                             & (df["error_bound"].astype(str) == eb_str)
                             & (df["shuffle"] == shuf)]
             medians = [subset[subset["algorithm"] == a]["compression_ratio"].median() for a in algos]
-            # Position: each quant pair takes (2*bar_w + pair_gap), groups separated by group_gap
             pair_width = 2 * bar_w + pair_gap
             total_width = 4 * pair_width + 3 * group_gap
             start = -total_width / 2
             offset = start + qi * (pair_width + group_gap) + si * (bar_w + pair_gap)
 
-            x = np.arange(n_algos) * 1.2  # spread algorithms further apart
+            x = np.arange(n_algos) * 1.2
             hatch = "//" if shuf == 4 else None
             edgecolor = "black" if shuf == 4 else None
             ax.bar(x + offset, medians, bar_w, color=color,
                    alpha=0.85 if shuf == 0 else 0.55,
                    hatch=hatch, edgecolor=edgecolor, linewidth=0.5)
 
-    # Legend: one entry per quant level (solid + hatched pair)
+            for a, med in zip(algos, medians):
+                csv_rows.append({
+                    "quantization": qlabel, "algorithm": a, "shuffle": shuf,
+                    "median_compression_ratio": round(med, 4) if pd.notna(med) else None,
+                })
+
+    save_csv(csv_rows, output_dir, "4_ratio_by_quantization.csv")
+
     legend_handles = []
     for _, qlabel in quant_levels:
         c = quant_colors[qlabel]
@@ -246,16 +302,25 @@ def fig_psnr(df, algos, output_dir):
     eb_levels = [0.001, 0.01, 0.1]
     eb_colors = ["#2ca02c", "#ff7f0e", "#d62728"]
     bar_w = 0.12
+    csv_rows = []
     for ei, (eb, ecolor) in enumerate(zip(eb_levels, eb_colors)):
         for si, (shuf, sinfo) in enumerate(SHUF_STYLES.items()):
             subset = df_lossy[(np.isclose(df_lossy["error_bound"], eb)) & (df_lossy["shuffle"] == shuf)]
             medians = []
             for a in algos:
                 vals = subset[subset["algorithm"] == a]["psnr_val"].replace([np.inf], np.nan).dropna()
-                medians.append(vals.median() if len(vals) > 0 else 0)
+                med = vals.median() if len(vals) > 0 else 0
+                medians.append(med)
+                csv_rows.append({
+                    "error_bound": eb, "algorithm": a, "shuffle": shuf,
+                    "median_psnr_db": round(med, 4) if med else None,
+                    "n": len(vals),
+                })
             offset = (ei * 2 + si - 2.5) * bar_w
             ax.bar(x + offset, medians, bar_w * 0.9, color=ecolor,
                    alpha=sinfo["alpha"], hatch=sinfo["hatch"])
+
+    save_csv(csv_rows, output_dir, "5_psnr.csv")
 
     legend_handles = [Patch(facecolor=c, alpha=0.85, label=f"eb={eb}") for eb, c in zip(eb_levels, eb_colors)]
     legend_handles.append(Patch(facecolor="gray", alpha=0.45, hatch="//", label="= Shuffle(4)"))
@@ -278,6 +343,7 @@ def fig_pareto(df, algos, output_dir):
     axes = axes.flatten()
     fig.suptitle("Ratio vs Throughput Tradeoff — All Files", fontsize=16, fontweight="bold")
 
+    csv_rows = []
     for i, (qtype, eb, subtitle) in enumerate(configs):
         ax = axes[i]
         if qtype == "none":
@@ -307,6 +373,15 @@ def fig_pareto(df, algos, output_dir):
                             textcoords="offset points", xytext=xyoff,
                             fontsize=9, fontweight="bold", color=PALETTE[a])
 
+                csv_rows.append({
+                    "config": subtitle, "algorithm": a, "shuffle": shuf,
+                    "ratio_q25": round(q25_r, 4), "ratio_median": round(med_ratio, 4),
+                    "ratio_q75": round(q75_r, 4),
+                    "throughput_q25": round(q25_t, 4), "throughput_median": round(med_tp, 4),
+                    "throughput_q75": round(q75_t, 4),
+                    "n": len(sub),
+                })
+
         ax.legend(handles=[
             Line2D([0], [0], marker="o", color="gray", markersize=8, linestyle="", label="No Shuffle"),
             Line2D([0], [0], marker="D", color="gray", markersize=8, linestyle="", alpha=0.6, label="Shuffle(4)"),
@@ -316,6 +391,8 @@ def fig_pareto(df, algos, output_dir):
         ax.set_title(subtitle, fontsize=13)
         ax.axvline(1.0, color="red", linestyle="--", alpha=0.3)
         ax.set_xlim(left=0.8)
+
+    save_csv(csv_rows, output_dir, "6_pareto_ratio_vs_throughput.csv")
 
     plt.tight_layout(rect=[0, 0, 1, 0.93])
     return save_fig(fig, output_dir, "6_pareto_ratio_vs_throughput.png")
