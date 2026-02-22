@@ -592,11 +592,21 @@ int runNNInference(
         d_top_actions
     );
 
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        cudaFree(d_action);
+        if (d_predicted_ratio) cudaFree(d_predicted_ratio);
+        if (d_predicted_comp_time) cudaFree(d_predicted_comp_time);
+        if (d_top_actions) cudaFree(d_top_actions);
+        return -1;
+    }
+
     err = cudaMemcpyAsync(&h_action, d_action, sizeof(int),
                            cudaMemcpyDeviceToHost, stream);
     if (err != cudaSuccess) {
         cudaFree(d_action);
         if (d_predicted_ratio) cudaFree(d_predicted_ratio);
+        if (d_predicted_comp_time) cudaFree(d_predicted_comp_time);
         if (d_top_actions) cudaFree(d_top_actions);
         return -1;
     }

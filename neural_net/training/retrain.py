@@ -27,12 +27,11 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 
-# Ensure the neural_net directory is importable
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from data import encode_and_split, ALGORITHM_NAMES, OUTPUT_COLUMNS
-from train import train_model_with_data
-from export_weights import export_weights
+from neural_net.core.data import encode_and_split, ALGORITHM_NAMES, OUTPUT_COLUMNS
+from neural_net.training.train import train_model_with_data
+from neural_net.export.export_weights import export_weights
 
 
 def prepare_experience_data(experience_paths: list, original_df: pd.DataFrame) -> pd.DataFrame:
@@ -99,13 +98,13 @@ def main():
 
     # Default output path
     if args.output is None:
-        args.output = str(Path(__file__).parent / 'weights' / 'model.nnwt')
+        args.output = str(Path(__file__).parent.parent / 'weights' / 'model.nnwt')
 
     # Step 1: Benchmark original binary files
     print("=" * 65)
     print("BENCHMARKING ORIGINAL DATA")
     print("=" * 65)
-    from binary_data import benchmark_binary_files
+    from neural_net.training.benchmark import benchmark_binary_files
     original_df = benchmark_binary_files(
         args.data_dir, lib_path=args.lib_path, max_files=args.max_files)
     print(f"  Original: {len(original_df)} rows")
@@ -138,7 +137,7 @@ def main():
     print("\n" + "=" * 65)
     print("EXPORTING WEIGHTS")
     print("=" * 65)
-    model_pt = str(Path(__file__).parent / 'weights' / 'model.pt')
+    model_pt = str(Path(__file__).parent.parent / 'weights' / 'model.pt')
     export_weights(model_pt, args.output)
 
     print(f"\n{'=' * 65}")

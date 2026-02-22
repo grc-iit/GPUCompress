@@ -19,8 +19,10 @@ import torch
 from pathlib import Path
 from typing import Dict
 
-from data import inverse_transform_outputs, ALGORITHM_NAMES
-from model import CompressionPredictor
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+
+from neural_net.core.data import inverse_transform_outputs, ALGORITHM_NAMES
+from neural_net.core.model import CompressionPredictor
 
 
 def load_trained_model(weights_path: str, device: torch.device) -> tuple:
@@ -235,7 +237,7 @@ if __name__ == '__main__':
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    weights_path = args.weights or str(Path(__file__).parent / 'weights' / 'model.pt')
+    weights_path = args.weights or str(Path(__file__).parent.parent / 'weights' / 'model.pt')
     if not Path(weights_path).exists():
         print(f"No trained model found at {weights_path}. Run train.py first.")
         sys.exit(1)
@@ -246,10 +248,10 @@ if __name__ == '__main__':
 
     # Load data
     if args.csv:
-        from data import load_from_csv
+        from neural_net.core.data import load_from_csv
         data = load_from_csv(args.csv)
     elif args.data_dir:
-        from binary_data import load_and_prepare_from_binary
+        from neural_net.training.benchmark import load_and_prepare_from_binary
         data = load_and_prepare_from_binary(
             args.data_dir, lib_path=args.lib_path, max_files=args.max_files)
     else:

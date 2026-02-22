@@ -9,11 +9,12 @@ import numpy as np
 import pandas as pd
 from typing import Dict
 
+from neural_net.core.configs import ALGORITHM_NAMES
+
 # ============================================================
 # Constants
 # ============================================================
 
-ALGORITHM_NAMES = ['lz4', 'snappy', 'deflate', 'gdeflate', 'zstd', 'ans', 'cascaded', 'bitcomp']
 NUM_ALGORITHMS = len(ALGORITHM_NAMES)
 
 INPUT_COLUMNS = ['algorithm', 'quantization', 'shuffle', 'error_bound',

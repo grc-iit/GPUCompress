@@ -18,12 +18,11 @@ from torch.utils.data import TensorDataset, DataLoader
 from sklearn.model_selection import KFold
 from pathlib import Path
 
-# Add neural_net to path so imports work when run from repo root
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from data import encode_and_split, ALGORITHM_NAMES, CONTINUOUS_FEATURES, OUTPUT_COLUMNS
-from data import inverse_transform_outputs
-from model import CompressionPredictor
+from neural_net.core.data import encode_and_split, ALGORITHM_NAMES, CONTINUOUS_FEATURES, OUTPUT_COLUMNS
+from neural_net.core.data import inverse_transform_outputs
+from neural_net.core.model import CompressionPredictor
 
 
 def prepare_fold(df_train, df_val):

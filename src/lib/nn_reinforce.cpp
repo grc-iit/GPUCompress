@@ -250,14 +250,16 @@ extern "C" int nn_reinforce_apply(void* d_weights, float learning_rate) {
     cudaError_t err = cudaMemcpy(d_weights, &h_weights,
                                   sizeof(NNWeightsGPU),
                                   cudaMemcpyHostToDevice);
+
+    // Always reset gradients to avoid stale accumulation on next call
+    zero_gradients();
+
     if (err != cudaSuccess) {
         fprintf(stderr, "nn_reinforce_apply: cudaMemcpy H2D failed: %s\n",
                 cudaGetErrorString(err));
         return -1;
     }
 
-    // ---- Reset for next batch ----
-    zero_gradients();
     return 0;
 }
 

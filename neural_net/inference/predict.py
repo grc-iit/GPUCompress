@@ -1,21 +1,26 @@
 """
-Predict compression performance for a binary file using trained XGBoost.
+Predict compression performance for a binary file using the trained NN.
+
+No GPU required — computes data stats on CPU and runs all 64 compression
+configs through the model to find the best one.
 
 Usage:
-    python neural_net/xgb_predict.py --bin-file some_data.bin
-    python neural_net/xgb_predict.py --bin-file some_data.bin --rank-by psnr_db
+    python neural_net/predict.py --bin-file some_data.bin
+    python neural_net/predict.py --bin-file some_data.bin --rank-by psnr_db
 """
 
 import sys
 import argparse
-import pickle
 import numpy as np
+import torch
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from data import compute_stats_cpu, ALGORITHM_NAMES, inverse_transform_outputs
+from neural_net.core.data import compute_stats_cpu, ALGORITHM_NAMES, inverse_transform_outputs
+from neural_net.core.model import CompressionPredictor
 
+# All 64 configs: 8 algorithms × 2 shuffle × 4 quantization
 SHUFFLE_OPTIONS = [0, 4]
 QUANT_OPTIONS = [
     ('none', 0.0),
@@ -26,6 +31,9 @@ QUANT_OPTIONS = [
 
 
 def predict_all_configs(bin_path, weights_path, rank_by='compression_ratio'):
+    """Predict performance of all 64 configs for a binary file."""
+
+    # Load binary file
     raw_bytes = Path(bin_path).read_bytes()
     original_size = len(raw_bytes)
     if original_size == 0 or original_size % 4 != 0:
@@ -34,25 +42,35 @@ def predict_all_configs(bin_path, weights_path, rank_by='compression_ratio'):
 
     print(f"File: {bin_path} ({original_size:,} bytes)")
 
+    # Compute stats on CPU
     print("Computing data statistics on CPU...")
     entropy, mad, second_derivative = compute_stats_cpu(raw_bytes)
     print(f"  entropy={entropy:.4f}  mad={mad:.6f}  second_derivative={second_derivative:.6f}")
 
-    # Load models
-    with open(weights_path, 'rb') as f:
-        checkpoint = pickle.load(f)
-    models = checkpoint['models']
+    # Load model
+    device = torch.device('cpu')
+    checkpoint = torch.load(weights_path, map_location=device, weights_only=False)
+    model = CompressionPredictor(
+        input_dim=checkpoint['input_dim'],
+        hidden_dim=checkpoint['hidden_dim'],
+        output_dim=checkpoint['output_dim']
+    ).to(device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
+
     x_means = checkpoint['x_means']
     x_stds = checkpoint['x_stds']
     y_means = checkpoint['y_means']
     y_stds = checkpoint['y_stds']
+    feature_names = checkpoint['feature_names']
 
-    # Build 64 input rows
+    # Build input rows for all 64 configs
     rows = []
     configs = []
     for algo in ALGORITHM_NAMES:
         for shuffle in SHUFFLE_OPTIONS:
             for quant, error_bound in QUANT_OPTIONS:
+                # One-hot algorithm
                 algo_features = [1.0 if algo == a else 0.0 for a in ALGORITHM_NAMES]
                 quant_enc = 1.0 if quant == 'linear' else 0.0
                 shuffle_enc = 1.0 if shuffle > 0 else 0.0
@@ -69,19 +87,21 @@ def predict_all_configs(bin_path, weights_path, rank_by='compression_ratio'):
     X_raw = np.array(rows, dtype=np.float32)
     X_norm = (X_raw - x_means) / x_stds
 
-    # Predict each output
-    output_names = ['comp_time_log', 'decomp_time_log', 'ratio_log', 'psnr_clamped']
-    pred_norm = np.zeros((len(rows), 4), dtype=np.float32)
-    for i, name in enumerate(output_names):
-        pred_norm[:, i] = models[name].predict(X_norm)
+    # Run inference
+    with torch.no_grad():
+        pred_norm = model(torch.from_numpy(X_norm)).numpy()
 
     pred_orig = inverse_transform_outputs(pred_norm, y_means, y_stds)
 
-    # Rank
+    # Rank results
     higher_is_better = rank_by in ('compression_ratio', 'psnr_db')
     metric_values = pred_orig[rank_by]
-    ranking = np.argsort(-metric_values) if higher_is_better else np.argsort(metric_values)
+    if higher_is_better:
+        ranking = np.argsort(-metric_values)
+    else:
+        ranking = np.argsort(metric_values)
 
+    # Print results
     print(f"\nAll 64 configs ranked by {rank_by} ({'higher' if higher_is_better else 'lower'} is better):\n")
     print(f"  {'Rank':>4}  {'Algorithm':<12} {'Quant':<8} {'Shuf':>4}  {'ErrBound':>8}  "
           f"{'Ratio':>8}  {'PSNR':>8}  {'Comp ms':>8}  {'Decomp ms':>9}")
@@ -100,19 +120,21 @@ def predict_all_configs(bin_path, weights_path, rank_by='compression_ratio'):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Predict with XGBoost (CPU only)')
+    parser = argparse.ArgumentParser(
+        description='Predict compression performance for a binary file (CPU only)')
     parser.add_argument('--bin-file', type=str, required=True,
                         help='Path to a .bin file (raw float32 array)')
     parser.add_argument('--weights', type=str, default=None,
-                        help='Path to xgb_model.pkl')
+                        help='Path to model.pt (default: neural_net/weights/model.pt)')
     parser.add_argument('--rank-by', type=str, default='compression_ratio',
                         choices=['compression_ratio', 'compression_time_ms',
-                                 'decompression_time_ms', 'psnr_db'])
+                                 'decompression_time_ms', 'psnr_db'],
+                        help='Metric to rank configs by (default: compression_ratio)')
     args = parser.parse_args()
 
-    weights_path = args.weights or str(Path(__file__).parent / 'weights' / 'xgb_model.pkl')
+    weights_path = args.weights or str(Path(__file__).parent.parent / 'weights' / 'model.pt')
     if not Path(weights_path).exists():
-        print(f"No trained model at {weights_path}. Run xgb_train.py first.")
+        print(f"No trained model at {weights_path}. Run train.py first.")
         sys.exit(1)
 
     predict_all_configs(args.bin_file, weights_path, rank_by=args.rank_by)

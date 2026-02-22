@@ -32,7 +32,7 @@ import torch
 # Add project root to path so we can import the ctypes wrapper
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from neural_net.gpucompress_ctypes import GPUCompressLib, ALGO_AUTO, ALGO_NAMES, \
+from neural_net.core.gpu_library import GPUCompressLib, ALGO_AUTO, ALGO_NAMES, \
     PREPROC_QUANTIZE, PREPROC_SHUFFLE_2, PREPROC_SHUFFLE_4, PREPROC_SHUFFLE_8
 
 ALGO_NAME_LIST = ['lz4', 'snappy', 'deflate', 'gdeflate', 'zstd', 'ans', 'cascaded', 'bitcomp']

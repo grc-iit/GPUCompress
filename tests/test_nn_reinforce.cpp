@@ -448,7 +448,7 @@ static bool test_sgd_smoke(const NNWeightsGPU& h_weights_orig) {
     // Reinforce: init, 10 samples, apply with lr=0.01
     nn_reinforce_init(d_weights);
     for (int i = 0; i < 10; i++)
-        nn_reinforce_add_sample(input_raw, static_cast<double>(target));
+        nn_reinforce_add_sample(input_raw, static_cast<double>(target), 0.0);
     nn_reinforce_apply(d_weights, 0.01f);
 
     // Re-copy updated weights from GPU

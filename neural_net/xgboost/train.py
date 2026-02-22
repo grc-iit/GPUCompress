@@ -16,13 +16,13 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from sklearn.model_selection import KFold
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import pickle
 import shap
 import xgboost as xgb
-from data import inverse_transform_outputs, OUTPUT_COLUMNS, ALGORITHM_NAMES, CONTINUOUS_FEATURES
-from cv_eval import prepare_fold
+from neural_net.core.data import inverse_transform_outputs, OUTPUT_COLUMNS, ALGORITHM_NAMES, CONTINUOUS_FEATURES
+from neural_net.training.cross_validate import prepare_fold
 
 # Human-readable labels for features
 FEATURE_LABELS = {
@@ -182,7 +182,7 @@ def train_and_evaluate(data):
         print(f"    MAPE: {mape:.1f}%")
 
     # Save models + normalization stats
-    weights_dir = Path(__file__).parent / 'weights'
+    weights_dir = Path(__file__).parent.parent / 'weights'
     weights_dir.mkdir(exist_ok=True)
     save_path = weights_dir / 'xgb_model.pkl'
     pickle.dump({
@@ -282,6 +282,6 @@ if __name__ == '__main__':
     if args.cv:
         cross_validate(args.csv, n_folds=args.cv)
     else:
-        from data import load_from_csv
+        from neural_net.core.data import load_from_csv
         data = load_from_csv(args.csv)
         models = train_and_evaluate(data)

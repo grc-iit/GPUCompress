@@ -12,6 +12,7 @@ Usage:
     python neural_net/export_weights.py
 """
 
+import sys
 import time
 import argparse
 import numpy as np
@@ -20,8 +21,10 @@ import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
 from pathlib import Path
 
-from data import inverse_transform_outputs
-from model import CompressionPredictor
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+
+from neural_net.core.data import inverse_transform_outputs
+from neural_net.core.model import CompressionPredictor
 
 
 def train_model_with_data(data: dict, epochs: int = 200, batch_size: int = 512,
@@ -175,7 +178,7 @@ def train_model_with_data(data: dict, epochs: int = 200, batch_size: int = 512,
         print(f"    MAPE: {mape:.1f}%")
 
     # ---- Save model + scalers ----
-    weights_dir = Path(__file__).parent / 'weights'
+    weights_dir = Path(__file__).parent.parent / 'weights'
     weights_dir.mkdir(exist_ok=True)
 
     save_path = weights_dir / 'model.pt'
@@ -219,10 +222,10 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     if args.csv:
-        from data import load_from_csv
+        from neural_net.core.data import load_from_csv
         data = load_from_csv(args.csv)
     elif args.data_dir:
-        from binary_data import load_and_prepare_from_binary
+        from neural_net.training.benchmark import load_and_prepare_from_binary
         data = load_and_prepare_from_binary(
             args.data_dir, lib_path=args.lib_path, max_files=args.max_files)
     else:

@@ -36,12 +36,16 @@ Usage:
     python export_weights.py [--input weights/model.pt] [--output weights/model.nnwt]
 """
 
+import sys
 import struct
 import argparse
 import numpy as np
 import torch
 from pathlib import Path
-from model import CompressionPredictor
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+
+from neural_net.core.model import CompressionPredictor
 
 
 MAGIC = 0x4E4E5754  # "NNWT"
@@ -182,8 +186,9 @@ def verify_export(path: str, model, x_means, x_stds, y_means, y_stds,
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Export NN weights to binary')
-    parser.add_argument('--input', default='weights/model.pt', help='Input model path')
-    parser.add_argument('--output', default='weights/model.nnwt', help='Output binary path')
+    default_weights = str(Path(__file__).parent.parent / 'weights')
+    parser.add_argument('--input', default=f'{default_weights}/model.pt', help='Input model path')
+    parser.add_argument('--output', default=f'{default_weights}/model.nnwt', help='Output binary path')
     args = parser.parse_args()
 
     print(f"Exporting model from {args.input}...")

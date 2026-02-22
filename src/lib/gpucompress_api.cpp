@@ -92,8 +92,6 @@ char g_experience_path[512] = "";
 /** Online reinforcement state */
 bool g_reinforce_enabled = false;
 float g_reinforce_lr = 1e-4f;
-double g_reinforce_threshold = 0.60;  // 60% ratio MAPE
-double g_reinforce_ct_threshold = 0.60;  // 60% comp_time MAPE
 bool g_reinforce_initialized = false;
 
 /** Algorithm names */
@@ -220,6 +218,35 @@ extern "C" gpucompress_config_t gpucompress_default_config(void) {
 }
 
 /* ============================================================
+ * Reinforcement helper
+ * ============================================================ */
+
+static void build_input_features(float out[15], int action,
+                                  double error_bound, size_t data_size,
+                                  double entropy, double mad, double second_deriv) {
+    int algo_idx = action % 8;
+    int quant_flag = (action / 8) % 2;
+    int shuffle_flag = (action / 16) % 2;
+
+    for (int f = 0; f < 8; f++)
+        out[f] = (f == algo_idx) ? 1.0f : 0.0f;
+    out[8] = static_cast<float>(quant_flag);
+    out[9] = static_cast<float>(shuffle_flag);
+
+    double eb_c = error_bound;
+    if (eb_c < 1e-7) eb_c = 1e-7;
+    out[10] = static_cast<float>(log10(eb_c));
+
+    double ds = static_cast<double>(data_size);
+    if (ds < 1.0) ds = 1.0;
+    out[11] = static_cast<float>(log2(ds));
+
+    out[12] = static_cast<float>(entropy);
+    out[13] = static_cast<float>(mad);
+    out[14] = static_cast<float>(second_deriv);
+}
+
+/* ============================================================
  * Core Compression
  * ============================================================ */
 
@@ -336,8 +363,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
             algo_to_use = static_cast<gpucompress_algorithm_t>(decoded.algorithm + 1);
             preproc_to_use = 0;
             if (decoded.shuffle_size > 0)
-                preproc_to_use |= (decoded.shuffle_size == 4) ?
-                    GPUCOMPRESS_PREPROC_SHUFFLE_4 : GPUCOMPRESS_PREPROC_SHUFFLE_2;
+                preproc_to_use |= GPUCOMPRESS_PREPROC_SHUFFLE_4;
             if (decoded.use_quantization)
                 preproc_to_use |= GPUCOMPRESS_PREPROC_QUANTIZE;
         } else {
@@ -542,13 +568,19 @@ extern "C" gpucompress_error_t gpucompress_compress(
         sample.error_bound = cfg.error_bound;
         sample.action = nn_action;
         sample.actual_ratio = actual_ratio;
-        sample.actual_comp_time_ms = 0.0;  // Not timed in this path
+        sample.actual_comp_time_ms = static_cast<double>(primary_comp_time_ms);
         experience_buffer_append(&sample);
 
         // Check prediction error
         double pred_ratio_d = static_cast<double>(predicted_ratio);
         double error_pct = (actual_ratio > 0.0) ?
             std::abs(pred_ratio_d - actual_ratio) / actual_ratio : 0.0;
+
+        // Collect explored (action, ratio, comp_time) for reinforcement
+        struct ExploredResult { int action; double ratio; double comp_time_ms; };
+        std::vector<ExploredResult> explored_samples;
+        explored_samples.push_back({nn_action, actual_ratio,
+                                    static_cast<double>(primary_comp_time_ms)});
 
         if (error_pct > g_exploration_threshold || is_ood) {
             // Level 2: Explore alternatives
@@ -561,12 +593,6 @@ extern "C" gpucompress_error_t gpucompress_compress(
             } else {
                 K = 4;
             }
-
-            // Collect explored (action, ratio, comp_time) for reinforcement
-            struct ExploredResult { int action; double ratio; double comp_time_ms; };
-            std::vector<ExploredResult> explored_samples;
-            explored_samples.push_back({nn_action, actual_ratio,
-                                        static_cast<double>(primary_comp_time_ms)});
 
             // Try top-K alternative configs
             double best_ratio = actual_ratio;
@@ -581,8 +607,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
                     static_cast<gpucompress_algorithm_t>(alt.algorithm + 1);
                 unsigned int alt_preproc = 0;
                 if (alt.shuffle_size > 0)
-                    alt_preproc |= (alt.shuffle_size == 4) ?
-                        GPUCOMPRESS_PREPROC_SHUFFLE_4 : GPUCOMPRESS_PREPROC_SHUFFLE_2;
+                    alt_preproc |= GPUCOMPRESS_PREPROC_SHUFFLE_4;
                 if (alt.use_quantization)
                     alt_preproc |= GPUCOMPRESS_PREPROC_QUANTIZE;
 
@@ -635,16 +660,18 @@ extern "C" gpucompress_error_t gpucompress_compress(
                 size_t alt_comp_size = 0;
 
                 if (alt_comp) {
+                    uint8_t* d_alt_out = nullptr;
+                    cudaEvent_t at0 = nullptr, at1 = nullptr;
+                    bool events_created = false;
                     try {
                         CompressionConfig alt_cc =
                             alt_comp->configure_compression(alt_compress_size);
                         size_t alt_max = alt_cc.max_compressed_buffer_size;
-                        uint8_t* d_alt_out = nullptr;
                         if (cudaMalloc(&d_alt_out, alt_max) == cudaSuccess) {
-                            cudaEvent_t at0, at1;
                             float alt_ct_ms = 0.0f;
                             bool at_ok = (cudaEventCreate(&at0) == cudaSuccess &&
                                           cudaEventCreate(&at1) == cudaSuccess);
+                            events_created = at_ok;
                             if (at_ok) cudaEventRecord(at0, stream);
 
                             alt_comp->compress(d_alt_input, d_alt_out, alt_cc);
@@ -655,6 +682,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
                                 cudaEventElapsedTime(&alt_ct_ms, at0, at1);
                                 cudaEventDestroy(at0);
                                 cudaEventDestroy(at1);
+                                events_created = false;
                             }
 
                             alt_comp_size = alt_comp->get_compressed_output_size(d_alt_out);
@@ -674,7 +702,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
                             alt_sample.error_bound = cfg.error_bound;
                             alt_sample.action = alt_action;
                             alt_sample.actual_ratio = alt_ratio;
-                            alt_sample.actual_comp_time_ms = 0.0;
+                            alt_sample.actual_comp_time_ms = static_cast<double>(alt_ct_ms);
                             experience_buffer_append(&alt_sample);
 
                             // Track if this is better than current best
@@ -718,15 +746,20 @@ extern "C" gpucompress_error_t gpucompress_compress(
                                     *output_size = alt_total;
                                     total_size = alt_total;
                                     compressed_size = alt_comp_size;
+                                    actual_ratio = static_cast<double>(input_size) / static_cast<double>(compressed_size);
                                     algo_to_use = alt_algo;
                                     preproc_to_use = alt_preproc;
                                 }
                             }
-                            cudaFree(d_alt_out);
                         }
                     } catch (...) {
                         // Compression failed for this config, skip it
                     }
+                    if (events_created) {
+                        if (at0) cudaEventDestroy(at0);
+                        if (at1) cudaEventDestroy(at1);
+                    }
+                    if (d_alt_out) cudaFree(d_alt_out);
                 }
 
                 if (d_alt_quant) cudaFree(d_alt_quant);
@@ -735,20 +768,9 @@ extern "C" gpucompress_error_t gpucompress_compress(
 
         }
 
-        // Online reinforcement: if ratio OR comp_time MAPE exceeds threshold,
-        // do CPU backward pass and update GPU weights.
-        // This runs independently of exploration so comp_time can be reinforced
-        // even when ratio predictions are already good.
-        double ct_error_pct = 0.0;
-        if (primary_comp_time_ms > 0.0f && predicted_comp_time > 0.0f) {
-            double pred_ct = static_cast<double>(predicted_comp_time);
-            double actual_ct = static_cast<double>(primary_comp_time_ms);
-            ct_error_pct = std::abs(pred_ct - actual_ct) / actual_ct;
-        }
-
-        if (g_reinforce_enabled &&
-            (error_pct > g_reinforce_threshold ||
-             ct_error_pct > g_reinforce_ct_threshold)) {
+        // Online reinforcement: always reinforce with primary measurement,
+        // plus any explored samples collected above.
+        if (g_reinforce_enabled) {
             void* d_weights = gpucompress_nn_get_device_ptr_impl();
             if (d_weights) {
                 // Lazy-init: copy GPU weights to host on first trigger
@@ -759,32 +781,18 @@ extern "C" gpucompress_error_t gpucompress_compress(
                 }
 
                 if (g_reinforce_initialized) {
-                    // Build input for primary config (always available)
-                    int algo_idx = nn_action % 8;
-                    int quant_flag = (nn_action / 8) % 2;
-                    int shuffle_flag = (nn_action / 16) % 2;
+                    // Feed all samples (primary + explored)
+                    for (size_t ei = 0; ei < explored_samples.size(); ei++) {
+                        float input_raw[15];
+                        build_input_features(input_raw, explored_samples[ei].action,
+                                             cfg.error_bound, input_size,
+                                             entropy, mad, second_derivative);
+                        nn_reinforce_add_sample(input_raw,
+                                                explored_samples[ei].ratio,
+                                                explored_samples[ei].comp_time_ms);
+                    }
 
-                    float input_raw[15];
-                    for (int f = 0; f < 8; f++)
-                        input_raw[f] = (f == algo_idx) ? 1.0f : 0.0f;
-                    input_raw[8] = static_cast<float>(quant_flag);
-                    input_raw[9] = static_cast<float>(shuffle_flag);
-
-                    double eb_c = cfg.error_bound;
-                    if (eb_c < 1e-7) eb_c = 1e-7;
-                    input_raw[10] = static_cast<float>(log10(eb_c));
-
-                    double ds = static_cast<double>(input_size);
-                    if (ds < 1.0) ds = 1.0;
-                    input_raw[11] = static_cast<float>(log2(ds));
-
-                    input_raw[12] = static_cast<float>(entropy);
-                    input_raw[13] = static_cast<float>(mad);
-                    input_raw[14] = static_cast<float>(second_derivative);
-
-                    nn_reinforce_add_sample(input_raw, actual_ratio,
-                                            static_cast<double>(primary_comp_time_ms));
-
+                    // Batched SGD over all samples
                     nn_reinforce_apply(d_weights, g_reinforce_lr);
                     sgd_fired = true;
                 }
@@ -1174,9 +1182,7 @@ extern "C" gpucompress_error_t gpucompress_recommend_config(
 
     *preprocessing_out = 0;
     if (decoded.shuffle_size > 0) {
-        *preprocessing_out |= (decoded.shuffle_size == 4) ?
-                              GPUCOMPRESS_PREPROC_SHUFFLE_4 :
-                              GPUCOMPRESS_PREPROC_SHUFFLE_2;
+        *preprocessing_out |= GPUCOMPRESS_PREPROC_SHUFFLE_4;
     }
     if (decoded.use_quantization) {
         *preprocessing_out |= GPUCOMPRESS_PREPROC_QUANTIZE;
@@ -1284,12 +1290,10 @@ extern "C" void gpucompress_set_exploration_threshold(double threshold) {
 }
 
 extern "C" void gpucompress_set_reinforcement(int enable, float learning_rate,
-                                               float mape_threshold,
-                                               float ct_mape_threshold) {
+                                               float /*mape_threshold*/,
+                                               float /*ct_mape_threshold*/) {
     g_reinforce_enabled = (enable != 0);
     if (learning_rate > 0.0f) g_reinforce_lr = learning_rate;
-    if (mape_threshold > 0.0f) g_reinforce_threshold = static_cast<double>(mape_threshold);
-    if (ct_mape_threshold > 0.0f) g_reinforce_ct_threshold = static_cast<double>(ct_mape_threshold);
 
     if (!g_reinforce_enabled) {
         nn_reinforce_cleanup();

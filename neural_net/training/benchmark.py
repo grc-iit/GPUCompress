@@ -13,12 +13,16 @@ import pandas as pd
 from pathlib import Path
 from typing import Dict
 
-from gpucompress_ctypes import (
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+
+from neural_net.core.gpu_library import (
     GPUCompressLib, ALGO_LZ4, ALGO_SNAPPY, ALGO_DEFLATE, ALGO_GDEFLATE,
     ALGO_ZSTD, ALGO_ANS, ALGO_CASCADED, ALGO_BITCOMP, ALGO_NAMES,
     HEADER_SIZE,
 )
-from data import encode_and_split
+from neural_net.core.data import encode_and_split
 
 # ============================================================
 # Benchmark configuration space (64 configs)
