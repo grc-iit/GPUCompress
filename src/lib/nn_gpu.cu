@@ -95,6 +95,7 @@ __global__ void nnInferenceKernel(
     int criterion,
     int* __restrict__ out_action,
     float* __restrict__ out_predicted_ratio,
+    float* __restrict__ out_predicted_comp_time,
     int* __restrict__ out_top_actions
 ) {
     int tid = threadIdx.x;
@@ -224,9 +225,11 @@ __global__ void nnInferenceKernel(
         rank_val = -rank_val;
     }
 
-    // ---- Store per-thread predicted ratio for later retrieval ----
+    // ---- Store per-thread predicted ratio and comp_time for later retrieval ----
     __shared__ float s_ratios[NN_NUM_CONFIGS];
+    __shared__ float s_comp_times[NN_NUM_CONFIGS];
     s_ratios[tid] = ratio;
+    s_comp_times[tid] = comp_time;
 
     // ---- Parallel reduction to find best config ----
     __shared__ float s_vals[NN_NUM_CONFIGS];
@@ -271,9 +274,12 @@ __global__ void nnInferenceKernel(
                 out_top_actions[i] = local_idxs[i];
             }
 
-            // Write predicted ratio for the winner
+            // Write predicted ratio and comp_time for the winner
             if (out_predicted_ratio != nullptr) {
                 *out_predicted_ratio = s_ratios[local_idxs[0]];
+            }
+            if (out_predicted_comp_time != nullptr) {
+                *out_predicted_comp_time = s_comp_times[local_idxs[0]];
             }
         }
     } else {
@@ -292,9 +298,12 @@ __global__ void nnInferenceKernel(
         if (tid == 0) {
             *out_action = s_idxs[0];
 
-            // Write predicted ratio for the winner
+            // Write predicted ratio and comp_time for the winner
             if (out_predicted_ratio != nullptr) {
                 *out_predicted_ratio = s_ratios[s_idxs[0]];
+            }
+            if (out_predicted_comp_time != nullptr) {
+                *out_predicted_comp_time = s_comp_times[s_idxs[0]];
             }
         }
     }
@@ -528,15 +537,17 @@ int runNNInference(
     double error_bound,
     cudaStream_t stream,
     float* out_predicted_ratio,
+    float* out_predicted_comp_time,
     int* out_top_actions
 ) {
     if (!g_nn_loaded || d_nn_weights == nullptr) {
         return -1;  // Error: NN not loaded
     }
 
-    // Allocate device outputs: action + optional predicted_ratio + optional top_actions
+    // Allocate device outputs: action + optional predicted_ratio/comp_time + optional top_actions
     int* d_action = nullptr;
     float* d_predicted_ratio = nullptr;
+    float* d_predicted_comp_time = nullptr;
     int* d_top_actions = nullptr;
     int h_action = 0;
 
@@ -551,11 +562,21 @@ int runNNInference(
         }
     }
 
+    if (out_predicted_comp_time) {
+        err = cudaMalloc(&d_predicted_comp_time, sizeof(float));
+        if (err != cudaSuccess) {
+            cudaFree(d_action);
+            if (d_predicted_ratio) cudaFree(d_predicted_ratio);
+            return -1;
+        }
+    }
+
     if (out_top_actions) {
         err = cudaMalloc(&d_top_actions, NN_NUM_CONFIGS * sizeof(int));
         if (err != cudaSuccess) {
             cudaFree(d_action);
             if (d_predicted_ratio) cudaFree(d_predicted_ratio);
+            if (d_predicted_comp_time) cudaFree(d_predicted_comp_time);
             return -1;
         }
     }
@@ -567,6 +588,7 @@ int runNNInference(
         static_cast<int>(g_rank_criterion),
         d_action,
         d_predicted_ratio,
+        d_predicted_comp_time,
         d_top_actions
     );
 
@@ -585,6 +607,19 @@ int runNNInference(
         if (err != cudaSuccess) {
             cudaFree(d_action);
             cudaFree(d_predicted_ratio);
+            if (d_predicted_comp_time) cudaFree(d_predicted_comp_time);
+            if (d_top_actions) cudaFree(d_top_actions);
+            return -1;
+        }
+    }
+
+    if (d_predicted_comp_time) {
+        err = cudaMemcpyAsync(out_predicted_comp_time, d_predicted_comp_time, sizeof(float),
+                               cudaMemcpyDeviceToHost, stream);
+        if (err != cudaSuccess) {
+            cudaFree(d_action);
+            if (d_predicted_ratio) cudaFree(d_predicted_ratio);
+            cudaFree(d_predicted_comp_time);
             if (d_top_actions) cudaFree(d_top_actions);
             return -1;
         }
@@ -597,6 +632,7 @@ int runNNInference(
         if (err != cudaSuccess) {
             cudaFree(d_action);
             if (d_predicted_ratio) cudaFree(d_predicted_ratio);
+            if (d_predicted_comp_time) cudaFree(d_predicted_comp_time);
             cudaFree(d_top_actions);
             return -1;
         }
@@ -606,6 +642,7 @@ int runNNInference(
 
     cudaFree(d_action);
     if (d_predicted_ratio) cudaFree(d_predicted_ratio);
+    if (d_predicted_comp_time) cudaFree(d_predicted_comp_time);
     if (d_top_actions) cudaFree(d_top_actions);
 
     if (err != cudaSuccess) return -1;

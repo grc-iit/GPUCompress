@@ -134,6 +134,8 @@ typedef struct {
     unsigned int preprocessing_used;     /**< Preprocessing actually applied */
     double throughput_mbps;              /**< Compression throughput (MB/s) */
     double predicted_ratio;              /**< NN-predicted compression ratio (0.0 if not ALGO_AUTO/NN) */
+    double predicted_comp_time_ms;       /**< NN-predicted compression time in ms (0.0 if not ALGO_AUTO/NN) */
+    int    sgd_fired;                    /**< 1 if online reinforcement (SGD) was triggered, 0 otherwise */
 } gpucompress_stats_t;
 
 /* ============================================================

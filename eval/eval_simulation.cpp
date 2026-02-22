@@ -45,7 +45,8 @@ static const char* CSV_HEADER =
     "file,field,scenario,timestep,entropy,mad,second_derivative,"
     "original_size,algorithm,shuffle,quantization,error_bound,"
     "compressed_size,compression_ratio,compress_time_ms,throughput_mbps,"
-    "experience_count,experience_delta,predicted_ratio,mape\n";
+    "experience_count,experience_delta,predicted_ratio,mape,"
+    "predicted_comp_time_ms,comp_time_mape,reinforced\n";
 
 // ============================================================
 // CLI configuration
@@ -368,10 +369,12 @@ int main(int argc, char** argv) {
 
     // MAPE tracking
     double total_mape = 0.0;
+    double total_comp_time_mape = 0.0;
 
     // Rolling MAPE (circular buffer of last 20)
     const size_t ROLLING_WINDOW = 20;
     std::vector<double> rolling_mape(ROLLING_WINDOW, 0.0);
+    std::vector<double> rolling_ct_mape(ROLLING_WINDOW, 0.0);
     size_t rolling_idx = 0;
     size_t rolling_filled = 0;
 
@@ -455,10 +458,18 @@ int main(int argc, char** argv) {
             ? std::abs(pred_ratio - ratio) / ratio
             : 0.0;
 
+        // Compute comp_time MAPE from NN prediction
+        double pred_comp_time = stats.predicted_comp_time_ms;
+        double comp_time_mape = (comp_time > 0.0)
+            ? std::abs(pred_comp_time - comp_time) / comp_time
+            : 0.0;
+
         total_mape += mape;
+        total_comp_time_mape += comp_time_mape;
 
         // Rolling MAPE buffer
         rolling_mape[rolling_idx % ROLLING_WINDOW] = mape;
+        rolling_ct_mape[rolling_idx % ROLLING_WINDOW] = comp_time_mape;
         rolling_idx++;
         if (rolling_filled < ROLLING_WINDOW) rolling_filled++;
 
@@ -471,17 +482,25 @@ int main(int argc, char** argv) {
         const char* quant_str = (stats.preprocessing_used & GPUCOMPRESS_PREPROC_QUANTIZE)
                                 ? "linear" : "none";
 
+        // Compute rolling MAPEs
+        double rolling_sum = 0.0, rolling_ct_sum = 0.0;
+        for (size_t ri = 0; ri < rolling_filled; ++ri) {
+            rolling_sum += rolling_mape[ri];
+            rolling_ct_sum += rolling_ct_mape[ri];
+        }
+        double rolling_avg = (rolling_filled > 0) ? rolling_sum / rolling_filled : 0.0;
+        double rolling_ct_avg = (rolling_filled > 0) ? rolling_ct_sum / rolling_filled : 0.0;
+
         // Print per-file summary
-        bool reinforced = config.reinforce &&
-                          (mape > static_cast<double>(config.reinforce_threshold));
+        bool reinforced = (stats.sgd_fired != 0);
 
         std::cout << "  [" << std::setw(3) << (fi + 1) << "/" << files.size() << "] "
                   << std::setw(50) << std::left << filename << std::right
-                  << "  algo=" << std::setw(9) << algo_name
                   << "  ratio=" << std::fixed << std::setprecision(3) << ratio
                   << "  mape=" << std::setprecision(1) << (mape * 100.0) << "%"
-                  << "  exp_delta=" << exp_delta
-                  << (explored ? " *EXPLORE*" : "")
+                  << "  ct_mape=" << std::setprecision(1) << (comp_time_mape * 100.0) << "%"
+                  << "  avg=" << std::setprecision(1) << (rolling_avg * 100.0) << "%"
+                  << "/" << std::setprecision(1) << (rolling_ct_avg * 100.0) << "%"
                   << (reinforced ? " *SGD*" : "")
                   << std::endl;
 
@@ -508,17 +527,6 @@ int main(int argc, char** argv) {
             std::cout << std::endl;
         }
 
-        // Print rolling MAPE every ROLLING_WINDOW files
-        if (rolling_idx > 0 && rolling_idx % ROLLING_WINDOW == 0) {
-            double rolling_sum = 0.0;
-            for (size_t ri = 0; ri < rolling_filled; ++ri)
-                rolling_sum += rolling_mape[ri];
-            double rolling_avg = rolling_sum / rolling_filled;
-            std::cout << "  Rolling MAPE (last " << ROLLING_WINDOW << "): "
-                      << std::fixed << std::setprecision(1)
-                      << (rolling_avg * 100.0) << "%" << std::endl;
-        }
-
         // Write CSV row
         csv_out << filename << ","
                 << meta.field << ","
@@ -539,7 +547,10 @@ int main(int argc, char** argv) {
                 << curr_experience << ","
                 << exp_delta << ","
                 << fmt_double(pred_ratio, 6) << ","
-                << fmt_double(mape, 6) << "\n";
+                << fmt_double(mape, 6) << ","
+                << fmt_double(pred_comp_time, 4) << ","
+                << fmt_double(comp_time_mape, 6) << ","
+                << (reinforced ? 1 : 0) << "\n";
     }
 
     csv_out.close();
@@ -559,13 +570,24 @@ int main(int argc, char** argv) {
               << "% of files)" << std::endl;
     std::cout << "  Mean ratio:          " << std::setprecision(4)
               << (files_processed > 0 ? total_ratio / files_processed : 0.0) << std::endl;
-    std::cout << "  Mean MAPE:           " << std::setprecision(1)
+    std::cout << "  Mean Ratio MAPE:     " << std::setprecision(1)
               << (files_processed > 0 ? 100.0 * total_mape / files_processed : 0.0)
+              << "%" << std::endl;
+    std::cout << "  Mean CT MAPE:        " << std::setprecision(1)
+              << (files_processed > 0 ? 100.0 * total_comp_time_mape / files_processed : 0.0)
               << "%" << std::endl;
     std::cout << "  Wall time:           " << std::setprecision(1) << wall_time << "s" << std::endl;
     std::cout << "  Output:              " << config.output << std::endl;
     std::cout << "  Experience:          " << config.experience << std::endl;
     std::cout << "========================================" << std::endl;
+
+    // 7. Generate MAPE plot
+    {
+        std::string plot_cmd = "python3 eval/plot_mape.py " + config.output + " eval/mape_reinforcement.png 2>/dev/null &";
+        std::cout << "\nGenerating MAPE plot..." << std::endl;
+        int plot_rc = system(plot_cmd.c_str());
+        (void)plot_rc;
+    }
 
     gpucompress_disable_active_learning();
     gpucompress_cleanup();

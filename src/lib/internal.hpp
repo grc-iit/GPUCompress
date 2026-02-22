@@ -392,6 +392,7 @@ int runNNInference(
     double error_bound,
     cudaStream_t stream,
     float* out_predicted_ratio = nullptr,
+    float* out_predicted_comp_time = nullptr,
     int* out_top_actions = nullptr
 );
 
@@ -444,6 +445,7 @@ int runAutoStatsNNPipeline(
     double* out_mad = nullptr,
     double* out_deriv = nullptr,
     float* out_predicted_ratio = nullptr,
+    float* out_predicted_comp_time = nullptr,
     int* out_top_actions = nullptr
 );
 

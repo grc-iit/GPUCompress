@@ -402,6 +402,7 @@ int runNNInference(
     double error_bound,
     cudaStream_t stream,
     float* out_predicted_ratio = nullptr,
+    float* out_predicted_comp_time = nullptr,
     int* out_top_actions = nullptr
 );
 
@@ -657,6 +658,7 @@ int runAutoStatsNNPipeline(
     double* out_mad,
     double* out_deriv,
     float* out_predicted_ratio,
+    float* out_predicted_comp_time,
     int* out_top_actions
 ) {
     if (!isNNLoaded()) {
@@ -674,7 +676,7 @@ int runAutoStatsNNPipeline(
     int action = runNNInference(
         entropy, mad_norm, deriv_norm,
         input_size, error_bound, stream,
-        out_predicted_ratio, out_top_actions
+        out_predicted_ratio, out_predicted_comp_time, out_top_actions
     );
     if (action < 0) {
         return -1;

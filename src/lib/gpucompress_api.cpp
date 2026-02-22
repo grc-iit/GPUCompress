@@ -276,8 +276,10 @@ extern "C" gpucompress_error_t gpucompress_compress(
     double mad = 0.0;
     double second_derivative = 0.0;
     bool nn_was_used = false;
+    bool sgd_fired = false;
     int nn_action = 0;
     float predicted_ratio = 0.0f;
+    float predicted_comp_time = 0.0f;
     int top_actions[32] = {0};
     bool is_ood = false;
 
@@ -291,6 +293,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
             // Always get stats when active learning is enabled
             bool need_stats = (stats != nullptr) || g_active_learning_enabled;
             float* p_ratio = (stats != nullptr || g_active_learning_enabled) ? &predicted_ratio : nullptr;
+            float* p_comp_time = p_ratio ? &predicted_comp_time : nullptr;
             int* p_top = g_active_learning_enabled ? top_actions : nullptr;
 
             rc = gpucompress::runAutoStatsNNPipeline(
@@ -300,6 +303,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
                 need_stats ? &mad : nullptr,
                 need_stats ? &second_derivative : nullptr,
                 p_ratio,
+                p_comp_time,
                 p_top);
 
             if (rc == 0) {
@@ -738,6 +742,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
                         }
 
                         nn_reinforce_apply(d_weights, g_reinforce_lr);
+                        sgd_fired = true;
                     }
                 }
             }
@@ -759,6 +764,8 @@ extern "C" gpucompress_error_t gpucompress_compress(
         stats->preprocessing_used = preproc_to_use;
         stats->throughput_mbps = 0.0;  // Would need timing to calculate
         stats->predicted_ratio = static_cast<double>(predicted_ratio);
+        stats->predicted_comp_time_ms = static_cast<double>(predicted_comp_time);
+        stats->sgd_fired = sgd_fired ? 1 : 0;
     }
 
     return GPUCOMPRESS_SUCCESS;
