@@ -5,6 +5,13 @@ GPU_LZ4.cu
 build/
 cufile.log
 .venv
+venv/
 test_data/*.csv
 __pycache__/
 *.csv
+*.nnwt
+*.pt
+*.pkl
+plots/*.png
+eval/*.png
+neural_net/weights/*.png

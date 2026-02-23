@@ -189,12 +189,31 @@ compression manager initialization code.
 
 ```
 GPUCompress/
+├── include/
+│   └── gpucompress.h                # Public C API header
 ├── src/
-│   ├── GPU_Compress.cpp      # Main compression executable
-│   ├── GPU_Decompress.cpp    # Main decompression executable
-│   ├── CompressionFactory.cpp/.hpp  # nvcomp algorithm factory
-│   ├── byte_shuffle_kernels.cu      # Preprocessing kernels
-│   └── quantization_kernels.cu      # Quantization kernels
+│   ├── cli/
+│   │   ├── compress.cpp             # gpu_compress entry point
+│   │   └── decompress.cpp           # gpu_decompress entry point
+│   ├── core/
+│   │   ├── compression_factory.cpp  # nvcomp algorithm factory
+│   │   ├── compression_factory.hpp
+│   │   └── compression_header.h     # 64-byte header format
+│   ├── lib/
+│   │   ├── gpucompress_api.cpp      # C API implementation
+│   │   ├── entropy_kernel.cu        # GPU entropy calculation
+│   │   ├── nn_gpu.cu               # NN inference on GPU
+│   │   ├── nn_reinforce.cpp         # Online reinforcement
+│   │   ├── stats_kernel.cu          # Stats pipeline kernels
+│   │   └── experience_buffer.cpp    # Active learning buffer
+│   ├── preprocessing/
+│   │   ├── byte_shuffle_kernels.cu  # Byte shuffle CUDA kernels
+│   │   └── quantization_kernels.cu  # Linear quantization kernels
+│   └── hdf5/
+│       └── H5Zgpucompress.c         # HDF5 filter plugin
+├── neural_net/                      # NN training and inference
+├── eval/                            # Evaluation scripts and tools
+├── syntheticGeneration/             # Synthetic data generator
 ├── scripts/
 │   ├── install_dependencies.sh      # Automated setup
 │   └── setup_env.sh                 # Environment setup

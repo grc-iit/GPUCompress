@@ -2,7 +2,7 @@
  * @file gpucompress.h
  * @brief GPUCompress C API - GPU-accelerated compression library
  *
- * This library provides GPU-accelerated compression with optional RL-based
+ * This library provides GPU-accelerated compression with neural network-based
  * algorithm selection. It wraps nvcomp algorithms with preprocessing
  * (quantization, byte shuffle) and supports HDF5 filter integration.
  *
@@ -42,10 +42,10 @@ extern "C" {
 
 /**
  * Compression algorithm identifiers.
- * Use GPUCOMPRESS_ALGO_AUTO for RL-based automatic selection.
+ * Use GPUCOMPRESS_ALGO_AUTO for neural network-based automatic selection.
  */
 typedef enum {
-    GPUCOMPRESS_ALGO_AUTO     = 0,  /**< RL-based automatic selection */
+    GPUCOMPRESS_ALGO_AUTO     = 0,  /**< NN-based automatic selection */
     GPUCOMPRESS_ALGO_LZ4      = 1,  /**< Fast compression, general purpose */
     GPUCOMPRESS_ALGO_SNAPPY   = 2,  /**< Fastest compression, lower ratio */
     GPUCOMPRESS_ALGO_DEFLATE  = 3,  /**< Better ratio, slower */
@@ -94,7 +94,7 @@ typedef enum {
     GPUCOMPRESS_ERROR_COMPRESSION     = -3,  /**< Compression failed */
     GPUCOMPRESS_ERROR_DECOMPRESSION   = -4,  /**< Decompression failed */
     GPUCOMPRESS_ERROR_OUT_OF_MEMORY   = -5,  /**< Memory allocation failed */
-    GPUCOMPRESS_ERROR_QTABLE_NOT_LOADED = -6, /**< Q-Table not loaded for AUTO */
+    GPUCOMPRESS_ERROR_RESERVED_6      = -6,  /**< Reserved (formerly Q-Table) */
     GPUCOMPRESS_ERROR_INVALID_HEADER  = -7,  /**< Invalid compression header */
     GPUCOMPRESS_ERROR_NOT_INITIALIZED = -8,  /**< Library not initialized */
     GPUCOMPRESS_ERROR_BUFFER_TOO_SMALL = -9  /**< Output buffer too small */
@@ -113,7 +113,7 @@ const char* gpucompress_error_string(gpucompress_error_t error);
  * Compression configuration.
  */
 typedef struct {
-    gpucompress_algorithm_t algorithm;  /**< Algorithm (AUTO for RL selection) */
+    gpucompress_algorithm_t algorithm;  /**< Algorithm (AUTO for NN selection) */
     unsigned int preprocessing;          /**< Bitmask of gpucompress_preproc_t */
     double error_bound;                  /**< Quantization error bound (0 = lossless) */
     int cuda_device;                     /**< CUDA device (-1 = default) */
@@ -135,6 +135,7 @@ typedef struct {
     double throughput_mbps;              /**< Compression throughput (MB/s) */
     double predicted_ratio;              /**< NN-predicted compression ratio (0.0 if not ALGO_AUTO/NN) */
     double predicted_comp_time_ms;       /**< NN-predicted compression time in ms (0.0 if not ALGO_AUTO/NN) */
+    double actual_comp_time_ms;          /**< Actual GPU compression time in ms (CUDA event timing) */
     int    sgd_fired;                    /**< 1 if online reinforcement (SGD) was triggered, 0 otherwise */
 } gpucompress_stats_t;
 
@@ -148,11 +149,11 @@ typedef struct {
  * Must be called before any other GPUCompress functions.
  * Thread-safe: can be called multiple times (uses reference counting).
  *
- * @param qtable_path Path to Q-Table file for RL-based selection.
- *                    Use NULL for default path or if not using ALGO_AUTO.
+ * @param weights_path Path to .nnwt weights file for NN-based selection.
+ *                     Use NULL if not using ALGO_AUTO.
  * @return GPUCOMPRESS_SUCCESS or error code
  */
-gpucompress_error_t gpucompress_init(const char* qtable_path);
+gpucompress_error_t gpucompress_init(const char* weights_path);
 
 /**
  * Clean up GPUCompress library resources.
@@ -356,51 +357,6 @@ gpucompress_error_t gpucompress_compute_stats(
     double* entropy,
     double* mad,
     double* second_derivative
-);
-
-/* ============================================================
- * Q-Table / RL Management
- * ============================================================ */
-
-/**
- * Load Q-Table from file for RL-based algorithm selection.
- *
- * Supports JSON and binary formats. Q-Table is loaded to GPU
- * constant memory for fast inference.
- *
- * @param filepath Path to Q-Table file (.json or .bin)
- * @return GPUCOMPRESS_SUCCESS or error code
- */
-gpucompress_error_t gpucompress_load_qtable(const char* filepath);
-
-/**
- * Check if Q-Table is loaded.
- *
- * @return 1 if Q-Table is loaded, 0 otherwise
- */
-int gpucompress_qtable_is_loaded(void);
-
-/**
- * Get recommended configuration based on data characteristics.
- *
- * Uses loaded Q-Table to recommend algorithm and preprocessing
- * based on entropy, error bound level, MAD, and second derivative.
- *
- * @param entropy            Data entropy in bits (0.0 to 8.0)
- * @param error_bound        Desired error bound (0 for lossless)
- * @param mad                Mean Absolute Deviation (0.0 if unknown)
- * @param second_derivative  Mean absolute second derivative (0.0 if unknown)
- * @param algorithm_out      Output: recommended algorithm
- * @param preprocessing_out  Output: recommended preprocessing flags
- * @return GPUCOMPRESS_SUCCESS or error code
- */
-gpucompress_error_t gpucompress_recommend_config(
-    double entropy,
-    double error_bound,
-    double mad,
-    double second_derivative,
-    gpucompress_algorithm_t* algorithm_out,
-    unsigned int* preprocessing_out
 );
 
 /* ============================================================

@@ -36,13 +36,6 @@ extern "C" {
     // From entropy_kernel.cu
     double gpucompress_entropy_gpu_impl(const void* d_data, size_t num_bytes, void* stream);
 
-    // From qtable_gpu.cu
-    int gpucompress_qtable_load_impl(const char* filepath);
-    int gpucompress_qtable_is_loaded_impl(void);
-    int gpucompress_qtable_get_best_action_impl(int state);
-    void gpucompress_qtable_init_default_impl(void);
-    void gpucompress_qtable_cleanup_impl(void);
-
     // From nn_gpu.cu
     int gpucompress_nn_load_impl(const char* filepath);
     int gpucompress_nn_is_loaded_impl(void);
@@ -94,6 +87,7 @@ char g_experience_path[512] = "";
 /** Online reinforcement state */
 bool g_reinforce_enabled = false;
 float g_reinforce_lr = 1e-4f;
+float g_reinforce_mape_threshold = 0.20f;
 bool g_reinforce_initialized = false;
 
 /** Algorithm names */
@@ -117,7 +111,7 @@ const char* ERROR_MESSAGES[] = {
     "Compression failed",
     "Decompression failed",
     "Out of memory",
-    "Q-Table not loaded",
+    "Reserved",
     "Invalid compression header",
     "Library not initialized",
     "Output buffer too small"
@@ -129,7 +123,7 @@ const char* ERROR_MESSAGES[] = {
  * Initialization and Cleanup
  * ============================================================ */
 
-extern "C" gpucompress_error_t gpucompress_init(const char* qtable_path) {
+extern "C" gpucompress_error_t gpucompress_init(const char* weights_path) {
     std::lock_guard<std::mutex> lock(g_init_mutex);
 
     // Increment reference count
@@ -154,29 +148,11 @@ extern "C" gpucompress_error_t gpucompress_init(const char* qtable_path) {
         return GPUCOMPRESS_ERROR_CUDA_FAILED;
     }
 
-    // Load model if path provided (auto-detect .nnwt vs Q-Table)
-    if (qtable_path != nullptr && qtable_path[0] != '\0') {
-        std::string path(qtable_path);
-        bool loaded = false;
-
-        // Try NN weights if .nnwt extension
-        if (path.size() >= 5 && path.substr(path.size() - 5) == ".nnwt") {
-            if (gpucompress_nn_load_impl(qtable_path) == 0) {
-                loaded = true;
-            } else {
-                fprintf(stderr, "Warning: Failed to load NN weights from %s\n", qtable_path);
-            }
+    // Load NN weights if path provided
+    if (weights_path != nullptr && weights_path[0] != '\0') {
+        if (gpucompress_nn_load_impl(weights_path) != 0) {
+            fprintf(stderr, "Warning: Failed to load NN weights from %s\n", weights_path);
         }
-
-        // Try Q-Table if not .nnwt or NN load failed
-        if (!loaded) {
-            if (gpucompress_qtable_load_impl(qtable_path) != 0) {
-                fprintf(stderr, "Warning: Failed to load Q-Table from %s\n", qtable_path);
-            }
-        }
-    } else {
-        // Initialize default Q-Table
-        gpucompress_qtable_init_default_impl();
     }
 
     g_initialized.store(true);
@@ -195,7 +171,6 @@ extern "C" void gpucompress_cleanup(void) {
         experience_buffer_cleanup();
         g_active_learning_enabled = false;
         gpucompress_nn_cleanup_impl();
-        gpucompress_qtable_cleanup_impl();
         if (g_default_stream != nullptr) {
             cudaStreamDestroy(g_default_stream);
             g_default_stream = nullptr;
@@ -348,20 +323,10 @@ extern "C" gpucompress_error_t gpucompress_compress(
                         input_size, cfg.error_bound);
                 }
             }
-        } else if (num_elements > 0 && gpucompress_qtable_is_loaded_impl()) {
-            // Q-Table fallback
-            int error_level = gpucompress::errorBoundToLevel(cfg.error_bound);
-            rc = gpucompress::runAutoStatsPipeline(
-                d_input, input_size, error_level,
-                gpucompress::getQTableDevicePtr(), stream,
-                &action,
-                stats ? &entropy : nullptr,
-                stats ? &mad : nullptr,
-                stats ? &second_derivative : nullptr);
         }
 
         if (rc == 0) {
-            gpucompress::QTableAction decoded = gpucompress::decodeAction(action);
+            gpucompress::DecodedAction decoded = gpucompress::decodeAction(action);
             algo_to_use = static_cast<gpucompress_algorithm_t>(decoded.algorithm + 1);
             preproc_to_use = 0;
             if (decoded.shuffle_size > 0)
@@ -575,10 +540,15 @@ extern "C" gpucompress_error_t gpucompress_compress(
         sample.actual_psnr = 0.0;
         experience_buffer_append(&sample);
 
-        // Check prediction error
+        // Check prediction error (max of ratio MAPE and time MAPE)
         double pred_ratio_d = static_cast<double>(predicted_ratio);
-        double error_pct = (actual_ratio > 0.0) ?
+        double ratio_mape = (actual_ratio > 0.0) ?
             std::abs(pred_ratio_d - actual_ratio) / actual_ratio : 0.0;
+        double actual_ct = static_cast<double>(primary_comp_time_ms);
+        double pred_ct = static_cast<double>(predicted_comp_time);
+        double time_mape = (actual_ct > 0.0) ?
+            std::abs(pred_ct - actual_ct) / actual_ct : 0.0;
+        double error_pct = std::max(ratio_mape, time_mape);
 
         // Collect explored (action, ratio, comp_time) for reinforcement
         struct ExploredResult { int action; double ratio; double comp_time_ms;
@@ -608,7 +578,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
                 int alt_action = top_actions[i];
                 if (alt_action == nn_action) continue;
 
-                gpucompress::QTableAction alt = gpucompress::decodeAction(alt_action);
+                gpucompress::DecodedAction alt = gpucompress::decodeAction(alt_action);
                 gpucompress_algorithm_t alt_algo =
                     static_cast<gpucompress_algorithm_t>(alt.algorithm + 1);
                 unsigned int alt_preproc = 0;
@@ -910,9 +880,8 @@ extern "C" gpucompress_error_t gpucompress_compress(
 
         }
 
-        // Online reinforcement: always reinforce with primary measurement,
-        // plus any explored samples collected above.
-        if (g_reinforce_enabled) {
+        // Online reinforcement: fire SGD only when ratio MAPE exceeds threshold.
+        if (g_reinforce_enabled && error_pct > static_cast<double>(g_reinforce_mape_threshold)) {
             void* d_weights = gpucompress_nn_get_device_ptr_impl();
             if (d_weights) {
                 // Lazy-init: copy GPU weights to host on first trigger
@@ -957,9 +926,11 @@ extern "C" gpucompress_error_t gpucompress_compress(
         stats->second_derivative = second_derivative;
         stats->algorithm_used = algo_to_use;
         stats->preprocessing_used = preproc_to_use;
-        stats->throughput_mbps = 0.0;  // Would need timing to calculate
+        stats->throughput_mbps = (primary_comp_time_ms > 0.0f) ?
+            (input_size / (1024.0 * 1024.0)) / (primary_comp_time_ms / 1000.0) : 0.0;
         stats->predicted_ratio = static_cast<double>(predicted_ratio);
         stats->predicted_comp_time_ms = static_cast<double>(predicted_comp_time);
+        stats->actual_comp_time_ms = static_cast<double>(primary_comp_time_ms);
         stats->sgd_fired = sgd_fired ? 1 : 0;
     }
 
@@ -1282,60 +1253,6 @@ extern "C" gpucompress_error_t gpucompress_compute_stats(
 }
 
 /* ============================================================
- * Q-Table Management
- * ============================================================ */
-
-extern "C" gpucompress_error_t gpucompress_load_qtable(const char* filepath) {
-    if (filepath == nullptr) {
-        return GPUCOMPRESS_ERROR_INVALID_INPUT;
-    }
-
-    int result = gpucompress_qtable_load_impl(filepath);
-    return (result == 0) ? GPUCOMPRESS_SUCCESS : GPUCOMPRESS_ERROR_QTABLE_NOT_LOADED;
-}
-
-extern "C" int gpucompress_qtable_is_loaded(void) {
-    return gpucompress_qtable_is_loaded_impl();
-}
-
-extern "C" gpucompress_error_t gpucompress_recommend_config(
-    double entropy,
-    double error_bound,
-    double mad,
-    double second_derivative,
-    gpucompress_algorithm_t* algorithm_out,
-    unsigned int* preprocessing_out
-) {
-    if (algorithm_out == nullptr || preprocessing_out == nullptr) {
-        return GPUCOMPRESS_ERROR_INVALID_INPUT;
-    }
-
-    if (!gpucompress_qtable_is_loaded_impl()) {
-        // Return defaults if Q-Table not loaded
-        *algorithm_out = GPUCOMPRESS_ALGO_LZ4;
-        *preprocessing_out = GPUCOMPRESS_PREPROC_NONE;
-        return GPUCOMPRESS_ERROR_QTABLE_NOT_LOADED;
-    }
-
-    int error_level = gpucompress::errorBoundToLevel(error_bound);
-    int state = gpucompress::encodeState(entropy, error_level, mad, second_derivative);
-    int action = gpucompress_qtable_get_best_action_impl(state);
-    gpucompress::QTableAction decoded = gpucompress::decodeAction(action);
-
-    *algorithm_out = static_cast<gpucompress_algorithm_t>(decoded.algorithm + 1);
-
-    *preprocessing_out = 0;
-    if (decoded.shuffle_size > 0) {
-        *preprocessing_out |= GPUCOMPRESS_PREPROC_SHUFFLE_4;
-    }
-    if (decoded.use_quantization) {
-        *preprocessing_out |= GPUCOMPRESS_PREPROC_QUANTIZE;
-    }
-
-    return GPUCOMPRESS_SUCCESS;
-}
-
-/* ============================================================
  * Neural Network Management
  * ============================================================ */
 
@@ -1434,10 +1351,11 @@ extern "C" void gpucompress_set_exploration_threshold(double threshold) {
 }
 
 extern "C" void gpucompress_set_reinforcement(int enable, float learning_rate,
-                                               float /*mape_threshold*/,
+                                               float mape_threshold,
                                                float /*ct_mape_threshold*/) {
     g_reinforce_enabled = (enable != 0);
     if (learning_rate > 0.0f) g_reinforce_lr = learning_rate;
+    if (mape_threshold > 0.0f) g_reinforce_mape_threshold = mape_threshold;
 
     if (!g_reinforce_enabled) {
         nn_reinforce_cleanup();

@@ -111,7 +111,7 @@ else
     EXP_LINES=$(wc -l < "$EXP_P1")
     echo "  Experience samples: $((EXP_LINES - 1)) (excluding header)"
 
-    if python3 "$PROJECT_DIR/neural_net/retrain.py" \
+    if python3 "$PROJECT_DIR/neural_net/training/retrain.py" \
         --experience "$EXP_P1" \
         --output "$RETRAINED_WEIGHTS" 2>&1; then
         echo "  Retrained model: $RETRAINED_WEIGHTS"

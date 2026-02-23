@@ -1,12 +1,12 @@
 # GPUCompress: Project Overview
 
-GPUCompress is a GPU-accelerated compression library that uses reinforcement learning to automatically select the best compression algorithm based on data characteristics. The project has three major components:
+GPUCompress is a GPU-accelerated compression library that uses a neural network to automatically select the best compression algorithm based on data characteristics. The project has three major components:
 
 1. **GPU Compression Library** (`src/`, `include/`) -- A C/CUDA library wrapping 8 nvCOMP algorithms with optional byte-shuffle and quantization preprocessing, exposed through both a C API (`libgpucompress.so`) and CLI tools (`gpu_compress`, `gpu_decompress`).
 
-2. **RL Training System** (`rl/`) -- An offline Q-learning pipeline that trains a Q-table mapping data features (entropy, MAD, smoothness) to optimal compression configurations. The trained table is loaded into GPU constant memory at inference time.
+2. **Neural Network Training System** (`neural_net/`) -- A training pipeline that produces a neural network mapping data features (entropy, MAD, smoothness) to optimal compression configurations. The trained weights (`.nnwt`) are loaded to GPU at inference time.
 
-3. **Synthetic Data Generator** (`syntheticGeneration/`) -- A palette-based generator that produces datasets with precisely controlled entropy, locality, and value distributions for training the RL agent.
+3. **Synthetic Data Generator** (`syntheticGeneration/`) -- A palette-based generator that produces datasets with precisely controlled entropy, locality, and value distributions for training the neural network.
 
 ---
 
@@ -21,20 +21,19 @@ GPUCompress is a GPU-accelerated compression library that uses reinforcement lea
       | .bin files with controlled                 | raw data buffer
       | entropy characteristics                    v
       v                                     gpucompress_compress()
- trainer.py                                        |
+ neural_net/training/                              |
       |                                            |--- calculate entropy,
       |--- load file                               |    MAD, 2nd derivative
       |--- calculate entropy, MAD, deriv           |
-      |--- encode state (1024 states)              |--- encode state
-      |--- select action (epsilon-greedy)          |--- Q-table lookup (GPU
-      |--- execute gpu_compress                    |    constant memory)
-      |--- measure ratio, throughput, PSNR         |--- decode action
-      |--- compute reward                          |--- apply preprocessing
-      |--- Q(s,a) += alpha * (r - Q(s,a))         |    (quantize, shuffle)
-      v                                            |--- compress (nvCOMP)
- qtable.json / qtable.bin                          v
-      |                                     compressed buffer +
-      +-------- deployed to -------->>      64-byte header
+      |--- train NN on all 32 configs              |--- NN inference (GPU)
+      |--- predict ratio, comp_time, PSNR         |--- rank all 32 configs
+      |--- minimize prediction error               |--- select best action
+      v                                            |--- apply preprocessing
+ model.nnwt                                        |    (quantize, shuffle)
+      |                                            |--- compress (nvCOMP)
+      +-------- deployed to -------->>             v
+                                            compressed buffer +
+                                            64-byte header
 ```
 
 ---
@@ -48,12 +47,12 @@ The public API follows an init/use/cleanup lifecycle:
 ```c
 #include "gpucompress.h"
 
-// 1. Initialize (optionally load Q-table for AUTO mode)
-gpucompress_init("/path/to/qtable.bin");
+// 1. Initialize (optionally load NN weights for AUTO mode)
+gpucompress_init("/path/to/model.nnwt");
 
 // 2. Configure
 gpucompress_config_t cfg = gpucompress_default_config();
-cfg.algorithm     = GPUCOMPRESS_ALGO_AUTO;  // RL-based selection
+cfg.algorithm     = GPUCOMPRESS_ALGO_AUTO;  // NN-based selection
 cfg.preprocessing = GPUCOMPRESS_PREPROC_SHUFFLE_4 | GPUCOMPRESS_PREPROC_QUANTIZE;
 cfg.error_bound   = 0.001;
 
@@ -81,7 +80,7 @@ gpucompress_cleanup();
 
 | Enum | Name | Characteristics |
 |------|------|-----------------|
-| `GPUCOMPRESS_ALGO_AUTO` (0) | RL auto-select | Uses Q-table to pick best option |
+| `GPUCOMPRESS_ALGO_AUTO` (0) | NN auto-select | Uses neural network to pick best option |
 | `GPUCOMPRESS_ALGO_LZ4` (1) | LZ4 | Fast, general purpose |
 | `GPUCOMPRESS_ALGO_SNAPPY` (2) | Snappy | Fastest, lower ratio |
 | `GPUCOMPRESS_ALGO_DEFLATE` (3) | Deflate | Better ratio, slower |
@@ -180,176 +179,10 @@ gpu_decompress <compressed_input> <output>
 | -3 | `ERROR_COMPRESSION` | Compression failed |
 | -4 | `ERROR_DECOMPRESSION` | Decompression failed |
 | -5 | `ERROR_OUT_OF_MEMORY` | Allocation failed |
-| -6 | `ERROR_QTABLE_NOT_LOADED` | Q-table required for AUTO but not loaded |
+| -6 | `ERROR_RESERVED_6` | Reserved |
 | -7 | `ERROR_INVALID_HEADER` | Corrupt or missing header |
 | -8 | `ERROR_NOT_INITIALIZED` | `gpucompress_init()` not called |
 | -9 | `ERROR_BUFFER_TOO_SMALL` | Output buffer insufficient |
-
----
-
-## RL Training System
-
-### State Space (1024 states)
-
-Each data block is characterized by four features, each discretized into bins:
-
-| Feature | Bins | Thresholds | Meaning |
-|---------|------|------------|---------|
-| Shannon entropy | 16 | 0.5-bit width: [0.0, 0.5), [0.5, 1.0), ..., [7.5, 8.0) | Byte-level randomness |
-| Error level | 4 | `>= 0.1` aggressive, `>= 0.01` moderate, `>= 0.001` precise, `<= 0` lossless | Quantization tolerance |
-| MAD | 4 | `< 0.05`, `< 0.15`, `< 0.30`, `>= 0.30` | Data spread |
-| 2nd derivative | 4 | `< 0.05`, `< 0.15`, `< 0.35`, `>= 0.35` | Smoothness |
-
-**State encoding** (mixed-radix):
-
-```
-state = ((entropy_bin * 4 + error_level) * 4 + mad_bin) * 4 + deriv_bin
-```
-
-**State decoding:**
-
-```
-deriv_bin    = state % 4;     state /= 4
-mad_bin      = state % 4;     state /= 4
-error_level  = state % 4
-entropy_bin  = state / 4
-```
-
-### Action Space (32 actions)
-
-Each action encodes three choices:
-
-| Component | Options | Count |
-|-----------|---------|-------|
-| Algorithm | lz4, snappy, deflate, gdeflate, zstd, ans, cascaded, bitcomp | 8 |
-| Quantization | None, Linear | 2 |
-| Byte shuffle | None, 4-byte | 2 |
-
-**Action encoding:**
-
-```
-action = algorithm_idx + (quant_flag * 8) + (shuffle_flag * 16)
-```
-
-**Action decoding:**
-
-```
-algorithm_idx    = action % 8
-use_quantization = (action / 8) % 2 == 1
-shuffle_size     = (action / 16) % 2 == 1 ? 4 : 0
-```
-
-When operating in lossless mode (`error_bound <= 0`), quantization actions are masked out, reducing the effective action space to 16.
-
-### Q-Learning Update
-
-Single-step Q-learning with no discount (each compression is an independent decision):
-
-```
-Q(s, a) <- Q(s, a) + alpha * (reward - Q(s, a))
-```
-
-| Hyperparameter | Value |
-|----------------|-------|
-| Learning rate (alpha) | 0.1 |
-| Discount factor (gamma) | 0.0 |
-| Epsilon start | 1.0 |
-| Epsilon end | 0.01 |
-| Epsilon decay (per epoch) | 0.995 |
-| Default epochs | 100 |
-| Checkpoint interval | 10 epochs |
-
-### Reward Computation
-
-Reward is a weighted sum of three normalized metrics:
-
-```
-reward = w_ratio * min(ratio / 10, 1)
-       + w_throughput * min(throughput_mbps / 5000, 1)
-       + w_psnr * min(psnr_db / 100, 1)
-```
-
-For lossless compression, PSNR is infinity and `psnr_norm = 1.0`.
-
-**Presets:**
-
-| Preset | Ratio | Throughput | PSNR | Use case |
-|--------|-------|------------|------|----------|
-| `balanced` | 0.5 | 0.3 | 0.2 | General purpose |
-| `max_ratio` | 0.8 | 0.1 | 0.1 | Smallest files |
-| `max_speed` | 0.1 | 0.8 | 0.1 | Fastest compression |
-| `max_quality` | 0.1 | 0.1 | 0.8 | Minimize distortion |
-| `storage` | 0.6 | 0.2 | 0.2 | Archival |
-| `streaming` | 0.3 | 0.5 | 0.2 | Real-time streaming |
-
-### Exploration Policy
-
-Epsilon-greedy with exponential decay:
-
-- With probability epsilon: select a random valid action (explore)
-- With probability 1 - epsilon: select `argmax Q(s, :)` (exploit)
-- After each epoch: `epsilon = max(epsilon_end, epsilon * 0.995)`
-
-A `GreedyPolicy` class (epsilon = 0) is used for inference after training.
-
-### Q-Table Persistence
-
-**JSON format** (`qtable.json`) -- Human-readable, includes visit counts:
-
-```json
-{
-  "version": 2,
-  "n_states": 1024,
-  "n_actions": 32,
-  "q_values": [[...], ...],
-  "visit_counts": [[...], ...]
-}
-```
-
-**Binary format** (`qtable.bin`) -- For GPU loading:
-
-```
-Offset  Size                   Field
-------  ----                   -----
- 0       4                     Magic: 0x51544142 ("QTAB")
- 4       4                     Version: 1
- 8       4                     n_states: 1024
-12       4                     n_actions: 32
-16       1024 * 32 * 4 = 128KB q_values (float32, row-major)
-```
-
-### Training CLI
-
-```
-python -m rl.trainer [options]
-
-Required:
-  -d, --data-dir DIR        Directory with .bin/.raw/.dat training files
-
-Optional:
-  -o, --output-dir DIR      Model output directory (default: rl/models)
-  -e, --epochs N            Training epochs (default: 100)
-  -p, --preset NAME         Reward preset (default: balanced)
-  --error-bound VALUE       Single bound or "all" for all 4 levels
-  --resume PATH             Resume from previous qtable.json
-  --gpu-compress PATH       Path to gpu_compress binary (default: ./build/gpu_compress)
-  --use-c-api               Use libgpucompress.so for entropy (faster)
-  -q, --quiet               Reduce output
-  --clean                   Remove all Q-table files from output directory
-```
-
-### Module Structure
-
-| File | Role |
-|------|------|
-| `rl/config.py` | All constants: state/action dimensions, hyperparameters, reward presets |
-| `rl/qtable.py` | Q-table data structure, encode/decode state/action, save/load, export binary |
-| `rl/policy.py` | `EpsilonGreedyPolicy` (training) and `GreedyPolicy` (inference) |
-| `rl/reward.py` | `compute_reward()` with preset-based weighting |
-| `rl/executor.py` | `CompressionExecutor`: runs `gpu_compress` via subprocess or C API, measures metrics |
-| `rl/trainer.py` | `QTableTrainer`: main training loop, file loading, episode management |
-| `rl/export_qtable.py` | Export trained Q-table to binary format |
-| `rl/generate_initial_qtable.py` | Generate initial Q-table with heuristic values |
 
 ---
 
@@ -519,21 +352,14 @@ End-to-end pipeline from dataset generation through training to GPU inference:
    python generator.py batch -o train_data/ --mode training -s 128KB --format bin
    -> 784 .bin files with diverse entropy/locality characteristics
 
-2. TRAIN Q-TABLE
-   python -m rl.trainer -d train_data/ -o rl/models/ -e 100 -p balanced --error-bound all
-   -> For each file, each error bound:
-      a. Load data, compute entropy + MAD + 2nd derivative
-      b. Encode state (1024 states)
-      c. Select action via epsilon-greedy (32 actions)
-      d. Run gpu_compress with that algorithm + preprocessing
-      e. Measure compression ratio, throughput, PSNR
-      f. Compute weighted reward
-      g. Update Q(s,a)
-   -> Output: rl/models/qtable.json + qtable.bin
+2. TRAIN NEURAL NETWORK
+   python -m neural_net.training.retrain --experience data.csv --output model.nnwt
+   -> Trains NN to predict compression ratio, time, and PSNR for all 32 configs
+   -> Output: model.nnwt
 
 3. DEPLOY TO GPU
-   gpucompress_init("rl/models/qtable.bin");
-   // Q-table loaded into GPU constant memory
+   gpucompress_init("model.nnwt");
+   // NN weights loaded to GPU memory
 
 4. RUNTIME INFERENCE
    gpucompress_config_t cfg = gpucompress_default_config();
@@ -541,8 +367,8 @@ End-to-end pipeline from dataset generation through training to GPU inference:
    gpucompress_compress(data, size, out, &out_size, &cfg, &stats);
    // Library internally:
    //   a. Computes entropy, MAD, 2nd derivative on GPU
-   //   b. Encodes state
-   //   c. Looks up argmax Q(s,:) in constant memory
+   //   b. Runs NN inference over all 32 configs
+   //   c. Selects best config by predicted metrics
    //   d. Applies selected preprocessing + algorithm
    //   e. Prepends 64-byte header with all metadata
 ```
@@ -609,7 +435,10 @@ GPUCompress/
 │   ├── lib/
 │   │   ├── gpucompress_api.cpp        # C API implementation
 │   │   ├── entropy_kernel.cu          # GPU entropy calculation
-│   │   └── qtable_gpu.cu             # Q-table GPU constant memory
+│   │   ├── nn_gpu.cu                 # NN inference on GPU
+│   │   ├── nn_reinforce.cpp           # Online reinforcement
+│   │   ├── stats_kernel.cu            # Stats pipeline kernels
+│   │   └── experience_buffer.cpp      # Active learning buffer
 │   ├── core/
 │   │   ├── compression_factory.cpp    # Algorithm factory (8 nvCOMP managers)
 │   │   ├── compression_factory.hpp
@@ -624,18 +453,11 @@ GPUCompress/
 │   │   └── decompress.cpp             # gpu_decompress entry point
 │   └── hdf5/
 │       └── H5Zgpucompress.c           # HDF5 filter plugin
-├── rl/
-│   ├── config.py                      # State/action/reward configuration
-│   ├── qtable.py                      # Q-table data structure
-│   ├── policy.py                      # Epsilon-greedy / greedy policies
-│   ├── reward.py                      # Reward computation with presets
-│   ├── executor.py                    # Compression executor (subprocess / C API)
-│   ├── trainer.py                     # Main training loop
-│   ├── export_qtable.py               # Binary export utility
-│   └── generate_initial_qtable.py     # Heuristic initialization
+├── neural_net/                            # NN training and inference
+│   ├── core/                              # Model definition and export
+│   └── training/                          # Training and retraining scripts
 ├── syntheticGeneration/
-│   ├── generator.py                   # Python data generator
-│   └── newScript.cc                   # C++ reference implementation
+│   └── generator.py                   # Python data generator
 ├── tests/
 │   └── quantization/
 │       └── test_quantization_suite.cu # Quantization correctness tests

@@ -1,6 +1,6 @@
 # CUDA Memory Transfer Audit
 
-An audit of every `cudaMemcpy`, `cudaMalloc`, and `cudaFree` across the compress, decompress, stats, NN inference, and Q-table hot paths. Findings are ranked by performance impact.
+An audit of every `cudaMemcpy`, `cudaMalloc`, and `cudaFree` across the compress, decompress, stats, and NN inference hot paths. Findings are ranked by performance impact.
 
 ---
 

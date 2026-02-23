@@ -1,10 +1,12 @@
-# GPUCompress HDF5 Integration and Offline Q-Table RL Training
+# GPUCompress HDF5 Integration
+
+## Historical Note
+
+This document describes the original commit (`6c4909a`) that introduced the shared library C API and HDF5 filter plugin. The Q-Table RL system described in some sections has since been replaced by a neural network-based approach (see `neural_net/`).
 
 ## Commit Overview
 
-This commit (`6c4909a`) transforms GPUCompress from a standalone CLI tool into a reusable shared library (`libgpucompress.so`) with a public C API, adds an HDF5 filter plugin so any HDF5 application can transparently use GPU compression, and introduces an offline Q-Table Reinforcement Learning system (Python) that trains a policy to automatically pick the best compression algorithm based on data characteristics.
-
-**22 files changed, +6,423 lines across 3 major subsystems.**
+This commit transforms GPUCompress from a standalone CLI tool into a reusable shared library (`libgpucompress.so`) with a public C API and an HDF5 filter plugin so any HDF5 application can transparently use GPU compression.
 
 ---
 

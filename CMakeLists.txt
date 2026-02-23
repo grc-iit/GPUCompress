@@ -55,7 +55,6 @@ set(PREPROCESSING_SOURCES
 set(LIB_SOURCES
     src/lib/gpucompress_api.cpp
     src/lib/entropy_kernel.cu
-    src/lib/qtable_gpu.cu
     src/lib/nn_gpu.cu
     src/lib/nn_reinforce.cpp
     src/lib/stats_kernel.cu
@@ -218,7 +217,13 @@ set_source_files_properties(tests/test_nn_reinforce.cpp PROPERTIES LANGUAGE CUDA
 target_link_libraries(test_nn_reinforce PRIVATE gpucompress CUDA::cudart pthread)
 
 # ============================================================
-# Executable 6: Simulation Evaluation
+# Executable 6: NN Pipeline End-to-End Test
+# ============================================================
+add_executable(test_nn_pipeline tests/test_nn_pipeline.cpp)
+target_link_libraries(test_nn_pipeline PRIVATE gpucompress pthread)
+
+# ============================================================
+# Executable 7: Simulation Evaluation
 # ============================================================
 add_executable(eval_simulation eval/eval_simulation.cpp)
 target_link_libraries(eval_simulation PRIVATE gpucompress pthread)
@@ -286,7 +291,9 @@ message(STATUS "  - libgpucompress.so    (shared library with C API)")
 message(STATUS "  - gpu_compress         (compression executable)")
 message(STATUS "  - gpu_decompress       (decompression executable)")
 message(STATUS "  - test_quantization    (quantization test suite)")
-message(STATUS "  - test_active_learning (active learning integration test)")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/neural_net/test_active_learning.cu")
+    message(STATUS "  - test_active_learning (active learning integration test)")
+endif()
 if(HDF5_FOUND)
     message(STATUS "  - libH5Zgpucompress.so (HDF5 filter plugin)")
 endif()
@@ -294,7 +301,6 @@ message(STATUS "")
 message(STATUS "Features:")
 message(STATUS "  - 8 compression algorithms (LZ4, Snappy, Deflate, Gdeflate, Zstd, ANS, Cascaded, Bitcomp)")
 message(STATUS "  - GPU-accelerated entropy calculation")
-message(STATUS "  - Q-Table based RL algorithm selection")
 message(STATUS "  - Neural network based algorithm selection (.nnwt)")
 message(STATUS "  - Error-bound quantization (lossy)")
 message(STATUS "  - Byte shuffle preprocessing")

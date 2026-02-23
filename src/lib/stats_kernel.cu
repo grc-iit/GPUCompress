@@ -2,15 +2,13 @@
  * @file stats_kernel.cu
  * @brief GPU kernels for ALGO_AUTO statistics pipeline
  *
- * Computes MAD, second derivative, entropy, state encoding, and Q-Table
- * lookup entirely on GPU. Only copies back the final action int (4 bytes)
- * plus optional stats doubles for reporting.
+ * Computes MAD, second derivative, and entropy entirely on GPU.
  *
  * Pipeline:
- *   1. statsPass1Kernel:  sum + min + max + second_deriv_sum (1 pass over float data)
- *   2. Entropy kernels:   histogram + entropy               (1 pass over byte data)
- *   3. madPass2Kernel:    sum(|x - mean|)                   (1 pass, needs mean from step 1)
- *   4. finalizeAndLookupKernel: normalize, bin, encode state, Q-Table argmax
+ *   1. statsPass1Kernel:        sum + min + max + second_deriv_sum (1 pass over float data)
+ *   2. Entropy kernels:         histogram + entropy               (1 pass over byte data)
+ *   3. madPass2Kernel:          sum(|x - mean|)                   (1 pass, needs mean from step 1)
+ *   4. finalizeStatsOnlyKernel: normalize MAD and derivative
  */
 
 #include <cuda_runtime.h>
@@ -248,100 +246,6 @@ __global__ void madPass2Kernel(
 }
 
 /* ============================================================
- * Kernel 5: finalizeAndLookupKernel
- * ============================================================ */
-
-/**
- * Single block, 32 threads. Thread 0 normalizes and bins metrics,
- * encodes state. All 32 threads do parallel argmax over Q-Table row.
- */
-__global__ void finalizeAndLookupKernel(
-    AutoStatsGPU* __restrict__ stats,
-    const float* __restrict__ qtable
-) {
-    __shared__ double s_mad_norm;
-    __shared__ double s_deriv_norm;
-    __shared__ int    s_state;
-    __shared__ float  s_qval[32];
-    __shared__ int    s_qidx[32];
-
-    int tid = threadIdx.x;
-
-    // Thread 0: normalize metrics and compute state
-    if (tid == 0) {
-        size_t n = stats->num_elements;
-        double range = static_cast<double>(stats->vmax) - static_cast<double>(stats->vmin);
-
-        // Normalize MAD
-        double mad_norm = 0.0;
-        if (range > 0.0 && n > 0) {
-            mad_norm = (stats->mad_sum / static_cast<double>(n)) / range;
-        }
-
-        // Normalize second derivative
-        double deriv_norm = 0.0;
-        if (range > 0.0 && n > 2) {
-            deriv_norm = (stats->abs_diff_sum / static_cast<double>(n - 2)) / range;
-        }
-
-        s_mad_norm = mad_norm;
-        s_deriv_norm = deriv_norm;
-
-        // Bin MAD
-        int mad_bin = 3;
-        for (int i = 0; i < 3; i++) {
-            if (mad_norm < c_mad_thresholds[i]) { mad_bin = i; break; }
-        }
-
-        // Bin derivative
-        int deriv_bin = 3;
-        for (int i = 0; i < 3; i++) {
-            if (deriv_norm < c_deriv_thresholds[i]) { deriv_bin = i; break; }
-        }
-
-        // Bin entropy (0.5-width bins, 16 bins)
-        int entropy_bin = static_cast<int>(stats->entropy * 2.0);
-        if (entropy_bin < 0) entropy_bin = 0;
-        if (entropy_bin >= 16) entropy_bin = 15;
-
-        int error_level = stats->error_level;
-
-        // Encode state: ((entropy_bin * 4 + error_level) * 4 + mad_bin) * 4 + deriv_bin
-        int state = ((entropy_bin * 4 + error_level) * 4 + mad_bin) * 4 + deriv_bin;
-
-        s_state = state;
-    }
-    __syncthreads();
-
-    // All 32 threads: load Q-Table values for this state
-    int state = s_state;
-    if (tid < 32) {
-        s_qval[tid] = qtable[state * 32 + tid];
-        s_qidx[tid] = tid;
-    }
-    __syncthreads();
-
-    // Parallel reduction argmax (32 threads -> 1)
-    for (int s = 16; s > 0; s >>= 1) {
-        if (tid < s) {
-            if (s_qval[tid + s] > s_qval[tid]) {
-                s_qval[tid] = s_qval[tid + s];
-                s_qidx[tid] = s_qidx[tid + s];
-            }
-        }
-        __syncthreads();
-    }
-
-    // Thread 0: write outputs
-    if (tid == 0) {
-        stats->mad_normalized = s_mad_norm;
-        stats->deriv_normalized = s_deriv_norm;
-        stats->state = s_state;
-        stats->action = s_qidx[0];
-    }
-}
-
-/* ============================================================
  * Kernel 6: finalizeStatsOnlyKernel (for NN pipeline)
  * ============================================================ */
 
@@ -388,9 +292,6 @@ void launchEntropyKernelsAsync(
     double* d_entropy_out,
     cudaStream_t stream
 );
-
-// From qtable_gpu.cu
-const float* getQTableDevicePtr();
 
 // From nn_gpu.cu
 bool isNNLoaded();
@@ -520,127 +421,6 @@ static int runStatsKernels(
     *out_mad = h_result.mad_normalized;
     *out_deriv = h_result.deriv_normalized;
 
-    return 0;
-}
-
-/* ============================================================
- * Host Pipeline Function (Q-Table mode)
- * ============================================================ */
-
-int runAutoStatsPipeline(
-    const void* d_input,
-    size_t input_size,
-    int error_level,
-    const float* d_qtable,
-    cudaStream_t stream,
-    int* out_action,
-    double* out_entropy,
-    double* out_mad,
-    double* out_deriv
-) {
-    size_t num_elements = input_size / sizeof(float);
-    if (num_elements == 0 || d_input == nullptr || d_qtable == nullptr) {
-        return -1;
-    }
-
-    cudaError_t err;
-
-    // Allocate workspace: AutoStatsGPU + 256-uint histogram
-    size_t workspace_size = sizeof(AutoStatsGPU) + 256 * sizeof(unsigned int);
-    void* d_workspace = nullptr;
-    err = cudaMalloc(&d_workspace, workspace_size);
-    if (err != cudaSuccess) {
-        return -1;
-    }
-
-    AutoStatsGPU* d_stats = static_cast<AutoStatsGPU*>(d_workspace);
-    unsigned int* d_histogram = reinterpret_cast<unsigned int*>(
-        static_cast<uint8_t*>(d_workspace) + sizeof(AutoStatsGPU));
-
-    // Initialize workspace to zero
-    err = cudaMemsetAsync(d_workspace, 0, workspace_size, stream);
-    if (err != cudaSuccess) {
-        cudaFree(d_workspace);
-        return -1;
-    }
-
-    // Initialize AutoStatsGPU fields that need non-zero init
-    AutoStatsGPU h_init;
-    memset(&h_init, 0, sizeof(h_init));
-    h_init.vmin = FLT_MAX;
-    h_init.vmax = -FLT_MAX;
-    h_init.num_elements = num_elements;
-    h_init.error_level = error_level;
-
-    err = cudaMemcpyAsync(d_stats, &h_init, sizeof(AutoStatsGPU),
-                          cudaMemcpyHostToDevice, stream);
-    if (err != cudaSuccess) {
-        cudaFree(d_workspace);
-        return -1;
-    }
-
-    // Kernel 1: statsPass1 - sum, min, max, derivative_sum
-    int num_blocks = static_cast<int>((num_elements + STATS_BLOCK_SIZE - 1) / STATS_BLOCK_SIZE);
-    if (num_blocks > STATS_MAX_BLOCKS) num_blocks = STATS_MAX_BLOCKS;
-
-    statsPass1Kernel<<<num_blocks, STATS_BLOCK_SIZE, 0, stream>>>(
-        static_cast<const float*>(d_input), num_elements, d_stats);
-
-    // Kernels 2/3: Entropy pipeline (histogram + entropy computation)
-    launchEntropyKernelsAsync(d_input, input_size, d_histogram,
-                              &d_stats->entropy, stream);
-
-    // Kernel 4: madPass2 - sum(|x - mean|)
-    madPass2Kernel<<<num_blocks, STATS_BLOCK_SIZE, 0, stream>>>(
-        static_cast<const float*>(d_input), num_elements, d_stats);
-
-    // Kernel 5: finalize and Q-Table lookup
-    finalizeAndLookupKernel<<<1, 32, 0, stream>>>(d_stats, d_qtable);
-
-    // Copy back results
-    // We need action (4 bytes), and optionally entropy/mad/deriv (24 bytes)
-    // Copy the finalize outputs block: mad_normalized, deriv_normalized, state, action
-    struct ResultBlock {
-        double entropy;
-        double mad_normalized;
-        double deriv_normalized;
-        int    state;
-        int    action;
-    };
-
-    ResultBlock h_result;
-
-    // Copy entropy
-    err = cudaMemcpyAsync(&h_result.entropy, &d_stats->entropy, sizeof(double),
-                          cudaMemcpyDeviceToHost, stream);
-    if (err != cudaSuccess) {
-        cudaFree(d_workspace);
-        return -1;
-    }
-
-    // Copy mad_normalized, deriv_normalized, state, action (contiguous in struct)
-    err = cudaMemcpyAsync(&h_result.mad_normalized, &d_stats->mad_normalized,
-                          2 * sizeof(double) + 2 * sizeof(int),
-                          cudaMemcpyDeviceToHost, stream);
-    if (err != cudaSuccess) {
-        cudaFree(d_workspace);
-        return -1;
-    }
-
-    // Synchronize
-    err = cudaStreamSynchronize(stream);
-    if (err != cudaSuccess) {
-        cudaFree(d_workspace);
-        return -1;
-    }
-
-    // Write outputs
-    *out_action = h_result.action;
-    if (out_entropy) *out_entropy = h_result.entropy;
-    if (out_mad) *out_mad = h_result.mad_normalized;
-    if (out_deriv) *out_deriv = h_result.deriv_normalized;
-
-    cudaFree(d_workspace);
     return 0;
 }
 
