@@ -338,6 +338,15 @@ else()
 endif()
 
 # ============================================================
+# Executable: NN Shuffle Selection Test
+# ============================================================
+add_executable(test_nn_shuffle tests/test_nn_shuffle.cu)
+target_link_libraries(test_nn_shuffle PRIVATE gpucompress CUDA::cudart)
+set_target_properties(test_nn_shuffle PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+
+# ============================================================
 # Executable: Shuffle Test Suite
 # ============================================================
 add_executable(test_shuffle tests/test_shuffle.cu)

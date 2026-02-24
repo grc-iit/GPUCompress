@@ -336,8 +336,15 @@ extern "C" gpucompress_error_t gpucompress_compress(
                 preproc_to_use |= GPUCOMPRESS_PREPROC_SHUFFLE_4;
             if (decoded.use_quantization)
                 preproc_to_use |= GPUCOMPRESS_PREPROC_QUANTIZE;
+
+            printf("NN: chose %s%s%s (action=%d, predicted_ratio=%.2f)\n",
+                   gpucompress_algorithm_name(algo_to_use),
+                   (preproc_to_use & GPUCOMPRESS_PREPROC_SHUFFLE_4) ? " +shuffle" : "",
+                   (preproc_to_use & GPUCOMPRESS_PREPROC_QUANTIZE)  ? " +quant"   : "",
+                   action, predicted_ratio);
         } else {
             algo_to_use = GPUCOMPRESS_ALGO_LZ4;
+            printf("NN: fallback to lz4 (inference failed)\n");
         }
     }
 
