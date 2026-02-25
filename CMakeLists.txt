@@ -393,6 +393,20 @@ if(HDF5_FOUND)
         ${HDF5_C_LIBRARIES}
         m
     )
+
+    # HDF5 Benchmark: No Compression vs Static vs Dynamic (NN)
+    add_executable(benchmark_hdf5 tests/benchmark_hdf5.c)
+    target_include_directories(benchmark_hdf5 PRIVATE
+        ${HDF5_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_libraries(benchmark_hdf5 PRIVATE
+        gpucompress
+        H5Zgpucompress
+        ${HDF5_C_LIBRARIES}
+        m
+    )
 endif()
 
 # ============================================================

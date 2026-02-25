@@ -64,7 +64,13 @@ def prepare_experience_data(experience_paths: list, original_df: pd.DataFrame) -
 
     # Fill columns not available from experience buffer
     result['success'] = True
-    result['file'] = ['experience_' + str(i) for i in range(len(result))]
+
+    # Group by data stats to assign file names — rows with identical
+    # (entropy, mad, second_derivative, original_size) came from the same
+    # underlying data and must stay together during train/val splitting.
+    group_keys = result.groupby(
+        ['entropy', 'mad', 'second_derivative', 'original_size']).ngroup()
+    result['file'] = 'experience_file_' + group_keys.astype(str)
 
     # Decompression time: use values from experience CSV, fill zeros with median
     result['decompression_time_ms'] = exp['decompression_time_ms']

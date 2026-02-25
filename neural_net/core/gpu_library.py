@@ -80,7 +80,7 @@ class GPUCompressLib:
 
     def __init__(self, lib_path: str = None):
         if lib_path is None:
-            lib_path = str(Path(__file__).parent.parent / 'build' / 'libgpucompress.so')
+            lib_path = str(Path(__file__).parent.parent.parent / 'build' / 'libgpucompress.so')
         self._lib = ctypes.CDLL(lib_path)
         self._setup_prototypes()
         self._initialized = False

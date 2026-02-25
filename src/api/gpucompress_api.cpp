@@ -84,6 +84,12 @@ bool g_active_learning_enabled = false;
 double g_exploration_threshold = 0.20;  // 20% MAPE
 char g_experience_path[512] = "";
 
+/** Last NN action and exploration state (for query after compress) */
+int g_last_nn_action = -1;
+int g_last_nn_original_action = -1;
+int g_last_exploration_triggered = 0;
+int g_last_sgd_fired = 0;
+
 /** Online reinforcement state */
 bool g_reinforce_enabled = false;
 float g_reinforce_lr = 1e-4f;
@@ -286,7 +292,9 @@ extern "C" gpucompress_error_t gpucompress_compress(
     double second_derivative = 0.0;
     bool nn_was_used = false;
     bool sgd_fired = false;
+    bool exploration_triggered = false;
     int nn_action = 0;
+    int nn_original_action = -1;
     float predicted_ratio = 0.0f;
     float predicted_comp_time = 0.0f;
     int top_actions[32] = {0};
@@ -318,6 +326,8 @@ extern "C" gpucompress_error_t gpucompress_compress(
             if (rc == 0) {
                 nn_was_used = true;
                 nn_action = action;
+                nn_original_action = action;
+                g_last_nn_action = action;
 
                 // Check OOD
                 if (g_active_learning_enabled) {
@@ -568,6 +578,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
                                     0.0, 0.0});
 
         if (error_pct > g_exploration_threshold || is_ood) {
+            exploration_triggered = true;
             // Level 2: Explore alternatives
             // Determine K (number of alternatives to try)
             int K;
@@ -828,6 +839,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
                             // Track if this is better than current best
                             if (alt_ratio > best_ratio) {
                                 best_ratio = alt_ratio;
+                                g_last_nn_action = alt_action;
 
                                 // Copy better result to output
                                 size_t header_sz = GPUCOMPRESS_HEADER_SIZE;
@@ -941,7 +953,15 @@ extern "C" gpucompress_error_t gpucompress_compress(
         stats->predicted_comp_time_ms = static_cast<double>(predicted_comp_time);
         stats->actual_comp_time_ms = static_cast<double>(primary_comp_time_ms);
         stats->sgd_fired = sgd_fired ? 1 : 0;
+        stats->exploration_triggered = exploration_triggered ? 1 : 0;
+        stats->nn_original_action = nn_original_action;
+        stats->nn_final_action = g_last_nn_action;
     }
+
+    /* Update globals for query after HDF5 filter path */
+    g_last_nn_original_action = nn_original_action;
+    g_last_exploration_triggered = exploration_triggered ? 1 : 0;
+    g_last_sgd_fired = sgd_fired ? 1 : 0;
 
     return GPUCOMPRESS_SUCCESS;
 }
@@ -1283,6 +1303,22 @@ extern "C" int gpucompress_nn_is_loaded(void) {
 /* ============================================================
  * Utility Functions
  * ============================================================ */
+
+extern "C" int gpucompress_get_last_nn_action(void) {
+    return g_last_nn_action;
+}
+
+extern "C" int gpucompress_get_last_nn_original_action(void) {
+    return g_last_nn_original_action;
+}
+
+extern "C" int gpucompress_get_last_exploration_triggered(void) {
+    return g_last_exploration_triggered;
+}
+
+extern "C" int gpucompress_get_last_sgd_fired(void) {
+    return g_last_sgd_fired;
+}
 
 extern "C" const char* gpucompress_algorithm_name(gpucompress_algorithm_t algorithm) {
     int idx = static_cast<int>(algorithm);

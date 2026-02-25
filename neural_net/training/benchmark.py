@@ -7,14 +7,14 @@ libgpucompress.so, and benchmarks all 64 compression configs per file.
 Primary data source for NN training.
 """
 
+import sys
 import time
-import numpy as np
-import pandas as pd
 from pathlib import Path
 from typing import Dict
 
-import sys
-from pathlib import Path
+import numpy as np
+import pandas as pd
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from neural_net.core.gpu_library import (
@@ -99,6 +99,15 @@ def benchmark_binary_files(
 
             # Compute stats once per file on GPU
             entropy, mad_val, deriv_val = lib.compute_stats(raw_data)
+
+            # Warmup: run one compress/decompress cycle to initialize GPU
+            # state (JIT compilation, memory pools) before timing.
+            warmup_cfg = lib.make_config(algo=ALGORITHMS[0], shuffle=0)
+            try:
+                warmup_out = lib.compress(raw_data, warmup_cfg)
+                lib.decompress(warmup_out, original_size)
+            except RuntimeError:
+                pass  # warmup failure is non-fatal
 
             print(f"\n  File: {bin_file.name} ({original_size:,} bytes)")
             print(f"    Stats: entropy={entropy:.4f}  MAD={mad_val:.4f}  "

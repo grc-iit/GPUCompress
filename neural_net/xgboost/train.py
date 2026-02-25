@@ -10,16 +10,14 @@ Usage:
 
 import sys
 import argparse
+import pickle
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 from pathlib import Path
 from sklearn.model_selection import KFold
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-import pickle
-import shap
 import xgboost as xgb
 from neural_net.core.data import inverse_transform_outputs, OUTPUT_COLUMNS, ALGORITHM_NAMES, CONTINUOUS_FEATURES
 from neural_net.training.cross_validate import prepare_fold
@@ -83,6 +81,9 @@ def _aggregate_shap(feature_names, shap_matrix):
 
 def collect_feature_importance(models, val_X, feature_names, output_dir):
     """Compute SHAP values and save heatmap plot."""
+    import shap
+    import matplotlib.pyplot as plt
+
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True)
 
@@ -185,14 +186,15 @@ def train_and_evaluate(data):
     weights_dir = Path(__file__).parent.parent / 'weights'
     weights_dir.mkdir(exist_ok=True)
     save_path = weights_dir / 'xgb_model.pkl'
-    pickle.dump({
-        'models': models,
-        'x_means': data['x_means'],
-        'x_stds': data['x_stds'],
-        'y_means': data['y_means'],
-        'y_stds': data['y_stds'],
-        'feature_names': data['feature_names'],
-    }, open(save_path, 'wb'))
+    with open(save_path, 'wb') as f:
+        pickle.dump({
+            'models': models,
+            'x_means': data['x_means'],
+            'x_stds': data['x_stds'],
+            'y_means': data['y_means'],
+            'y_stds': data['y_stds'],
+            'feature_names': data['feature_names'],
+        }, f)
     print(f"\nModels saved to {save_path}")
 
     # Feature importance

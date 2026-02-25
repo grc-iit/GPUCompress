@@ -14,15 +14,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from neural_net.core.data import compute_stats_cpu, ALGORITHM_NAMES, inverse_transform_outputs
-
-SHUFFLE_OPTIONS = [0, 4]
-QUANT_OPTIONS = [
-    ('none', 0.0),
-    ('linear', 0.1),
-    ('linear', 0.01),
-    ('linear', 0.001),
-]
+from neural_net.core.data import compute_stats_cpu, inverse_transform_outputs
+from neural_net.core.configs import build_all_config_features
 
 
 def predict_all_configs(bin_path, weights_path, rank_by='compression_ratio'):
@@ -48,23 +41,8 @@ def predict_all_configs(bin_path, weights_path, rank_by='compression_ratio'):
     y_stds = checkpoint['y_stds']
 
     # Build 64 input rows
-    rows = []
-    configs = []
-    for algo in ALGORITHM_NAMES:
-        for shuffle in SHUFFLE_OPTIONS:
-            for quant, error_bound in QUANT_OPTIONS:
-                algo_features = [1.0 if algo == a else 0.0 for a in ALGORITHM_NAMES]
-                quant_enc = 1.0 if quant == 'linear' else 0.0
-                shuffle_enc = 1.0 if shuffle > 0 else 0.0
-                error_bound_enc = np.log10(max(error_bound, 1e-7))
-                data_size_enc = np.log2(max(original_size, 1))
-
-                feature_vec = algo_features + [
-                    quant_enc, shuffle_enc, error_bound_enc,
-                    data_size_enc, entropy, mad, second_derivative
-                ]
-                rows.append(feature_vec)
-                configs.append((algo, quant, shuffle, error_bound))
+    rows, configs = build_all_config_features(
+        entropy, mad, second_derivative, original_size, error_bounds=0.0)
 
     X_raw = np.array(rows, dtype=np.float32)
     X_norm = (X_raw - x_means) / x_stds

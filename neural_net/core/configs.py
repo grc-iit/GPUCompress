@@ -17,40 +17,41 @@ NUM_CONFIGS_NN = 32    # 8 algo × 2 quant × 2 shuffle (NN action space)
 NUM_CONFIGS_FULL = 64  # 8 algo × 2 shuffle × 4 quant (training space)
 
 
-def decode_action(action_id: int) -> dict:
-    """Decode NN action ID (0-31) to config dict."""
-    return {
-        'algorithm': action_id % 8,
-        'quantization': (action_id // 8) % 2,
-        'shuffle': (action_id // 16) % 2,
-    }
-
-
 def build_all_config_features(entropy, mad, second_derivative,
                                data_size, error_bounds):
     """Build feature vectors for all 64 training configs.
 
-    Returns list of (feature_dict, algo_name, shuffle, quant_str, error_bound) tuples.
-    Used by predict.py and xgb_predict.py to avoid duplicating feature construction.
+    Args:
+        entropy, mad, second_derivative: Data statistics.
+        data_size: Original data size in bytes.
+        error_bounds: Ignored (kept for API compat). Lossless configs
+            always use sentinel 1e-7; lossy configs use QUANT_OPTIONS.
+
+    Returns:
+        (rows, configs) where:
+            rows: list of 64 feature vectors (list[float], length 15 each)
+            configs: list of 64 (algo_name, quant_str, shuffle, error_bound) tuples
     """
-    import numpy as np
     import math
 
+    rows = []
     configs = []
     for algo_idx, algo_name in enumerate(ALGORITHM_NAMES):
         for shuffle in SHUFFLE_OPTIONS:
             for quant, eb in QUANT_OPTIONS:
-                features = {}
-                for i, a in enumerate(ALGORITHM_NAMES):
-                    features[f'alg_{a}'] = 1.0 if i == algo_idx else 0.0
-                features['quant_enc'] = 1.0 if quant else 0.0
-                features['shuffle_enc'] = 1.0 if shuffle > 0 else 0.0
-                eb_val = eb if quant else (error_bounds if error_bounds > 0 else 1e-7)
-                features['error_bound_enc'] = math.log10(max(eb_val, 1e-7))
-                features['data_size_enc'] = math.log2(max(data_size, 1))
-                features['entropy'] = entropy
-                features['mad'] = mad
-                features['second_derivative'] = second_derivative
+                algo_features = [1.0 if i == algo_idx else 0.0
+                                 for i in range(len(ALGORITHM_NAMES))]
+                quant_enc = 1.0 if quant else 0.0
+                shuffle_enc = 1.0 if shuffle > 0 else 0.0
+                eb_val = eb if quant else 1e-7
+                error_bound_enc = math.log10(max(eb_val, 1e-7))
+                data_size_enc = math.log2(max(data_size, 1))
+
+                feature_vec = algo_features + [
+                    quant_enc, shuffle_enc, error_bound_enc,
+                    data_size_enc, entropy, mad, second_derivative
+                ]
+                rows.append(feature_vec)
                 quant_str = 'linear' if quant else 'none'
-                configs.append((features, algo_name, shuffle, quant_str, eb))
-    return configs
+                configs.append((algo_name, quant_str, shuffle, eb))
+    return rows, configs

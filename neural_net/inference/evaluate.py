@@ -143,6 +143,18 @@ def evaluate_ranking(model, data: Dict, device: torch.device,
     print(f"RANKING EVALUATION -- rank by: {rank_by}")
     print(f"{'=' * 65}")
     print(f"  Total (file, error_bound) groups: {total_groups}")
+
+    if total_groups == 0:
+        print("  No valid groups to evaluate.")
+        return {
+            'rank_by': rank_by,
+            'total_groups': 0,
+            'top1_accuracy': 0.0,
+            'top3_accuracy': 0.0,
+            'mean_regret': 0.0,
+            'median_regret': 0.0,
+        }
+
     print(f"  Top-1 accuracy: {top1_correct}/{total_groups} = {100*top1_correct/total_groups:.1f}%")
     print(f"  Top-3 accuracy: {top3_correct}/{total_groups} = {100*top3_correct/total_groups:.1f}%")
 

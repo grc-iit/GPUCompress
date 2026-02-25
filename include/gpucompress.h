@@ -133,6 +133,9 @@ typedef struct {
     double predicted_comp_time_ms;       /**< NN-predicted compression time in ms (0.0 if not ALGO_AUTO/NN) */
     double actual_comp_time_ms;          /**< Actual GPU compression time in ms (CUDA event timing) */
     int    sgd_fired;                    /**< 1 if online reinforcement (SGD) was triggered, 0 otherwise */
+    int    exploration_triggered;         /**< 1 if Level 2 exploration was triggered, 0 otherwise */
+    int    nn_original_action;           /**< NN's primary action before exploration (-1 if not ALGO_AUTO) */
+    int    nn_final_action;              /**< Final action used (may differ from original if exploration found better) */
 } gpucompress_stats_t;
 
 /* ============================================================
@@ -472,6 +475,31 @@ gpucompress_error_t gpucompress_reload_nn(const char* filepath);
  * @return Human-readable algorithm name
  */
 const char* gpucompress_algorithm_name(gpucompress_algorithm_t algorithm);
+
+/**
+ * Get the last NN action chosen during ALGO_AUTO compression.
+ * Action encodes: algorithm (action % 8), quantize ((action/8) % 2), shuffle ((action/16) % 2).
+ * Returns -1 if no NN prediction has been made yet.
+ */
+int gpucompress_get_last_nn_action(void);
+
+/**
+ * Get the NN's original action before exploration may have changed it.
+ * Returns -1 if no NN prediction has been made yet.
+ */
+int gpucompress_get_last_nn_original_action(void);
+
+/**
+ * Check if Level 2 exploration was triggered during the last ALGO_AUTO compress.
+ * Returns 1 if exploration was triggered, 0 otherwise.
+ */
+int gpucompress_get_last_exploration_triggered(void);
+
+/**
+ * Check if online SGD (reinforcement) fired during the last ALGO_AUTO compress.
+ * Returns 1 if SGD was applied, 0 otherwise.
+ */
+int gpucompress_get_last_sgd_fired(void);
 
 /**
  * Parse algorithm from string.
