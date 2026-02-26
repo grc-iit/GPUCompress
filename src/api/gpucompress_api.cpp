@@ -14,6 +14,7 @@
 #include <cmath>
 #include <utility>
 #include <vector>
+#include <algorithm>
 
 #include "gpucompress.h"
 #include "api/internal.hpp"
@@ -93,8 +94,13 @@ int g_last_nn_original_action = -1;
 int g_last_exploration_triggered = 0;
 int g_last_sgd_fired = 0;
 
+/** Per-chunk diagnostic history */
+#define MAX_CHUNK_HISTORY 4096
+gpucompress_chunk_diag_t g_chunk_history[MAX_CHUNK_HISTORY];
+int g_chunk_history_count = 0;
+
 /** Online reinforcement (SGD) state */
-float g_reinforce_lr = 1e-4f;
+float g_reinforce_lr = 0.01f;
 float g_reinforce_mape_threshold = 0.20f;
 bool g_reinforce_initialized = false;
 
@@ -567,15 +573,11 @@ extern "C" gpucompress_error_t gpucompress_compress(
             experience_buffer_append(&sample);
         }
 
-        // Check prediction error (max of ratio MAPE and time MAPE)
+        // Check prediction error (ratio MAPE only — time prediction is too noisy)
         double pred_ratio_d = static_cast<double>(predicted_ratio);
         double ratio_mape = (actual_ratio > 0.0) ?
             std::abs(pred_ratio_d - actual_ratio) / actual_ratio : 0.0;
-        double actual_ct = static_cast<double>(primary_comp_time_ms);
-        double pred_ct = static_cast<double>(predicted_comp_time);
-        double time_mape = (actual_ct > 0.0) ?
-            std::abs(pred_ct - actual_ct) / actual_ct : 0.0;
-        double error_pct = std::max(ratio_mape, time_mape);
+        double error_pct = ratio_mape;
 
         // Collect explored (action, ratio, comp_time) for reinforcement
         struct ExploredResult { int action; double ratio; double comp_time_ms;
@@ -585,18 +587,31 @@ extern "C" gpucompress_error_t gpucompress_compress(
                                     static_cast<double>(primary_comp_time_ms),
                                     0.0, 0.0});
 
-        if (g_exploration_enabled && (error_pct > g_exploration_threshold || is_ood)) {
+        if (g_exploration_enabled && error_pct > g_exploration_threshold) {
             exploration_triggered = true;
             // Level 2: Explore alternatives
             // Determine K (number of alternatives to try)
+            // OOD increases K but no longer forces exploration independently
             int K;
             if (is_ood) {
-                K = 31;  // Try all 32 configs (minus original)
+                K = 31;  // OOD: try all 32 configs (minus original)
             } else if (error_pct > 0.50) {
                 K = 9;
             } else {
                 K = 4;
             }
+
+            gpucompress::DecodedAction primary_dec = gpucompress::decodeAction(nn_action);
+            fprintf(stderr, "[EXPLORE] Chunk %zuB | primary=action%d (%s%s%s) ratio=%.3f | "
+                    "ratio_mape=%.1f%% %s| K=%d\n",
+                    input_size, nn_action,
+                    ALGORITHM_NAMES[primary_dec.algorithm + 1],
+                    primary_dec.shuffle_size > 0 ? "+shuf" : "",
+                    primary_dec.use_quantization ? "+quant" : "",
+                    actual_ratio,
+                    ratio_mape * 100.0,
+                    is_ood ? "OOD " : "",
+                    K);
 
             // Try top-K alternative configs
             double best_ratio = actual_ratio;
@@ -831,6 +846,15 @@ extern "C" gpucompress_error_t gpucompress_compress(
                                                         static_cast<double>(alt_ct_ms),
                                                         alt_decomp_ms, alt_psnr});
 
+                            fprintf(stderr, "[EXPLORE]   alt %d/%d: action%d (%s%s%s) "
+                                    "ratio=%.3f comp=%.2fms%s\n",
+                                    i, K, alt_action,
+                                    ALGORITHM_NAMES[alt.algorithm + 1],
+                                    alt.shuffle_size > 0 ? "+shuf" : "",
+                                    alt.use_quantization ? "+quant" : "",
+                                    alt_ratio, alt_ct_ms,
+                                    (alt_ratio > best_ratio) ? " << NEW BEST" : "");
+
                             // Store alternative experience
                             ExperienceSample alt_sample;
                             alt_sample.entropy = entropy;
@@ -909,6 +933,20 @@ extern "C" gpucompress_error_t gpucompress_compress(
                 if (d_alt_shuf) cudaFree(d_alt_shuf);
             }
 
+            // Summary: did exploration find something better?
+            gpucompress_algorithm_t final_algo = algo_to_use;
+            unsigned int final_preproc = preproc_to_use;
+            double final_ratio = static_cast<double>(input_size) / static_cast<double>(compressed_size);
+            if (final_algo != static_cast<gpucompress_algorithm_t>(primary_dec.algorithm + 1) ||
+                final_preproc != (primary_dec.shuffle_size > 0 ? GPUCOMPRESS_PREPROC_SHUFFLE_4 : 0u)) {
+                fprintf(stderr, "[EXPLORE] >> Switched to %s%s ratio=%.3f (was %.3f)\n",
+                        gpucompress_algorithm_name(final_algo),
+                        (final_preproc & GPUCOMPRESS_PREPROC_SHUFFLE_4) ? "+shuf" : "",
+                        final_ratio, actual_ratio);
+            } else {
+                fprintf(stderr, "[EXPLORE] >> Kept primary (ratio=%.3f)\n", actual_ratio);
+            }
+
         }
 
         // Online reinforcement: fire SGD only when ratio MAPE exceeds threshold.
@@ -923,8 +961,14 @@ extern "C" gpucompress_error_t gpucompress_compress(
                 }
 
                 if (g_reinforce_initialized) {
-                    // Feed all samples (primary + explored)
-                    for (size_t ei = 0; ei < explored_samples.size(); ei++) {
+                    // Sort explored samples by ratio (descending) and feed top 3 to SGD.
+                    // Feeding all 16 samples creates conflicting gradients that destabilize weights.
+                    std::sort(explored_samples.begin(), explored_samples.end(),
+                              [](const ExploredResult& a, const ExploredResult& b) {
+                                  return a.ratio > b.ratio;
+                              });
+                    size_t sgd_limit = std::min(explored_samples.size(), static_cast<size_t>(3));
+                    for (size_t ei = 0; ei < sgd_limit; ei++) {
                         float input_raw[15];
                         build_input_features(input_raw, explored_samples[ei].action,
                                              cfg.error_bound, input_size,
@@ -973,6 +1017,15 @@ extern "C" gpucompress_error_t gpucompress_compress(
     g_last_nn_original_action = nn_original_action;
     g_last_exploration_triggered = exploration_triggered ? 1 : 0;
     g_last_sgd_fired = sgd_fired ? 1 : 0;
+
+    /* Append to per-chunk history */
+    if (g_chunk_history_count < MAX_CHUNK_HISTORY) {
+        gpucompress_chunk_diag_t *h = &g_chunk_history[g_chunk_history_count++];
+        h->nn_action             = g_last_nn_action;
+        h->nn_original_action    = nn_original_action;
+        h->exploration_triggered = exploration_triggered ? 1 : 0;
+        h->sgd_fired             = sgd_fired ? 1 : 0;
+    }
 
     return GPUCOMPRESS_SUCCESS;
 }
@@ -1322,6 +1375,21 @@ extern "C" int gpucompress_get_last_exploration_triggered(void) {
 
 extern "C" int gpucompress_get_last_sgd_fired(void) {
     return g_last_sgd_fired;
+}
+
+extern "C" void gpucompress_reset_chunk_history(void) {
+    g_chunk_history_count = 0;
+}
+
+extern "C" int gpucompress_get_chunk_history_count(void) {
+    return g_chunk_history_count;
+}
+
+extern "C" int gpucompress_get_chunk_diag(int idx, gpucompress_chunk_diag_t *out) {
+    if (idx < 0 || idx >= g_chunk_history_count || out == NULL)
+        return -1;
+    *out = g_chunk_history[idx];
+    return 0;
 }
 
 extern "C" const char* gpucompress_algorithm_name(gpucompress_algorithm_t algorithm) {

@@ -537,6 +537,34 @@ int gpucompress_get_last_exploration_triggered(void);
  */
 int gpucompress_get_last_sgd_fired(void);
 
+/* ── Per-chunk diagnostic history ─────────────────────────────────── */
+
+/**
+ * Per-chunk diagnostic snapshot recorded during H5Dwrite(H5S_ALL).
+ */
+typedef struct {
+    int nn_action;
+    int nn_original_action;
+    int exploration_triggered;
+    int sgd_fired;
+} gpucompress_chunk_diag_t;
+
+/**
+ * Reset the per-chunk diagnostic history (call before H5Dwrite).
+ */
+void gpucompress_reset_chunk_history(void);
+
+/**
+ * Return the number of chunk diagnostics recorded since the last reset.
+ */
+int  gpucompress_get_chunk_history_count(void);
+
+/**
+ * Copy the diagnostic record for chunk @p idx into @p out.
+ * @return 0 on success, -1 if idx is out of range or out is NULL.
+ */
+int  gpucompress_get_chunk_diag(int idx, gpucompress_chunk_diag_t *out);
+
 /**
  * Parse algorithm from string.
  *

@@ -90,6 +90,27 @@ bash eval/run_eval_pipeline.sh --timesteps 15 --weights model.nnwt
 
 ---
 
+## CPU Flame Graph (perf + FlameGraph)
+
+```bash
+# 1. Record CPU stacks while running benchmark
+sudo perf record -g -F 999 -o /tmp/bench_adapt_perf.data \
+  ./build/bench_adaptation neural_net/weights/model.nnwt gaussian
+
+# 2. Collapse stacks into folded format
+sudo perf script -i /tmp/bench_adapt_perf.data | \
+  /home/cc/FlameGraph/stackcollapse-perf.pl > /tmp/bench_adapt.folded
+
+# 3. Generate interactive SVG flame graph
+/home/cc/FlameGraph/flamegraph.pl --title "bench_adaptation" \
+  /tmp/bench_adapt.folded > /tmp/bench_adapt_flamegraph.svg
+
+# Open in browser
+xdg-open /tmp/bench_adapt_flamegraph.svg
+```
+
+---
+
 ## Quick Reference
 
 ### Generator CLI flags

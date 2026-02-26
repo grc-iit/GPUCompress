@@ -426,6 +426,48 @@ if(HDF5_FOUND)
         ${HDF5_C_LIBRARIES}
         m
     )
+
+    # NN Adaptation Benchmark: per-chunk exploration tracking over 1GB streams
+    add_executable(bench_adaptation tests/bench_adaptation.c)
+    target_include_directories(bench_adaptation PRIVATE
+        ${HDF5_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_libraries(bench_adaptation PRIVATE
+        gpucompress
+        H5Zgpucompress
+        ${HDF5_C_LIBRARIES}
+        m
+    )
+
+    # LR x MAPE sweep benchmark
+    add_executable(bench_lr_sweep tests/bench_lr_sweep.c)
+    target_include_directories(bench_lr_sweep PRIVATE
+        ${HDF5_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_libraries(bench_lr_sweep PRIVATE
+        gpucompress
+        H5Zgpucompress
+        ${HDF5_C_LIBRARIES}
+        m
+    )
+
+    # Mixed-algorithm lossless verification test
+    add_executable(test_mixed_algo_verify tests/test_mixed_algo_verify.c)
+    target_include_directories(test_mixed_algo_verify PRIVATE
+        ${HDF5_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_libraries(test_mixed_algo_verify PRIVATE
+        gpucompress
+        H5Zgpucompress
+        ${HDF5_C_LIBRARIES}
+        m
+    )
 endif()
 
 # ============================================================
