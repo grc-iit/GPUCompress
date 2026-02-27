@@ -14,6 +14,8 @@
 #include "gpucompress.h"
 #include "compression/compression_factory.hpp"
 #include "compression/compression_header.h"
+#include "stats/auto_stats_gpu.h"
+#include "nn/nn_weights.h"
 
 namespace gpucompress {
 
@@ -225,6 +227,33 @@ int runStatsOnlyPipeline(
     double* out_mad,
     double* out_deriv
 );
+
+/**
+ * Run stats kernels without D→H copy or sync.
+ * Returns device pointer to stats buffer for fused pipeline.
+ */
+AutoStatsGPU* runStatsKernelsNoSync(const void* d_input, size_t input_size, cudaStream_t stream);
+
+/**
+ * Get device pointer to pre-allocated stats buffer.
+ */
+AutoStatsGPU* getStatsDevicePtr();
+
+/**
+ * Fused NN inference: reads stats directly from device pointer.
+ * Eliminates stats D→H→GPU round-trip.
+ */
+int runNNFusedInference(const AutoStatsGPU* d_stats, size_t data_size, double error_bound,
+    cudaStream_t stream, int* out_action, float* out_ratio = nullptr,
+    float* out_comp_time = nullptr, int* out_is_ood = nullptr, int* out_top_actions = nullptr);
+
+/**
+ * GPU-native SGD: forward/backward pass + weight update entirely on GPU.
+ * Eliminates ~152KB D→H + H→D round-trip per SGD call.
+ */
+int runNNSGD(const AutoStatsGPU* d_stats, const SGDSample* samples, int num_samples,
+    size_t data_size, double error_bound, float learning_rate, cudaStream_t stream,
+    float* out_grad_norm = nullptr, int* out_clipped = nullptr, int* out_count = nullptr);
 
 /**
  * Run the complete ALGO_AUTO statistics + NN inference pipeline on GPU.

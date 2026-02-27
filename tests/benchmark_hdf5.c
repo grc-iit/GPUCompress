@@ -1036,8 +1036,8 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    gpucompress_enable_online_learning();
-    gpucompress_set_reinforcement(1, 0.4f, 0.2f, 0.0f);
+    // gpucompress_enable_online_learning();
+    // gpucompress_set_reinforcement(1, 0.4f, 0.2f, 0.0f);
 
     /* Open per-chunk CSV */
     ensure_parent_dir(chunk_csv_path);

@@ -12,6 +12,31 @@ static constexpr int NN_INPUT_DIM  = 15;
 static constexpr int NN_HIDDEN_DIM = 128;
 static constexpr int NN_OUTPUT_DIM = 4;
 static constexpr int NN_NUM_CONFIGS = 32;  // 8 algos x 2 quant x 2 shuffle
+static constexpr int NN_MAX_SGD_SAMPLES = 8;
+
+/** Input sample for GPU SGD kernel. */
+struct SGDSample {
+    int action;
+    float actual_ratio;
+    float actual_comp_time;
+    float actual_decomp_time;
+    float actual_psnr;
+};
+
+/** Output from GPU SGD kernel. */
+struct SGDOutput {
+    float grad_norm;
+    int was_clipped;
+    int sample_count;
+};
+
+/** Output from fused NN inference kernel. */
+struct NNInferenceOutput {
+    int action;
+    float predicted_ratio;
+    float predicted_comp_time;
+    int is_ood;
+};
 
 /** All neural net weights packed contiguously (mirrors GPU layout). */
 struct NNWeightsGPU {

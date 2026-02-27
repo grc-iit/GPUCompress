@@ -231,6 +231,15 @@ add_executable(benchmark scripts/benchmark.cpp)
 target_link_libraries(benchmark PRIVATE gpucompress pthread)
 
 # ============================================================
+# Quantization round-trip visual verification test
+# ============================================================
+add_executable(test_quantization_roundtrip tests/test_quantization_roundtrip.c)
+target_include_directories(test_quantization_roundtrip PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_link_libraries(test_quantization_roundtrip PRIVATE gpucompress m)
+
+# ============================================================
 # Executable: Compression Core Test Suite
 # ============================================================
 # add_executable(test_compression_core  # source missing
@@ -413,6 +422,33 @@ if(HDF5_FOUND)
     #     ${HDF5_C_LIBRARIES}
     #     m
     # )
+
+    # HDF5 configuration validation test (all algos × preproc × patterns)
+    add_executable(test_hdf5_configs tests/test_hdf5_configs.c)
+    target_include_directories(test_hdf5_configs PRIVATE
+        ${HDF5_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_libraries(test_hdf5_configs PRIVATE
+        gpucompress
+        H5Zgpucompress
+        ${HDF5_C_LIBRARIES}
+        m
+    )
+
+    add_executable(test_f9_transfers tests/test_f9_transfers.c)
+    target_include_directories(test_f9_transfers PRIVATE
+        ${HDF5_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_libraries(test_f9_transfers PRIVATE
+        gpucompress
+        H5Zgpucompress
+        ${HDF5_C_LIBRARIES}
+        m
+    )
 endif()
 
 # ============================================================

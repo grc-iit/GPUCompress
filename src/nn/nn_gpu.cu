@@ -26,13 +26,14 @@
 #include <fstream>
 #include <vector>
 
+#include "stats/auto_stats_gpu.h"
+#include "nn/nn_weights.h"
+
 namespace gpucompress {
 
 /* ============================================================
  * Constants and shared weight layout
  * ============================================================ */
-
-#include "nn/nn_weights.h"
 
 static constexpr uint32_t NN_MAGIC = 0x4E4E5754;  // "NNWT"
 
@@ -342,6 +343,573 @@ __global__ void nnInferenceKernel(
 }
 
 /* ============================================================
+ * Fused Inference Kernel (reads stats from device pointer)
+ * ============================================================ */
+
+/**
+ * Fused GPU kernel: same as nnInferenceKernel but reads stats from
+ * AutoStatsGPU device pointer instead of scalar params.
+ * Thread 0 also performs OOD detection on the 5 continuous features.
+ */
+__global__ void nnFusedInferenceKernel(
+    const NNWeightsGPU* __restrict__ weights,
+    const AutoStatsGPU* __restrict__ d_stats,
+    size_t data_size,
+    double error_bound,
+    int criterion,
+    NNInferenceOutput* __restrict__ out_result,
+    int* __restrict__ out_top_actions
+) {
+    int tid = threadIdx.x;
+    if (tid >= NN_NUM_CONFIGS) return;
+
+    // Read stats from device memory
+    double entropy = d_stats->entropy;
+    double mad_norm = d_stats->mad_normalized;
+    double deriv_norm = d_stats->deriv_normalized;
+
+    // Decode this thread's configuration
+    int algo_idx = tid % 8;
+    int quant    = (tid / 8) % 2;
+    int shuffle  = (tid / 16) % 2;
+
+    // Build raw input features
+    float input_raw[NN_INPUT_DIM];
+    for (int i = 0; i < 8; i++) {
+        input_raw[i] = (i == algo_idx) ? 1.0f : 0.0f;
+    }
+    input_raw[8] = static_cast<float>(quant);
+    input_raw[9] = static_cast<float>(shuffle);
+
+    double eb_clipped = error_bound;
+    if (eb_clipped < 1e-7) eb_clipped = 1e-7;
+    input_raw[10] = static_cast<float>(log10(eb_clipped));
+
+    double ds = static_cast<double>(data_size);
+    if (ds < 1.0) ds = 1.0;
+    input_raw[11] = static_cast<float>(log2(ds));
+
+    input_raw[12] = static_cast<float>(entropy);
+    input_raw[13] = static_cast<float>(mad_norm);
+    input_raw[14] = static_cast<float>(deriv_norm);
+
+    // Standardize
+    float input[NN_INPUT_DIM];
+    for (int i = 0; i < NN_INPUT_DIM; i++) {
+        float std_val = weights->x_stds[i];
+        if (std_val < 1e-8f) std_val = 1e-8f;
+        input[i] = (input_raw[i] - weights->x_means[i]) / std_val;
+    }
+
+    // Layer 1: Linear(15, 128) + ReLU
+    float hidden1[NN_HIDDEN_DIM];
+    for (int j = 0; j < NN_HIDDEN_DIM; j++) {
+        float sum = weights->b1[j];
+        for (int i = 0; i < NN_INPUT_DIM; i++) {
+            sum += weights->w1[j * NN_INPUT_DIM + i] * input[i];
+        }
+        hidden1[j] = (sum > 0.0f) ? sum : 0.0f;
+    }
+
+    // Layer 2: Linear(128, 128) + ReLU
+    float hidden2[NN_HIDDEN_DIM];
+    for (int j = 0; j < NN_HIDDEN_DIM; j++) {
+        float sum = weights->b2[j];
+        for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+            sum += weights->w2[j * NN_HIDDEN_DIM + i] * hidden1[i];
+        }
+        hidden2[j] = (sum > 0.0f) ? sum : 0.0f;
+    }
+
+    // Layer 3: Linear(128, 4)
+    float output_norm[NN_OUTPUT_DIM];
+    for (int j = 0; j < NN_OUTPUT_DIM; j++) {
+        float sum = weights->b3[j];
+        for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+            sum += weights->w3[j * NN_HIDDEN_DIM + i] * hidden2[i];
+        }
+        output_norm[j] = sum;
+    }
+
+    // De-normalize outputs
+    float output_raw[NN_OUTPUT_DIM];
+    for (int j = 0; j < NN_OUTPUT_DIM; j++) {
+        output_raw[j] = output_norm[j] * weights->y_stds[j] + weights->y_means[j];
+    }
+
+    float comp_time  = expm1f(output_raw[0]);
+    float decomp_time = expm1f(output_raw[1]);
+    float ratio      = expm1f(output_raw[2]);
+    float psnr       = output_raw[3];
+
+    // Select ranking metric
+    float rank_val;
+    bool higher_is_better;
+    switch (criterion) {
+        case NN_RANK_BY_RATIO:      rank_val = ratio;       higher_is_better = true;  break;
+        case NN_RANK_BY_COMP_TIME:  rank_val = comp_time;   higher_is_better = false; break;
+        case NN_RANK_BY_DECOMP_TIME:rank_val = decomp_time; higher_is_better = false; break;
+        case NN_RANK_BY_PSNR:       rank_val = psnr;        higher_is_better = true;  break;
+        default:                    rank_val = ratio;       higher_is_better = true;
+    }
+    if (!higher_is_better) rank_val = -rank_val;
+    if (quant == 1 && error_bound <= 0.0) rank_val = -INFINITY;
+
+    __shared__ float s_ratios[NN_NUM_CONFIGS];
+    __shared__ float s_comp_times[NN_NUM_CONFIGS];
+    s_ratios[tid] = ratio;
+    s_comp_times[tid] = comp_time;
+
+    __shared__ float s_vals[NN_NUM_CONFIGS];
+    __shared__ int   s_idxs[NN_NUM_CONFIGS];
+    s_vals[tid] = rank_val;
+    s_idxs[tid] = tid;
+    __syncthreads();
+
+    if (out_top_actions != nullptr) {
+        // Thread 0 sorts all 32 actions
+        if (tid == 0) {
+            float local_vals[NN_NUM_CONFIGS];
+            int   local_idxs[NN_NUM_CONFIGS];
+            for (int i = 0; i < NN_NUM_CONFIGS; i++) {
+                local_vals[i] = s_vals[i];
+                local_idxs[i] = s_idxs[i];
+            }
+            for (int i = 1; i < NN_NUM_CONFIGS; i++) {
+                float key_val = local_vals[i];
+                int   key_idx = local_idxs[i];
+                int j = i - 1;
+                while (j >= 0 && local_vals[j] < key_val) {
+                    local_vals[j + 1] = local_vals[j];
+                    local_idxs[j + 1] = local_idxs[j];
+                    j--;
+                }
+                local_vals[j + 1] = key_val;
+                local_idxs[j + 1] = key_idx;
+            }
+
+            int winner = local_idxs[0];
+            out_result->action = winner;
+            out_result->predicted_ratio = s_ratios[winner];
+            out_result->predicted_comp_time = s_comp_times[winner];
+            for (int i = 0; i < NN_NUM_CONFIGS; i++) {
+                out_top_actions[i] = local_idxs[i];
+            }
+
+            // OOD detection on continuous features (indices 10-14)
+            int ood = 0;
+            float features[5] = {input_raw[10], input_raw[11], input_raw[12],
+                                 input_raw[13], input_raw[14]};
+            int indices[5] = {10, 11, 12, 13, 14};
+            for (int i = 0; i < 5; i++) {
+                int idx = indices[i];
+                float range = weights->x_maxs[idx] - weights->x_mins[idx];
+                float margin = range * 0.10f;
+                if (features[i] < weights->x_mins[idx] - margin ||
+                    features[i] > weights->x_maxs[idx] + margin) {
+                    ood = 1;
+                    break;
+                }
+            }
+            out_result->is_ood = ood;
+        }
+    } else {
+        // Tree reduction
+        for (int s = NN_NUM_CONFIGS / 2; s > 0; s >>= 1) {
+            if (tid < s) {
+                if (s_vals[tid + s] > s_vals[tid]) {
+                    s_vals[tid] = s_vals[tid + s];
+                    s_idxs[tid] = s_idxs[tid + s];
+                }
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            int winner = s_idxs[0];
+            out_result->action = winner;
+            out_result->predicted_ratio = s_ratios[winner];
+            out_result->predicted_comp_time = s_comp_times[winner];
+
+            // OOD detection
+            int ood = 0;
+            float features[5] = {input_raw[10], input_raw[11], input_raw[12],
+                                 input_raw[13], input_raw[14]};
+            int indices[5] = {10, 11, 12, 13, 14};
+            for (int i = 0; i < 5; i++) {
+                int idx = indices[i];
+                float range = weights->x_maxs[idx] - weights->x_mins[idx];
+                float margin = range * 0.10f;
+                if (features[i] < weights->x_mins[idx] - margin ||
+                    features[i] > weights->x_maxs[idx] + margin) {
+                    ood = 1;
+                    break;
+                }
+            }
+            out_result->is_ood = ood;
+        }
+    }
+}
+
+/* ============================================================
+ * Pre-allocated fused inference buffers
+ * ============================================================ */
+
+static NNInferenceOutput* d_fused_infer_output = nullptr;
+static int* d_fused_top_actions = nullptr;
+
+static void allocFusedInferenceBuffers() {
+    if (d_fused_infer_output == nullptr)
+        cudaMalloc(&d_fused_infer_output, sizeof(NNInferenceOutput));
+    if (d_fused_top_actions == nullptr)
+        cudaMalloc(&d_fused_top_actions, NN_NUM_CONFIGS * sizeof(int));
+}
+
+static void freeFusedInferenceBuffers() {
+    if (d_fused_infer_output) { cudaFree(d_fused_infer_output); d_fused_infer_output = nullptr; }
+    if (d_fused_top_actions) { cudaFree(d_fused_top_actions); d_fused_top_actions = nullptr; }
+}
+
+/* ============================================================
+ * GPU SGD Kernel
+ * ============================================================ */
+
+// Total gradient buffer size in floats
+static constexpr int SGD_GRAD_SIZE =
+    NN_HIDDEN_DIM * NN_INPUT_DIM +   // dw1: 1920
+    NN_HIDDEN_DIM +                    // db1: 128
+    NN_HIDDEN_DIM * NN_HIDDEN_DIM +   // dw2: 16384
+    NN_HIDDEN_DIM +                    // db2: 128
+    NN_OUTPUT_DIM * NN_HIDDEN_DIM +   // dw3: 512
+    NN_OUTPUT_DIM;                     // db3: 4
+// = 19076 floats = ~76KB
+
+// Offsets into gradient buffer
+static constexpr int SGD_OFF_DW1 = 0;
+static constexpr int SGD_OFF_DB1 = NN_HIDDEN_DIM * NN_INPUT_DIM;                    // 1920
+static constexpr int SGD_OFF_DW2 = SGD_OFF_DB1 + NN_HIDDEN_DIM;                     // 2048
+static constexpr int SGD_OFF_DB2 = SGD_OFF_DW2 + NN_HIDDEN_DIM * NN_HIDDEN_DIM;     // 18432
+static constexpr int SGD_OFF_DW3 = SGD_OFF_DB2 + NN_HIDDEN_DIM;                     // 18560
+static constexpr int SGD_OFF_DB3 = SGD_OFF_DW3 + NN_OUTPUT_DIM * NN_HIDDEN_DIM;     // 19072
+
+/**
+ * GPU SGD kernel: forward + backward pass + weight update, all on GPU.
+ *
+ * Launch: <<<1, 128>>>
+ * Thread t (0-127) owns hidden neuron t.
+ *
+ * Shared memory layout (~3.5KB):
+ *   s_x[15], s_h1[128], s_z1[128], s_h2[128], s_z2[128],
+ *   s_y[4], s_d3[4], s_dz2[128], s_reduce[128]
+ */
+__global__ void nnSGDKernel(
+    NNWeightsGPU* __restrict__ weights,
+    const AutoStatsGPU* __restrict__ d_stats,
+    const SGDSample* __restrict__ samples,
+    int num_samples,
+    size_t data_size,
+    double error_bound,
+    float learning_rate,
+    float* __restrict__ d_grad_buffer,
+    SGDOutput* __restrict__ out_result
+) {
+    int t = threadIdx.x;  // 0..127
+
+    // Shared memory
+    __shared__ float s_x[NN_INPUT_DIM];
+    __shared__ float s_h1[NN_HIDDEN_DIM];
+    __shared__ float s_z1[NN_HIDDEN_DIM];
+    __shared__ float s_h2[NN_HIDDEN_DIM];
+    __shared__ float s_z2[NN_HIDDEN_DIM];
+    __shared__ float s_y[NN_OUTPUT_DIM];
+    __shared__ float s_d3[NN_OUTPUT_DIM];
+    __shared__ float s_dz2[NN_HIDDEN_DIM];
+    __shared__ float s_reduce[NN_HIDDEN_DIM];
+
+    // Read stats once
+    float stat_entropy = static_cast<float>(d_stats->entropy);
+    float stat_mad = static_cast<float>(d_stats->mad_normalized);
+    float stat_deriv = static_cast<float>(d_stats->deriv_normalized);
+
+    // Encode data_size and error_bound
+    double eb_c = error_bound;
+    if (eb_c < 1e-7) eb_c = 1e-7;
+    float eb_enc = static_cast<float>(log10(eb_c));
+    double ds = static_cast<double>(data_size);
+    if (ds < 1.0) ds = 1.0;
+    float ds_enc = static_cast<float>(log2(ds));
+
+    // Zero this thread's gradient slice
+    // Thread t owns: dw1[t*15..t*15+14], db1[t],
+    //                dw2[t*128..t*128+127], db2[t],
+    //                dw3[out*128+t] for out=0..3, db3[t] (only t<4)
+    for (int i = 0; i < NN_INPUT_DIM; i++)
+        d_grad_buffer[SGD_OFF_DW1 + t * NN_INPUT_DIM + i] = 0.0f;
+    d_grad_buffer[SGD_OFF_DB1 + t] = 0.0f;
+    for (int i = 0; i < NN_HIDDEN_DIM; i++)
+        d_grad_buffer[SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i] = 0.0f;
+    d_grad_buffer[SGD_OFF_DB2 + t] = 0.0f;
+    for (int out = 0; out < NN_OUTPUT_DIM; out++)
+        d_grad_buffer[SGD_OFF_DW3 + out * NN_HIDDEN_DIM + t] = 0.0f;
+    if (t < NN_OUTPUT_DIM)
+        d_grad_buffer[SGD_OFF_DB3 + t] = 0.0f;
+    __syncthreads();
+
+    // Per-sample loop
+    for (int si = 0; si < num_samples; si++) {
+        SGDSample sample = samples[si];
+
+        // Thread 0 builds standardized input → s_x[15]
+        if (t == 0) {
+            int algo_idx = sample.action % 8;
+            int quant = (sample.action / 8) % 2;
+            int shuffle = (sample.action / 16) % 2;
+
+            float raw[NN_INPUT_DIM];
+            for (int i = 0; i < 8; i++) raw[i] = (i == algo_idx) ? 1.0f : 0.0f;
+            raw[8] = static_cast<float>(quant);
+            raw[9] = static_cast<float>(shuffle);
+            raw[10] = eb_enc;
+            raw[11] = ds_enc;
+            raw[12] = stat_entropy;
+            raw[13] = stat_mad;
+            raw[14] = stat_deriv;
+
+            for (int i = 0; i < NN_INPUT_DIM; i++) {
+                float std_val = weights->x_stds[i];
+                if (std_val < 1e-8f) std_val = 1e-8f;
+                s_x[i] = (raw[i] - weights->x_means[i]) / std_val;
+            }
+        }
+        __syncthreads();
+
+        // Forward L1: thread t computes h1[t]
+        {
+            float sum = weights->b1[t];
+            for (int i = 0; i < NN_INPUT_DIM; i++) {
+                sum += weights->w1[t * NN_INPUT_DIM + i] * s_x[i];
+            }
+            s_z1[t] = sum;
+            s_h1[t] = (sum > 0.0f) ? sum : 0.0f;
+        }
+        __syncthreads();
+
+        // Forward L2: thread t computes h2[t]
+        {
+            float sum = weights->b2[t];
+            for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+                sum += weights->w2[t * NN_HIDDEN_DIM + i] * s_h1[i];
+            }
+            s_z2[t] = sum;
+            s_h2[t] = (sum > 0.0f) ? sum : 0.0f;
+        }
+        __syncthreads();
+
+        // Forward L3: threads 0-3 compute y[out]
+        if (t < NN_OUTPUT_DIM) {
+            float sum = weights->b3[t];
+            for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+                sum += weights->w3[t * NN_HIDDEN_DIM + i] * s_h2[i];
+            }
+            s_y[t] = sum;
+        }
+        __syncthreads();
+
+        // Thread 0 computes targets + output errors → s_d3[4]
+        if (t == 0) {
+            // Targets in normalized space
+            float y_std2 = weights->y_stds[2];
+            if (y_std2 < 1e-8f) y_std2 = 1e-8f;
+            float target_ratio = (log1pf(sample.actual_ratio) - weights->y_means[2]) / y_std2;
+
+            s_d3[2] = s_y[2] - target_ratio;
+
+            // Comp time (output 0)
+            if (sample.actual_comp_time > 0.0f) {
+                float y_std0 = weights->y_stds[0];
+                if (y_std0 < 1e-8f) y_std0 = 1e-8f;
+                s_d3[0] = s_y[0] - (log1pf(sample.actual_comp_time) - weights->y_means[0]) / y_std0;
+            } else {
+                s_d3[0] = 0.0f;
+            }
+
+            // Decomp time (output 1)
+            if (sample.actual_decomp_time > 0.0f) {
+                float y_std1 = weights->y_stds[1];
+                if (y_std1 < 1e-8f) y_std1 = 1e-8f;
+                s_d3[1] = s_y[1] - (log1pf(sample.actual_decomp_time) - weights->y_means[1]) / y_std1;
+            } else {
+                s_d3[1] = 0.0f;
+            }
+
+            // PSNR (output 3)
+            if (sample.actual_psnr > 0.0f) {
+                float clamped = fminf(sample.actual_psnr, 120.0f);
+                float y_std3 = weights->y_stds[3];
+                if (y_std3 < 1e-8f) y_std3 = 1e-8f;
+                s_d3[3] = s_y[3] - (clamped - weights->y_means[3]) / y_std3;
+            } else {
+                s_d3[3] = 0.0f;
+            }
+        }
+        __syncthreads();
+
+        // Layer 3 gradients: thread t handles dw3[out][t] for out=0..3
+        for (int out = 0; out < NN_OUTPUT_DIM; out++) {
+            if (s_d3[out] != 0.0f) {
+                d_grad_buffer[SGD_OFF_DW3 + out * NN_HIDDEN_DIM + t] += s_d3[out] * s_h2[t];
+            }
+        }
+        if (t < NN_OUTPUT_DIM) {
+            d_grad_buffer[SGD_OFF_DB3 + t] += s_d3[t];
+        }
+
+        // Backward L3→L2: dh2[t] = sum(w3[out][t]*d3[out])
+        {
+            float dh2_t = 0.0f;
+            for (int out = 0; out < NN_OUTPUT_DIM; out++) {
+                dh2_t += weights->w3[out * NN_HIDDEN_DIM + t] * s_d3[out];
+            }
+            // ReLU backward
+            s_dz2[t] = (s_z2[t] > 0.0f) ? dh2_t : 0.0f;
+        }
+        __syncthreads();
+
+        // Layer 2 gradients
+        for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+            d_grad_buffer[SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i] += s_dz2[t] * s_h1[i];
+        }
+        d_grad_buffer[SGD_OFF_DB2 + t] += s_dz2[t];
+
+        // Backward L2→L1: dh1[t] = sum(w2[j][t]*dz2[j])
+        float dz1_t;
+        {
+            float dh1_t = 0.0f;
+            for (int j = 0; j < NN_HIDDEN_DIM; j++) {
+                dh1_t += weights->w2[j * NN_HIDDEN_DIM + t] * s_dz2[j];
+            }
+            dz1_t = (s_z1[t] > 0.0f) ? dh1_t : 0.0f;
+        }
+
+        // Layer 1 gradients
+        for (int i = 0; i < NN_INPUT_DIM; i++) {
+            d_grad_buffer[SGD_OFF_DW1 + t * NN_INPUT_DIM + i] += dz1_t * s_x[i];
+        }
+        d_grad_buffer[SGD_OFF_DB1 + t] += dz1_t;
+
+        __syncthreads();
+    }
+
+    // --- After all samples: average, clip, SGD step ---
+    float inv_n = 1.0f / static_cast<float>(num_samples);
+
+    // Average and compute local norm contribution
+    float local_norm_sq = 0.0f;
+
+    // dw1 owned by thread t
+    for (int i = 0; i < NN_INPUT_DIM; i++) {
+        int idx = SGD_OFF_DW1 + t * NN_INPUT_DIM + i;
+        d_grad_buffer[idx] *= inv_n;
+        local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
+    }
+    // db1
+    {
+        int idx = SGD_OFF_DB1 + t;
+        d_grad_buffer[idx] *= inv_n;
+        local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
+    }
+    // dw2
+    for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+        int idx = SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i;
+        d_grad_buffer[idx] *= inv_n;
+        local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
+    }
+    // db2
+    {
+        int idx = SGD_OFF_DB2 + t;
+        d_grad_buffer[idx] *= inv_n;
+        local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
+    }
+    // dw3 (thread t owns [out*128+t] for out=0..3)
+    for (int out = 0; out < NN_OUTPUT_DIM; out++) {
+        int idx = SGD_OFF_DW3 + out * NN_HIDDEN_DIM + t;
+        d_grad_buffer[idx] *= inv_n;
+        local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
+    }
+    // db3 (threads 0-3)
+    if (t < NN_OUTPUT_DIM) {
+        int idx = SGD_OFF_DB3 + t;
+        d_grad_buffer[idx] *= inv_n;
+        local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
+    }
+
+    // Shared memory reduction for total norm
+    s_reduce[t] = local_norm_sq;
+    __syncthreads();
+    for (int s = NN_HIDDEN_DIM / 2; s > 0; s >>= 1) {
+        if (t < s) s_reduce[t] += s_reduce[t + s];
+        __syncthreads();
+    }
+
+    float norm = sqrtf(s_reduce[0]);
+    float clip_scale = (norm > 1.0f) ? (1.0f / norm) : 1.0f;
+    float lr_scaled = learning_rate * clip_scale;
+
+    // SGD step: update weights in-place
+    // w1
+    for (int i = 0; i < NN_INPUT_DIM; i++) {
+        weights->w1[t * NN_INPUT_DIM + i] -=
+            lr_scaled * d_grad_buffer[SGD_OFF_DW1 + t * NN_INPUT_DIM + i];
+    }
+    weights->b1[t] -= lr_scaled * d_grad_buffer[SGD_OFF_DB1 + t];
+
+    // w2
+    for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+        weights->w2[t * NN_HIDDEN_DIM + i] -=
+            lr_scaled * d_grad_buffer[SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i];
+    }
+    weights->b2[t] -= lr_scaled * d_grad_buffer[SGD_OFF_DB2 + t];
+
+    // w3 (4 outputs, thread t updates its column)
+    for (int out = 0; out < NN_OUTPUT_DIM; out++) {
+        weights->w3[out * NN_HIDDEN_DIM + t] -=
+            lr_scaled * d_grad_buffer[SGD_OFF_DW3 + out * NN_HIDDEN_DIM + t];
+    }
+    if (t < NN_OUTPUT_DIM) {
+        weights->b3[t] -= lr_scaled * d_grad_buffer[SGD_OFF_DB3 + t];
+    }
+
+    // Thread 0 writes output
+    if (t == 0) {
+        out_result->grad_norm = norm;
+        out_result->was_clipped = (norm > 1.0f) ? 1 : 0;
+        out_result->sample_count = num_samples;
+    }
+}
+
+/* ============================================================
+ * Pre-allocated SGD buffers
+ * ============================================================ */
+
+static float* d_sgd_grad_buffer = nullptr;
+static SGDOutput* d_sgd_output = nullptr;
+static SGDSample* d_sgd_samples = nullptr;
+
+static void allocSGDBuffers() {
+    if (d_sgd_grad_buffer == nullptr)
+        cudaMalloc(&d_sgd_grad_buffer, SGD_GRAD_SIZE * sizeof(float));
+    if (d_sgd_output == nullptr)
+        cudaMalloc(&d_sgd_output, sizeof(SGDOutput));
+    if (d_sgd_samples == nullptr)
+        cudaMalloc(&d_sgd_samples, NN_MAX_SGD_SAMPLES * sizeof(SGDSample));
+}
+
+static void freeSGDBuffers() {
+    if (d_sgd_grad_buffer) { cudaFree(d_sgd_grad_buffer); d_sgd_grad_buffer = nullptr; }
+    if (d_sgd_output) { cudaFree(d_sgd_output); d_sgd_output = nullptr; }
+    if (d_sgd_samples) { cudaFree(d_sgd_samples); d_sgd_samples = nullptr; }
+}
+
+/* ============================================================
  * Host Functions
  * ============================================================ */
 
@@ -459,6 +1027,8 @@ bool loadNNFromBinary(const char* filepath) {
 
     // Pre-allocate inference output buffers
     allocInferenceBuffers();
+    allocFusedInferenceBuffers();
+    allocSGDBuffers();
 
     size_t total_params = NN_HIDDEN_DIM * NN_INPUT_DIM + NN_HIDDEN_DIM +
                           NN_HIDDEN_DIM * NN_HIDDEN_DIM + NN_HIDDEN_DIM +
@@ -522,6 +1092,8 @@ void cleanupNN() {
         d_nn_weights = nullptr;
     }
     freeInferenceBuffers();
+    freeFusedInferenceBuffers();
+    freeSGDBuffers();
     g_nn_loaded = false;
     g_has_bounds = false;
 }
@@ -634,6 +1206,134 @@ int runNNInference(
     if (err != cudaSuccess) return -1;
 
     return h_action;
+}
+
+/**
+ * Fused NN inference: reads stats directly from device pointer.
+ * Single D→H copy of NNInferenceOutput (16B), optional top_actions.
+ */
+int runNNFusedInference(
+    const AutoStatsGPU* d_stats,
+    size_t data_size,
+    double error_bound,
+    cudaStream_t stream,
+    int* out_action,
+    float* out_ratio,
+    float* out_comp_time,
+    int* out_is_ood,
+    int* out_top_actions
+) {
+    if (!g_nn_loaded || d_nn_weights == nullptr || d_stats == nullptr) {
+        return -1;
+    }
+
+    // Ensure fused buffers exist
+    if (d_fused_infer_output == nullptr) {
+        allocFusedInferenceBuffers();
+        if (d_fused_infer_output == nullptr) return -1;
+    }
+
+    nnFusedInferenceKernel<<<1, NN_NUM_CONFIGS, 0, stream>>>(
+        d_nn_weights,
+        d_stats,
+        data_size, error_bound,
+        static_cast<int>(g_rank_criterion),
+        d_fused_infer_output,
+        out_top_actions ? d_fused_top_actions : nullptr
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return -1;
+
+    // Single D→H of NNInferenceOutput (16B)
+    NNInferenceOutput h_result;
+    err = cudaMemcpyAsync(&h_result, d_fused_infer_output, sizeof(NNInferenceOutput),
+                           cudaMemcpyDeviceToHost, stream);
+    if (err != cudaSuccess) return -1;
+
+    if (out_top_actions) {
+        err = cudaMemcpyAsync(out_top_actions, d_fused_top_actions,
+                               NN_NUM_CONFIGS * sizeof(int),
+                               cudaMemcpyDeviceToHost, stream);
+        if (err != cudaSuccess) return -1;
+    }
+
+    err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) return -1;
+
+    if (out_action) *out_action = h_result.action;
+    if (out_ratio) *out_ratio = h_result.predicted_ratio;
+    if (out_comp_time) *out_comp_time = h_result.predicted_comp_time;
+    if (out_is_ood) *out_is_ood = h_result.is_ood;
+
+    return h_result.action;
+}
+
+/**
+ * GPU-native SGD: forward/backward + weight update entirely on GPU.
+ * Copies only samples H→D (60B) and SGDOutput D→H (12B).
+ */
+int runNNSGD(
+    const AutoStatsGPU* d_stats,
+    const SGDSample* samples,
+    int num_samples,
+    size_t data_size,
+    double error_bound,
+    float learning_rate,
+    cudaStream_t stream,
+    float* out_grad_norm,
+    int* out_clipped,
+    int* out_count
+) {
+    if (!g_nn_loaded || d_nn_weights == nullptr || d_stats == nullptr) return -1;
+    if (samples == nullptr || num_samples <= 0) return -1;
+    if (num_samples > NN_MAX_SGD_SAMPLES) num_samples = NN_MAX_SGD_SAMPLES;
+
+    // Ensure SGD buffers exist
+    if (d_sgd_grad_buffer == nullptr) {
+        allocSGDBuffers();
+        if (d_sgd_grad_buffer == nullptr) return -1;
+    }
+
+    // H→D: copy samples (tiny: num_samples * 20B)
+    cudaError_t err = cudaMemcpyAsync(d_sgd_samples, samples,
+                                       num_samples * sizeof(SGDSample),
+                                       cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess) return -1;
+
+    // Launch SGD kernel
+    nnSGDKernel<<<1, NN_HIDDEN_DIM, 0, stream>>>(
+        d_nn_weights,
+        d_stats,
+        d_sgd_samples,
+        num_samples,
+        data_size, error_bound,
+        learning_rate,
+        d_sgd_grad_buffer,
+        d_sgd_output
+    );
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return -1;
+
+    // D→H: copy SGDOutput (12B)
+    SGDOutput h_result;
+    err = cudaMemcpyAsync(&h_result, d_sgd_output, sizeof(SGDOutput),
+                           cudaMemcpyDeviceToHost, stream);
+    if (err != cudaSuccess) return -1;
+
+    err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) return -1;
+
+    if (out_grad_norm) *out_grad_norm = h_result.grad_norm;
+    if (out_clipped) *out_clipped = h_result.was_clipped;
+    if (out_count) *out_count = h_result.sample_count;
+
+    fprintf(stderr, "[SGD] GPU: %d samples, grad_norm=%.4f%s\n",
+            h_result.sample_count, h_result.grad_norm,
+            h_result.was_clipped ? " (clipped)" : "");
+
+    return 0;
 }
 
 } // namespace gpucompress

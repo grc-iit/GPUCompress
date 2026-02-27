@@ -17,35 +17,38 @@
 #include <cfloat>
 #include <cmath>
 
+#include "stats/auto_stats_gpu.h"
+
 namespace gpucompress {
 
 /* ============================================================
- * AutoStatsGPU struct (device-side intermediate buffer)
+ * Pre-allocated stats workspace (avoids per-call cudaMalloc/Free)
  * ============================================================ */
 
-struct __align__(8) AutoStatsGPU {
-    // Pass 1 outputs
-    double sum;              // sum of all elements (for mean)
-    double abs_diff_sum;     // sum of |x[i+1] - 2*x[i] + x[i-1]|
-    float  vmin;             // data min
-    float  vmax;             // data max
-    size_t num_elements;
+static void*          g_d_stats_workspace = nullptr;
+static AutoStatsGPU*  g_d_stats           = nullptr;
+static unsigned int*  g_d_stats_histogram = nullptr;
+static constexpr size_t kStatsWorkspaceSize =
+    sizeof(AutoStatsGPU) + 256 * sizeof(unsigned int);
 
-    // Pass 2 output
-    double mad_sum;          // sum of |x[i] - mean|
+static int ensureStatsWorkspace() {
+    if (g_d_stats_workspace != nullptr) return 0;
+    cudaError_t err = cudaMalloc(&g_d_stats_workspace, kStatsWorkspaceSize);
+    if (err != cudaSuccess) return -1;
+    g_d_stats = static_cast<AutoStatsGPU*>(g_d_stats_workspace);
+    g_d_stats_histogram = reinterpret_cast<unsigned int*>(
+        static_cast<uint8_t*>(g_d_stats_workspace) + sizeof(AutoStatsGPU));
+    return 0;
+}
 
-    // Entropy pipeline output
-    double entropy;
-
-    // Finalize outputs (contiguous for single D->H copy)
-    double mad_normalized;
-    double deriv_normalized;
-    int    state;
-    int    action;
-
-    // Error level (input, set from host)
-    int    error_level;
-};
+void freeStatsWorkspace() {
+    if (g_d_stats_workspace) {
+        cudaFree(g_d_stats_workspace);
+        g_d_stats_workspace = nullptr;
+        g_d_stats = nullptr;
+        g_d_stats_histogram = nullptr;
+    }
+}
 
 /* ============================================================
  * Device helper: CAS-based atomicAdd for double
@@ -301,52 +304,30 @@ int runNNInference(
 );
 
 /* ============================================================
- * Internal helper: run stats kernels, copy results, free workspace
+ * No-sync stats path: runs all kernels, returns device pointer.
+ * No D→H copy, no sync. Used by fused stats→NN pipeline.
  * ============================================================ */
 
-/**
- * Shared stats-only kernel sequence used by runStatsOnlyPipeline and
- * runAutoStatsNNPipeline. Allocates workspace, runs all stats kernels
- * with finalizeStatsOnlyKernel, copies entropy/mad/deriv back to host,
- * synchronizes, and frees workspace.
- *
- * Returns 0 on success, -1 on error.
- */
-static int runStatsKernels(
+AutoStatsGPU* runStatsKernelsNoSync(
     const void* d_input,
     size_t input_size,
-    cudaStream_t stream,
-    double* out_entropy,
-    double* out_mad,
-    double* out_deriv
+    cudaStream_t stream
 ) {
     size_t num_elements = input_size / sizeof(float);
     if (num_elements == 0 || d_input == nullptr) {
-        return -1;
+        return nullptr;
     }
 
-    cudaError_t err;
+    if (ensureStatsWorkspace() != 0) return nullptr;
 
-    // Allocate workspace: AutoStatsGPU + 256-uint histogram
-    size_t workspace_size = sizeof(AutoStatsGPU) + 256 * sizeof(unsigned int);
-    void* d_workspace = nullptr;
-    err = cudaMalloc(&d_workspace, workspace_size);
-    if (err != cudaSuccess) {
-        return -1;
-    }
-
-    AutoStatsGPU* d_stats = static_cast<AutoStatsGPU*>(d_workspace);
-    unsigned int* d_histogram = reinterpret_cast<unsigned int*>(
-        static_cast<uint8_t*>(d_workspace) + sizeof(AutoStatsGPU));
+    AutoStatsGPU* d_stats = g_d_stats;
+    unsigned int* d_histogram = g_d_stats_histogram;
 
     // Initialize workspace to zero
-    err = cudaMemsetAsync(d_workspace, 0, workspace_size, stream);
-    if (err != cudaSuccess) {
-        cudaFree(d_workspace);
-        return -1;
-    }
+    cudaError_t err = cudaMemsetAsync(g_d_stats_workspace, 0, kStatsWorkspaceSize, stream);
+    if (err != cudaSuccess) return nullptr;
 
-    // Initialize AutoStatsGPU fields
+    // CRITICAL: h_init sets vmin=FLT_MAX, vmax=-FLT_MAX
     AutoStatsGPU h_init;
     memset(&h_init, 0, sizeof(h_init));
     h_init.vmin = FLT_MAX;
@@ -356,28 +337,47 @@ static int runStatsKernels(
 
     err = cudaMemcpyAsync(d_stats, &h_init, sizeof(AutoStatsGPU),
                           cudaMemcpyHostToDevice, stream);
-    if (err != cudaSuccess) {
-        cudaFree(d_workspace);
-        return -1;
-    }
+    if (err != cudaSuccess) return nullptr;
 
-    // Kernel 1: statsPass1 - sum, min, max, derivative_sum
     int num_blocks = static_cast<int>((num_elements + STATS_BLOCK_SIZE - 1) / STATS_BLOCK_SIZE);
     if (num_blocks > STATS_MAX_BLOCKS) num_blocks = STATS_MAX_BLOCKS;
 
     statsPass1Kernel<<<num_blocks, STATS_BLOCK_SIZE, 0, stream>>>(
         static_cast<const float*>(d_input), num_elements, d_stats);
 
-    // Kernels 2/3: Entropy pipeline
     launchEntropyKernelsAsync(d_input, input_size, d_histogram,
                               &d_stats->entropy, stream);
 
-    // Kernel 4: madPass2 - sum(|x - mean|)
     madPass2Kernel<<<num_blocks, STATS_BLOCK_SIZE, 0, stream>>>(
         static_cast<const float*>(d_input), num_elements, d_stats);
 
-    // Kernel 5: finalize stats only (no Q-Table or NN)
     finalizeStatsOnlyKernel<<<1, 1, 0, stream>>>(d_stats);
+
+    return d_stats;
+}
+
+/**
+ * Return device pointer to pre-allocated stats buffer.
+ */
+AutoStatsGPU* getStatsDevicePtr() {
+    return g_d_stats;
+}
+
+/* ============================================================
+ * Internal helper: run stats kernels with D→H copy + sync.
+ * Calls runStatsKernelsNoSync() then copies results to host.
+ * ============================================================ */
+
+static int runStatsKernels(
+    const void* d_input,
+    size_t input_size,
+    cudaStream_t stream,
+    double* out_entropy,
+    double* out_mad,
+    double* out_deriv
+) {
+    AutoStatsGPU* d_stats = runStatsKernelsNoSync(d_input, input_size, stream);
+    if (d_stats == nullptr) return -1;
 
     // Copy results back to host
     struct StatsResultBlock {
@@ -387,28 +387,17 @@ static int runStatsKernels(
     };
     StatsResultBlock h_result;
 
-    err = cudaMemcpyAsync(&h_result.entropy, &d_stats->entropy, sizeof(double),
+    cudaError_t err = cudaMemcpyAsync(&h_result.entropy, &d_stats->entropy, sizeof(double),
                           cudaMemcpyDeviceToHost, stream);
-    if (err != cudaSuccess) {
-        cudaFree(d_workspace);
-        return -1;
-    }
+    if (err != cudaSuccess) return -1;
 
     err = cudaMemcpyAsync(&h_result.mad_normalized, &d_stats->mad_normalized,
                           2 * sizeof(double),
                           cudaMemcpyDeviceToHost, stream);
-    if (err != cudaSuccess) {
-        cudaFree(d_workspace);
-        return -1;
-    }
+    if (err != cudaSuccess) return -1;
 
     err = cudaStreamSynchronize(stream);
-    if (err != cudaSuccess) {
-        cudaFree(d_workspace);
-        return -1;
-    }
-
-    cudaFree(d_workspace);
+    if (err != cudaSuccess) return -1;
 
     *out_entropy = h_result.entropy;
     *out_mad = h_result.mad_normalized;
@@ -485,3 +474,8 @@ int runStatsOnlyPipeline(
 }
 
 } // namespace gpucompress
+
+// C-linkage cleanup callable from gpucompress_cleanup()
+extern "C" void gpucompress_free_stats_workspace(void) {
+    gpucompress::freeStatsWorkspace();
+}

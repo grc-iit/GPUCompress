@@ -22,7 +22,6 @@
 #include "compression/compression_header.h"
 #include "preprocessing/byte_shuffle.cuh"
 #include "preprocessing/quantization.cuh"
-#include "nn/experience_buffer.h"
 #include "stats/stats_cpu.h"
 
 #include "nvcomp.hpp"
@@ -44,6 +43,9 @@ extern "C" {
     void gpucompress_nn_cleanup_impl(void);
     void gpucompress_nn_set_criterion_impl(int criterion);
     void* gpucompress_nn_get_device_ptr_impl(void);
+
+    // From stats_kernel.cu
+    void gpucompress_free_stats_workspace(void);
 
     // From nn_reinforce.cpp
     int nn_reinforce_init(const void* d_weights);
@@ -84,9 +86,7 @@ const char* VERSION_STRING = "1.0.0";
 /** Online learning state */
 bool g_online_learning_enabled = false;   // master switch
 bool g_exploration_enabled = false;       // OFF by default
-bool g_experience_logging_enabled = false; // OFF by default
 double g_exploration_threshold = 0.20;    // 20% MAPE
-char g_experience_path[512] = "";
 
 /** Last NN action and exploration state (for query after compress) */
 int g_last_nn_action = -1;
@@ -99,10 +99,13 @@ int g_last_sgd_fired = 0;
 gpucompress_chunk_diag_t g_chunk_history[MAX_CHUNK_HISTORY];
 int g_chunk_history_count = 0;
 
+/** Pre-allocated CUDA timing events (reused across all timing sites) */
+cudaEvent_t g_t_start = nullptr;
+cudaEvent_t g_t_stop  = nullptr;
+
 /** Online reinforcement (SGD) state */
 float g_reinforce_lr = 0.01f;
 float g_reinforce_mape_threshold = 0.20f;
-bool g_reinforce_initialized = false;
 
 /** Algorithm names */
 const char* ALGORITHM_NAMES[] = {
@@ -162,6 +165,10 @@ extern "C" gpucompress_error_t gpucompress_init(const char* weights_path) {
         return GPUCOMPRESS_ERROR_CUDA_FAILED;
     }
 
+    // Pre-allocate timing events
+    cudaEventCreate(&g_t_start);
+    cudaEventCreate(&g_t_stop);
+
     // Load NN weights if path provided
     if (weights_path != nullptr && weights_path[0] != '\0') {
         if (gpucompress_nn_load_impl(weights_path) != 0) {
@@ -184,12 +191,12 @@ extern "C" void gpucompress_cleanup(void) {
     if (old_ref <= 1) {
         // Last reference, cleanup
         nn_reinforce_cleanup();
-        g_reinforce_initialized = false;
-        experience_buffer_cleanup();
         g_online_learning_enabled = false;
         g_exploration_enabled = false;
-        g_experience_logging_enabled = false;
         gpucompress_nn_cleanup_impl();
+        gpucompress_free_stats_workspace();
+        if (g_t_start) { cudaEventDestroy(g_t_start); g_t_start = nullptr; }
+        if (g_t_stop)  { cudaEventDestroy(g_t_stop);  g_t_stop  = nullptr; }
         if (g_default_stream != nullptr) {
             cudaStreamDestroy(g_default_stream);
             g_default_stream = nullptr;
@@ -211,35 +218,6 @@ extern "C" gpucompress_config_t gpucompress_default_config(void) {
     config.cuda_device = -1;
     config.cuda_stream = nullptr;
     return config;
-}
-
-/* ============================================================
- * Reinforcement helper
- * ============================================================ */
-
-static void build_input_features(float out[15], int action,
-                                  double error_bound, size_t data_size,
-                                  double entropy, double mad, double second_deriv) {
-    int algo_idx = action % 8;
-    int quant_flag = (action / 8) % 2;
-    int shuffle_flag = (action / 16) % 2;
-
-    for (int f = 0; f < 8; f++)
-        out[f] = (f == algo_idx) ? 1.0f : 0.0f;
-    out[8] = static_cast<float>(quant_flag);
-    out[9] = static_cast<float>(shuffle_flag);
-
-    double eb_c = error_bound;
-    if (eb_c < 1e-7) eb_c = 1e-7;
-    out[10] = static_cast<float>(log10(eb_c));
-
-    double ds = static_cast<double>(data_size);
-    if (ds < 1.0) ds = 1.0;
-    out[11] = static_cast<float>(log2(ds));
-
-    out[12] = static_cast<float>(entropy);
-    out[13] = static_cast<float>(mad);
-    out[14] = static_cast<float>(second_deriv);
 }
 
 /* ============================================================
@@ -309,6 +287,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
     float predicted_comp_time = 0.0f;
     int top_actions[32] = {0};
     bool is_ood = false;
+    AutoStatsGPU* d_stats_ptr = nullptr;
 
     if (cfg.algorithm == GPUCOMPRESS_ALGO_AUTO) {
         size_t num_elements = input_size / sizeof(float);
@@ -316,23 +295,36 @@ extern "C" gpucompress_error_t gpucompress_compress(
         int rc = -1;
 
         if (num_elements > 0 && gpucompress_nn_is_loaded_impl()) {
-            // GPU stats from device pointer (data already copied to d_input)
-            cudaStreamSynchronize(stream);
-            int stats_rc = gpucompress::runStatsOnlyPipeline(
-                d_input, input_size, stream,
-                &entropy, &mad, &second_derivative);
+            // Fused stats→NN: run stats kernels (no D→H, no sync)
+            d_stats_ptr = gpucompress::runStatsKernelsNoSync(d_input, input_size, stream);
 
-            if (stats_rc == 0) {
-                // NN inference using GPU-computed stats
+            if (d_stats_ptr) {
                 float* p_ratio = (stats != nullptr || g_online_learning_enabled) ? &predicted_ratio : nullptr;
                 float* p_comp_time = p_ratio ? &predicted_comp_time : nullptr;
                 int* p_top = g_online_learning_enabled ? top_actions : nullptr;
+                int fused_ood = 0;
 
-                action = gpucompress::runNNInference(
-                    entropy, mad, second_derivative,
-                    input_size, cfg.error_bound, stream,
-                    p_ratio, p_comp_time, p_top);
+                action = gpucompress::runNNFusedInference(
+                    d_stats_ptr, input_size, cfg.error_bound, stream,
+                    &action, p_ratio, p_comp_time,
+                    g_online_learning_enabled ? &fused_ood : nullptr, p_top);
                 rc = (action >= 0) ? 0 : -1;
+
+                if (rc == 0) {
+                    is_ood = (fused_ood != 0);
+                }
+            }
+
+            // Conditional stats D→H only when user wants stats output or online learning needs them
+            if (d_stats_ptr && (stats != nullptr || g_online_learning_enabled)) {
+                cudaMemcpyAsync(&entropy, &d_stats_ptr->entropy, sizeof(double),
+                                cudaMemcpyDeviceToHost, stream);
+                // mad_normalized and deriv_normalized are contiguous
+                cudaMemcpyAsync(&mad, &d_stats_ptr->mad_normalized, sizeof(double),
+                                cudaMemcpyDeviceToHost, stream);
+                cudaMemcpyAsync(&second_derivative, &d_stats_ptr->deriv_normalized, sizeof(double),
+                                cudaMemcpyDeviceToHost, stream);
+                cudaStreamSynchronize(stream);
             }
 
             if (rc == 0) {
@@ -340,13 +332,6 @@ extern "C" gpucompress_error_t gpucompress_compress(
                 nn_action = action;
                 nn_original_action = action;
                 g_last_nn_action = action;
-
-                // Check OOD
-                if (g_online_learning_enabled) {
-                    is_ood = gpucompress::isInputOOD(
-                        entropy, mad, second_derivative,
-                        input_size, cfg.error_bound);
-                }
             }
         }
 
@@ -458,16 +443,13 @@ extern "C" gpucompress_error_t gpucompress_compress(
     uint8_t* d_compressed = d_output + header_size;
 
     // Compress (with timing for reinforcement)
-    cudaEvent_t t_start, t_stop;
     float primary_comp_time_ms = 0.0f;
-    bool timing_ok = (cudaEventCreate(&t_start) == cudaSuccess &&
-                      cudaEventCreate(&t_stop) == cudaSuccess);
-    if (timing_ok) cudaEventRecord(t_start, stream);
+    bool timing_ok = (g_t_start != nullptr && g_t_stop != nullptr);
+    if (timing_ok) cudaEventRecord(g_t_start, stream);
 
     try {
         compressor->compress(d_compress_input, d_compressed, comp_config);
     } catch (...) {
-        if (timing_ok) { cudaEventDestroy(t_start); cudaEventDestroy(t_stop); }
         cudaFree(d_output);
         if (d_quantized) cudaFree(d_quantized);
         if (d_shuffled) cudaFree(d_shuffled);
@@ -476,11 +458,9 @@ extern "C" gpucompress_error_t gpucompress_compress(
     }
 
     if (timing_ok) {
-        cudaEventRecord(t_stop, stream);
-        cudaEventSynchronize(t_stop);
-        cudaEventElapsedTime(&primary_comp_time_ms, t_start, t_stop);
-        cudaEventDestroy(t_start);
-        cudaEventDestroy(t_stop);
+        cudaEventRecord(g_t_stop, stream);
+        cudaEventSynchronize(g_t_stop);
+        cudaEventElapsedTime(&primary_comp_time_ms, g_t_start, g_t_stop);
     }
 
     // Get compressed size
@@ -523,11 +503,13 @@ extern "C" gpucompress_error_t gpucompress_compress(
         header.data_max = 0.0;
     }
 
-    // Write header to GPU output
-    writeHeaderToDevice(d_output, header, stream);
+    // Write header directly to host output (no GPU round-trip for 64 bytes)
+    memcpy(output, &header, sizeof(CompressionHeader));
 
-    // Copy output to host
-    cuda_err = cudaMemcpyAsync(output, d_output, total_size, cudaMemcpyDeviceToHost, stream);
+    // Copy only compressed payload from GPU to host (skip header region)
+    uint8_t* host_payload = static_cast<uint8_t*>(output) + header_size;
+    cuda_err = cudaMemcpyAsync(host_payload, d_compressed, compressed_size,
+                               cudaMemcpyDeviceToHost, stream);
     if (cuda_err != cudaSuccess) {
         cudaFree(d_output);
         if (d_quantized) cudaFree(d_quantized);
@@ -556,22 +538,6 @@ extern "C" gpucompress_error_t gpucompress_compress(
         g_online_learning_enabled) {
         double actual_ratio = static_cast<double>(input_size) /
                               static_cast<double>(compressed_size);
-
-        // Level 1: Store passive sample (no decompress for primary — too expensive)
-        ExperienceSample sample;
-        sample.entropy = entropy;
-        sample.mad = mad;
-        sample.second_derivative = second_derivative;
-        sample.data_size = input_size;
-        sample.error_bound = cfg.error_bound;
-        sample.action = nn_action;
-        sample.actual_ratio = actual_ratio;
-        sample.actual_comp_time_ms = static_cast<double>(primary_comp_time_ms);
-        sample.actual_decomp_time_ms = 0.0;
-        sample.actual_psnr = 0.0;
-        if (g_experience_logging_enabled) {
-            experience_buffer_append(&sample);
-        }
 
         // Check prediction error (ratio MAPE only — time prediction is too noisy)
         double pred_ratio_d = static_cast<double>(predicted_ratio);
@@ -680,28 +646,20 @@ extern "C" gpucompress_error_t gpucompress_compress(
 
                 if (alt_comp) {
                     uint8_t* d_alt_out = nullptr;
-                    cudaEvent_t at0 = nullptr, at1 = nullptr;
-                    bool events_created = false;
                     try {
                         CompressionConfig alt_cc =
                             alt_comp->configure_compression(alt_compress_size);
                         size_t alt_max = alt_cc.max_compressed_buffer_size;
                         if (cudaMalloc(&d_alt_out, alt_max) == cudaSuccess) {
                             float alt_ct_ms = 0.0f;
-                            bool at_ok = (cudaEventCreate(&at0) == cudaSuccess &&
-                                          cudaEventCreate(&at1) == cudaSuccess);
-                            events_created = at_ok;
-                            if (at_ok) cudaEventRecord(at0, stream);
+                            if (timing_ok) cudaEventRecord(g_t_start, stream);
 
                             alt_comp->compress(d_alt_input, d_alt_out, alt_cc);
 
-                            if (at_ok) {
-                                cudaEventRecord(at1, stream);
-                                cudaEventSynchronize(at1);
-                                cudaEventElapsedTime(&alt_ct_ms, at0, at1);
-                                cudaEventDestroy(at0);
-                                cudaEventDestroy(at1);
-                                events_created = false;
+                            if (timing_ok) {
+                                cudaEventRecord(g_t_stop, stream);
+                                cudaEventSynchronize(g_t_stop);
+                                cudaEventElapsedTime(&alt_ct_ms, g_t_start, g_t_stop);
                             }
 
                             alt_comp_size = alt_comp->get_compressed_output_size(d_alt_out);
@@ -747,16 +705,12 @@ extern "C" gpucompress_error_t gpucompress_compress(
                                         size_t rt_decomp_size = rt_dc.decomp_data_size;
                                         uint8_t* d_rt_decompressed = nullptr;
                                         if (cudaMalloc(&d_rt_decompressed, rt_decomp_size) == cudaSuccess) {
-                                            cudaEvent_t dt0 = nullptr, dt1 = nullptr;
-                                            bool dt_ok = (cudaEventCreate(&dt0) == cudaSuccess &&
-                                                          cudaEventCreate(&dt1) == cudaSuccess);
-                                            if (dt_ok) cudaEventRecord(dt0, stream);
+                                            if (timing_ok) cudaEventRecord(g_t_start, stream);
 
                                             try {
                                                 rt_decomp->decompress(d_rt_decompressed, d_alt_out, rt_dc);
                                             } catch (...) {
                                                 // Decompress failed, leave decomp_time and psnr at 0
-                                                if (dt_ok) { cudaEventDestroy(dt0); cudaEventDestroy(dt1); }
                                                 cudaFree(d_rt_decompressed);
                                                 cudaFree(d_rt_buf);
                                                 goto skip_roundtrip;
@@ -791,14 +745,12 @@ extern "C" gpucompress_error_t gpucompress_compress(
                                                 if (d_rt_dequant) d_rt_result = static_cast<uint8_t*>(d_rt_dequant);
                                             }
 
-                                            if (dt_ok) {
-                                                cudaEventRecord(dt1, stream);
-                                                cudaEventSynchronize(dt1);
+                                            if (timing_ok) {
+                                                cudaEventRecord(g_t_stop, stream);
+                                                cudaEventSynchronize(g_t_stop);
                                                 float dt_ms = 0.0f;
-                                                cudaEventElapsedTime(&dt_ms, dt0, dt1);
+                                                cudaEventElapsedTime(&dt_ms, g_t_start, g_t_stop);
                                                 alt_decomp_ms = static_cast<double>(dt_ms);
-                                                cudaEventDestroy(dt0);
-                                                cudaEventDestroy(dt1);
                                             }
 
                                             // Compute PSNR (CPU-side for simplicity)
@@ -855,22 +807,6 @@ extern "C" gpucompress_error_t gpucompress_compress(
                                     alt_ratio, alt_ct_ms,
                                     (alt_ratio > best_ratio) ? " << NEW BEST" : "");
 
-                            // Store alternative experience
-                            ExperienceSample alt_sample;
-                            alt_sample.entropy = entropy;
-                            alt_sample.mad = mad;
-                            alt_sample.second_derivative = second_derivative;
-                            alt_sample.data_size = input_size;
-                            alt_sample.error_bound = cfg.error_bound;
-                            alt_sample.action = alt_action;
-                            alt_sample.actual_ratio = alt_ratio;
-                            alt_sample.actual_comp_time_ms = static_cast<double>(alt_ct_ms);
-                            alt_sample.actual_decomp_time_ms = alt_decomp_ms;
-                            alt_sample.actual_psnr = alt_psnr;
-                            if (g_experience_logging_enabled) {
-                                experience_buffer_append(&alt_sample);
-                            }
-
                             // Track if this is better than current best
                             if (alt_ratio > best_ratio) {
                                 best_ratio = alt_ratio;
@@ -922,10 +858,6 @@ extern "C" gpucompress_error_t gpucompress_compress(
                     } catch (...) {
                         // Compression failed for this config, skip it
                     }
-                    if (events_created) {
-                        if (at0) cudaEventDestroy(at0);
-                        if (at1) cudaEventDestroy(at1);
-                    }
                     if (d_alt_out) cudaFree(d_alt_out);
                 }
 
@@ -949,41 +881,31 @@ extern "C" gpucompress_error_t gpucompress_compress(
 
         }
 
-        // Online reinforcement: fire SGD only when ratio MAPE exceeds threshold.
-        if (error_pct > static_cast<double>(g_reinforce_mape_threshold)) {
-            void* d_weights = gpucompress_nn_get_device_ptr_impl();
-            if (d_weights) {
-                // Lazy-init: copy GPU weights to host on first trigger
-                if (!g_reinforce_initialized) {
-                    if (nn_reinforce_init(d_weights) == 0) {
-                        g_reinforce_initialized = true;
-                    }
-                }
+        // Online reinforcement: fire GPU SGD only when ratio MAPE exceeds threshold.
+        if (error_pct > static_cast<double>(g_reinforce_mape_threshold) && d_stats_ptr) {
+            // Sort explored samples by ratio (descending) and feed top 3 to GPU SGD.
+            std::sort(explored_samples.begin(), explored_samples.end(),
+                      [](const ExploredResult& a, const ExploredResult& b) {
+                          return a.ratio > b.ratio;
+                      });
+            size_t sgd_limit = std::min(explored_samples.size(), static_cast<size_t>(3));
 
-                if (g_reinforce_initialized) {
-                    // Sort explored samples by ratio (descending) and feed top 3 to SGD.
-                    // Feeding all 16 samples creates conflicting gradients that destabilize weights.
-                    std::sort(explored_samples.begin(), explored_samples.end(),
-                              [](const ExploredResult& a, const ExploredResult& b) {
-                                  return a.ratio > b.ratio;
-                              });
-                    size_t sgd_limit = std::min(explored_samples.size(), static_cast<size_t>(3));
-                    for (size_t ei = 0; ei < sgd_limit; ei++) {
-                        float input_raw[15];
-                        build_input_features(input_raw, explored_samples[ei].action,
-                                             cfg.error_bound, input_size,
-                                             entropy, mad, second_derivative);
-                        nn_reinforce_add_sample(input_raw,
-                                                explored_samples[ei].ratio,
-                                                explored_samples[ei].comp_time_ms,
-                                                explored_samples[ei].decomp_time_ms,
-                                                explored_samples[ei].psnr);
-                    }
+            SGDSample sgd_samples[NN_MAX_SGD_SAMPLES];
+            for (size_t ei = 0; ei < sgd_limit; ei++) {
+                sgd_samples[ei].action = explored_samples[ei].action;
+                sgd_samples[ei].actual_ratio = static_cast<float>(explored_samples[ei].ratio);
+                sgd_samples[ei].actual_comp_time = static_cast<float>(explored_samples[ei].comp_time_ms);
+                sgd_samples[ei].actual_decomp_time = static_cast<float>(explored_samples[ei].decomp_time_ms);
+                sgd_samples[ei].actual_psnr = static_cast<float>(explored_samples[ei].psnr);
+            }
 
-                    // Batched SGD over all samples
-                    nn_reinforce_apply(d_weights, g_reinforce_lr);
-                    sgd_fired = true;
-                }
+            float sgd_grad_norm = 0.0f;
+            int sgd_clipped = 0, sgd_count = 0;
+            if (gpucompress::runNNSGD(d_stats_ptr, sgd_samples,
+                    static_cast<int>(sgd_limit), input_size, cfg.error_bound,
+                    g_reinforce_lr, stream,
+                    &sgd_grad_norm, &sgd_clipped, &sgd_count) == 0) {
+                sgd_fired = true;
             }
         }
     }
@@ -1441,15 +1363,6 @@ extern "C" void gpucompress_enable_online_learning(void) {
 extern "C" void gpucompress_disable_online_learning(void) {
     g_online_learning_enabled = false;
     g_exploration_enabled = false;
-    if (g_experience_logging_enabled) {
-        g_experience_logging_enabled = false;
-        experience_buffer_cleanup();
-        g_experience_path[0] = '\0';
-    }
-    if (g_reinforce_initialized) {
-        nn_reinforce_cleanup();
-        g_reinforce_initialized = false;
-    }
 }
 
 extern "C" int gpucompress_online_learning_enabled(void) {
@@ -1460,23 +1373,13 @@ extern "C" void gpucompress_set_exploration(int enable) {
     g_exploration_enabled = (enable != 0);
 }
 
-extern "C" gpucompress_error_t gpucompress_enable_experience_logging(const char* csv_path) {
-    if (csv_path == nullptr || csv_path[0] == '\0') {
-        return GPUCOMPRESS_ERROR_INVALID_INPUT;
-    }
-    if (experience_buffer_init(csv_path) != 0) {
-        return GPUCOMPRESS_ERROR_INVALID_INPUT;
-    }
-    strncpy(g_experience_path, csv_path, sizeof(g_experience_path) - 1);
-    g_experience_path[sizeof(g_experience_path) - 1] = '\0';
-    g_experience_logging_enabled = true;
+extern "C" gpucompress_error_t gpucompress_enable_experience_logging(const char* /*csv_path*/) {
+    // Stubbed out — experience logging removed in F9
     return GPUCOMPRESS_SUCCESS;
 }
 
 extern "C" void gpucompress_disable_experience_logging(void) {
-    g_experience_logging_enabled = false;
-    experience_buffer_cleanup();
-    g_experience_path[0] = '\0';
+    // Stubbed out — experience logging removed in F9
 }
 
 /* ============================================================
@@ -1484,11 +1387,11 @@ extern "C" void gpucompress_disable_experience_logging(void) {
  * ============================================================ */
 
 extern "C" gpucompress_error_t gpucompress_enable_active_learning(
-    const char* experience_path
+    const char* /*experience_path*/
 ) {
     gpucompress_enable_online_learning();
     g_exploration_enabled = true;
-    return gpucompress_enable_experience_logging(experience_path);
+    return GPUCOMPRESS_SUCCESS;
 }
 
 extern "C" void gpucompress_disable_active_learning(void) {
@@ -1519,7 +1422,7 @@ extern "C" void gpucompress_reinforce_last_stats(float* grad_norm,
 }
 
 extern "C" size_t gpucompress_experience_count(void) {
-    return experience_buffer_count();
+    return 0;  // Stubbed out — experience logging removed in F9
 }
 
 extern "C" gpucompress_error_t gpucompress_reload_nn(const char* filepath) {
@@ -1528,12 +1431,6 @@ extern "C" gpucompress_error_t gpucompress_reload_nn(const char* filepath) {
     }
 
     std::lock_guard<std::mutex> lock(g_init_mutex);
-
-    // Clean up reinforcement state (weights are about to change)
-    if (g_reinforce_initialized) {
-        nn_reinforce_cleanup();
-        g_reinforce_initialized = false;
-    }
 
     // Clean up old weights
     gpucompress_nn_cleanup_impl();

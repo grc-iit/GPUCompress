@@ -20,6 +20,21 @@
 #define WARP_SIZE 32
 #define BLOCK_SIZE 256
 
+// Pre-allocated GPU scalars for min/max reduction (avoids per-call malloc/free).
+// 8 bytes each — large enough for both float and double paths.
+static void* d_range_min = nullptr;
+static void* d_range_max = nullptr;
+
+static int ensure_range_bufs() {
+    if (d_range_min == nullptr) {
+        if (cudaMalloc(&d_range_min, sizeof(double)) != cudaSuccess) return -1;
+    }
+    if (d_range_max == nullptr) {
+        if (cudaMalloc(&d_range_max, sizeof(double)) != cudaSuccess) return -1;
+    }
+    return 0;
+}
+
 // ============================================================================
 // Min/Max Reduction Kernels for Data Range Computation
 // ============================================================================
@@ -303,20 +318,15 @@ static int compute_data_range(
     double& data_max,
     cudaStream_t stream
 ) {
+    if (ensure_range_bufs() != 0) return -1;
+
     int num_blocks = min((int)((num_elements + BLOCK_SIZE - 1) / BLOCK_SIZE), 1024);
 
     if (element_size == 4) {
-        // Float
-        float* d_min = nullptr;
-        float* d_max = nullptr;
-        if (cudaMalloc(&d_min, sizeof(float)) != cudaSuccess ||
-            cudaMalloc(&d_max, sizeof(float)) != cudaSuccess) {
-            cudaFree(d_min);
-            cudaFree(d_max);
-            return -1;
-        }
+        // Float — reuse pre-allocated buffers
+        float* d_min = static_cast<float*>(d_range_min);
+        float* d_max = static_cast<float*>(d_range_max);
 
-        // Init min to largest value, max to smallest value
         float init_min = FLT_MAX;
         float init_max = -FLT_MAX;
         cudaMemcpyAsync(d_min, &init_min, sizeof(float), cudaMemcpyHostToDevice, stream);
@@ -332,19 +342,10 @@ static int compute_data_range(
 
         data_min = h_min;
         data_max = h_max;
-
-        cudaFree(d_min);
-        cudaFree(d_max);
     } else {
-        // Double
-        double* d_min_d = nullptr;
-        double* d_max_d = nullptr;
-        if (cudaMalloc(&d_min_d, sizeof(double)) != cudaSuccess ||
-            cudaMalloc(&d_max_d, sizeof(double)) != cudaSuccess) {
-            cudaFree(d_min_d);
-            cudaFree(d_max_d);
-            return -1;
-        }
+        // Double — reuse pre-allocated buffers
+        double* d_min_d = static_cast<double*>(d_range_min);
+        double* d_max_d = static_cast<double*>(d_range_max);
 
         double init_min = DBL_MAX;
         double init_max = -DBL_MAX;
@@ -357,9 +358,6 @@ static int compute_data_range(
         cudaMemcpyAsync(&data_min, d_min_d, sizeof(double), cudaMemcpyDeviceToHost, stream);
         cudaMemcpyAsync(&data_max, d_max_d, sizeof(double), cudaMemcpyDeviceToHost, stream);
         cudaStreamSynchronize(stream);
-
-        cudaFree(d_min_d);
-        cudaFree(d_max_d);
     }
     return 0;
 }
@@ -553,7 +551,7 @@ QuantizationResult quantize_simple(
         }
     }
 
-    cudaStreamSynchronize(stream);
+    // No sync needed — quantize kernel is on same stream as subsequent compression
 
     // Fill result
     result.d_quantized = d_output;
