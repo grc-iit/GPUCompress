@@ -503,25 +503,6 @@ if(HDF5_FOUND)
             CUDA_SEPARABLE_COMPILATION ON
         )
 
-        # 8MB end-to-end VOL demo
-        add_executable(demo_vol_8mb tests/demo_vol_8mb.cu)
-        set_source_files_properties(tests/demo_vol_8mb.cu PROPERTIES LANGUAGE CUDA)
-        target_include_directories(demo_vol_8mb PRIVATE
-            ${HDF5_VOL_INCLUDE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/include
-            ${CMAKE_CURRENT_SOURCE_DIR}/src
-        )
-        target_link_libraries(demo_vol_8mb PRIVATE
-            gpucompress
-            H5VLgpucompress
-            ${HDF5_VOL_LIB}
-            CUDA::cudart
-            m
-        )
-        set_target_properties(demo_vol_8mb PROPERTIES
-            CUDA_SEPARABLE_COMPILATION ON
-        )
-
         # GPU pipeline demo: full write→inspect→read→verify walkthrough
         add_executable(demo_gpu_pipeline examples/demo_gpu_pipeline.cu)
         set_source_files_properties(examples/demo_gpu_pipeline.cu PROPERTIES LANGUAGE CUDA)
@@ -535,18 +516,6 @@ if(HDF5_FOUND)
         )
         set_target_properties(demo_gpu_pipeline PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
-        # GPU-native HDF5 write example
-        add_executable(gpu_hdf5_write examples/gpu_hdf5_write.cu)
-        set_source_files_properties(examples/gpu_hdf5_write.cu PROPERTIES LANGUAGE CUDA)
-        target_include_directories(gpu_hdf5_write PRIVATE
-            ${HDF5_VOL_INCLUDE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/include
-        )
-        target_link_libraries(gpu_hdf5_write PRIVATE
-            gpucompress H5VLgpucompress ${HDF5_VOL_LIB} CUDA::cudart m
-        )
-        set_target_properties(gpu_hdf5_write PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-
         # VOL 8MB round-trip test (mirrors test_h5z_8mb but uses GPU device pointers)
         add_executable(test_vol_8mb tests/test_vol_8mb.cu)
         set_source_files_properties(tests/test_vol_8mb.cu PROPERTIES LANGUAGE CUDA)
@@ -559,6 +528,32 @@ if(HDF5_FOUND)
             gpucompress H5VLgpucompress H5Zgpucompress ${HDF5_VOL_LIB} CUDA::cudart m
         )
         set_target_properties(test_vol_8mb PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+        # NN VOL demo: 64 MB random data, ALGO_AUTO lossless, no online learning
+        add_executable(nn_vol_demo examples/nn_vol_demo.cu)
+        set_source_files_properties(examples/nn_vol_demo.cu PROPERTIES LANGUAGE CUDA)
+        target_include_directories(nn_vol_demo PRIVATE
+            ${HDF5_VOL_INCLUDE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+        target_link_libraries(nn_vol_demo PRIVATE
+            gpucompress H5VLgpucompress H5Zgpucompress ${HDF5_VOL_LIB} CUDA::cudart m
+        )
+        set_target_properties(nn_vol_demo PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+        # Chunking/header verification example
+        add_executable(hdf5_chunk_verify examples/hdf5_chunk_verify.cu)
+        set_source_files_properties(examples/hdf5_chunk_verify.cu PROPERTIES LANGUAGE CUDA)
+        target_include_directories(hdf5_chunk_verify PRIVATE
+            ${HDF5_VOL_INCLUDE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+        target_link_libraries(hdf5_chunk_verify PRIVATE
+            gpucompress H5VLgpucompress H5Zgpucompress ${HDF5_VOL_LIB} CUDA::cudart m
+        )
+        set_target_properties(hdf5_chunk_verify PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
         message(STATUS "HDF5 VOL connector: using ${HDF5_VOL_LIB}")
     else()

@@ -106,6 +106,17 @@ void H5VL_gpucompress_set_trace(int on);
 void H5VL_gpucompress_get_stats(int *writes, int *reads,
                                  int *comp,   int *decomp);
 
+/**
+ * Read VOL memory transfer counters (tracked across all cudaMemcpy calls
+ * issued by the VOL connector itself — does not include transfers inside
+ * gpucompress_compress_gpu / gpucompress_decompress_gpu).
+ * Any pointer may be NULL.
+ */
+void H5VL_gpucompress_get_transfer_stats(
+    int    *h2d_count, size_t *h2d_bytes,
+    int    *d2h_count, size_t *d2h_bytes,
+    int    *d2d_count, size_t *d2d_bytes);
+
 #ifdef __cplusplus
 }
 #endif

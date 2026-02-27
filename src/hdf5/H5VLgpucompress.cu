@@ -346,15 +346,38 @@ static const H5VL_class_t H5VL_gpucompress_g = {
  * Activity counters — queryable from tests / demos
  * ============================================================ */
 
-static int s_gpu_writes    = 0;  /* times gpu_aware_chunked_write was called */
-static int s_gpu_reads     = 0;  /* times gpu_aware_chunked_read was called  */
-static int s_chunks_comp   = 0;  /* chunks successfully compressed on GPU    */
-static int s_chunks_decomp = 0;  /* chunks successfully decompressed on GPU  */
+static int    s_gpu_writes    = 0;  /* times gpu_aware_chunked_write was called */
+static int    s_gpu_reads     = 0;  /* times gpu_aware_chunked_read was called  */
+static int    s_chunks_comp   = 0;  /* chunks successfully compressed on GPU    */
+static int    s_chunks_decomp = 0;  /* chunks successfully decompressed on GPU  */
+
+/* Transfer byte counters */
+static size_t s_h2d_bytes = 0;   /* total bytes copied host→device */
+static size_t s_d2h_bytes = 0;   /* total bytes copied device→host */
+static size_t s_d2d_bytes = 0;   /* total bytes copied device→device */
+static int    s_h2d_count = 0;   /* number of H→D cudaMemcpy calls  */
+static int    s_d2h_count = 0;   /* number of D→H cudaMemcpy calls  */
+static int    s_d2d_count = 0;   /* number of D→D cudaMemcpy calls  */
+
+/* Wrapper: track and execute cudaMemcpy */
+static inline cudaError_t vol_memcpy(void *dst, const void *src,
+                                      size_t bytes, cudaMemcpyKind kind)
+{
+    switch (kind) {
+        case cudaMemcpyHostToDevice:   s_h2d_bytes += bytes; s_h2d_count++; break;
+        case cudaMemcpyDeviceToHost:   s_d2h_bytes += bytes; s_d2h_count++; break;
+        case cudaMemcpyDeviceToDevice: s_d2d_bytes += bytes; s_d2d_count++; break;
+        default: break;
+    }
+    return cudaMemcpy(dst, src, bytes, kind);
+}
 
 extern "C" void
 H5VL_gpucompress_reset_stats(void)
 {
     s_gpu_writes = s_gpu_reads = s_chunks_comp = s_chunks_decomp = 0;
+    s_h2d_bytes = s_d2h_bytes = s_d2d_bytes = 0;
+    s_h2d_count = s_d2h_count = s_d2d_count = 0;
 }
 
 extern "C" void
@@ -364,6 +387,20 @@ H5VL_gpucompress_get_stats(int *writes, int *reads, int *comp, int *decomp)
     if (reads)  *reads  = s_gpu_reads;
     if (comp)   *comp   = s_chunks_comp;
     if (decomp) *decomp = s_chunks_decomp;
+}
+
+extern "C" void
+H5VL_gpucompress_get_transfer_stats(
+    int *h2d_count, size_t *h2d_bytes,
+    int *d2h_count, size_t *d2h_bytes,
+    int *d2d_count, size_t *d2d_bytes)
+{
+    if (h2d_count) *h2d_count = s_h2d_count;
+    if (h2d_bytes) *h2d_bytes = s_h2d_bytes;
+    if (d2h_count) *d2h_count = s_d2h_count;
+    if (d2h_bytes) *d2h_bytes = s_d2h_bytes;
+    if (d2d_count) *d2d_count = s_d2d_count;
+    if (d2d_bytes) *d2d_bytes = s_d2d_bytes;
 }
 
 /* ============================================================
@@ -771,9 +808,9 @@ alloc_dim_arrays(int ndims, const hsize_t *src_dims,
     if (cudaMalloc(d_src_dims,    bytes) != cudaSuccess) return -1;
     if (cudaMalloc(d_chunk_dims,  bytes) != cudaSuccess) { cudaFree(*d_src_dims);   return -1; }
     if (cudaMalloc(d_chunk_start, bytes) != cudaSuccess) { cudaFree(*d_src_dims); cudaFree(*d_chunk_dims); return -1; }
-    cudaMemcpy(*d_src_dims,    src_dims,   bytes, cudaMemcpyHostToDevice);
-    cudaMemcpy(*d_chunk_dims,  chunk_dims, bytes, cudaMemcpyHostToDevice);
-    cudaMemcpy(*d_chunk_start, chunk_start, bytes, cudaMemcpyHostToDevice);
+    vol_memcpy(*d_src_dims,    src_dims,   bytes, cudaMemcpyHostToDevice);
+    vol_memcpy(*d_chunk_dims,  chunk_dims, bytes, cudaMemcpyHostToDevice);
+    vol_memcpy(*d_chunk_start, chunk_start, bytes, cudaMemcpyHostToDevice);
     return 0;
 }
 
@@ -1036,7 +1073,7 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                     /* D→H: only the compressed bytes */
                     VOL_TRACE("    cudaMemcpy D→H %zuB (compressed only, not %zuB raw)",
                               comp_size, actual_bytes);
-                    if (cudaMemcpy(h_compressed, d_compressed, comp_size,
+                    if (vol_memcpy(h_compressed, d_compressed, comp_size,
                                    cudaMemcpyDeviceToHost) != cudaSuccess) {
                         ret = -1; break;
                     }
@@ -1050,7 +1087,7 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                 } else {
                     /* Partial chunk at boundary: pad with zeros in d_chunk */
                     cudaMemset(d_chunk, 0, chunk_bytes);
-                    cudaMemcpy(d_chunk, src_ptr, actual_bytes,
+                    vol_memcpy(d_chunk, src_ptr, actual_bytes,
                                cudaMemcpyDeviceToDevice);
 
                     size_t comp_size = max_comp;
@@ -1062,7 +1099,7 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                               comp_size, (double)chunk_bytes / comp_size);
 
                     VOL_TRACE("    cudaMemcpy D→H %zuB", comp_size);
-                    if (cudaMemcpy(h_compressed, d_compressed, comp_size,
+                    if (vol_memcpy(h_compressed, d_compressed, comp_size,
                                    cudaMemcpyDeviceToHost) != cudaSuccess) {
                         ret = -1; break;
                     }
@@ -1085,9 +1122,9 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                     }
                 } else {
                     /* Update chunk_start and actual_chunk on device */
-                    cudaMemcpy(d_chunk_dims,  actual_chunk, (size_t)ndims * sizeof(hsize_t),
+                    vol_memcpy(d_chunk_dims,  actual_chunk, (size_t)ndims * sizeof(hsize_t),
                                cudaMemcpyHostToDevice);
-                    cudaMemcpy(d_chunk_start, chunk_start,  (size_t)ndims * sizeof(hsize_t),
+                    vol_memcpy(d_chunk_start, chunk_start,  (size_t)ndims * sizeof(hsize_t),
                                cudaMemcpyHostToDevice);
                 }
 
@@ -1111,7 +1148,7 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                           comp_size, (double)actual_bytes / comp_size);
 
                 VOL_TRACE("    cudaMemcpy D→H %zuB", comp_size);
-                if (cudaMemcpy(h_compressed, d_compressed, comp_size,
+                if (vol_memcpy(h_compressed, d_compressed, comp_size,
                                cudaMemcpyDeviceToHost) != cudaSuccess) {
                     ret = -1; break;
                 }
@@ -1272,7 +1309,7 @@ gpu_aware_chunked_read(H5VL_gpucompress_t *o,
 
             /* H→D: compressed bytes */
             VOL_TRACE("    cudaMemcpy H→D %zuB (compressed)", comp_size);
-            if (cudaMemcpy(d_compressed, h_compressed, comp_size,
+            if (vol_memcpy(d_compressed, h_compressed, comp_size,
                            cudaMemcpyHostToDevice) != cudaSuccess) {
                 ret = -1; break;
             }
@@ -1293,7 +1330,7 @@ gpu_aware_chunked_read(H5VL_gpucompress_t *o,
                     off += (size_t)chunk_start[d] * s;
                     s   *= (size_t)dset_dims[d];
                 }
-                if (cudaMemcpy(static_cast<uint8_t*>(d_buf) + off,
+                if (vol_memcpy(static_cast<uint8_t*>(d_buf) + off,
                                d_decompressed, actual_bytes,
                                cudaMemcpyDeviceToDevice) != cudaSuccess) {
                     ret = -1; break;
@@ -1308,9 +1345,9 @@ gpu_aware_chunked_read(H5VL_gpucompress_t *o,
                         ret = -1; break;
                     }
                 } else {
-                    cudaMemcpy(d_chunk_dims,  actual_chunk, (size_t)ndims * sizeof(hsize_t),
+                    vol_memcpy(d_chunk_dims,  actual_chunk, (size_t)ndims * sizeof(hsize_t),
                                cudaMemcpyHostToDevice);
-                    cudaMemcpy(d_chunk_start, chunk_start,  (size_t)ndims * sizeof(hsize_t),
+                    vol_memcpy(d_chunk_start, chunk_start,  (size_t)ndims * sizeof(hsize_t),
                                cudaMemcpyHostToDevice);
                 }
 

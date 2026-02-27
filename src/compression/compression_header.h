@@ -133,11 +133,23 @@ struct CompressionHeader {
      * @param enabled Whether quantization is enabled
      */
     void setQuantizationFlags(uint32_t type, int precision, bool enabled) {
+        uint32_t algo = (quant_flags >> 9) & 0x0F;  /* preserve bits 9-12 */
         quant_flags = 0;
-        quant_flags |= (type & 0x0F);           // bits 0-3
+        quant_flags |= (type & 0x0F);                // bits 0-3
         uint32_t prec_code = (precision == 8 ? 1 : (precision == 16 ? 2 : 3));
-        quant_flags |= (prec_code << 4);        // bits 4-7
-        quant_flags |= (enabled ? (1 << 8) : 0); // bit 8
+        quant_flags |= (prec_code << 4);             // bits 4-7
+        quant_flags |= (enabled ? (1u << 8) : 0u);  // bit 8
+        quant_flags |= (algo << 9);                  // bits 9-12 (restored)
+    }
+
+    /** Store compression algorithm id (gpucompress_algorithm_t value) in bits 9-12. */
+    void setAlgorithmId(uint8_t algo_id) {
+        quant_flags = (quant_flags & ~(0x0Fu << 9)) | ((uint32_t)(algo_id & 0x0F) << 9);
+    }
+
+    /** Retrieve algorithm id stored in bits 9-12 (0 = unknown/not set). */
+    uint8_t getAlgorithmId() const {
+        return (uint8_t)((quant_flags >> 9) & 0x0F);
     }
 
     /**
