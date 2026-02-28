@@ -83,10 +83,10 @@ static int g_gpucompress_initialized = 0;
 /** Flag to track if filter is registered */
 static int g_filter_registered = 0;
 
-/** Per-chunk algorithm tracking (max 256 chunks) */
-#define MAX_TRACKED_CHUNKS 256
-static int g_chunk_algorithms[MAX_TRACKED_CHUNKS];
-static int g_chunk_count = 0;
+/** Per-chunk algorithm tracking (dynamic, unbounded) */
+static int* g_chunk_algorithms = NULL;
+static int  g_chunk_count    = 0;
+static int  g_chunk_capacity = 0;
 
 /** Verbose logging flag (set by GPUCOMPRESS_VERBOSE env var) */
 static int g_verbose = -1;  /* -1 = not checked yet */
@@ -322,8 +322,21 @@ static size_t H5Z_filter_gpucompress(
                    gpucompress_algorithm_name(stats.algorithm_used));
         }
 
-        /* Track algorithm for attribute writing */
-        if (g_chunk_count < MAX_TRACKED_CHUNKS) {
+        /* Track algorithm for attribute writing — grow array as needed */
+        if (g_chunk_count >= g_chunk_capacity) {
+            int new_cap = (g_chunk_capacity == 0) ? 256 : g_chunk_capacity * 2;
+            int* new_arr = (int*)realloc(g_chunk_algorithms,
+                                         (size_t)new_cap * sizeof(int));
+            if (new_arr == NULL) {
+                fprintf(stderr, "[H5Zgpucompress] WARNING: chunk tracker alloc failed"
+                        " at capacity %d — chunk %d not tracked\n",
+                        g_chunk_capacity, g_chunk_count);
+            } else {
+                g_chunk_algorithms = new_arr;
+                g_chunk_capacity   = new_cap;
+            }
+        }
+        if (g_chunk_count < g_chunk_capacity) {
             g_chunk_algorithms[g_chunk_count++] = (int)stats.algorithm_used;
         }
 
@@ -481,9 +494,11 @@ const void* H5Z_gpucompress_get_filter_info(void) {
 
 /**
  * Reset chunk algorithm tracking. Call before H5Dwrite.
+ * Keeps the allocated buffer for reuse.
  */
 void H5Z_gpucompress_reset_chunk_tracking(void) {
     g_chunk_count = 0;
+    /* g_chunk_algorithms and g_chunk_capacity kept for reuse */
 }
 
 /**
@@ -518,10 +533,14 @@ herr_t H5Z_gpucompress_write_chunk_attr(hid_t dset_id) {
     if (g_chunk_count <= 0)
         return -1;
 
-    /* Build comma-separated algorithm string with bounds checking */
-    char attr_buf[4096];
+    /* Build comma-separated algorithm string — dynamically sized.
+     * Worst-case algo name length is ~12 chars ("impulse_tr.."); 16 is safe. */
+    size_t buf_cap = (size_t)g_chunk_count * 16 + 1;
+    char* attr_buf = (char*)malloc(buf_cap);
+    if (attr_buf == NULL) return -1;
+
     size_t offset = 0;
-    size_t remaining = sizeof(attr_buf);
+    size_t remaining = buf_cap;
     for (int i = 0; i < g_chunk_count && remaining > 1; i++) {
         int written = snprintf(attr_buf + offset, remaining, "%s%s",
             (i > 0) ? "," : "",
@@ -542,6 +561,7 @@ herr_t H5Z_gpucompress_write_chunk_attr(hid_t dset_id) {
     if (attr < 0) {
         H5Sclose(aspace);
         H5Tclose(atype);
+        free(attr_buf);
         return -1;
     }
 
@@ -549,6 +569,7 @@ herr_t H5Z_gpucompress_write_chunk_attr(hid_t dset_id) {
     H5Aclose(attr);
     H5Sclose(aspace);
     H5Tclose(atype);
+    free(attr_buf);
 
     return (write_rc < 0) ? -1 : 0;
 }
@@ -566,6 +587,12 @@ static void H5Z_gpucompress_fini(void) {
     if (g_gpucompress_initialized) {
         gpucompress_cleanup();
         g_gpucompress_initialized = 0;
+    }
+    if (g_chunk_algorithms) {
+        free(g_chunk_algorithms);
+        g_chunk_algorithms = NULL;
+        g_chunk_count      = 0;
+        g_chunk_capacity   = 0;
     }
 }
 

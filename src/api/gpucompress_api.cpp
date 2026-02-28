@@ -102,10 +102,11 @@ std::atomic<int> g_last_nn_original_action{-1};
 std::atomic<int> g_last_exploration_triggered{0};
 std::atomic<int> g_last_sgd_fired{0};
 
-/** Per-chunk diagnostic history */
-#define MAX_CHUNK_HISTORY 4096
-gpucompress_chunk_diag_t g_chunk_history[MAX_CHUNK_HISTORY];
-std::atomic<int> g_chunk_history_count{0};
+/** Per-chunk diagnostic history — dynamic, unbounded */
+static gpucompress_chunk_diag_t* g_chunk_history      = nullptr;
+static int                       g_chunk_history_cap   = 0;
+std::atomic<int>                 g_chunk_history_count{0};
+static std::mutex                g_chunk_history_mutex;
 
 /* ---- CompContext pool ---- */
 static CompContext g_comp_pool[N_COMP_CTX];
@@ -336,6 +337,16 @@ extern "C" void gpucompress_cleanup(void) {
         }
         g_initialized.store(false);
         g_ref_count.store(0);
+        /* Free dynamic chunk history */
+        {
+            std::lock_guard<std::mutex> lk(g_chunk_history_mutex);
+            if (g_chunk_history) {
+                free(g_chunk_history);
+                g_chunk_history    = nullptr;
+                g_chunk_history_cap = 0;
+            }
+            g_chunk_history_count.store(0);
+        }
     }
 }
 
@@ -1082,10 +1093,17 @@ extern "C" gpucompress_error_t gpucompress_compress(
     g_last_exploration_triggered.store(exploration_triggered ? 1 : 0);
     g_last_sgd_fired.store(sgd_fired ? 1 : 0);
 
-    /* Append to per-chunk history */
+    /* Append to per-chunk history — grow array as needed */
     {
+        std::lock_guard<std::mutex> lk(g_chunk_history_mutex);
         int idx = g_chunk_history_count.fetch_add(1);
-        if (idx < MAX_CHUNK_HISTORY) {
+        if (idx >= g_chunk_history_cap) {
+            int new_cap = (g_chunk_history_cap == 0) ? 4096 : g_chunk_history_cap * 2;
+            auto* p = static_cast<gpucompress_chunk_diag_t*>(
+                realloc(g_chunk_history, (size_t)new_cap * sizeof(gpucompress_chunk_diag_t)));
+            if (p) { g_chunk_history = p; g_chunk_history_cap = new_cap; }
+        }
+        if (idx < g_chunk_history_cap) {
             gpucompress_chunk_diag_t *h = &g_chunk_history[idx];
             h->nn_action             = g_last_nn_action.load();
             h->nn_original_action    = nn_original_action;
@@ -1449,6 +1467,7 @@ extern "C" int gpucompress_get_last_sgd_fired(void) {
 
 extern "C" void gpucompress_reset_chunk_history(void) {
     g_chunk_history_count.store(0);
+    /* keep allocated buffer for reuse */
 }
 
 extern "C" int gpucompress_get_chunk_history_count(void) {
@@ -1458,6 +1477,8 @@ extern "C" int gpucompress_get_chunk_history_count(void) {
 extern "C" int gpucompress_get_chunk_diag(int idx, gpucompress_chunk_diag_t *out) {
     if (idx < 0 || idx >= g_chunk_history_count.load() || out == NULL)
         return -1;
+    std::lock_guard<std::mutex> lk(g_chunk_history_mutex);
+    if (idx >= g_chunk_history_cap) return -1;
     *out = g_chunk_history[idx];
     return 0;
 }
@@ -2203,10 +2224,17 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
     g_last_exploration_triggered.store(exploration_triggered ? 1 : 0);
     g_last_sgd_fired.store(sgd_fired ? 1 : 0);
 
-    /* Append to per-chunk history */
+    /* Append to per-chunk history — grow array as needed */
     {
+        std::lock_guard<std::mutex> lk(g_chunk_history_mutex);
         int idx = g_chunk_history_count.fetch_add(1);
-        if (idx < MAX_CHUNK_HISTORY) {
+        if (idx >= g_chunk_history_cap) {
+            int new_cap = (g_chunk_history_cap == 0) ? 4096 : g_chunk_history_cap * 2;
+            auto* p = static_cast<gpucompress_chunk_diag_t*>(
+                realloc(g_chunk_history, (size_t)new_cap * sizeof(gpucompress_chunk_diag_t)));
+            if (p) { g_chunk_history = p; g_chunk_history_cap = new_cap; }
+        }
+        if (idx < g_chunk_history_cap) {
             gpucompress_chunk_diag_t *h = &g_chunk_history[idx];
             h->nn_action             = g_last_nn_action.load();
             h->nn_original_action    = nn_original_action;

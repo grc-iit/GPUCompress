@@ -369,6 +369,20 @@ if(HDF5_FOUND)
     #     m
     # )
 
+    # DESIGN-6 regression: chunk tracker grows past 256 without overflow
+    add_executable(test_design6_chunk_tracker tests/test_design6_chunk_tracker.c)
+    target_include_directories(test_design6_chunk_tracker PRIVATE
+        ${HDF5_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_libraries(test_design6_chunk_tracker PRIVATE
+        gpucompress
+        H5Zgpucompress
+        ${HDF5_C_LIBRARIES}
+        m
+    )
+
     # HDF5 Benchmark: No Compression vs Static vs Dynamic (NN)
     add_executable(benchmark_hdf5 tests/benchmark_hdf5.c)
     target_include_directories(benchmark_hdf5 PRIVATE

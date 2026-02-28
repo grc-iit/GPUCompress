@@ -348,13 +348,17 @@ Workers push IOItems to the I/O queue in compression-completion order, not in lo
 ### DESIGN-6: `H5Zgpucompress` 256-Chunk Static Limit
 **File:** `src/hdf5/H5Zgpucompress.c`
 **Severity:** MEDIUM
+**Status:** ✅ FIXED
 
-```c
-static int g_chunk_algorithms[256];  // Fixed size
-```
-If a dataset has >256 chunks, the algorithm tracker silently overflows or stops recording. No bounds check.
+`g_chunk_algorithms[256]` replaced with `int* g_chunk_algorithms` (dynamic). Capacity tracked in `g_chunk_capacity`; array grown via `realloc()` with doubling strategy (initial 256, then ×2) when count reaches capacity. `H5Z_gpucompress_reset_chunk_tracking()` resets count to 0, keeping the buffer for reuse. `H5Z_gpucompress_fini()` frees the buffer. `attr_buf[4096]` in `write_chunk_attr` also replaced with heap-allocated buffer sized to `chunk_count × 16 + 1`.
 
-**Fix:** Use dynamic array (`malloc`/`realloc`) or remove the tracker and use HDF5 attribute APIs.
+Verified by `tests/test_design6_chunk_tracker.c` (3/3):
+- 300-chunk round-trip: tracker grows past index 255, all algorithms recorded, byte-exact data
+- 512-chunk round-trip: scales to 2× original limit, byte-exact data
+- Reset reuse: `reset()` after 300-chunk write sets count to 0; re-tracking 10 chunks gives count=10
+
+**VOL path also fixed (`src/api/gpucompress_api.cpp`):**
+`g_chunk_history[4096]` (static) replaced with `gpucompress_chunk_diag_t* g_chunk_history` (dynamic). Growth is mutex-protected (`g_chunk_history_mutex`) to handle concurrent appends from 8 CompContext workers — the mutex is taken for every append so `realloc` is never called while another thread writes into the old pointer. `gpucompress_reset_chunk_history()` resets count to 0 keeping the buffer. `gpucompress_cleanup()` frees the buffer.
 
 ---
 
