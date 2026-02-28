@@ -647,6 +647,18 @@ if(HDF5_FOUND)
         )
         set_target_properties(test_qw4_atomic_counters PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
+        # PERF-14: native atomicAdd(double*) correctness vs CPU reference stats
+        add_executable(test_perf14_atomic_double tests/test_perf14_atomic_double.cu)
+        set_source_files_properties(tests/test_perf14_atomic_double.cu PROPERTIES LANGUAGE CUDA)
+        target_include_directories(test_perf14_atomic_double PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+        target_link_libraries(test_perf14_atomic_double PRIVATE
+            gpucompress CUDA::cudart m
+        )
+        set_target_properties(test_perf14_atomic_double PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
         # PERF-16 regression: gather/scatter kernel on dedicated non-default stream
         add_executable(test_perf16_gather_stream tests/test_perf16_gather_stream.cu)
         set_source_files_properties(tests/test_perf16_gather_stream.cu PROPERTIES LANGUAGE CUDA)

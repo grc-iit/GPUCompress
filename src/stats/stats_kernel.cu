@@ -52,20 +52,8 @@ void freeStatsWorkspace() {
     }
 }
 
-/* ============================================================
- * Device helper: CAS-based atomicAdd for double
- * ============================================================ */
-
-__device__ double atomicAddDouble(double* address, double val) {
-    unsigned long long int* address_as_ull = (unsigned long long int*)address;
-    unsigned long long int old = *address_as_ull, assumed;
-    do {
-        assumed = old;
-        old = atomicCAS(address_as_ull, assumed,
-                        __double_as_longlong(__longlong_as_double(assumed) + val));
-    } while (assumed != old);
-    return __longlong_as_double(old);
-}
+/* atomicAdd(double*, double) is natively supported on sm_60+ (Pascal and newer).
+ * No CAS emulation needed — targeting sm_80 (Ampere). */
 
 /* ============================================================
  * Device helper: CAS-based atomicMin/Max for float
@@ -177,8 +165,8 @@ __global__ void statsPass1Kernel(
         }
 
         if (lane == 0) {
-            atomicAddDouble(&stats->sum, t_sum);
-            atomicAddDouble(&stats->abs_diff_sum, t_deriv);
+            atomicAdd(&stats->sum, t_sum);
+            atomicAdd(&stats->abs_diff_sum, t_deriv);
             atomicMinFloat(&stats->vmin, t_min);
             atomicMaxFloat(&stats->vmax, t_max);
         }
@@ -238,7 +226,7 @@ __global__ void madPass2Kernel(
             t_mad += __shfl_down_sync(mask, t_mad, offset);
         }
         if (lane == 0) {
-            atomicAddDouble(&stats->mad_sum, t_mad);
+            atomicAdd(&stats->mad_sum, t_mad);
         }
     }
 }
