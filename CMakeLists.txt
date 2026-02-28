@@ -628,6 +628,19 @@ if(HDF5_FOUND)
         )
         set_target_properties(test_bug7_concurrent_quantize PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
+        # QW-4 regression: s_gpu_writes/s_chunks_comp atomic counter integrity
+        add_executable(test_qw4_atomic_counters tests/test_qw4_atomic_counters.cu)
+        set_source_files_properties(tests/test_qw4_atomic_counters.cu PROPERTIES LANGUAGE CUDA)
+        target_include_directories(test_qw4_atomic_counters PRIVATE
+            ${HDF5_VOL_INCLUDE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+        target_link_libraries(test_qw4_atomic_counters PRIVATE
+            gpucompress H5VLgpucompress ${HDF5_VOL_LIB} CUDA::cudart m pthread
+        )
+        set_target_properties(test_qw4_atomic_counters PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
         # SGD parallel chunk demo: 128MB dataset, 16MB chunks, LR=0.4, MAPE=20%
         add_executable(demo_sgd_parallel_chunks tests/demo_sgd_parallel_chunks.cu)
         set_source_files_properties(tests/demo_sgd_parallel_chunks.cu PROPERTIES LANGUAGE CUDA)

@@ -353,10 +353,10 @@ static const H5VL_class_t H5VL_gpucompress_g = {
  * Activity counters — queryable from tests / demos
  * ============================================================ */
 
-static int    s_gpu_writes    = 0;  /* times gpu_aware_chunked_write was called */
-static int    s_gpu_reads     = 0;  /* times gpu_aware_chunked_read was called  */
-static int    s_chunks_comp   = 0;  /* chunks successfully compressed on GPU    */
-static int    s_chunks_decomp = 0;  /* chunks successfully decompressed on GPU  */
+static std::atomic<int> s_gpu_writes    {0};  /* times gpu_aware_chunked_write was called */
+static std::atomic<int> s_gpu_reads     {0};  /* times gpu_aware_chunked_read was called  */
+static std::atomic<int> s_chunks_comp   {0};  /* chunks successfully compressed on GPU    */
+static std::atomic<int> s_chunks_decomp {0};  /* chunks successfully decompressed on GPU  */
 
 /* Transfer byte counters */
 static size_t s_h2d_bytes = 0;   /* total bytes copied host→device */
@@ -382,7 +382,8 @@ static inline cudaError_t vol_memcpy(void *dst, const void *src,
 extern "C" void
 H5VL_gpucompress_reset_stats(void)
 {
-    s_gpu_writes = s_gpu_reads = s_chunks_comp = s_chunks_decomp = 0;
+    s_gpu_writes.store(0); s_gpu_reads.store(0);
+    s_chunks_comp.store(0); s_chunks_decomp.store(0);
     s_h2d_bytes = s_d2h_bytes = s_d2d_bytes = 0;
     s_h2d_count = s_d2h_count = s_d2d_count = 0;
 }
@@ -390,10 +391,10 @@ H5VL_gpucompress_reset_stats(void)
 extern "C" void
 H5VL_gpucompress_get_stats(int *writes, int *reads, int *comp, int *decomp)
 {
-    if (writes) *writes = s_gpu_writes;
-    if (reads)  *reads  = s_gpu_reads;
-    if (comp)   *comp   = s_chunks_comp;
-    if (decomp) *decomp = s_chunks_decomp;
+    if (writes) *writes = s_gpu_writes.load();
+    if (reads)  *reads  = s_gpu_reads.load();
+    if (comp)   *comp   = s_chunks_comp.load();
+    if (decomp) *decomp = s_chunks_decomp.load();
 }
 
 extern "C" void
