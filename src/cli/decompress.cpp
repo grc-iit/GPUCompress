@@ -16,7 +16,6 @@
 #include <memory>
 #include <algorithm>
 #include <cctype>
-
 #include <cuda_runtime.h>
 #include <cufile.h>
 
@@ -99,7 +98,7 @@ int main(int argc, char* argv[]) {
     
     printf("Input file (compressed): %s\n", input_file);
     printf("Compressed file size: %lu bytes (%.2f MB)\n", file_size, file_size / (1024.0 * 1024.0));
-    
+
     // ========== Step 2: Initialize GPU ==========
     
     cudaStream_t stream;

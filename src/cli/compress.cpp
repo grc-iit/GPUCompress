@@ -112,7 +112,6 @@ int main(int argc, char* argv[]) {
     QuantizationType quant_type = QuantizationType::NONE;
     double error_bound = 0.0;
     size_t quant_element_size = sizeof(float);  // Default to float32
-
     // Parse arguments
     int arg_idx = 3;
 

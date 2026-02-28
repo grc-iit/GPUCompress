@@ -483,6 +483,14 @@ void gpucompress_set_reinforcement(int enable, float learning_rate,
                                    float mape_threshold, float ct_mape_threshold);
 
 /**
+ * Enable/disable verbose transfer and SGD logging to stderr.
+ * Off by default. Enable when debugging data-transfer timing or SGD behavior.
+ *
+ * @param enable 1 to enable verbose logging, 0 to disable
+ */
+void gpucompress_set_verbose(int enable);
+
+/**
  * Get stats from the last online reinforcement SGD step.
  *
  * @param grad_norm    Output: gradient L2 norm before clipping (can be NULL)

@@ -44,7 +44,7 @@
 #include "gpucompress.h"
 
 #define N_WORKERS    8
-#define DATA_FLOATS  (512*1024)   /* 2 MB per worker */
+#define DATA_FLOATS  (2*1024*1024)   /* 8 MB per worker */
 
 /* Different data patterns to give the NN different inputs, exercising more paths */
 static void fill_data(float *buf, int n, int pattern)

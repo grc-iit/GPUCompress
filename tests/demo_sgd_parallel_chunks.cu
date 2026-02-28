@@ -47,7 +47,7 @@
  * Configuration
  * ============================================================ */
 #define DATASET_MB      1024
-#define CHUNK_MB        16
+#define CHUNK_MB        8
 #define REINFORCE_LR    0.4f
 #define REINFORCE_MAPE  0.20f   /* 20% MAPE threshold */
 #define EXPLORE_THRESH  0.20    /* 20% MAPE triggers exploration */

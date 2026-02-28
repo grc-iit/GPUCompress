@@ -105,7 +105,7 @@ static void print_partition_analysis(void)
 }
 
 /* ---- round-trip worker ---- */
-#define DATA_FLOATS  (256*1024)   /* 1 MB */
+#define DATA_FLOATS  (2*1024*1024)   /* 8 MB */
 #define N_THREADS    16
 
 typedef struct {

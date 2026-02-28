@@ -17,7 +17,13 @@ endif()
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
 set(CMAKE_CUDA_FLAGS_DEBUG "-g -G -O0")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")
-set(CMAKE_CUDA_FLAGS_RELEASE "-O3")
+set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -use_fast_math")
+
+# Target the actual GPU architecture (sm_80 = Ampere A100).
+# Override at configure time: cmake -B build -DCMAKE_CUDA_ARCHITECTURES=90
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 80 CACHE STRING "CUDA architectures to target")
+endif()
 
 # Find CUDA
 find_package(CUDAToolkit REQUIRED)
@@ -718,6 +724,29 @@ if(HDF5_FOUND)
             gpucompress H5VLgpucompress H5Zgpucompress ${HDF5_VOL_LIB} CUDA::cudart m
         )
         set_target_properties(nn_vol_demo PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+        # Quick algorithm × pattern sweep (no HDF5)
+        add_executable(quick_algo_sweep tests/quick_algo_sweep.cu)
+        set_source_files_properties(tests/quick_algo_sweep.cu PROPERTIES LANGUAGE CUDA)
+        target_include_directories(quick_algo_sweep PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+        target_link_libraries(quick_algo_sweep PRIVATE gpucompress CUDA::cudart)
+        set_target_properties(quick_algo_sweep PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+        # GPU-native VOL benchmark: no-comp vs static vs NN+SGD, GPU-generated data
+        add_executable(benchmark_vol_gpu tests/benchmark_vol_gpu.cu)
+        set_source_files_properties(tests/benchmark_vol_gpu.cu PROPERTIES LANGUAGE CUDA)
+        target_include_directories(benchmark_vol_gpu PRIVATE
+            ${HDF5_VOL_INCLUDE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+        target_link_libraries(benchmark_vol_gpu PRIVATE
+            gpucompress H5VLgpucompress ${HDF5_VOL_LIB} CUDA::cudart m
+        )
+        set_target_properties(benchmark_vol_gpu PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
         # Chunking/header verification example
         add_executable(hdf5_chunk_verify examples/hdf5_chunk_verify.cu)

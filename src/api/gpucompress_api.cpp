@@ -70,6 +70,11 @@ cudaStream_t g_sgd_stream    = nullptr;
 cudaEvent_t  g_sgd_done      = nullptr;
 std::atomic<bool> g_sgd_ever_fired{false};
 
+/** Verbose transfer/SGD logging — off by default, set via gpucompress_set_verbose(). */
+bool g_gc_verbose = false;
+
+#define GC_LOG(fmt, ...) do { if (g_gc_verbose) fprintf(stderr, fmt, ##__VA_ARGS__); } while(0)
+
 /* ============================================================
  * Global State
  * ============================================================ */
@@ -1573,6 +1578,10 @@ extern "C" void gpucompress_reinforce_last_stats(float* grad_norm,
                                                     int* num_samples,
                                                     int* was_clipped) {
     nn_reinforce_get_last_stats(grad_norm, num_samples, was_clipped);
+}
+
+extern "C" void gpucompress_set_verbose(int enable) {
+    g_gc_verbose = (enable != 0);
 }
 
 extern "C" size_t gpucompress_experience_count(void) {

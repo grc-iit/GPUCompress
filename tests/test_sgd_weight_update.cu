@@ -21,7 +21,7 @@
 #include "gpucompress.h"
 
 #define N_ITERS       30
-#define DATA_MB       4
+#define DATA_MB       8
 #define REINFORCE_LR  0.05f
 #define MAPE_THRESH   0.001f   /* 0.1% — fires on essentially any OOD data */
 

@@ -55,6 +55,9 @@ struct CompContext {
     void* d_range_max;
 };
 
+/** Runtime verbose-logging flag — set via gpucompress_set_verbose(). */
+extern bool g_gc_verbose;
+
 namespace gpucompress {
 
 /* ============================================================

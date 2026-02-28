@@ -253,38 +253,39 @@ Each compressed chunk does `malloc(comp_sz)` + `memcpy` to create the `IOItem` p
 ### PERF-11: CUDA Architecture Targeting Old GPU (sm_52 = Kepler)
 **File:** `CMakeLists.txt` / `CMakeCache.txt`
 **Severity:** HIGH (10-30% performance loss on modern hardware)
+**Status:** ✅ FIXED
 
 ```
-CMAKE_CUDA_ARCHITECTURES = 52   # Maxwell, circa 2014
+CMAKE_CUDA_ARCHITECTURES = 52   # Maxwell, circa 2014  ← was default
 System GPU = sm_80               # Ampere A100
 ```
 
 Missing Ampere features: TF32 tensor cores, native float atomics, improved shared memory bandwidth, async copy (cp.async).
 
-**Fix (one line):**
-```bash
-cmake -B build -DCMAKE_CUDA_ARCHITECTURES=80
-```
-Or set in CMakeLists.txt:
+**Fix applied in `CMakeLists.txt`:**
 ```cmake
-set(CMAKE_CUDA_ARCHITECTURES 80 CACHE STRING "CUDA architectures to target")
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 80 CACHE STRING "CUDA architectures to target")
+endif()
 ```
+Rebuilt with `cmake -B build -DCMAKE_CUDA_ARCHITECTURES=80`. Verified `.target sm_80` in `libgpucompress.so` via `cuobjdump`. 120/120 HDF5, 6/6 quant pass.
 
 ---
 
 ### PERF-12: Missing `-use_fast_math` Flag
 **File:** `CMakeLists.txt` line 20
 **Severity:** MEDIUM (~5-10% throughput improvement for NN/stats kernels)
+**Status:** ✅ FIXED
 
 ```cmake
-# Current:
+# Before:
 set(CMAKE_CUDA_FLAGS_RELEASE "-O3")
 
-# Recommended:
+# After:
 set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -use_fast_math")
 ```
 
-`-use_fast_math` enables approximate `__logf`, `__expf`, `__sqrtf` which are 2-5× faster than IEEE-compliant versions. Acceptable for compression statistics and NN inference.
+`-use_fast_math` enables approximate `__logf`, `__expf`, `__sqrtf` which are 2-5× faster than IEEE-compliant versions. Acceptable for compression statistics and NN inference. Fixed alongside PERF-11 in the same CMakeLists.txt edit.
 
 ---
 
@@ -363,6 +364,7 @@ If a dataset has >256 chunks, the algorithm tracker silently overflows or stops 
 ### DESIGN-7: CLI Tools Cannot Handle Files Larger Than GPU Memory
 **File:** `src/cli/compress.cpp`, `src/cli/decompress.cpp`
 **Severity:** HIGH for large-file users
+**Status:** ⚠️ NOT APPLICABLE TO PRIMARY WORKFLOW — no fix implemented
 
 ```cpp
 size_t aligned_input_size = ((file_size + 4095) / 4096) * 4096;
@@ -370,7 +372,16 @@ cudaMalloc(&d_input, aligned_input_size);  // Entire file must fit
 ```
 For files >10-40 GB (depending on GPU), this will OOM. The VOL connector handles this via chunking, but the CLI tool does not.
 
-**Fix:** Add streaming mode: process in GPU-sized chunks (e.g., 1 GB), with prepended metadata block.
+**Why not fixed:** This issue only affects the CLI load-from-disk path. The primary workflow for this project is GPU-native:
+simulation generates data directly in GPU memory → `H5Dwrite(GPU_ptr)` → HDF5 VOL connector.
+
+In this path the user already holds the full dataset in VRAM (required for the simulation to run).
+The VOL connector reads slices of that pre-existing allocation without any extra `cudaMalloc` for the full dataset.
+The CLI's "read entire file from disk → cudaMalloc(file_size)" pattern is structurally impossible in this workflow.
+
+A streaming prototype (version 3 file format) was implemented then reverted once this analysis was confirmed.
+If CLI large-file support is needed in the future, the streaming approach (block table header + per-block
+`pread`/`pwrite` + `~2× chunk_size` GPU working set) is the correct design.
 
 ---
 
@@ -512,8 +523,8 @@ These require minimal code changes and carry clear, verifiable benefits:
 
 | # | Change | File | Expected Gain | Risk |
 |---|--------|------|--------------|------|
-| QW-1 | Set `CMAKE_CUDA_ARCHITECTURES=80` | CMakeLists.txt | 10-30% GPU kernel speedup | Low |
-| QW-2 | Add `-use_fast_math` to CUDA Release flags | CMakeLists.txt | 5-10% speedup | Low |
+| QW-1 | ~~Set `CMAKE_CUDA_ARCHITECTURES=80`~~ | CMakeLists.txt | ✅ DONE — added `if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)` guard + `set(...80 CACHE STRING...)`. Rebuilt; `.target sm_80` confirmed in `libgpucompress.so`. 120/120 + 6/6 pass. | — |
+| QW-2 | ~~Add `-use_fast_math` to CUDA Release flags~~ | CMakeLists.txt | ✅ DONE — `CMAKE_CUDA_FLAGS_RELEASE "-O3 -use_fast_math"`. Fixed together with QW-1. | — |
 | QW-3 | ~~Fix format string `%u` → `PRIu64`~~ | gpucompress_api.cpp:1243 | ✅ DONE — `#include <cinttypes>`, `PRIu64` + `(uint64_t)` cast. Verified by `test_bug4_format_string` (5/5). | — |
 | QW-4 | ~~Make global stats atomics (`s_gpu_writes` etc.)~~ | H5VLgpucompress.cu | ✅ DONE — `static int` → `static std::atomic<int>` for `s_gpu_writes`, `s_gpu_reads`, `s_chunks_comp`, `s_chunks_decomp`; `.store(0)` in reset, `.load()` in get. Verified by `test_qw4_atomic_counters` (16/16). | — |
 | QW-5 | ~~Add `file.gcount()` checks in `loadNNFromBinary`~~ | nn_gpu.cu | ✅ DONE — `NN_READ` macro checks every array read; consolidated 6 header reads into 1. Verified by `test_bug5_truncated_nnwt` (7/7). | — |
