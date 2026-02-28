@@ -17,7 +17,6 @@
 #include <fstream>
 
 #include "nn/nn_weights.h"
-#include "nn/nn_reinforce.h"
 
 /* Forward declarations for gpucompress namespace functions */
 namespace gpucompress {
@@ -263,31 +262,6 @@ static void test_full_pipeline() {
         &ratio, &comp_time, top);
     ASSERT(action >= 0 && action < 32, "inference should return valid action");
 
-    // Reinforce with "actual" data
-    void* d_weights = const_cast<NNWeightsGPU*>(gpucompress::getNNWeightsDevicePtr());
-
-    int rc = nn_reinforce_init(d_weights);
-    ASSERT(rc == 0, "reinforce init should succeed");
-
-    // Build input matching what the kernel would construct for this action
-    float input_raw[15] = {0};
-    int algo_idx = action % 8;
-    int quant = (action / 8) % 2;
-    int shuffle = (action / 16) % 2;
-    input_raw[algo_idx] = 1.0f;
-    input_raw[8] = (float)quant;
-    input_raw[9] = (float)shuffle;
-    input_raw[10] = log10f(0.001f);
-    input_raw[11] = log2f(4.0f * 1024 * 1024);
-    input_raw[12] = 5.0f;
-    input_raw[13] = 0.25f;
-    input_raw[14] = 0.15f;
-
-    nn_reinforce_add_sample(input_raw, 3.0, 2.0, 1.0, 90.0);
-    rc = nn_reinforce_apply(d_weights, 0.0001f);
-    ASSERT(rc == 0, "reinforce apply should succeed");
-
-    nn_reinforce_cleanup();
     gpucompress::cleanupNN();
     remove(nnwt_path);
     PASS();

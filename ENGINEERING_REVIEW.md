@@ -178,10 +178,9 @@ Thread 0 does insertion sort over 32 configs (O(n²)=O(1024) ops) while threads 
 ### PERF-3: Feature Encoding Repeated Per Thread
 **File:** `src/nn/nn_gpu.cu` — inference kernels
 **Severity:** LOW-MEDIUM
+**Status:** ✅ FIXED
 
-All 32 threads independently compute `log10(error_bound)` and `log2(data_size)`. These transcendental ops are identical across threads.
-
-**Fix:** Compute in thread 0, store in shared memory, `__syncthreads()`, then all threads read.
+Thread 0 now computes `log10(eb)`, `log2(ds)`, and float-casts of entropy/MAD/deriv into `__shared__ float s_enc[5]`, then `__syncthreads()`. All 32 threads read from `s_enc[]` in `nnForwardPass`. The two OOD detection blocks (bitonic + tree-reduction branches) also reuse `s_enc[]` instead of recomputing. Net savings: 31 × (`log10` + `log2`) = 62 transcendental ops per inference call, plus 31 × 3 redundant global memory reads from `d_stats` in the fused kernel.
 
 ---
 
@@ -292,8 +291,9 @@ set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -use_fast_math")
 ### PERF-13: Duplicated Forward Pass in Two Inference Kernels
 **File:** `src/nn/nn_gpu.cu`
 **Severity:** MEDIUM (maintenance risk, and both are slightly slower than needed)
+**Status:** ✅ FIXED
 
-`nnInferenceKernel` and `nnFusedInferenceKernel` share ~250 lines of identical forward pass code. The only difference is how stats are loaded (passed as scalars vs. read from `d_stats` device pointer). A `__device__` helper function or template would eliminate duplication.
+Extracted `__device__ static void nnForwardPass(...)` helper. Both `nnInferenceKernel` and `nnFusedInferenceKernel` now call it instead of duplicating ~220 lines of MLP forward-pass code. Stats loading (scalar params vs. `d_stats` pointer) is handled by the callers before invoking the helper.
 
 ---
 
@@ -333,8 +333,9 @@ The Level-2 exploration loop (~300 lines) lives inline in `gpucompress_compress_
 ### DESIGN-4: Stubbed `nn_reinforce.cpp` Still in API Surface
 **File:** `src/nn/nn_reinforce.h`, `nn_reinforce.cpp`
 **Severity:** LOW
+**Status:** ✅ FIXED
 
-All functions return 0/no-op. GPU SGD replaced the CPU path. These APIs appear in the public interface but do nothing. Confusing for users. Either deprecate with `[[deprecated]]` or remove entirely.
+`nn_reinforce.h` and `nn_reinforce.cpp` deleted. `gpucompress_reinforce_last_stats` removed from `include/gpucompress.h` and `gpucompress_api.cpp`. All forward declarations and call-sites (`nn_reinforce_init/add_sample/apply/cleanup/get_last_stats`) removed from `test_nn.cu`, `test_nn_pipeline.cpp`, and `eval_simulation.cpp`. `nn_reinforce.cpp` removed from `LIB_SOURCES` in CMakeLists.txt. Clean build verified.
 
 ---
 

@@ -4,7 +4,12 @@
 
 Iterative review of all 7 `src/` subfolders in the GPUCompress library. Each subfolder was reviewed for bugs, correctness issues, and code quality problems. Fixes were applied one at a time with build verification, followed by a dedicated test suite for each subfolder.
 
-**Total: 39 issues fixed, 63 tests added across 7 test suites — all passing with zero regressions.**
+**Total: 39 issues fixed, 59 tests across 7 test suites — all passing with zero regressions.**
+
+> **Post-review changes (F9 / cleanup sessions):**
+> - CPU reinforce path (`nn_reinforce_apply`, `nn_reinforce_add_sample`) replaced by GPU SGD kernel (`nnSGDKernel`). Issues #4 and #6 in `src/nn/` are moot — the code they fixed no longer exists.
+> - Experience buffer (`experience_buffer.h/.cpp`) deleted entirely. Issue #7 in `src/nn/` is moot. The public API `gpucompress_enable_active_learning` no longer takes a path argument.
+> - Tests covering the removed code (reinforce round-trip, null input, quant mask) deleted from `test_nn.cu`. Test count for `src/nn/` reduced from 10 → 6.
 
 The project structure after review:
 
@@ -14,7 +19,7 @@ src/
 ├── cli/            CLI compress/decompress executables (GDS-based)
 ├── compression/    Compression factory, header format, utilities
 ├── hdf5/           HDF5 filter plugin (libH5Zgpucompress.so)
-├── nn/             Neural network inference, reinforcement, experience buffer
+├── nn/             Neural network inference + GPU SGD (CPU reinforce path removed)
 ├── preprocessing/  Byte shuffle and quantization kernels
 └── stats/          GPU entropy, MAD, second derivative computation
 ```
@@ -71,21 +76,21 @@ src/
 
 ---
 
-## 4. `src/nn/` — 7 issues, 10 tests
+## 4. `src/nn/` — 7 issues, 6 tests (active)
 
-**Test file:** `tests/test_nn.cu`
+**Test file:** `tests/functionalityTests/test_nn.cu`
 
-| # | Type | Fix |
-|---|------|-----|
-| 1 | Bug | `loadNNFromBinary` didn't reset `g_nn_loaded = false` at top — failed reload left stale weights active |
-| 2 | Bug | `cleanupNN` didn't reset `g_has_bounds = false` — OOD detection used stale bounds after cleanup |
-| 3 | Bug | `x_stds` division-by-zero in both GPU kernel and CPU reinforce — added `if (std_val < 1e-8f) std_val = 1e-8f` guard |
-| 4 | Bug | `nn_reinforce_apply` SGD step modified `h_weights` in-place before confirming GPU copy succeeded — now uses temp copy, commits only after successful `cudaMemcpy` |
-| 5 | Perf | `runNNInference` called `cudaMalloc`/`cudaFree` per call — added pre-allocated static inference buffers with `allocInferenceBuffers()`/`freeInferenceBuffers()` |
-| 6 | Bug | `nn_reinforce_add_sample` missing null check on `input_raw` parameter |
-| 7 | Bug | `experience_buffer_append` silently wrote "lz4" for any invalid action index — added range validation (`action < 0 || action >= 32` returns -1) |
+| # | Type | Fix | Status |
+|---|------|-----|--------|
+| 1 | Bug | `loadNNFromBinary` didn't reset `g_nn_loaded = false` at top — failed reload left stale weights active | ✅ Active |
+| 2 | Bug | `cleanupNN` didn't reset `g_has_bounds = false` — OOD detection used stale bounds after cleanup | ✅ Active |
+| 3 | Bug | `x_stds` division-by-zero in both GPU kernel and CPU reinforce — added `if (std_val < 1e-8f) std_val = 1e-8f` guard | ✅ Active |
+| 4 | Bug | `nn_reinforce_apply` SGD step modified `h_weights` in-place before confirming GPU copy succeeded | ~~Moot~~ — CPU reinforce path replaced by `nnSGDKernel` (GPU SGD) |
+| 5 | Perf | `runNNInference` called `cudaMalloc`/`cudaFree` per call — added pre-allocated static inference buffers | ✅ Active |
+| 6 | Bug | `nn_reinforce_add_sample` missing null check on `input_raw` parameter | ~~Moot~~ — CPU reinforce path removed |
+| 7 | Bug | `experience_buffer_append` silently wrote "lz4" for invalid action index | ~~Moot~~ — experience buffer deleted entirely |
 
-**Key tests:** Reload failure state, cleanup resets bounds, zero-std no NaN, repeated inference (100x), reinforce round-trip, experience buffer invalid action, full pipeline integration. Uses synthetic `.nnwt` binary file generation.
+**Active tests (6):** Reload failure state, cleanup resets bounds, zero-std no NaN, repeated inference (100x), inference returns -1 when unloaded, full pipeline (load → infer → GPU SGD). Uses synthetic `.nnwt` binary file generation.
 
 ---
 
@@ -146,11 +151,11 @@ All tests use realistic data sizes (1–16 MB) per user requirement.
 | `test_compression_core` | `src/compression/` | 10 | 8–16 MB |
 | `test_preprocessing` | `src/preprocessing/` | 8 | 4–16 MB |
 | `test_stats` | `src/stats/` | 9 | 8–16 MB |
-| `test_nn` | `src/nn/` | 10 | Synthetic weights |
+| `test_nn` | `src/nn/` | 6 *(was 10; 4 tests removed — CPU reinforce + experience buffer code deleted)* | Synthetic weights |
 | `test_api` | `src/api/` | 11 | 1–4 MB |
 | `test_hdf5_plugin` | `src/hdf5/` | 8 | 2–4 MB |
 | `test_cli` | `src/cli/` | 7 | 1–4 MB |
-| **Total** | | **63** | |
+| **Total** | | **59** | |
 
 **Build and run all tests:**
 

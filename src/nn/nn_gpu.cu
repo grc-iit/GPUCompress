@@ -105,13 +105,14 @@ static bool g_has_bounds = false;
  */
 __device__ static void nnForwardPass(
     const NNWeightsGPU* __restrict__ weights,
-    int    tid,
-    double entropy,
-    double mad_norm,
-    double deriv_norm,
-    size_t data_size,
-    double error_bound,
-    int    criterion,
+    int   tid,
+    float eb_enc,       // log10(clip(error_bound, 1e-7)) — precomputed by caller
+    float ds_enc,       // log2(max(data_size, 1))        — precomputed by caller
+    float entropy_f,    // (float)entropy                  — precomputed by caller
+    float mad_f,        // (float)mad_norm                 — precomputed by caller
+    float deriv_f,      // (float)deriv_norm               — precomputed by caller
+    double error_bound, // kept for quant-mask check only
+    int   criterion,
     float* out_rank_val,
     float* out_ratio,
     float* out_comp_time
@@ -122,19 +123,13 @@ __device__ static void nnForwardPass(
 
     float input_raw[NN_INPUT_DIM];
     for (int i = 0; i < 8; i++) input_raw[i] = (i == algo_idx) ? 1.0f : 0.0f;
-    input_raw[8] = static_cast<float>(quant);
-    input_raw[9] = static_cast<float>(shuffle);
-
-    double eb_clipped = (error_bound < 1e-7) ? 1e-7 : error_bound;
-    input_raw[10] = static_cast<float>(log10(eb_clipped));
-
-    double ds = static_cast<double>(data_size);
-    if (ds < 1.0) ds = 1.0;
-    input_raw[11] = static_cast<float>(log2(ds));
-
-    input_raw[12] = static_cast<float>(entropy);
-    input_raw[13] = static_cast<float>(mad_norm);
-    input_raw[14] = static_cast<float>(deriv_norm);
+    input_raw[8]  = static_cast<float>(quant);
+    input_raw[9]  = static_cast<float>(shuffle);
+    input_raw[10] = eb_enc;
+    input_raw[11] = ds_enc;
+    input_raw[12] = entropy_f;
+    input_raw[13] = mad_f;
+    input_raw[14] = deriv_f;
 
     float input[NN_INPUT_DIM];
     for (int i = 0; i < NN_INPUT_DIM; i++) {
@@ -235,10 +230,25 @@ __global__ void nnInferenceKernel(
     int tid = threadIdx.x;
     if (tid >= NN_NUM_CONFIGS) return;
 
+    // ---- Precompute scalars shared across all 32 threads (thread 0 only) ----
+    __shared__ float s_enc[5];  // [eb_enc, ds_enc, entropy_f, mad_f, deriv_f]
+    if (tid == 0) {
+        double eb_c = (error_bound < 1e-7) ? 1e-7 : error_bound;
+        s_enc[0] = static_cast<float>(log10(eb_c));
+        double ds = static_cast<double>(data_size);
+        if (ds < 1.0) ds = 1.0;
+        s_enc[1] = static_cast<float>(log2(ds));
+        s_enc[2] = static_cast<float>(entropy);
+        s_enc[3] = static_cast<float>(mad_norm);
+        s_enc[4] = static_cast<float>(deriv_norm);
+    }
+    __syncthreads();
+
     // ---- Forward pass via shared device function ----
     float rank_val, ratio, comp_time;
-    nnForwardPass(weights, tid, entropy, mad_norm, deriv_norm,
-                  data_size, error_bound, criterion,
+    nnForwardPass(weights, tid,
+                  s_enc[0], s_enc[1], s_enc[2], s_enc[3], s_enc[4],
+                  error_bound, criterion,
                   &rank_val, &ratio, &comp_time);
 
     // ---- Store per-thread predicted ratio and comp_time for later retrieval ----
@@ -331,15 +341,26 @@ __global__ void nnFusedInferenceKernel(
     int tid = threadIdx.x;
     if (tid >= NN_NUM_CONFIGS) return;
 
-    // Read stats from device memory
-    double entropy = d_stats->entropy;
-    double mad_norm = d_stats->mad_normalized;
-    double deriv_norm = d_stats->deriv_normalized;
+    // ---- Precompute scalars shared across all 32 threads (thread 0 only) ----
+    // Reads d_stats once, computes log10/log2 once — 31 redundant ops eliminated.
+    __shared__ float s_enc[5];  // [eb_enc, ds_enc, entropy_f, mad_f, deriv_f]
+    if (tid == 0) {
+        double eb_c = (error_bound < 1e-7) ? 1e-7 : error_bound;
+        s_enc[0] = static_cast<float>(log10(eb_c));
+        double ds = static_cast<double>(data_size);
+        if (ds < 1.0) ds = 1.0;
+        s_enc[1] = static_cast<float>(log2(ds));
+        s_enc[2] = static_cast<float>(d_stats->entropy);
+        s_enc[3] = static_cast<float>(d_stats->mad_normalized);
+        s_enc[4] = static_cast<float>(d_stats->deriv_normalized);
+    }
+    __syncthreads();
 
     // ---- Forward pass via shared device function ----
     float rank_val, ratio, comp_time;
-    nnForwardPass(weights, tid, entropy, mad_norm, deriv_norm,
-                  data_size, error_bound, criterion,
+    nnForwardPass(weights, tid,
+                  s_enc[0], s_enc[1], s_enc[2], s_enc[3], s_enc[4],
+                  error_bound, criterion,
                   &rank_val, &ratio, &comp_time);
 
     __shared__ float s_ratios[NN_NUM_CONFIGS];
@@ -380,16 +401,9 @@ __global__ void nnFusedInferenceKernel(
             out_result->predicted_comp_time = s_comp_times[winner];
 
             // OOD detection on continuous features (indices 10-14)
+            // Reuse s_enc[] — already computed before the forward pass.
             int ood = 0;
-            double eb_ood = (error_bound < 1e-7) ? 1e-7 : error_bound;
-            double ds_ood = static_cast<double>(data_size); if (ds_ood < 1.0) ds_ood = 1.0;
-            float features[5] = {
-                static_cast<float>(log10(eb_ood)),
-                static_cast<float>(log2(ds_ood)),
-                static_cast<float>(entropy),
-                static_cast<float>(mad_norm),
-                static_cast<float>(deriv_norm)
-            };
+            float features[5] = { s_enc[0], s_enc[1], s_enc[2], s_enc[3], s_enc[4] };
             int indices[5] = {10, 11, 12, 13, 14};
             for (int i = 0; i < 5; i++) {
                 int idx = indices[i];
@@ -420,17 +434,9 @@ __global__ void nnFusedInferenceKernel(
             out_result->predicted_ratio = s_ratios[winner];
             out_result->predicted_comp_time = s_comp_times[winner];
 
-            // OOD detection
+            // OOD detection — reuse s_enc[] computed before the forward pass.
             int ood = 0;
-            double eb_ood = (error_bound < 1e-7) ? 1e-7 : error_bound;
-            double ds_ood = static_cast<double>(data_size); if (ds_ood < 1.0) ds_ood = 1.0;
-            float features[5] = {
-                static_cast<float>(log10(eb_ood)),
-                static_cast<float>(log2(ds_ood)),
-                static_cast<float>(entropy),
-                static_cast<float>(mad_norm),
-                static_cast<float>(deriv_norm)
-            };
+            float features[5] = { s_enc[0], s_enc[1], s_enc[2], s_enc[3], s_enc[4] };
             int indices[5] = {10, 11, 12, 13, 14};
             for (int i = 0; i < 5; i++) {
                 int idx = indices[i];

@@ -1,11 +1,10 @@
 /**
  * @file test_nn_reinforce.cpp
- * @brief Correctness tests for online NN reinforcement (nn_reinforce.cpp).
+ * @brief NN forward/backward correctness tests.
  *
- * Three sequential tests:
+ * Two sequential tests:
  *   1. Forward pass parity (CPU vs GPU)
- *   2. Numerical gradient check
- *   3. SGD smoke test (prediction moves toward target)
+ *   2. Numerical gradient check (CPU analytical vs finite-difference)
  *
  * Requires a .nnwt weights file (auto-discovered or passed via argv[1]).
  * Link against libgpucompress.
@@ -19,7 +18,6 @@
 
 #include "gpucompress.h"
 #include "nn/nn_weights.h"
-#include "nn/nn_reinforce.h"
 
 /* ============================================================
  * External symbols from libgpucompress.so
@@ -118,7 +116,7 @@ static float compute_loss(const NNWeightsGPU& w, const float input_raw[15],
 
 /**
  * CPU backward pass returning analytical gradients for all weights.
- * Matches nn_reinforce.cpp logic exactly (MSE on output index 2 only).
+ * MSE loss on output index 2 only.
  */
 static void cpu_backward(const NNWeightsGPU& w, const float input_raw[15],
                           float target_norm,
@@ -404,85 +402,6 @@ static bool test_gradient_check(const NNWeightsGPU& h_weights) {
     }
 }
 
-/* ============================================================
- * Test 3: SGD smoke test (prediction moves toward target)
- * ============================================================ */
-
-static bool test_sgd_smoke(const NNWeightsGPU& h_weights_orig) {
-    printf("\n[Test 3] SGD smoke test\n");
-
-    void* d_weights = gpucompress_nn_get_device_ptr_impl();
-    if (!d_weights) {
-        printf("  No device weights pointer\n  FAIL\n");
-        return false;
-    }
-
-    // Fixed input (action 0)
-    float input_raw[NN_INPUT_DIM];
-    build_input(0, TEST_ERROR_BOUND, TEST_DATA_SIZE,
-                TEST_ENTROPY, TEST_MAD, TEST_DERIV, input_raw);
-
-    // Initial prediction
-    float y_init[NN_OUTPUT_DIM];
-    cpu_forward(h_weights_orig, input_raw, y_init);
-    float init_pred = expm1f(y_init[2] * h_weights_orig.y_stds[2]
-                             + h_weights_orig.y_means[2]);
-
-    // Target far from prediction
-    float target = init_pred + 5.0f;
-
-    printf("  Initial prediction: %.3f\n", init_pred);
-    printf("  Target: %.3f\n", target);
-
-    // Save normalization params before
-    float y_means_before[NN_OUTPUT_DIM], y_stds_before[NN_OUTPUT_DIM];
-    float x_means_before[NN_INPUT_DIM], x_stds_before[NN_INPUT_DIM];
-    memcpy(y_means_before, h_weights_orig.y_means, sizeof(y_means_before));
-    memcpy(y_stds_before,  h_weights_orig.y_stds,  sizeof(y_stds_before));
-    memcpy(x_means_before, h_weights_orig.x_means, sizeof(x_means_before));
-    memcpy(x_stds_before,  h_weights_orig.x_stds,  sizeof(x_stds_before));
-
-    // Save w1 snapshot to verify weights changed
-    float w1_before[NN_HIDDEN_DIM * NN_INPUT_DIM];
-    memcpy(w1_before, h_weights_orig.w1, sizeof(w1_before));
-
-    // Reinforce: init, 10 samples, apply with lr=0.01
-    nn_reinforce_init(d_weights);
-    for (int i = 0; i < 10; i++)
-        nn_reinforce_add_sample(input_raw, static_cast<double>(target), 0.0, 0.0, 0.0);
-    nn_reinforce_apply(d_weights, 0.01f);
-
-    // Re-copy updated weights from GPU
-    NNWeightsGPU h_updated;
-    cudaMemcpy(&h_updated, d_weights, sizeof(NNWeightsGPU), cudaMemcpyDeviceToHost);
-
-    // New prediction
-    float y_new[NN_OUTPUT_DIM];
-    cpu_forward(h_updated, input_raw, y_new);
-    float new_pred = expm1f(y_new[2] * h_updated.y_stds[2] + h_updated.y_means[2]);
-
-    float old_dist = fabsf(init_pred - target);
-    float new_dist = fabsf(new_pred - target);
-
-    printf("  After 10x reinforce: %.3f (closer by %.3f)\n",
-           new_pred, old_dist - new_dist);
-
-    // Check weights actually changed
-    bool weights_changed = (memcmp(w1_before, h_updated.w1, sizeof(w1_before)) != 0);
-    printf("  Weights changed: %s\n", weights_changed ? "yes" : "no");
-
-    // Check normalization params did NOT change
-    bool norm_unchanged =
-        (memcmp(y_means_before, h_updated.y_means, sizeof(y_means_before)) == 0) &&
-        (memcmp(y_stds_before,  h_updated.y_stds,  sizeof(y_stds_before))  == 0) &&
-        (memcmp(x_means_before, h_updated.x_means, sizeof(x_means_before)) == 0) &&
-        (memcmp(x_stds_before,  h_updated.x_stds,  sizeof(x_stds_before))  == 0);
-    printf("  Normalization unchanged: %s\n", norm_unchanged ? "yes" : "no");
-
-    bool pass = (new_dist < old_dist) && weights_changed && norm_unchanged;
-    printf("  %s\n", pass ? "PASS" : "FAIL");
-    return pass;
-}
 
 /* ============================================================
  * Main
@@ -533,13 +452,11 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Run tests (order matters: test 3 modifies GPU weights)
     int pass_count = 0;
-    int total = 3;
+    int total = 2;
 
     if (test_forward_parity(h_weights)) pass_count++;
     if (test_gradient_check(h_weights))  pass_count++;
-    if (test_sgd_smoke(h_weights))       pass_count++;
 
     printf("\n");
     if (pass_count == total)
@@ -547,7 +464,6 @@ int main(int argc, char** argv) {
     else
         printf("%d/%d tests passed.\n", pass_count, total);
 
-    nn_reinforce_cleanup();
     gpucompress_cleanup();
     return (pass_count == total) ? 0 : 1;
 }

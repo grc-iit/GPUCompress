@@ -191,11 +191,6 @@ static int test_active_learning_and_reinforce(int& failures) {
 
         if (stats.sgd_fired) {
             total_sgd_fired++;
-            float grad_norm = 0.0f;
-            int num_samples = 0, was_clipped = 0;
-            gpucompress_reinforce_last_stats(&grad_norm, &num_samples, &was_clipped);
-            fprintf(stderr, "    Reinforce: grad_norm=%.6f samples=%d clipped=%d\n",
-                    grad_norm, num_samples, was_clipped);
         }
 
         // Round-trip verify (lossy)

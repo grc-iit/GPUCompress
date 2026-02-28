@@ -63,7 +63,6 @@ set(LIB_SOURCES
     src/stats/entropy_kernel.cu
     src/stats/stats_cpu.cpp
     src/nn/nn_gpu.cu
-    src/nn/nn_reinforce.cpp
     src/stats/stats_kernel.cu
 )
 
@@ -73,7 +72,6 @@ set_source_files_properties(
     src/cli/compress.cpp
     src/cli/decompress.cpp
     src/api/gpucompress_api.cpp
-    src/nn/nn_reinforce.cpp
     PROPERTIES LANGUAGE CUDA
 )
 

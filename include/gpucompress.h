@@ -475,16 +475,6 @@ void gpucompress_set_reinforcement(int enable, float learning_rate,
 void gpucompress_set_verbose(int enable);
 
 /**
- * Get stats from the last online reinforcement SGD step.
- *
- * @param grad_norm    Output: gradient L2 norm before clipping (can be NULL)
- * @param num_samples  Output: number of samples in the SGD batch (can be NULL)
- * @param was_clipped  Output: 1 if gradient was clipped to unit norm (can be NULL)
- */
-void gpucompress_reinforce_last_stats(float* grad_norm, int* num_samples,
-                                       int* was_clipped);
-
-/**
  * Hot-reload neural network weights from a new .nnwt file.
  *
  * Replaces the current NN model without restarting the library.

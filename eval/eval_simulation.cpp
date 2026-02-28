@@ -501,14 +501,7 @@ int main(int argc, char** argv) {
                       << std::endl;
 
             if (reinforced) {
-                float grad_norm = 0.0f;
-                int num_samples = 0, was_clipped = 0;
-                gpucompress_reinforce_last_stats(&grad_norm, &num_samples,
-                                                  &was_clipped);
-                std::cout << "           >>> SGD fired: "
-                          << num_samples << " samples"
-                          << "  grad_norm=" << std::setprecision(4) << grad_norm
-                          << (was_clipped ? " (CLIPPED)" : "")
+                std::cout << "           >>> SGD fired"
                           << "  lr=" << config.reinforce_lr
                           << std::endl;
             }

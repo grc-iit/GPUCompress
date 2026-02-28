@@ -49,16 +49,6 @@ extern "C" {
     // From stats_kernel.cu
     void gpucompress_free_stats_workspace(void);
 
-    // From nn_reinforce.cpp
-    int nn_reinforce_init(const void* d_weights);
-    void nn_reinforce_add_sample(const float input_raw[15], double actual_ratio,
-                                 double actual_comp_time,
-                                 double actual_decomp_time,
-                                 double actual_psnr);
-    int nn_reinforce_apply(void* d_weights, float learning_rate);
-    void nn_reinforce_cleanup(void);
-    void nn_reinforce_get_last_stats(float* grad_norm, int* num_samples,
-                                      int* was_clipped);
 }
 
 /* ============================================================
@@ -330,7 +320,6 @@ extern "C" void gpucompress_cleanup(void) {
 
     if (old_ref <= 1) {
         // Last reference, cleanup
-        nn_reinforce_cleanup();
         g_online_learning_enabled = false;
         g_exploration_enabled = false;
         gpucompress_nn_cleanup_impl();
@@ -1561,12 +1550,6 @@ extern "C" void gpucompress_set_reinforcement(int /*enable*/, float learning_rat
                                                float /*ct_mape_threshold*/) {
     if (learning_rate > 0.0f) g_reinforce_lr = learning_rate;
     if (mape_threshold > 0.0f) g_reinforce_mape_threshold = mape_threshold;
-}
-
-extern "C" void gpucompress_reinforce_last_stats(float* grad_norm,
-                                                    int* num_samples,
-                                                    int* was_clipped) {
-    nn_reinforce_get_last_stats(grad_norm, num_samples, was_clipped);
 }
 
 extern "C" void gpucompress_set_verbose(int enable) {
