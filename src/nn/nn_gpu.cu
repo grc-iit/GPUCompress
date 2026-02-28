@@ -283,45 +283,30 @@ __global__ void nnInferenceKernel(
     // If top-K actions requested, do a full sort (simple insertion sort by thread 0)
     // Otherwise, just do tree reduction for the winner
     if (out_top_actions != nullptr) {
-        // Thread 0 sorts all 32 actions by rank_val (descending)
-        if (tid == 0) {
-            // Copy to local arrays for sorting
-            float local_vals[NN_NUM_CONFIGS];
-            int   local_idxs[NN_NUM_CONFIGS];
-            for (int i = 0; i < NN_NUM_CONFIGS; i++) {
-                local_vals[i] = s_vals[i];
-                local_idxs[i] = s_idxs[i];
-            }
-
-            // Insertion sort (descending by value) - 32 elements, fast enough
-            for (int i = 1; i < NN_NUM_CONFIGS; i++) {
-                float key_val = local_vals[i];
-                int   key_idx = local_idxs[i];
-                int j = i - 1;
-                while (j >= 0 && local_vals[j] < key_val) {
-                    local_vals[j + 1] = local_vals[j];
-                    local_idxs[j + 1] = local_idxs[j];
-                    j--;
+        // Parallel bitonic sort (descending) — all 32 threads participate.
+        // NN_NUM_CONFIGS==32==warp size: warp shuffles replace shared memory.
+        float my_val = s_vals[tid];
+        int   my_idx = s_idxs[tid];
+        for (int k = 2; k <= NN_NUM_CONFIGS; k <<= 1) {
+            for (int j = k >> 1; j >= 1; j >>= 1) {
+                float other_val = __shfl_xor_sync(0xFFFFFFFFu, my_val, j);
+                int   other_idx = __shfl_xor_sync(0xFFFFFFFFu, my_idx, j);
+                int   ixj = tid ^ j;
+                if (ixj > tid) {
+                    if (((tid & k) == 0 && my_val < other_val) ||
+                        ((tid & k) != 0 && my_val > other_val)) {
+                        my_val = other_val;
+                        my_idx = other_idx;
+                    }
                 }
-                local_vals[j + 1] = key_val;
-                local_idxs[j + 1] = key_idx;
             }
-
-            // Write winner
-            *out_action = local_idxs[0];
-
-            // Write all sorted action IDs
-            for (int i = 0; i < NN_NUM_CONFIGS; i++) {
-                out_top_actions[i] = local_idxs[i];
-            }
-
-            // Write predicted ratio and comp_time for the winner
-            if (out_predicted_ratio != nullptr) {
-                *out_predicted_ratio = s_ratios[local_idxs[0]];
-            }
-            if (out_predicted_comp_time != nullptr) {
-                *out_predicted_comp_time = s_comp_times[local_idxs[0]];
-            }
+        }
+        // All threads write their sorted slot in parallel; thread 0 is the winner.
+        out_top_actions[tid] = my_idx;
+        if (tid == 0) {
+            *out_action = my_idx;
+            if (out_predicted_ratio != nullptr)     *out_predicted_ratio    = s_ratios[my_idx];
+            if (out_predicted_comp_time != nullptr) *out_predicted_comp_time = s_comp_times[my_idx];
         }
     } else {
         // Tree reduction (32 → 16 → 8 → 4 → 2 → 1)
@@ -475,34 +460,30 @@ __global__ void nnFusedInferenceKernel(
     __syncthreads();
 
     if (out_top_actions != nullptr) {
-        // Thread 0 sorts all 32 actions
-        if (tid == 0) {
-            float local_vals[NN_NUM_CONFIGS];
-            int   local_idxs[NN_NUM_CONFIGS];
-            for (int i = 0; i < NN_NUM_CONFIGS; i++) {
-                local_vals[i] = s_vals[i];
-                local_idxs[i] = s_idxs[i];
-            }
-            for (int i = 1; i < NN_NUM_CONFIGS; i++) {
-                float key_val = local_vals[i];
-                int   key_idx = local_idxs[i];
-                int j = i - 1;
-                while (j >= 0 && local_vals[j] < key_val) {
-                    local_vals[j + 1] = local_vals[j];
-                    local_idxs[j + 1] = local_idxs[j];
-                    j--;
+        // Parallel bitonic sort (descending) — all 32 threads participate.
+        float my_val = s_vals[tid];
+        int   my_idx = s_idxs[tid];
+        for (int k = 2; k <= NN_NUM_CONFIGS; k <<= 1) {
+            for (int j = k >> 1; j >= 1; j >>= 1) {
+                float other_val = __shfl_xor_sync(0xFFFFFFFFu, my_val, j);
+                int   other_idx = __shfl_xor_sync(0xFFFFFFFFu, my_idx, j);
+                int   ixj = tid ^ j;
+                if (ixj > tid) {
+                    if (((tid & k) == 0 && my_val < other_val) ||
+                        ((tid & k) != 0 && my_val > other_val)) {
+                        my_val = other_val;
+                        my_idx = other_idx;
+                    }
                 }
-                local_vals[j + 1] = key_val;
-                local_idxs[j + 1] = key_idx;
             }
-
-            int winner = local_idxs[0];
+        }
+        // All threads write their sorted slot in parallel; thread 0 is the winner.
+        out_top_actions[tid] = my_idx;
+        if (tid == 0) {
+            int winner = my_idx;
             out_result->action = winner;
             out_result->predicted_ratio = s_ratios[winner];
             out_result->predicted_comp_time = s_comp_times[winner];
-            for (int i = 0; i < NN_NUM_CONFIGS; i++) {
-                out_top_actions[i] = local_idxs[i];
-            }
 
             // OOD detection on continuous features (indices 10-14)
             int ood = 0;

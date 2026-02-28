@@ -659,6 +659,16 @@ if(HDF5_FOUND)
         )
         set_target_properties(test_perf14_atomic_double PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
+        # PERF-2 speedup: bitonic sort vs insertion sort
+        add_executable(test_perf2_sort_speedup tests/test_perf2_sort_speedup.cu)
+        set_source_files_properties(tests/test_perf2_sort_speedup.cu PROPERTIES LANGUAGE CUDA)
+        target_include_directories(test_perf2_sort_speedup PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+        target_link_libraries(test_perf2_sort_speedup PRIVATE CUDA::cudart)
+        set_target_properties(test_perf2_sort_speedup PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
         # PERF-16 regression: gather/scatter kernel on dedicated non-default stream
         add_executable(test_perf16_gather_stream tests/test_perf16_gather_stream.cu)
         set_source_files_properties(tests/test_perf16_gather_stream.cu PROPERTIES LANGUAGE CUDA)
