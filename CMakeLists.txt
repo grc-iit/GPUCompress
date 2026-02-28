@@ -529,6 +529,45 @@ if(HDF5_FOUND)
         )
         set_target_properties(test_vol_8mb PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
+        # GPU-resident data benchmark: No Compression vs LZ4, no NN
+        add_executable(benchmark_lz4_vs_nocomp tests/benchmark_lz4_vs_nocomp.cu)
+        set_source_files_properties(tests/benchmark_lz4_vs_nocomp.cu PROPERTIES LANGUAGE CUDA)
+        target_include_directories(benchmark_lz4_vs_nocomp PRIVATE
+            ${HDF5_VOL_INCLUDE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+        target_link_libraries(benchmark_lz4_vs_nocomp PRIVATE
+            gpucompress H5VLgpucompress ${HDF5_VOL_LIB} CUDA::cudart m
+        )
+        set_target_properties(benchmark_lz4_vs_nocomp PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+        # File-size verification: no-comp vs LZ4, keeps output files for inspection
+        add_executable(check_filesize_vol tests/check_filesize_vol.cu)
+        set_source_files_properties(tests/check_filesize_vol.cu PROPERTIES LANGUAGE CUDA)
+        target_include_directories(check_filesize_vol PRIVATE
+            ${HDF5_VOL_INCLUDE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+        target_link_libraries(check_filesize_vol PRIVATE
+            gpucompress H5VLgpucompress ${HDF5_VOL_LIB} CUDA::cudart m
+        )
+        set_target_properties(check_filesize_vol PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+        # Correctness test: all 8 algos × 2 shuffle modes × 2 patterns, GPU round-trip
+        add_executable(test_correctness_vol tests/test_correctness_vol.cu)
+        set_source_files_properties(tests/test_correctness_vol.cu PROPERTIES LANGUAGE CUDA)
+        target_include_directories(test_correctness_vol PRIVATE
+            ${HDF5_VOL_INCLUDE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+        target_link_libraries(test_correctness_vol PRIVATE
+            gpucompress H5VLgpucompress ${HDF5_VOL_LIB} CUDA::cudart m
+        )
+        set_target_properties(test_correctness_vol PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
         # GPU-resident data benchmark: No Compression vs NN, single ramp pattern
         add_executable(benchmark_gpu_resident tests/benchmark_gpu_resident.cu)
         set_source_files_properties(tests/benchmark_gpu_resident.cu PROPERTIES LANGUAGE CUDA)

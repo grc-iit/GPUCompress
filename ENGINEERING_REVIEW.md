@@ -1,0 +1,710 @@
+# GPUCompress Engineering Review
+
+**Date:** 2026-02-28
+**Scope:** Full codebase audit — `src/`, `neural_net/`, `tests/`, `examples/`, build system
+**Method:** Parallel exploratory analysis across all subsystems; no assumptions made.
+
+---
+
+## Table of Contents
+
+1. [System Overview](#1-system-overview)
+2. [Critical Bugs](#2-critical-bugs)
+3. [Performance Suboptimalities](#3-performance-suboptimalities)
+4. [Design Issues](#4-design-issues)
+5. [Build System Issues](#5-build-system-issues)
+6. [Neural Net Training Issues](#6-neural-net-training-issues)
+7. [Testing Gaps](#7-testing-gaps)
+8. [Quick Wins (Low-Risk, High-Reward)](#8-quick-wins)
+9. [Architecture Observations](#9-architecture-observations)
+10. [Exploration Backlog](#10-exploration-backlog)
+
+---
+
+## 1. System Overview
+
+```
+GPU-resident float32 data
+        │
+        ▼
+  HDF5 VOL Connector (H5VLgpucompress.cu)
+  ┌──────────────────────────────────────────────────────────┐
+  │  Stage 1 (main thread): chunk iteration, WorkItem queue  │
+  │  Stage 2 (8 workers):  gpucompress_compress_gpu() +D→H  │
+  │  Stage 3 (I/O thread): write compressed chunks to disk   │
+  └──────────────────────────────────────────────────────────┘
+        │
+        ▼
+  gpucompress_compress_gpu()  [src/api/gpucompress_api.cpp]
+  ┌──────────────────────────────────────────────────────────┐
+  │  1. Acquire CompContext (pool of 8 independent slots)    │
+  │  2. Stats pipeline (entropy, MAD, deriv) on ctx->stream  │
+  │  3. nnFusedInferenceKernel → best of 32 configs         │
+  │  4. Optional: quantize + byte-shuffle preprocessing      │
+  │  5. nvcomp compression (LZ4/ZSTD/etc.)                  │
+  │  6. Optional: exploration (try K alternatives + SGD)     │
+  │  7. cudaStreamSynchronize(ctx->stream)                   │
+  │  8. Release CompContext                                   │
+  └──────────────────────────────────────────────────────────┘
+        │
+        ▼
+  Neural Network (src/nn/nn_gpu.cu)
+  15→128→128→4 MLP, ReLU activations
+  Inputs: one-hot algo, quant, shuffle, log(error_bound),
+          log(data_size), entropy, MAD, 2nd-deriv
+  Outputs: comp_time, decomp_time, ratio, PSNR  (all log-space)
+  Online SGD: GPU-native (nnSGDKernel) on dedicated g_sgd_stream
+  Inference: nnFusedInferenceKernel reads stats directly from d_stats
+```
+
+Action space: 32 configs = 8 algos × 2 quant modes × 2 shuffle modes
+Encoding: `action_id = algo + quant*8 + shuffle*16`
+
+---
+
+## 2. Critical Bugs
+
+### BUG-1: `d_owned` Memory Leak on Compression Error
+**File:** `src/hdf5/H5VLgpucompress.cu` — Worker lambda
+**Severity:** HIGH
+**Status:** Needs verification and fix
+
+```cpp
+// Worker code (current)
+gpucompress_error_t ce = gpucompress_compress_gpu(
+    wi.src, wi.sz, d_comp_w[w], &comp_sz, &cfg, NULL, NULL);
+
+if (wi.d_owned) { cudaFree(wi.d_owned); wi.d_owned = NULL; }  // freed on SUCCESS path
+
+if (ce != GPUCOMPRESS_SUCCESS) {
+    worker_err.store((herr_t)-1);
+    continue;  // BUG: d_owned already freed above — but what if cudaFree was AFTER the check?
+}
+```
+**Verify:** Confirm the exact ordering — if `cudaFree(d_owned)` is _before_ the error check, it's OK. If _after_, `d_owned` is leaked every time compression fails.
+
+---
+
+### BUG-2: Dimension Array Memory Leak on Mid-Loop Failure
+**File:** `src/hdf5/H5VLgpucompress.cu` — `gpu_aware_chunked_write`
+**Severity:** HIGH
+
+Dimension arrays `d_dset_dims`, `d_chunk_dims`, `d_chunk_start` are allocated via `alloc_dim_arrays()`. If a `cudaMalloc` for `d_owned` fails mid-iteration (`break` path), cleanup at the end of the function may not free these arrays if they were conditionally allocated. Need to verify all exit paths call `free_dim_arrays()`.
+
+---
+
+### BUG-3: Race Condition in `nnSGDKernel` Gradient Accumulation
+**File:** `src/nn/nn_gpu.cu` — `nnSGDKernel<<<1,128>>>`
+**Severity:** HIGH (potential weight corruption)
+
+The kernel accumulates gradients for `w3` across outputs. If multiple outputs need updates for the same weight index, writes to `d_grad_buffer` may race between threads. Needs code inspection to confirm atomics are or are not used:
+
+```cpp
+// Check this section in nnSGDKernel:
+// d_grad_buffer[SGD_OFF_DW3 + out * NN_HIDDEN_DIM + t] += ...
+// If two threads update the same element, this is a race.
+```
+**Action:** Audit which threads update which gradient positions. If non-overlapping (each thread owns its stripe), no bug. If overlapping (multiple outputs map to same element), use `atomicAdd`.
+
+---
+
+### BUG-4: Format String Mismatch
+**File:** `src/api/gpucompress_api.cpp` ~line 1243
+**Severity:** LOW (UB, likely benign on 64-bit but technically wrong)
+
+```cpp
+printf("... %u ...", header.original_size);  // original_size is uint64_t, needs %lu or PRIu64
+```
+
+---
+
+### BUG-5: Corrupted Weights on Truncated `.nnwt` File
+**File:** `src/nn/nn_gpu.cu` — `loadNNFromBinary()`
+**Severity:** MEDIUM
+
+`file.read()` does not guarantee atomic reads. If the file is truncated, partial data is silently loaded into `NNWeightsGPU` and then `cudaMemcpy`'d to GPU. No CRC, size check after each section, or `file.good()` check post-read. The model will silently produce garbage predictions.
+
+**Fix:** After each `file.read()` call, check `file.gcount()` equals expected bytes.
+
+---
+
+### BUG-6: Unprotected Global Statistics in VOL Connector
+**File:** `src/hdf5/H5VLgpucompress.cu`
+**Severity:** MEDIUM (data race if multiple threads write simultaneously)
+
+```cpp
+static int s_gpu_writes = 0;   // Not atomic
+static int s_chunks_comp = 0;  // Not atomic
+// Incremented in concurrent worker threads without lock
+```
+**Fix:** Use `std::atomic<int>` or protect with mutex.
+
+---
+
+## 3. Performance Suboptimalities
+
+### PERF-1: Exploration Round-Trip Overhead
+**File:** `src/api/gpucompress_api.cpp` — exploration path (~lines 808-934)
+**Severity:** HIGH (O(K × input_size) extra traffic)
+
+When exploration triggers:
+- K=4 (baseline), K=9 (high error), K=31 (OOD)
+- Each alternative: full compress → full decompress → PSNR (2× D→H copies of full data for lossy)
+- For 64 MB chunk with K=31: ~4 GB of extra memory traffic
+
+**Options:**
+1. Compute PSNR on GPU (eliminates D→H)
+2. Skip PSNR for alternatives outside top-N candidates
+3. Cache predicted ratio ÷ actual ratio to skip round-trip for obviously worse alternatives
+4. Early-exit exploration once a "good enough" alternative found
+
+---
+
+### PERF-2: Insertion Sort on Thread 0 (31 Threads Idle)
+**File:** `src/nn/nn_gpu.cu` — `nnInferenceKernel` / `nnFusedInferenceKernel`
+**Severity:** MEDIUM (97% thread utilization waste during ranking)
+
+Thread 0 does insertion sort over 32 configs (O(n²)=O(1024) ops) while threads 1-31 are idle.
+
+**Fix options:**
+1. Bitonic sort (parallel, 32-element, 5 passes of 16 comparisons = 80 ops vs 1024)
+2. Move sort to CPU (32-element CPU sort is negligible cost)
+3. For just the winner (no top-K needed), use parallel reduction (already done in `nnFusedInferenceKernel` for single winner)
+
+---
+
+### PERF-3: Feature Encoding Repeated Per Thread
+**File:** `src/nn/nn_gpu.cu` — inference kernels
+**Severity:** LOW-MEDIUM
+
+All 32 threads independently compute `log10(error_bound)` and `log2(data_size)`. These transcendental ops are identical across threads.
+
+**Fix:** Compute in thread 0, store in shared memory, `__syncthreads()`, then all threads read.
+
+---
+
+### PERF-4: Multiple Small D→H Copies in `runNNInference()`
+**File:** `src/nn/nn_gpu.cu` — `runNNInference()`
+**Severity:** MEDIUM (latency on each inference call)
+
+3 separate `cudaMemcpyAsync` calls for:
+- Best action (4B)
+- Predicted ratio + comp_time (8B)
+- Top-32 actions (128B)
+
+These should be batched into a single `cudaMemcpy` of the `NNInferenceOutput` struct (which already exists at 16B for the fused kernel).
+
+---
+
+### PERF-5: Three Separate D→H Copies in `runStatsKernels()`
+**File:** `src/stats/stats_kernel.cu`
+**Severity:** LOW-MEDIUM
+
+Copies entropy (8B), mad_normalized (8B), deriv_normalized (8B) in three separate transfers. Should be a single 24B copy from contiguous fields in `AutoStatsGPU`.
+
+---
+
+### PERF-6: H→D Initialization of `AutoStatsGPU` Stats Workspace
+**File:** `src/stats/stats_kernel.cu` — `runStatsKernelsNoSync()`
+**Severity:** LOW
+
+The stats workspace is initialized via `cudaMemsetAsync` (for zeros) + H→D copy for `vmin=FLT_MAX, vmax=-FLT_MAX`. The H→D copy adds a PCIe round-trip. Alternative: use a small init kernel that sets just those fields in-place on GPU.
+
+---
+
+### PERF-7: CAS-Based `atomicMin/Max` for Float
+**File:** `src/stats/stats_kernel.cu` — `statsPass1Kernel`
+**Severity:** LOW
+
+Manual CAS loop emulates float `atomicMin`/`atomicMax`. On Ampere (sm_80), native float atomics are available. Could use `__atomic_min_block()` or CUDA 11+ intrinsics.
+
+---
+
+### PERF-8: Per-Chunk `malloc` in Workers
+**File:** `src/hdf5/H5VLgpucompress.cu` — Worker lambda
+**Severity:** MEDIUM
+
+Each compressed chunk does `malloc(comp_sz)` + `memcpy` to create the `IOItem` payload, then `free(item.data)` in the I/O thread. For 1000 chunks, this is 1000 malloc/free cycles.
+
+**Fix:** Pre-allocate a pool of fixed-size buffers (size = `max_comp`) shared between all workers and the I/O thread via a free-list.
+
+---
+
+### PERF-9: No Buffer Pooling for Quantize/Shuffle Temporaries
+**File:** `src/api/gpucompress_api.cpp` — compress path
+**Severity:** LOW-MEDIUM
+
+`d_quantized` and `d_shuffled` are `cudaMalloc`'d per-call and freed immediately. In a tight loop (benchmark, VOL multi-chunk), this fragments GPU memory allocator.
+
+**Fix:** Add to `CompContext` or use a slab allocator sized to max chunk.
+
+---
+
+### PERF-10: `cudaStreamSynchronize` on Default Stream for Timing
+**File:** `src/api/gpucompress_api.cpp` — timing path
+**Severity:** LOW
+
+`cudaEventSynchronize(g_t_stop)` uses a global event on the default stream, potentially blocking other CompContext slots that also run on the default stream. In the concurrent-worker scenario, timing should use `ctx->t_start`/`ctx->t_stop` only.
+
+---
+
+### PERF-11: CUDA Architecture Targeting Old GPU (sm_52 = Kepler)
+**File:** `CMakeLists.txt` / `CMakeCache.txt`
+**Severity:** HIGH (10-30% performance loss on modern hardware)
+
+```
+CMAKE_CUDA_ARCHITECTURES = 52   # Maxwell, circa 2014
+System GPU = sm_80               # Ampere A100
+```
+
+Missing Ampere features: TF32 tensor cores, native float atomics, improved shared memory bandwidth, async copy (cp.async).
+
+**Fix (one line):**
+```bash
+cmake -B build -DCMAKE_CUDA_ARCHITECTURES=80
+```
+Or set in CMakeLists.txt:
+```cmake
+set(CMAKE_CUDA_ARCHITECTURES 80 CACHE STRING "CUDA architectures to target")
+```
+
+---
+
+### PERF-12: Missing `-use_fast_math` Flag
+**File:** `CMakeLists.txt` line 20
+**Severity:** MEDIUM (~5-10% throughput improvement for NN/stats kernels)
+
+```cmake
+# Current:
+set(CMAKE_CUDA_FLAGS_RELEASE "-O3")
+
+# Recommended:
+set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -use_fast_math")
+```
+
+`-use_fast_math` enables approximate `__logf`, `__expf`, `__sqrtf` which are 2-5× faster than IEEE-compliant versions. Acceptable for compression statistics and NN inference.
+
+---
+
+### PERF-13: Duplicated Forward Pass in Two Inference Kernels
+**File:** `src/nn/nn_gpu.cu`
+**Severity:** MEDIUM (maintenance risk, and both are slightly slower than needed)
+
+`nnInferenceKernel` and `nnFusedInferenceKernel` share ~250 lines of identical forward pass code. The only difference is how stats are loaded (passed as scalars vs. read from `d_stats` device pointer). A `__device__` helper function or template would eliminate duplication.
+
+---
+
+## 4. Design Issues
+
+### DESIGN-1: Exploration Logic Tightly Coupled in Main Compress Path
+**File:** `src/api/gpucompress_api.cpp`
+**Severity:** MEDIUM
+
+The Level-2 exploration loop (~300 lines) lives inline in `gpucompress_compress_gpu`. It's difficult to:
+- Unit test exploration independently
+- Tune exploration without rebuilding the entire compress function
+- Understand the main compression path at a glance
+
+**Suggestion:** Extract to `runExplorationPass(ctx, d_stats, ...) → ExplorationResult`.
+
+---
+
+### DESIGN-2: SGD Fired on Potentially Stale Stats
+**File:** `src/api/gpucompress_api.cpp`
+**Severity:** LOW (functionally OK, semantically odd)
+
+`d_stats_ptr` is computed at the start of compression. If exploration then selects a different algorithm and replaces the output, the SGD still uses the original stats (entropy/MAD/deriv of the data) which is correct — but the `action` in the SGDSample is the exploration-winner action, not the NN's first choice. This is intentional but worth documenting explicitly.
+
+---
+
+### DESIGN-3: Global Namespace Structs in `nn_weights.h`
+**File:** `src/nn/nn_weights.h`
+**Severity:** LOW (works, but fragile)
+
+`SGDSample`, `SGDOutput`, `NNInferenceOutput`, `NNWeightsGPU` are in global namespace to avoid `gpucompress::SGDSample` vs `::SGDSample` mismatch when included inside `namespace gpucompress {}`. This is a footgun: any new file that includes `nn_weights.h` inside a namespace will silently get global-namespace types.
+
+**Fix:** Move all structs into `namespace gpucompress {}` and update all includes/usages accordingly. The include-outside-namespace pattern in `nn_gpu.cu` was a workaround that should be cleaned up.
+
+---
+
+### DESIGN-4: Stubbed `nn_reinforce.cpp` Still in API Surface
+**File:** `src/nn/nn_reinforce.h`, `nn_reinforce.cpp`
+**Severity:** LOW
+
+All functions return 0/no-op. GPU SGD replaced the CPU path. These APIs appear in the public interface but do nothing. Confusing for users. Either deprecate with `[[deprecated]]` or remove entirely.
+
+---
+
+### DESIGN-5: Non-Deterministic Chunk Write Order in VOL
+**File:** `src/hdf5/H5VLgpucompress.cu`
+**Severity:** LOW (correctness fine, performance degrades)
+
+Workers push IOItems to the I/O queue in compression-completion order, not in logical chunk order. The I/O thread writes them to file in that order. HDF5's chunk B-tree is order-independent, but non-sequential chunk writes cause file fragmentation and extra B-tree rotations.
+
+**Potential fix:** Tag each IOItem with its logical chunk index; I/O thread sorts or uses ordered output structure. Trade-off: adds latency vs. reduces fragmentation.
+
+---
+
+### DESIGN-6: `H5Zgpucompress` 256-Chunk Static Limit
+**File:** `src/hdf5/H5Zgpucompress.c`
+**Severity:** MEDIUM
+
+```c
+static int g_chunk_algorithms[256];  // Fixed size
+```
+If a dataset has >256 chunks, the algorithm tracker silently overflows or stops recording. No bounds check.
+
+**Fix:** Use dynamic array (`malloc`/`realloc`) or remove the tracker and use HDF5 attribute APIs.
+
+---
+
+### DESIGN-7: CLI Tools Cannot Handle Files Larger Than GPU Memory
+**File:** `src/cli/compress.cpp`, `src/cli/decompress.cpp`
+**Severity:** HIGH for large-file users
+
+```cpp
+size_t aligned_input_size = ((file_size + 4095) / 4096) * 4096;
+cudaMalloc(&d_input, aligned_input_size);  // Entire file must fit
+```
+For files >10-40 GB (depending on GPU), this will OOM. The VOL connector handles this via chunking, but the CLI tool does not.
+
+**Fix:** Add streaming mode: process in GPU-sized chunks (e.g., 1 GB), with prepended metadata block.
+
+---
+
+### DESIGN-8: Experience Buffer Missing Key Metrics
+**File:** `src/nn/experience_buffer.h`
+**Severity:** MEDIUM (affects retraining quality)
+
+C++ active learning logs `entropy, mad, deriv, action, ratio, comp_time` but NOT `decomp_time` or `psnr`. When `retrain.py` processes experience data, it fills missing columns with dataset-wide medians, introducing systematic bias into retraining.
+
+**Fix:** Measure and log `decomp_time` during active learning exploration (decompress is already done for PSNR check in lossy mode).
+
+---
+
+## 5. Build System Issues
+
+### BUILD-1: Targeting Kepler GPU (sm_52) on Ampere Hardware
+See PERF-11 above. **Immediate action recommended.**
+
+### BUILD-2: Missing `-use_fast_math`
+See PERF-12 above.
+
+### BUILD-3: nvcomp Hardcoded at `/tmp/lib`
+**File:** `CMakeLists.txt` line 39
+Non-standard, fragile path. System reboots or `/tmp` cleanup breaks the build.
+
+```cmake
+# Current:
+link_directories(/tmp/lib)
+
+# Better:
+find_library(NVCOMP_LIB nvcomp HINTS /tmp/lib /usr/local/lib)
+```
+
+### BUILD-4: HDF5 2.x Hardcoded at `/tmp/hdf5-install`
+**File:** `CMakeLists.txt` ~line 431
+Same fragility as BUILD-3. Should be a CMake cache variable:
+
+```cmake
+set(HDF5_VOL_ROOT "/tmp/hdf5-install" CACHE PATH "HDF5 2.x install prefix")
+```
+
+### BUILD-5: C++ Standard is C++14
+**File:** `CMakeLists.txt`
+`std::optional`, `std::string_view`, structured bindings, `if constexpr` (C++17) would simplify several code paths. No blocker; upgrade when convenient.
+
+### BUILD-6: Separable Compilation Always On
+**File:** `CMakeLists.txt`
+`CUDA_SEPARABLE_COMPILATION ON` is enabled for all CUDA targets, including non-VOL ones. This adds compile-time overhead (~20-30% per file) and requires device-link step. Only strictly necessary for VOL connector (device function pointers).
+
+---
+
+## 6. Neural Net Training Issues
+
+### NN-1: ListNet Ranking Loss Not Implemented
+**File:** `neural_net/training/train.py`
+**Severity:** OPPORTUNITY (+3-7% top-1 accuracy, zero CUDA changes)
+
+Current loss: MSE on predicted vs. actual metric values.
+Better: ListNet softmax cross-entropy on ranking probabilities — directly optimizes the metric the system is evaluated on.
+
+Model architecture unchanged; only the loss function changes. No CUDA kernel modifications.
+
+---
+
+### NN-2: Bilinear Factored Architecture (Exploration)
+**File:** `neural_net/core/model.py`
+**Opportunity:** +2-5% accuracy, 9.6K params (vs current 19K), 50% smaller model
+
+Replaces:
+```python
+net = Sequential(Linear(15,128), ReLU, Linear(128,128), ReLU, Linear(128,4))
+```
+With:
+```python
+data_enc = Linear(5, 64)    # entropy, MAD, deriv, log(size), log(eb)
+cfg_enc  = Linear(10, 64)   # one-hot algo + quant + shuffle
+combined = data_enc(data) * cfg_enc(cfg)  # element-wise multiply
+output   = Linear(64, 4)(combined)
+```
+Captures multiplicative data×config interactions that the current fully-connected model must implicitly learn.
+
+---
+
+### NN-3: Code Duplication in `cross_validate.py`
+**File:** `neural_net/training/cross_validate.py`
+`prepare_fold()` reimplements the same feature encoding as `encode_and_split()` in `data.py`. Any change to feature definitions must be applied in two places.
+
+**Fix:** Extract `encode_dataframe(df, fit_normalizer=False, normalizer=None)` as shared utility.
+
+---
+
+### NN-4: Silent Infinite Regret Masking in `evaluate.py`
+**File:** `neural_net/inference/evaluate.py`
+```python
+if np.isfinite(regret):
+    regret = max(0.0, regret)
+else:
+    regret = 0.0  # Silently discards infinite regret
+```
+Should log a warning and count such cases separately in the evaluation report.
+
+---
+
+### NN-5: OOD Margin (10%) Not Validated or Documented
+**File:** `src/nn/nn_gpu.cu` — OOD detection in `nnFusedInferenceKernel`
+The 10% margin around training bounds is a magic number with no empirical justification in code or docs. Should be documented as a hyperparameter or made configurable.
+
+---
+
+## 7. Testing Gaps
+
+### TEST-1: No Multi-Chunk Test for VOL Connector
+`test_hdf5_configs.c` tests single-chunk datasets only. The 3-stage pipeline in `H5VLgpucompress.cu` is only exercised by `nn_vol_demo` (4 GB). Need:
+- Small multi-chunk test (e.g., 16 chunks × 256 KB) for boundary chunk handling
+- Verify that all chunks decompress correctly, including boundary chunks with padding
+
+### TEST-2: No Concurrent Compression Stress Test
+The CompContext pool (8 slots) is never tested under concurrent load. Need:
+- Test that launches 16+ simultaneous `gpucompress_compress_gpu()` calls
+- Verify no data corruption, no deadlock, correct results
+
+### TEST-3: No Corrupted/Truncated File Recovery Test
+`loadNNFromBinary()` is not tested with:
+- Truncated `.nnwt` file
+- Wrong magic number
+- Wrong architecture (different hidden_dim)
+
+### TEST-4: No CLI Round-Trip Test
+`compress.cpp` + `decompress.cpp` are not tested in the automated suite. Only the filter API is tested.
+
+### TEST-5: No Stats Numerical Match Test (CPU vs GPU)
+`compute_stats_cpu()` in Python and `runStatsKernelsNoSync()` on GPU should produce identical entropy/MAD/deriv values. This is never verified in tests. Floating-point ordering differences could cause subtle NN input mismatches at training vs. inference time.
+
+---
+
+## 8. Quick Wins
+
+These require minimal code changes and carry clear, verifiable benefits:
+
+| # | Change | File | Expected Gain | Risk |
+|---|--------|------|--------------|------|
+| QW-1 | Set `CMAKE_CUDA_ARCHITECTURES=80` | CMakeLists.txt | 10-30% GPU kernel speedup | Low |
+| QW-2 | Add `-use_fast_math` to CUDA Release flags | CMakeLists.txt | 5-10% speedup | Low |
+| QW-3 | Fix format string `%u` → `PRIu64` | gpucompress_api.cpp:1243 | Correctness | Zero |
+| QW-4 | Make global stats atomics (`s_gpu_writes` etc.) | H5VLgpucompress.cu | Thread safety | Low |
+| QW-5 | Add `file.gcount()` checks in `loadNNFromBinary` | nn_gpu.cu | Prevents silent corruption | Low |
+| QW-6 | Remove stderr spam (conditional on debug flag) | nn_gpu.cu, gpucompress_api.cpp | I/O overhead reduction | Low |
+| QW-7 | Batch 3 D→H copies in `runStatsKernels()` into 1 | stats_kernel.cu | PCIe efficiency | Low |
+| QW-8 | Move insertion sort to CPU (off critical GPU path) | nn_gpu.cu | Frees 31 idle threads | Low |
+
+---
+
+## 9. Architecture Observations
+
+### Strength: Fused Stats→NN Pipeline
+The `runStatsKernelsNoSync()` + `nnFusedInferenceKernel` pattern eliminates the stats D→H round-trip. Stats stay on GPU from computation through NN input. This was correctly implemented.
+
+### Strength: CompContext Pool for Concurrency
+8 independent compression slots, each with own stream, events, stats/NN/SGD buffers. Enables true parallel chunk compression. The CUDA event barrier (`cudaStreamWaitEvent` before inference, `g_sgd_done` event after SGD) correctly prevents the GPU-level SGD vs. inference data race without CPU polling.
+
+### Strength: VOL Connector Pointer Detection
+`cudaPointerGetAttributes()` to detect GPU vs. host pointers at the VOL layer enables transparent GPU-native I/O without API changes to calling code.
+
+### Weakness: Exploration Path Performance
+Exploration is the dominant cost for OOD data. K=31 alternatives with full round-trips is O(31 × chunk_size) GPU work per chunk. For 4 MB chunks this adds up quickly. A smarter exploration strategy (e.g., hierarchical: try 4 → if any better, try 8 more, etc.) would reduce average cost significantly.
+
+### Weakness: Single `g_sgd_stream` Serializes All SGD
+All 8 workers share one `g_sgd_stream`. SGD is serialized at the CUDA stream level. For high-throughput workloads where every chunk triggers SGD, this could become a bottleneck. Since SGD calls are protected by `g_sgd_mutex`, the CPU bottleneck happens first, so the CUDA stream serialization is probably not the current bottleneck — but worth profiling.
+
+### Weakness: No Adaptive Chunk Size
+The VOL pipeline uses a fixed chunk size set by the HDF5 DCPL. There's no mechanism for the NN to suggest a different chunk size based on data characteristics. For highly compressible data, larger chunks amortize overhead. For incompressible data, smaller chunks reduce compression attempt cost.
+
+---
+
+## 10. Exploration Backlog
+
+Items that need further investigation before a verdict:
+
+| ID | Question | How to Investigate |
+|----|----------|--------------------|
+| EXP-1 | Is `d_owned` actually leaked on worker compression failure? | Read exact ordering of `cudaFree(d_owned)` vs error check in worker lambda |
+| EXP-2 | Does `nnSGDKernel` have a gradient race? | Audit thread→gradient index mapping; check if any index is written by >1 thread |
+| EXP-3 | Do CPU and GPU stats implementations produce identical results? | Run same float32 array through both; compare entropy/MAD/deriv |
+| EXP-4 | Is sm_52 actually being used vs. JIT-compiled to sm_80? | `cuobjdump --dump-sass build/libgpucompress.so | head` |
+| EXP-5 | Is exploration actually triggered in normal workloads? | Add counter; run benchmark and check how often K>4 exploration fires |
+| EXP-6 | What is the actual GPU memory footprint? | `cudaMemGetInfo` before/after `gpucompress_init` |
+| EXP-7 | Is `g_sgd_stream` actually the bottleneck? | `nsys profile` while running VOL benchmark; look for SGD serialization |
+| EXP-8 | Does `-use_fast_math` affect compression quality/stats accuracy? | Profile NN accuracy (top-1) with and without flag |
+
+---
+
+## 11. Cross-Review Verification (CODE_REVIEW_FINDINGS.md)
+
+A second agent independently audited the same codebase. Each of its unique findings was verified against the actual source code. Results below:
+
+---
+
+### VERIFIED NEW: `d_range_min`/`d_range_max` Static Globals — Concurrent Quantize Bug
+**Source:** [PREP-2] in CODE_REVIEW_FINDINGS.md
+**Verified:** YES — this is a real, critical bug I missed.
+
+`quantization_kernels.cu:25-26` allocates two static GPU pointers:
+```cpp
+static void* d_range_min = nullptr;
+static void* d_range_max = nullptr;
+```
+
+`compute_data_range()` (called by `quantize_simple()`) writes the input data's min/max into these shared GPU addresses, then D→H copies them back. But `gpucompress_compress_gpu()` calls `quantize_simple()` concurrently from all 8 workers (each on its own `ctx->stream`).
+
+**What happens under concurrent quantize:**
+- Worker A: initializes `d_range_min = FLT_MAX` on stream A, launches min kernel on stream A
+- Worker B: initializes `d_range_min = FLT_MAX` on stream B *before A's kernel writes its result*, launches its kernel on stream B
+- Both kernels atomically update the same `d_range_min` device address — mixing A's and B's data
+- Both workers D→H copy `d_range_min` — both get a corrupted value
+- **Result:** wrong `data_min`/`data_max` → wrong `scale_factor` → silently wrong quantization output
+
+Additionally, `ensure_range_bufs()` has a TOCTOU race (two threads both see `nullptr`, both `cudaMalloc` — second allocation leaks).
+
+**Severity:** CRITICAL (silent data corruption in quantized output, every time ≥2 concurrent chunks need quantization)
+**My review:** missed this entirely.
+**Add to BUG section above as BUG-7.**
+
+---
+
+### VERIFIED NEW: `g_sgd_ever_fired` is Not Atomic
+**Source:** [API-1] in CODE_REVIEW_FINDINGS.md
+**Verified:** YES.
+
+`gpucompress_api.cpp:70`:
+```cpp
+bool g_sgd_ever_fired = false;  // plain bool, not atomic
+```
+
+Read in `runNNFusedInferenceCtx()` (`nn_gpu.cu:1378`) from 8 concurrent inference threads **without any mutex**:
+```cpp
+if (g_sgd_ever_fired)
+    cudaStreamWaitEvent(stream, g_sgd_done, 0);
+```
+
+Written in `runNNSGDCtx()` (`nn_gpu.cu:1472`) under `g_sgd_mutex`:
+```cpp
+g_sgd_ever_fired = true;
+```
+
+This is a textbook C++ data race (concurrent read + unsynchronized write). The practical impact is bounded: a missed `cudaStreamWaitEvent` could allow an inference kernel to read weights while SGD is writing them on `g_sgd_stream` — exactly the GPU race this flag was meant to prevent.
+
+**Fix:** `std::atomic<bool> g_sgd_ever_fired{false}` with `memory_order_relaxed` write, `memory_order_acquire` read.
+**Severity:** MEDIUM-HIGH (correctness, low probability but real race window).
+**My review:** missed this.
+
+---
+
+### VERIFIED NEW: `atomicAddDouble` CAS Contention — Native Atomic Available on sm_80+
+**Source:** [STATS-1] in CODE_REVIEW_FINDINGS.md
+**Verified:** YES (and my review only mentioned `atomicMinFloat`/`atomicMaxFloat`, not `atomicAddDouble`).
+
+`stats_kernel.cu:58-67` implements `atomicAddDouble` via CAS loop. With `STATS_MAX_BLOCKS=1024`, one thread per block (the warp-0 lane-0 winner after shared-memory inter-warp reduction) calls this function — 1024 threads serializing on two global addresses (`stats->sum` and `stats->abs_diff_sum`).
+
+On Ampere (sm_80+), CUDA natively supports `atomicAdd(double*, double)` since compute capability 6.0 (Pascal). The CAS emulation is both slower and generates unnecessary retry loops. A simple:
+```cpp
+// If targeting sm_60+:
+atomicAdd(address, val);  // native, no CAS loop
+```
+would eliminate all contention.
+
+**Severity:** MEDIUM (performance for large arrays on modern hardware).
+**My review:** partially mentioned (CAS for min/max) but missed the double-add variant.
+
+---
+
+### VERIFIED NEW: `[API-3]` Per-Call `cudaMalloc` for CASCADED/ANS/BITCOMP
+**Source:** [API-3] in CODE_REVIEW_FINDINGS.md
+**Verified:** YES.
+
+`gpucompress_api.cpp:1763-1768`: when the NN selects CASCADED, ANS, or BITCOMP and their worst-case output (2-4× input) exceeds the caller's pre-allocated output buffer, a per-call `cudaMalloc` + D→D copy + `cudaFree` happens:
+
+```cpp
+if (total_max_needed > *output_size) {
+    if (cudaMalloc(&d_temp_out, total_max_needed) != cudaSuccess) ...
+}
+// ... later: D→D copy to d_out, then cudaFree(d_temp_out)
+```
+
+In the VOL write path, `d_comp_w[w]` is sized to `max_comp = gpucompress_max_output_size(chunk_bytes)`. If this was computed assuming LZ4 (conservative 1.1×), and the NN at runtime picks CASCADED (which needs 2-4×), this triggers every chunk.
+
+**Severity:** MEDIUM (cudaMalloc/Free on hot path; CASCADED is rarely selected for float32 data, so low frequency in practice).
+**My review:** missed this.
+
+---
+
+### VERIFIED: [COMP-2] CASCADED/BITCOMP Use `NVCOMP_TYPE_LONGLONG` — Needs Measurement
+**Source:** [COMP-2] in CODE_REVIEW_FINDINGS.md
+**Verdict:** Code confirmed (`compression_factory.cpp:116, 123`). However, the other agent's framing is partly incorrect. `NVCOMP_TYPE_LONGLONG` tells CASCADED how to interpret runs and delta-encode values. For float32 data bit-patterns, reinterpreting as 64-bit integer groupings is not obviously wrong — it depends on whether float byte patterns exhibit better run-length when viewed as 32-bit or 64-bit words. The comment "Good for floating-point/scientific data" is plausible but unverified.
+**Severity:** INVESTIGATE — not a confirmed bug, just an untested assumption. Benchmark `NVCOMP_TYPE_INT` vs `NVCOMP_TYPE_LONGLONG` on representative float32 datasets.
+
+---
+
+### VERIFIED: [VOL-6] Gather Kernel on Default Stream — Serializes Stage 1
+**Source:** [VOL-6] in CODE_REVIEW_FINDINGS.md
+**Verified:** YES. `H5VLgpucompress.cu:1194-1200` launches `gather_chunk_kernel` on `cudaStreamDefault` and synchronizes before posting the WorkItem. Every non-contiguous or N-D chunk causes Stage 1 to stall. For purely chunked, C-order layouts this never triggers; for HDF5 datasets with non-C-order access patterns, this serializes the entire pipeline.
+**My review:** mentioned this in the stream table ("VOL gather kernel: Default — Potential issue") but didn't flag it prominently.
+
+---
+
+### CONFIRMED (already in my review):
+| Finding ID | Status | In my review? |
+|-----------|--------|---------------|
+| [COMP-1] 4-bit algorithm ID limit | Confirmed, real limitation | Not explicitly — add to EXP backlog |
+| [PREP-1] fprintf in quantization_kernels.cu | Confirmed | Mentioned generally (debug logging) |
+| [STATS-2] fprintf in stats path | Confirmed | Yes, PERF tables |
+| [NN-1] Full forward pass per thread | Confirmed — design choice | Yes |
+| [NN-2] Insertion sort | Confirmed | Yes, PERF-2 |
+| [NN-3] fprintf in SGD | Confirmed | Yes |
+| [NN-4] 128-thread SGD kernel | Confirmed — design choice | Yes |
+| [VOL-1] Synchronous D→H | Confirmed | Yes |
+| [VOL-2] Per-chunk malloc | Confirmed | Yes, PERF-8 |
+| [VOL-3] Single I/O thread | Confirmed | Yes |
+| [VOL-4] Workers continue after error | Confirmed | Yes (in BUG-1 context) |
+| [VOL-5] N_COMP_WORKERS == N_COMP_CTX | Confirmed good design | Yes |
+| [API-2] Exploration cost | Confirmed | Yes, PERF-1 |
+| [CROSS-1] fprintf throughout | Confirmed | Yes |
+| [CROSS-2] Thread safety of singletons | Confirmed (quantize path) | Partially |
+
+---
+
+### Summary of Net New Confirmed Findings
+
+| ID | Issue | Severity | File:Line |
+|----|-------|----------|-----------|
+| BUG-7 | `d_range_min`/`d_range_max` shared across concurrent quantize calls | **CRITICAL** | `quantization_kernels.cu:25-36, 327-344` |
+| BUG-8 | `g_sgd_ever_fired` plain bool read/written without atomics | **MEDIUM** | `gpucompress_api.cpp:70`, `nn_gpu.cu:1378,1472` |
+| PERF-14 | `atomicAddDouble` CAS should be native `atomicAdd` on sm_60+ | **MEDIUM** | `stats_kernel.cu:58-67` |
+| PERF-15 | Per-call `cudaMalloc` for CASCADED/ANS/BITCOMP temp buffer | **MEDIUM** | `gpucompress_api.cpp:1763-1768` |
+| PERF-16 | Gather kernel on default stream serializes Stage 1 (non-contiguous datasets) | **MEDIUM** | `H5VLgpucompress.cu:1194-1200` |
+| INVESTIGATE | CASCADED/BITCOMP `NVCOMP_TYPE_LONGLONG` assumption unverified | **LOW** | `compression_factory.cpp:116,123` |
+
+---
+
+*This document was generated from systematic codebase exploration. Update findings as issues are verified or resolved.*
