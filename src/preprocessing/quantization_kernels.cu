@@ -13,6 +13,9 @@
 #include <cfloat>
 #include <cstdio>
 
+extern bool g_gc_verbose;
+#define GC_LOG(fmt, ...) do { if (g_gc_verbose) fprintf(stderr, fmt, ##__VA_ARGS__); } while(0)
+
 // ============================================================================
 // Constants and Configuration
 // ============================================================================
@@ -780,9 +783,9 @@ bool verify_error_bound(
 
     int zero = 0;
     double init_max = 0.0;
-    fprintf(stderr, "[XFER H→D] verify error bound: init violations=0 (%zu B)\n", sizeof(int));
+    GC_LOG("[XFER H→D] verify error bound: init violations=0 (%zu B)\n", sizeof(int));
     cudaMemcpyAsync(d_violations, &zero, sizeof(int), cudaMemcpyHostToDevice, stream);
-    fprintf(stderr, "[XFER H→D] verify error bound: init max_error=0 (%zu B)\n", sizeof(double));
+    GC_LOG("[XFER H→D] verify error bound: init max_error=0 (%zu B)\n", sizeof(double));
     cudaMemcpyAsync(d_max_error, &init_max, sizeof(double), cudaMemcpyHostToDevice, stream);
 
     int num_blocks = min((int)((num_elements + BLOCK_SIZE - 1) / BLOCK_SIZE), 1024);
@@ -801,9 +804,9 @@ bool verify_error_bound(
 
     int h_violations;
     double h_max_error;
-    fprintf(stderr, "[XFER D→H] verify error bound: violation count (%zu B)\n", sizeof(int));
+    GC_LOG("[XFER D→H] verify error bound: violation count (%zu B)\n", sizeof(int));
     cudaMemcpyAsync(&h_violations, d_violations, sizeof(int), cudaMemcpyDeviceToHost, stream);
-    fprintf(stderr, "[XFER D→H] verify error bound: max_error (%zu B)\n", sizeof(double));
+    GC_LOG("[XFER D→H] verify error bound: max_error (%zu B)\n", sizeof(double));
     cudaMemcpyAsync(&h_max_error, d_max_error, sizeof(double), cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
 

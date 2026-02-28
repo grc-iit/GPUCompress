@@ -19,6 +19,7 @@
 
 #include "stats/auto_stats_gpu.h"
 #include "api/internal.hpp"
+#define GC_LOG(fmt, ...) do { if (g_gc_verbose) fprintf(stderr, fmt, ##__VA_ARGS__); } while(0)
 
 namespace gpucompress {
 
@@ -325,7 +326,7 @@ AutoStatsGPU* runStatsKernelsNoSync(
     unsigned int* d_histogram = g_d_stats_histogram;
 
     // Initialize workspace to zero
-    fprintf(stderr, "[XFER INIT] stats workspace: memset zero (%zu B)\n", kStatsWorkspaceSize);
+    GC_LOG("[XFER INIT] stats workspace: memset zero (%zu B)\n", kStatsWorkspaceSize);
     cudaError_t err = cudaMemsetAsync(g_d_stats_workspace, 0, kStatsWorkspaceSize, stream);
     if (err != cudaSuccess) return nullptr;
 
@@ -337,7 +338,7 @@ AutoStatsGPU* runStatsKernelsNoSync(
     h_init.num_elements = num_elements;
     h_init.error_level = 0;
 
-    fprintf(stderr, "[XFER H→D] stats init: vmin/vmax/num_elements (%zu B)\n", sizeof(AutoStatsGPU));
+    GC_LOG("[XFER H→D] stats init: vmin/vmax/num_elements (%zu B)\n", sizeof(AutoStatsGPU));
     err = cudaMemcpyAsync(d_stats, &h_init, sizeof(AutoStatsGPU),
                           cudaMemcpyHostToDevice, stream);
     if (err != cudaSuccess) return nullptr;
@@ -439,12 +440,12 @@ static int runStatsKernels(
     };
     StatsResultBlock h_result;
 
-    fprintf(stderr, "[XFER D→H] stats: entropy (%zu B)\n", sizeof(double));
+    GC_LOG("[XFER D→H] stats: entropy (%zu B)\n", sizeof(double));
     cudaError_t err = cudaMemcpyAsync(&h_result.entropy, &d_stats->entropy, sizeof(double),
                           cudaMemcpyDeviceToHost, stream);
     if (err != cudaSuccess) return -1;
 
-    fprintf(stderr, "[XFER D→H] stats: mad_normalized + deriv_normalized (%zu B)\n", 2 * sizeof(double));
+    GC_LOG("[XFER D→H] stats: mad_normalized + deriv_normalized (%zu B)\n", 2 * sizeof(double));
     err = cudaMemcpyAsync(&h_result.mad_normalized, &d_stats->mad_normalized,
                           2 * sizeof(double),
                           cudaMemcpyDeviceToHost, stream);

@@ -33,6 +33,8 @@
 // Quantization for lossy preprocessing
 #include "preprocessing/quantization.cuh"
 
+bool g_gc_verbose = false;
+
 using namespace nvcomp;
 
 // CUDA error checking macro

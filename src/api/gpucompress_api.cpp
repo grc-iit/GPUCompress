@@ -408,7 +408,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
     }
 
     // Copy input to GPU
-    fprintf(stderr, "[XFER H→D] compress: input data (%zu B)\n", input_size);
+    GC_LOG("[XFER H→D] compress: input data (%zu B)\n", input_size);
     cuda_err = cudaMemcpyAsync(d_input, input, input_size, cudaMemcpyHostToDevice, stream);
     if (cuda_err != cudaSuccess) {
         cudaFree(d_input);
@@ -462,14 +462,14 @@ extern "C" gpucompress_error_t gpucompress_compress(
 
             // Conditional stats D→H only when user wants stats output or online learning needs them
             if (d_stats_ptr && (stats != nullptr || g_online_learning_enabled)) {
-                fprintf(stderr, "[XFER D→H] stats: entropy (%zu B)\n", sizeof(double));
+                GC_LOG("[XFER D→H] stats: entropy (%zu B)\n", sizeof(double));
                 cudaMemcpyAsync(&entropy, &d_stats_ptr->entropy, sizeof(double),
                                 cudaMemcpyDeviceToHost, stream);
                 // mad_normalized and deriv_normalized are contiguous
-                fprintf(stderr, "[XFER D→H] stats: mad_normalized (%zu B)\n", sizeof(double));
+                GC_LOG("[XFER D→H] stats: mad_normalized (%zu B)\n", sizeof(double));
                 cudaMemcpyAsync(&mad, &d_stats_ptr->mad_normalized, sizeof(double),
                                 cudaMemcpyDeviceToHost, stream);
-                fprintf(stderr, "[XFER D→H] stats: deriv_normalized (%zu B)\n", sizeof(double));
+                GC_LOG("[XFER D→H] stats: deriv_normalized (%zu B)\n", sizeof(double));
                 cudaMemcpyAsync(&second_derivative, &d_stats_ptr->deriv_normalized, sizeof(double),
                                 cudaMemcpyDeviceToHost, stream);
                 cudaStreamSynchronize(stream);
@@ -657,7 +657,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
 
     // Copy only compressed payload from GPU to host (skip header region)
     uint8_t* host_payload = static_cast<uint8_t*>(output) + header_size;
-    fprintf(stderr, "[XFER D→H] compress: payload (%zu B)\n", compressed_size);
+    GC_LOG("[XFER D→H] compress: payload (%zu B)\n", compressed_size);
     cuda_err = cudaMemcpyAsync(host_payload, d_compressed, compressed_size,
                                cudaMemcpyDeviceToHost, stream);
     if (cuda_err != cudaSuccess) {
@@ -718,7 +718,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
             }
 
             gpucompress::DecodedAction primary_dec = gpucompress::decodeAction(nn_action);
-            fprintf(stderr, "[EXPLORE] Chunk %zuB | primary=action%d (%s%s%s) ratio=%.3f | "
+            GC_LOG("[EXPLORE] Chunk %zuB | primary=action%d (%s%s%s) ratio=%.3f | "
                     "ratio_mape=%.1f%% %s| K=%d\n",
                     input_size, nn_action,
                     ALGORITHM_NAMES[primary_dec.algorithm + 1],
@@ -912,9 +912,9 @@ extern "C" gpucompress_error_t gpucompress_compress(
                                                 size_t num_floats = input_size / sizeof(float);
                                                 std::vector<float> h_orig(num_floats);
                                                 std::vector<float> h_dec(num_floats);
-                                                fprintf(stderr, "[XFER D→H] explore PSNR: original data (%zu B)\n", input_size);
+                                                GC_LOG("[XFER D→H] explore PSNR: original data (%zu B)\n", input_size);
                                                 cudaMemcpy(h_orig.data(), d_input, input_size, cudaMemcpyDeviceToHost);
-                                                fprintf(stderr, "[XFER D→H] explore PSNR: decompressed data (%zu B)\n", input_size);
+                                                GC_LOG("[XFER D→H] explore PSNR: decompressed data (%zu B)\n", input_size);
                                                 cudaMemcpy(h_dec.data(), d_rt_result, input_size, cudaMemcpyDeviceToHost);
 
                                                 double mse = 0.0;
@@ -950,7 +950,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
                                                         static_cast<double>(alt_ct_ms),
                                                         alt_decomp_ms, alt_psnr});
 
-                            fprintf(stderr, "[EXPLORE]   alt %d/%d: action%d (%s%s%s) "
+                            GC_LOG("[EXPLORE]   alt %d/%d: action%d (%s%s%s) "
                                     "ratio=%.3f comp=%.2fms%s\n",
                                     i, K, alt_action,
                                     ALGORITHM_NAMES[alt.algorithm + 1],
@@ -994,7 +994,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
 
                                     // Write header + compressed data to host output
                                     memcpy(output, &alt_hdr, sizeof(CompressionHeader));
-                                    fprintf(stderr, "[XFER D→H] explore winner: alt compressed payload (%zu B)\n", alt_comp_size);
+                                    GC_LOG("[XFER D→H] explore winner: alt compressed payload (%zu B)\n", alt_comp_size);
                                     cudaMemcpy(
                                         static_cast<uint8_t*>(output) + header_sz,
                                         d_alt_out, alt_comp_size,
@@ -1024,12 +1024,12 @@ extern "C" gpucompress_error_t gpucompress_compress(
             double final_ratio = static_cast<double>(input_size) / static_cast<double>(compressed_size);
             if (final_algo != static_cast<gpucompress_algorithm_t>(primary_dec.algorithm + 1) ||
                 final_preproc != (primary_dec.shuffle_size > 0 ? GPUCOMPRESS_PREPROC_SHUFFLE_4 : 0u)) {
-                fprintf(stderr, "[EXPLORE] >> Switched to %s%s ratio=%.3f (was %.3f)\n",
+                GC_LOG("[EXPLORE] >> Switched to %s%s ratio=%.3f (was %.3f)\n",
                         gpucompress_algorithm_name(final_algo),
                         (final_preproc & GPUCOMPRESS_PREPROC_SHUFFLE_4) ? "+shuf" : "",
                         final_ratio, actual_ratio);
             } else {
-                fprintf(stderr, "[EXPLORE] >> Kept primary (ratio=%.3f)\n", actual_ratio);
+                GC_LOG("[EXPLORE] >> Kept primary (ratio=%.3f)\n", actual_ratio);
             }
 
         }
@@ -1160,7 +1160,7 @@ extern "C" gpucompress_error_t gpucompress_decompress(
 
     // Copy only the compressed payload to GPU (skip header)
     const uint8_t* host_payload = static_cast<const uint8_t*>(input) + header_size;
-    fprintf(stderr, "[XFER H→D] decompress: compressed payload (%zu B)\n", compressed_size);
+    GC_LOG("[XFER H→D] decompress: compressed payload (%zu B)\n", compressed_size);
     cuda_err = cudaMemcpyAsync(d_compressed_data, host_payload, compressed_size,
                                cudaMemcpyHostToDevice, stream);
     if (cuda_err != cudaSuccess) {
@@ -1252,7 +1252,7 @@ extern "C" gpucompress_error_t gpucompress_decompress(
     }
 
     // Copy result to host
-    fprintf(stderr, "[XFER D→H] decompress: result (%" PRIu64 " B)\n", (uint64_t)header.original_size);
+    GC_LOG("[XFER D→H] decompress: result (%" PRIu64 " B)\n", (uint64_t)header.original_size);
     cuda_err = cudaMemcpyAsync(output, d_result, header.original_size,
                                cudaMemcpyDeviceToHost, stream);
     if (cuda_err != cudaSuccess) {
@@ -1330,7 +1330,7 @@ extern "C" gpucompress_error_t gpucompress_calculate_entropy(
     }
 
     // Copy to GPU
-    fprintf(stderr, "[XFER H→D] compute_stats: input data (%zu B)\n", size);
+    GC_LOG("[XFER H→D] compute_stats: input data (%zu B)\n", size);
     cuda_err = cudaMemcpyAsync(d_data, data, size, cudaMemcpyHostToDevice, stream);
     if (cuda_err != cudaSuccess) {
         cudaFree(d_data);
@@ -1891,7 +1891,7 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
             }
 
             gpucompress::DecodedAction primary_dec = gpucompress::decodeAction(nn_action);
-            fprintf(stderr, "[EXPLORE-GPU] Chunk %zuB | primary=action%d (%s%s%s) ratio=%.3f | "
+            GC_LOG("[EXPLORE-GPU] Chunk %zuB | primary=action%d (%s%s%s) ratio=%.3f | "
                     "ratio_mape=%.1f%% %s| K=%d\n",
                     input_size, nn_action,
                     ALGORITHM_NAMES[primary_dec.algorithm + 1],
@@ -2108,7 +2108,7 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
                                                         static_cast<double>(alt_ct_ms),
                                                         alt_decomp_ms, alt_psnr});
 
-                            fprintf(stderr, "[EXPLORE-GPU]   alt %d/%d: action%d (%s%s%s) "
+                            GC_LOG("[EXPLORE-GPU]   alt %d/%d: action%d (%s%s%s) "
                                     "ratio=%.3f comp=%.2fms%s\n",
                                     i, K, alt_action,
                                     ALGORITHM_NAMES[alt.algorithm + 1],
