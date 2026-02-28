@@ -67,77 +67,79 @@ Encoding: `action_id = algo + quant*8 + shuffle*16`
 ### BUG-1: `d_owned` Memory Leak on Compression Error
 **File:** `src/hdf5/H5VLgpucompress.cu` — Worker lambda
 **Severity:** HIGH
-**Status:** Needs verification and fix
+**Status:** ✅ FIXED — `cudaFree(wi.d_owned)` is called unconditionally _before_ the `ce != GPUCOMPRESS_SUCCESS` error check (line 1072). Both success and error paths free the buffer correctly.
 
 ```cpp
-// Worker code (current)
-gpucompress_error_t ce = gpucompress_compress_gpu(
-    wi.src, wi.sz, d_comp_w[w], &comp_sz, &cfg, NULL, NULL);
-
-if (wi.d_owned) { cudaFree(wi.d_owned); wi.d_owned = NULL; }  // freed on SUCCESS path
-
-if (ce != GPUCOMPRESS_SUCCESS) {
-    worker_err.store((herr_t)-1);
-    continue;  // BUG: d_owned already freed above — but what if cudaFree was AFTER the check?
-}
+// Current code — correct order:
+gpucompress_compress_gpu(...);
+if (wi.d_owned) { cudaFree(wi.d_owned); wi.d_owned = NULL; }  // always freed
+if (ce != GPUCOMPRESS_SUCCESS) { worker_err.store(-1); continue; }
 ```
-**Verify:** Confirm the exact ordering — if `cudaFree(d_owned)` is _before_ the error check, it's OK. If _after_, `d_owned` is leaked every time compression fails.
 
 ---
 
 ### BUG-2: Dimension Array Memory Leak on Mid-Loop Failure
 **File:** `src/hdf5/H5VLgpucompress.cu` — `gpu_aware_chunked_write`
 **Severity:** HIGH
-
-Dimension arrays `d_dset_dims`, `d_chunk_dims`, `d_chunk_start` are allocated via `alloc_dim_arrays()`. If a `cudaMalloc` for `d_owned` fails mid-iteration (`break` path), cleanup at the end of the function may not free these arrays if they were conditionally allocated. Need to verify all exit paths call `free_dim_arrays()`.
+**Status:** ✅ FIXED — All break/error paths eventually reach the unified cleanup block at line 1245: `if (d_dset_dims) free_dim_arrays(d_dset_dims, d_chunk_dims, d_chunk_start)`. The guard `if (d_dset_dims)` handles the case where allocation never occurred.
 
 ---
 
 ### BUG-3: Race Condition in `nnSGDKernel` Gradient Accumulation
 **File:** `src/nn/nn_gpu.cu` — `nnSGDKernel<<<1,128>>>`
 **Severity:** HIGH (potential weight corruption)
+**Status:** ✅ AUDITED — NOT A BUG. Partition is perfect.
 
-The kernel accumulates gradients for `w3` across outputs. If multiple outputs need updates for the same weight index, writes to `d_grad_buffer` may race between threads. Needs code inspection to confirm atomics are or are not used:
+Formal analysis (verified by `tests/test_bug3_sgd_gradients.cu`):
+Thread `t` (0..127) exclusively owns:
+- `dw1[t*15..t*15+14]` — d_grad_buffer[SGD_OFF_DW1 + t*15 + 0..14]
+- `db1[t]` — d_grad_buffer[SGD_OFF_DB1 + t]
+- `dw2[t*128..t*128+127]` — d_grad_buffer[SGD_OFF_DW2 + t*128 + 0..127]
+- `db2[t]` — d_grad_buffer[SGD_OFF_DB2 + t]
+- `dw3[out*128+t]` for out=0..3 — 4 distinct indices (one per output, column t)
+- `db3[t]` only if t < NN_OUTPUT_DIM=4 (guarded)
 
-```cpp
-// Check this section in nnSGDKernel:
-// d_grad_buffer[SGD_OFF_DW3 + out * NN_HIDDEN_DIM + t] += ...
-// If two threads update the same element, this is a race.
-```
-**Action:** Audit which threads update which gradient positions. If non-overlapping (each thread owns its stripe), no bug. If overlapping (multiple outputs map to same element), use `atomicAdd`.
+For any (out, t) pair, `SGD_OFF_DW3 + out*128 + t` is written only by thread `t`.
+Zero races, zero aliasing. Static partition analysis: races=0, unowned_indices=0.
+16/16 concurrent compressions with SGD enabled pass byte-exact round-trip.
 
 ---
 
 ### BUG-4: Format String Mismatch
 **File:** `src/api/gpucompress_api.cpp` ~line 1243
 **Severity:** LOW (UB, likely benign on 64-bit but technically wrong)
+**Status:** ✅ FIXED — `#include <cinttypes>` added; `%u` replaced with `PRIu64` + `(uint64_t)` cast.
 
 ```cpp
-printf("... %u ...", header.original_size);  // original_size is uint64_t, needs %lu or PRIu64
+// Before (UB — %u is 32-bit, original_size is uint64_t):
+fprintf(stderr, "[XFER D→H] decompress: result (%u B)\n", header.original_size);
+// After (correct):
+fprintf(stderr, "[XFER D→H] decompress: result (%" PRIu64 " B)\n", (uint64_t)header.original_size);
 ```
+
+Verified by `tests/test_bug4_format_string.cu`: 5/5 round-trips pass; stderr shows correct full decimal sizes.
 
 ---
 
 ### BUG-5: Corrupted Weights on Truncated `.nnwt` File
 **File:** `src/nn/nn_gpu.cu` — `loadNNFromBinary()`
 **Severity:** MEDIUM
+**Status:** ✅ FIXED — Per-read `gcount()` checks added via `NN_READ` macro.
 
-`file.read()` does not guarantee atomic reads. If the file is truncated, partial data is silently loaded into `NNWeightsGPU` and then `cudaMemcpy`'d to GPU. No CRC, size check after each section, or `file.good()` check post-read. The model will silently produce garbage predictions.
+Fix:
+- Header: consolidated 6 × 4-byte reads into one 24-byte read with `gcount() != 24` check.
+- Each weight array (w1, b1, w2, b2, w3, b3, x_means/stds, y_means/stds, x_mins/maxs):
+  uses `NN_READ(ptr, nbytes, name)` macro that checks `gcount() == expected` and returns false immediately.
 
-**Fix:** After each `file.read()` call, check `file.gcount()` equals expected bytes.
+Verified by `tests/test_bug5_truncated_nnwt.cu`: 7/7 cases pass:
+- Empty file, truncated header, bad magic, wrong architecture, truncated mid-w2, truncated at w3, valid file.
 
 ---
 
 ### BUG-6: Unprotected Global Statistics in VOL Connector
 **File:** `src/hdf5/H5VLgpucompress.cu`
-**Severity:** MEDIUM (data race if multiple threads write simultaneously)
-
-```cpp
-static int s_gpu_writes = 0;   // Not atomic
-static int s_chunks_comp = 0;  // Not atomic
-// Incremented in concurrent worker threads without lock
-```
-**Fix:** Use `std::atomic<int>` or protect with mutex.
+**Severity:** MEDIUM
+**Status:** ✅ FIXED (de facto) — With the 3-stage pipeline, both `s_gpu_writes` (line 1114) and `s_chunks_comp` (line 1215) are incremented only in Stage 1 (main thread), not in worker threads. No concurrent access occurs under the current architecture.
 
 ---
 
@@ -486,15 +488,15 @@ The 10% margin around training bounds is a magic number with no empirical justif
 - Verify that all chunks decompress correctly, including boundary chunks with padding
 
 ### TEST-2: No Concurrent Compression Stress Test
-The CompContext pool (8 slots) is never tested under concurrent load. Need:
-- Test that launches 16+ simultaneous `gpucompress_compress_gpu()` calls
-- Verify no data corruption, no deadlock, correct results
+The CompContext pool (4 slots) is partially tested. Existing coverage:
+- `tests/test_bug8_sgd_concurrent.cu` — 16 concurrent `gpucompress_compress_gpu()` calls, SGD-enabled; 16/16 byte-exact round-trips pass.
+- `tests/test_bug3_sgd_gradients.cu` — concurrent SGD correctness (gradient partition analysis).
+
+Still missing: sustained stress test with >8×N_COMP_CTX concurrent callers to verify pool blocking/wake-up under contention.
 
 ### TEST-3: No Corrupted/Truncated File Recovery Test
-`loadNNFromBinary()` is not tested with:
-- Truncated `.nnwt` file
-- Wrong magic number
-- Wrong architecture (different hidden_dim)
+**✅ COVERED** — `tests/test_bug5_truncated_nnwt.cu` (7/7 pass):
+- Empty file, truncated header, bad magic number, wrong architecture (different hidden_dim), truncated mid-w2, truncated at w3, valid file.
 
 ### TEST-4: No CLI Round-Trip Test
 `compress.cpp` + `decompress.cpp` are not tested in the automated suite. Only the filter API is tested.
@@ -512,9 +514,9 @@ These require minimal code changes and carry clear, verifiable benefits:
 |---|--------|------|--------------|------|
 | QW-1 | Set `CMAKE_CUDA_ARCHITECTURES=80` | CMakeLists.txt | 10-30% GPU kernel speedup | Low |
 | QW-2 | Add `-use_fast_math` to CUDA Release flags | CMakeLists.txt | 5-10% speedup | Low |
-| QW-3 | Fix format string `%u` → `PRIu64` | gpucompress_api.cpp:1243 | Correctness | Zero |
+| QW-3 | ~~Fix format string `%u` → `PRIu64`~~ | gpucompress_api.cpp:1243 | ✅ DONE — `#include <cinttypes>`, `PRIu64` + `(uint64_t)` cast. Verified by `test_bug4_format_string` (5/5). | — |
 | QW-4 | Make global stats atomics (`s_gpu_writes` etc.) | H5VLgpucompress.cu | Thread safety | Low |
-| QW-5 | Add `file.gcount()` checks in `loadNNFromBinary` | nn_gpu.cu | Prevents silent corruption | Low |
+| QW-5 | ~~Add `file.gcount()` checks in `loadNNFromBinary`~~ | nn_gpu.cu | ✅ DONE — `NN_READ` macro checks every array read; consolidated 6 header reads into 1. Verified by `test_bug5_truncated_nnwt` (7/7). | — |
 | QW-6 | Remove stderr spam (conditional on debug flag) | nn_gpu.cu, gpucompress_api.cpp | I/O overhead reduction | Low |
 | QW-7 | Batch 3 D→H copies in `runStatsKernels()` into 1 | stats_kernel.cu | PCIe efficiency | Low |
 | QW-8 | Move insertion sort to CPU (off critical GPU path) | nn_gpu.cu | Frees 31 idle threads | Low |
@@ -527,7 +529,7 @@ These require minimal code changes and carry clear, verifiable benefits:
 The `runStatsKernelsNoSync()` + `nnFusedInferenceKernel` pattern eliminates the stats D→H round-trip. Stats stay on GPU from computation through NN input. This was correctly implemented.
 
 ### Strength: CompContext Pool for Concurrency
-8 independent compression slots, each with own stream, events, stats/NN/SGD buffers. Enables true parallel chunk compression. The CUDA event barrier (`cudaStreamWaitEvent` before inference, `g_sgd_done` event after SGD) correctly prevents the GPU-level SGD vs. inference data race without CPU polling.
+8 independent compression slots (`N_COMP_CTX=8`), each with own stream, events, stats/NN/SGD buffers. Enables true parallel chunk compression. The CUDA event barrier (`cudaStreamWaitEvent` before inference, `g_sgd_done` event after SGD) correctly prevents the GPU-level SGD vs. inference data race without CPU polling.
 
 ### Strength: VOL Connector Pointer Detection
 `cudaPointerGetAttributes()` to detect GPU vs. host pointers at the VOL layer enables transparent GPU-native I/O without API changes to calling code.
@@ -566,7 +568,7 @@ A second agent independently audited the same codebase. Each of its unique findi
 
 ---
 
-### VERIFIED NEW: `d_range_min`/`d_range_max` Static Globals — Concurrent Quantize Bug
+### VERIFIED NEW: `d_range_min`/`d_range_max` Static Globals — Concurrent Quantize Bug ✅ FIXED (BUG-7)
 **Source:** [PREP-2] in CODE_REVIEW_FINDINGS.md
 **Verified:** YES — this is a real, critical bug I missed.
 
@@ -615,9 +617,9 @@ g_sgd_ever_fired = true;
 
 This is a textbook C++ data race (concurrent read + unsynchronized write). The practical impact is bounded: a missed `cudaStreamWaitEvent` could allow an inference kernel to read weights while SGD is writing them on `g_sgd_stream` — exactly the GPU race this flag was meant to prevent.
 
-**Fix:** `std::atomic<bool> g_sgd_ever_fired{false}` with `memory_order_relaxed` write, `memory_order_acquire` read.
+**Fix:** `std::atomic<bool> g_sgd_ever_fired{false}` with `memory_order_release` write, `memory_order_acquire` read.
 **Severity:** MEDIUM-HIGH (correctness, low probability but real race window).
-**My review:** missed this.
+**Status:** ✅ FIXED — see BUG-8 section above. Verified by `tests/test_bug8_sgd_concurrent.cu`.
 
 ---
 
@@ -698,12 +700,25 @@ In the VOL write path, `d_comp_w[w]` is sized to `max_comp = gpucompress_max_out
 
 | ID | Issue | Severity | File:Line |
 |----|-------|----------|-----------|
-| BUG-7 | `d_range_min`/`d_range_max` shared across concurrent quantize calls | **CRITICAL** | `quantization_kernels.cu:25-36, 327-344` |
-| BUG-8 | `g_sgd_ever_fired` plain bool read/written without atomics | **MEDIUM** | `gpucompress_api.cpp:70`, `nn_gpu.cu:1378,1472` |
+| BUG-7 | `d_range_min`/`d_range_max` shared across concurrent quantize calls | **CRITICAL** ✅ FIXED | `quantization_kernels.cu` — per-CompContext buffers allocated in `initCompContextPool()` |
+| BUG-8 | `g_sgd_ever_fired` plain bool read/written without atomics | **MEDIUM** ✅ FIXED — `std::atomic<bool>` with `memory_order_release` write, `memory_order_acquire` read. Verified by `tests/test_bug8_sgd_concurrent` (16/16). | `gpucompress_api.cpp:70`, `nn_gpu.cu:1378,1472` |
 | PERF-14 | `atomicAddDouble` CAS should be native `atomicAdd` on sm_60+ | **MEDIUM** | `stats_kernel.cu:58-67` |
 | PERF-15 | Per-call `cudaMalloc` for CASCADED/ANS/BITCOMP temp buffer | **MEDIUM** | `gpucompress_api.cpp:1763-1768` |
 | PERF-16 | Gather kernel on default stream serializes Stage 1 (non-contiguous datasets) | **MEDIUM** | `H5VLgpucompress.cu:1194-1200` |
 | INVESTIGATE | CASCADED/BITCOMP `NVCOMP_TYPE_LONGLONG` assumption unverified | **LOW** | `compression_factory.cpp:116,123` |
+
+---
+
+### SGD Online Learning Verification
+
+`tests/test_sgd_weight_update.cu` verifies that `nnSGDKernel` actually modifies `d_nn_weights` and produces convergence:
+
+- **Data:** 4 MB linear ramp (OOD for the NN → large initial prediction error)
+- **Setup:** 30 iterations, same data, `REINFORCE_LR=0.05`, `MAPE_THRESH=0.1%`
+- **Result:** MAPE 91.16% → 17.72% over 30 steps; 30/30 SGD fires; PASS
+- **Assertion:** `mapeN < mape0` (final MAPE strictly less than initial)
+
+This confirms the full path: `gpucompress_compress_gpu` → SGD fires on `g_sgd_stream` → `d_nn_weights` updated in-place → subsequent inference reads updated weights → predicted ratio converges toward actual.
 
 ---
 

@@ -12,6 +12,7 @@
 #include <mutex>
 #include <cstring>
 #include <cstdio>
+#include <cinttypes>
 #include <cmath>
 #include <utility>
 #include <vector>
@@ -67,7 +68,7 @@ extern "C" {
 
 cudaStream_t g_sgd_stream    = nullptr;
 cudaEvent_t  g_sgd_done      = nullptr;
-bool         g_sgd_ever_fired = false;
+std::atomic<bool> g_sgd_ever_fired{false};
 
 /* ============================================================
  * Global State
@@ -194,6 +195,10 @@ int initCompContextPool() {
         if (cudaMalloc(&ctx.d_sgd_samples,
                        NN_MAX_SGD_SAMPLES * sizeof(SGDSample)) != cudaSuccess) return -1;
 
+        /* Per-slot quantization range buffers — eliminates shared static globals */
+        if (cudaMalloc(&ctx.d_range_min, sizeof(double)) != cudaSuccess) return -1;
+        if (cudaMalloc(&ctx.d_range_max, sizeof(double)) != cudaSuccess) return -1;
+
         g_pool_slot_free[i] = true;
         g_pool_free_count++;
     }
@@ -218,6 +223,8 @@ void destroyCompContextPool() {
                                        ctx.d_sgd_grad_buffer = nullptr; }
         if (ctx.d_sgd_output)        { cudaFree(ctx.d_sgd_output); ctx.d_sgd_output = nullptr; }
         if (ctx.d_sgd_samples)       { cudaFree(ctx.d_sgd_samples); ctx.d_sgd_samples = nullptr; }
+        if (ctx.d_range_min)         { cudaFree(ctx.d_range_min); ctx.d_range_min = nullptr; }
+        if (ctx.d_range_max)         { cudaFree(ctx.d_range_max); ctx.d_range_max = nullptr; }
         g_pool_slot_free[i] = false;
     }
     g_pool_free_count = 0;
@@ -326,7 +333,7 @@ extern "C" void gpucompress_cleanup(void) {
         gpucompress::destroyCompContextPool();
         if (g_sgd_stream) { cudaStreamDestroy(g_sgd_stream); g_sgd_stream = nullptr; }
         if (g_sgd_done)   { cudaEventDestroy(g_sgd_done);   g_sgd_done   = nullptr; }
-        g_sgd_ever_fired = false;
+        g_sgd_ever_fired.store(false, std::memory_order_relaxed);
         if (g_t_start) { cudaEventDestroy(g_t_start); g_t_start = nullptr; }
         if (g_t_stop)  { cudaEventDestroy(g_t_stop);  g_t_stop  = nullptr; }
         if (g_default_stream != nullptr) {
@@ -1240,7 +1247,7 @@ extern "C" gpucompress_error_t gpucompress_decompress(
     }
 
     // Copy result to host
-    fprintf(stderr, "[XFER D→H] decompress: result (%u B)\n", header.original_size);
+    fprintf(stderr, "[XFER D→H] decompress: result (%" PRIu64 " B)\n", (uint64_t)header.original_size);
     cuda_err = cudaMemcpyAsync(output, d_result, header.original_size,
                                cudaMemcpyDeviceToHost, stream);
     if (cuda_err != cudaSuccess) {
@@ -1706,7 +1713,8 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
                 QuantizationType::LINEAR, cfg.error_bound,
                 num_elements, sizeof(float));
             quant_result = quantize_simple(
-                const_cast<uint8_t*>(d_compress_input), num_elements, sizeof(float), quant_cfg, stream);
+                const_cast<uint8_t*>(d_compress_input), num_elements, sizeof(float), quant_cfg,
+                ctx->d_range_min, ctx->d_range_max, stream);
             if (quant_result.isValid()) {
                 d_quantized = static_cast<uint8_t*>(quant_result.d_quantized);
                 d_compress_input = d_quantized;
@@ -1916,7 +1924,8 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
                             QuantizationType::LINEAR, cfg.error_bound,
                             num_el, sizeof(float));
                         alt_quant_result = quantize_simple(
-                            d_alt_input, num_el, sizeof(float), qcfg, stream);
+                            d_alt_input, num_el, sizeof(float), qcfg,
+                            ctx->d_range_min, ctx->d_range_max, stream);
                         if (alt_quant_result.isValid()) {
                             d_alt_quant = static_cast<uint8_t*>(alt_quant_result.d_quantized);
                             d_alt_input = d_alt_quant;

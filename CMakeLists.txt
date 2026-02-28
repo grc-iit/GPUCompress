@@ -542,6 +542,105 @@ if(HDF5_FOUND)
         )
         set_target_properties(benchmark_lz4_vs_nocomp PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
+        # Qualitative analysis: LZ4 + quantization values and error inspection
+        add_executable(analyze_quantization_vol tests/analyze_quantization_vol.cu)
+        set_source_files_properties(tests/analyze_quantization_vol.cu PROPERTIES LANGUAGE CUDA)
+        target_include_directories(analyze_quantization_vol PRIVATE
+            ${HDF5_VOL_INCLUDE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+        target_link_libraries(analyze_quantization_vol PRIVATE
+            gpucompress H5VLgpucompress ${HDF5_VOL_LIB} CUDA::cudart m
+        )
+        set_target_properties(analyze_quantization_vol PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+        # BUG-3 audit: nnSGDKernel gradient partition (no race confirmed)
+        add_executable(test_bug3_sgd_gradients tests/test_bug3_sgd_gradients.cu)
+        set_source_files_properties(tests/test_bug3_sgd_gradients.cu PROPERTIES LANGUAGE CUDA)
+        target_include_directories(test_bug3_sgd_gradients PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+        target_link_libraries(test_bug3_sgd_gradients PRIVATE
+            gpucompress CUDA::cudart pthread
+        )
+        set_target_properties(test_bug3_sgd_gradients PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+        # BUG-4 regression: %u format string for uint64_t original_size
+        add_executable(test_bug4_format_string tests/test_bug4_format_string.cu)
+        set_source_files_properties(tests/test_bug4_format_string.cu PROPERTIES LANGUAGE CUDA)
+        target_include_directories(test_bug4_format_string PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+        target_link_libraries(test_bug4_format_string PRIVATE
+            gpucompress CUDA::cudart
+        )
+        set_target_properties(test_bug4_format_string PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+        # BUG-5 regression: truncated .nnwt file detection via gcount() checks
+        add_executable(test_bug5_truncated_nnwt tests/test_bug5_truncated_nnwt.cu)
+        set_source_files_properties(tests/test_bug5_truncated_nnwt.cu PROPERTIES LANGUAGE CUDA)
+        target_include_directories(test_bug5_truncated_nnwt PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+        target_link_libraries(test_bug5_truncated_nnwt PRIVATE
+            gpucompress CUDA::cudart
+        )
+        set_target_properties(test_bug5_truncated_nnwt PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+        # BUG-8 regression: g_sgd_ever_fired atomic visibility under concurrent SGD+inference
+        add_executable(test_bug8_sgd_concurrent tests/test_bug8_sgd_concurrent.cu)
+        set_source_files_properties(tests/test_bug8_sgd_concurrent.cu PROPERTIES LANGUAGE CUDA)
+        target_include_directories(test_bug8_sgd_concurrent PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+        target_link_libraries(test_bug8_sgd_concurrent PRIVATE
+            gpucompress CUDA::cudart pthread
+        )
+        set_target_properties(test_bug8_sgd_concurrent PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+        # SGD weight update verification: asserts weights change and prediction converges
+        add_executable(test_sgd_weight_update tests/test_sgd_weight_update.cu)
+        set_source_files_properties(tests/test_sgd_weight_update.cu PROPERTIES LANGUAGE CUDA)
+        target_include_directories(test_sgd_weight_update PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+        target_link_libraries(test_sgd_weight_update PRIVATE
+            gpucompress CUDA::cudart
+        )
+        set_target_properties(test_sgd_weight_update PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+        # BUG-7 regression: concurrent quantization range corruption
+        add_executable(test_bug7_concurrent_quantize tests/test_bug7_concurrent_quantize.cu)
+        set_source_files_properties(tests/test_bug7_concurrent_quantize.cu PROPERTIES LANGUAGE CUDA)
+        target_include_directories(test_bug7_concurrent_quantize PRIVATE
+            ${HDF5_VOL_INCLUDE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+        target_link_libraries(test_bug7_concurrent_quantize PRIVATE
+            gpucompress H5VLgpucompress ${HDF5_VOL_LIB} CUDA::cudart m
+        )
+        set_target_properties(test_bug7_concurrent_quantize PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+        # SGD parallel chunk demo: 128MB dataset, 16MB chunks, LR=0.4, MAPE=20%
+        add_executable(demo_sgd_parallel_chunks tests/demo_sgd_parallel_chunks.cu)
+        set_source_files_properties(tests/demo_sgd_parallel_chunks.cu PROPERTIES LANGUAGE CUDA)
+        target_include_directories(demo_sgd_parallel_chunks PRIVATE
+            ${HDF5_VOL_INCLUDE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+        target_link_libraries(demo_sgd_parallel_chunks PRIVATE
+            gpucompress H5VLgpucompress ${HDF5_VOL_LIB} CUDA::cudart m
+        )
+        set_target_properties(demo_sgd_parallel_chunks PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
         # File-size verification: no-comp vs LZ4, keeps output files for inspection
         add_executable(check_filesize_vol tests/check_filesize_vol.cu)
         set_source_files_properties(tests/check_filesize_vol.cu PROPERTIES LANGUAGE CUDA)

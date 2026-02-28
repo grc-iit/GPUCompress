@@ -307,7 +307,12 @@ __global__ void verify_error_bound_kernel(
 // ============================================================================
 
 /**
- * Compute min/max of data on GPU
+ * Compute min/max of data on GPU using caller-provided device buffers.
+ *
+ * d_buf_min / d_buf_max must each be at least sizeof(double) bytes.
+ * Using per-call or per-CompContext buffers (never shared statics) makes this
+ * function safe to call concurrently from multiple CUDA streams.
+ *
  * Returns 0 on success, -1 on error.
  */
 static int compute_data_range(
@@ -316,54 +321,44 @@ static int compute_data_range(
     size_t element_size,
     double& data_min,
     double& data_max,
+    void* d_buf_min,
+    void* d_buf_max,
     cudaStream_t stream
 ) {
-    if (ensure_range_bufs() != 0) return -1;
-
     int num_blocks = min((int)((num_elements + BLOCK_SIZE - 1) / BLOCK_SIZE), 1024);
 
     if (element_size == 4) {
-        // Float — reuse pre-allocated buffers
-        float* d_min = static_cast<float*>(d_range_min);
-        float* d_max = static_cast<float*>(d_range_max);
+        float* d_min = static_cast<float*>(d_buf_min);
+        float* d_max = static_cast<float*>(d_buf_max);
 
         float init_min = FLT_MAX;
         float init_max = -FLT_MAX;
-        fprintf(stderr, "[XFER H→D] quant float: init min=FLT_MAX (%zu B)\n", sizeof(float));
         cudaMemcpyAsync(d_min, &init_min, sizeof(float), cudaMemcpyHostToDevice, stream);
-        fprintf(stderr, "[XFER H→D] quant float: init max=-FLT_MAX (%zu B)\n", sizeof(float));
         cudaMemcpyAsync(d_max, &init_max, sizeof(float), cudaMemcpyHostToDevice, stream);
 
         compute_min_max_float_kernel<<<num_blocks, BLOCK_SIZE, 0, stream>>>(
             static_cast<float*>(d_input), num_elements, d_min, d_max);
 
         float h_min, h_max;
-        fprintf(stderr, "[XFER D→H] quant float: data_min (%zu B)\n", sizeof(float));
         cudaMemcpyAsync(&h_min, d_min, sizeof(float), cudaMemcpyDeviceToHost, stream);
-        fprintf(stderr, "[XFER D→H] quant float: data_max (%zu B)\n", sizeof(float));
         cudaMemcpyAsync(&h_max, d_max, sizeof(float), cudaMemcpyDeviceToHost, stream);
         cudaStreamSynchronize(stream);
 
         data_min = h_min;
         data_max = h_max;
     } else {
-        // Double — reuse pre-allocated buffers
-        double* d_min_d = static_cast<double*>(d_range_min);
-        double* d_max_d = static_cast<double*>(d_range_max);
+        double* d_min_d = static_cast<double*>(d_buf_min);
+        double* d_max_d = static_cast<double*>(d_buf_max);
 
         double init_min = DBL_MAX;
         double init_max = -DBL_MAX;
-        fprintf(stderr, "[XFER H→D] quant double: init min=DBL_MAX (%zu B)\n", sizeof(double));
         cudaMemcpyAsync(d_min_d, &init_min, sizeof(double), cudaMemcpyHostToDevice, stream);
-        fprintf(stderr, "[XFER H→D] quant double: init max=-DBL_MAX (%zu B)\n", sizeof(double));
         cudaMemcpyAsync(d_max_d, &init_max, sizeof(double), cudaMemcpyHostToDevice, stream);
 
         compute_min_max_double_kernel<<<num_blocks, BLOCK_SIZE, 0, stream>>>(
             static_cast<double*>(d_input), num_elements, d_min_d, d_max_d);
 
-        fprintf(stderr, "[XFER D→H] quant double: data_min (%zu B)\n", sizeof(double));
         cudaMemcpyAsync(&data_min, d_min_d, sizeof(double), cudaMemcpyDeviceToHost, stream);
-        fprintf(stderr, "[XFER D→H] quant double: data_max (%zu B)\n", sizeof(double));
         cudaMemcpyAsync(&data_max, d_max_d, sizeof(double), cudaMemcpyDeviceToHost, stream);
         cudaStreamSynchronize(stream);
     }
@@ -437,9 +432,16 @@ QuantizationResult quantize_simple(
         return result;
     }
 
-    // Step 1: Compute data range
+    // Step 1: Compute data range using the legacy shared static buffers.
+    // NOTE: Not safe for concurrent calls — use the overload with explicit
+    // d_range_min_buf/d_range_max_buf (e.g. from CompContext) for that.
+    if (ensure_range_bufs() != 0) {
+        fprintf(stderr, "quantize_simple: Failed to allocate range buffers\n");
+        return result;
+    }
     double data_min, data_max;
-    if (compute_data_range(d_input, num_elements, element_size, data_min, data_max, stream) != 0) {
+    if (compute_data_range(d_input, num_elements, element_size, data_min, data_max,
+                           d_range_min, d_range_max, stream) != 0) {
         fprintf(stderr, "quantize_simple: Failed to compute data range\n");
         return result;
     }
@@ -571,6 +573,129 @@ QuantizationResult quantize_simple(
     result.error_bound = config.error_bound;
     result.type = config.type;
     result.num_elements = num_elements;
+    result.original_element_size = element_size;
+
+    return result;
+}
+
+/**
+ * Thread-safe overload: uses caller-provided pre-allocated device buffers for the
+ * min/max reduction instead of the shared static globals.  Pass ctx->d_range_min
+ * and ctx->d_range_max from a CompContext slot to avoid concurrent aliasing.
+ */
+QuantizationResult quantize_simple(
+    void* d_input,
+    size_t num_elements,
+    size_t element_size,
+    QuantizationConfig config,
+    void* d_range_min_buf,
+    void* d_range_max_buf,
+    cudaStream_t stream
+) {
+    QuantizationResult result;
+
+    if (d_input == nullptr || num_elements == 0) {
+        fprintf(stderr, "quantize_simple: Invalid input (null or zero elements)\n");
+        return result;
+    }
+    if (element_size != 4 && element_size != 8) {
+        fprintf(stderr, "quantize_simple: Unsupported element size %zu\n", element_size);
+        return result;
+    }
+    if (config.error_bound <= 0.0) {
+        fprintf(stderr, "quantize_simple: Invalid error bound %.6e\n", config.error_bound);
+        return result;
+    }
+    if (d_range_min_buf == nullptr || d_range_max_buf == nullptr) {
+        fprintf(stderr, "quantize_simple: Null range buffers — use per-CompContext buffers\n");
+        return result;
+    }
+
+    double data_min, data_max;
+    if (compute_data_range(d_input, num_elements, element_size, data_min, data_max,
+                           d_range_min_buf, d_range_max_buf, stream) != 0) {
+        fprintf(stderr, "quantize_simple: Failed to compute data range\n");
+        return result;
+    }
+
+    double data_range = data_max - data_min;
+    if (data_range <= 0.0) data_range = 1.0;
+
+    double max_abs_value   = fmax(fabs(data_min), fabs(data_max));
+    double float_repr_error = max_abs_value * 2.4e-7;
+    double available_for_quant = config.error_bound - float_repr_error;
+    double safety_margin   = config.error_bound * 0.05;
+    available_for_quant   -= safety_margin;
+    double min_eb_for_int32 = data_range / 4.0e9;
+
+    double effective_eb;
+    if (available_for_quant <= 0) {
+        double min_achievable = fmax(float_repr_error, min_eb_for_int32);
+        (void)min_achievable;
+        effective_eb = fmax(min_eb_for_int32, float_repr_error * 0.1);
+    } else {
+        effective_eb = available_for_quant;
+    }
+    effective_eb = fmax(effective_eb, min_eb_for_int32);
+
+    int precision;
+    if (config.precision == QuantizationPrecision::AUTO) {
+        precision = compute_required_precision(data_range, effective_eb);
+    } else {
+        switch (config.precision) {
+            case QuantizationPrecision::INT8:  precision = 8;  break;
+            case QuantizationPrecision::INT16: precision = 16; break;
+            case QuantizationPrecision::INT32: precision = 32; break;
+            default: precision = 32;
+        }
+    }
+
+    double scale = 1.0 / (2.0 * effective_eb);
+
+    size_t output_bytes = num_elements * precision_to_bytes(precision);
+    void* d_output;
+    if (cudaMalloc(&d_output, output_bytes) != cudaSuccess) {
+        fprintf(stderr, "quantize_simple: Failed to allocate output buffer\n");
+        return result;
+    }
+
+    if (element_size == 4) {
+        if (precision == 8)
+            launch_quantize_kernel<float, int8_t>(
+                static_cast<float*>(d_input), static_cast<int8_t*>(d_output),
+                num_elements, scale, data_min, stream);
+        else if (precision == 16)
+            launch_quantize_kernel<float, int16_t>(
+                static_cast<float*>(d_input), static_cast<int16_t*>(d_output),
+                num_elements, scale, data_min, stream);
+        else
+            launch_quantize_kernel<float, int32_t>(
+                static_cast<float*>(d_input), static_cast<int32_t*>(d_output),
+                num_elements, scale, data_min, stream);
+    } else {
+        if (precision == 8)
+            launch_quantize_kernel<double, int8_t>(
+                static_cast<double*>(d_input), static_cast<int8_t*>(d_output),
+                num_elements, scale, data_min, stream);
+        else if (precision == 16)
+            launch_quantize_kernel<double, int16_t>(
+                static_cast<double*>(d_input), static_cast<int16_t*>(d_output),
+                num_elements, scale, data_min, stream);
+        else
+            launch_quantize_kernel<double, int32_t>(
+                static_cast<double*>(d_input), static_cast<int32_t*>(d_output),
+                num_elements, scale, data_min, stream);
+    }
+
+    result.d_quantized          = d_output;
+    result.quantized_bytes      = output_bytes;
+    result.actual_precision     = precision;
+    result.data_min             = data_min;
+    result.data_max             = data_max;
+    result.scale_factor         = scale;
+    result.error_bound          = config.error_bound;
+    result.type                 = config.type;
+    result.num_elements         = num_elements;
     result.original_element_size = element_size;
 
     return result;

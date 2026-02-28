@@ -18,6 +18,7 @@
  *   Layer 3: W(4×128×4) b(4×4)
  */
 
+#include <atomic>
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cstdio>
@@ -33,7 +34,7 @@
 /* SGD synchronization globals — defined in gpucompress_api.cpp at file scope */
 extern cudaStream_t g_sgd_stream;
 extern cudaEvent_t  g_sgd_done;
-extern bool         g_sgd_ever_fired;
+extern std::atomic<bool> g_sgd_ever_fired;
 
 namespace gpucompress {
 
@@ -938,14 +939,19 @@ bool loadNNFromBinary(const char* filepath) {
         return false;
     }
 
-    // Read header
+    // Read header as a single block so gcount() covers all 6 fields
     uint32_t magic, version, n_layers, input_dim, hidden_dim, output_dim;
-    file.read(reinterpret_cast<char*>(&magic), 4);
-    file.read(reinterpret_cast<char*>(&version), 4);
-    file.read(reinterpret_cast<char*>(&n_layers), 4);
-    file.read(reinterpret_cast<char*>(&input_dim), 4);
-    file.read(reinterpret_cast<char*>(&hidden_dim), 4);
-    file.read(reinterpret_cast<char*>(&output_dim), 4);
+    {
+        uint32_t hdr[6] = {};
+        file.read(reinterpret_cast<char*>(hdr), sizeof(hdr));
+        if ((size_t)file.gcount() != sizeof(hdr)) {
+            fprintf(stderr, "NN: Truncated header (%zd/24 bytes) in %s\n",
+                    (size_t)file.gcount(), filepath);
+            return false;
+        }
+        magic = hdr[0]; version = hdr[1]; n_layers = hdr[2];
+        input_dim = hdr[3]; hidden_dim = hdr[4]; output_dim = hdr[5];
+    }
 
     if (magic != NN_MAGIC) {
         fprintf(stderr, "NN: Invalid magic number: 0x%08X (expected 0x%08X)\n", magic, NN_MAGIC);
@@ -965,38 +971,54 @@ bool loadNNFromBinary(const char* filepath) {
         return false;
     }
 
-    // Read all weights into host struct
+    // Read all weights into host struct; check gcount() after every read
+    // so a truncated file is caught immediately with a precise error message.
+#define NN_READ(ptr, nbytes, name) \
+    do { \
+        size_t _nb = (size_t)(nbytes); \
+        file.read(reinterpret_cast<char*>(ptr), (std::streamsize)_nb); \
+        if ((size_t)file.gcount() != _nb) { \
+            fprintf(stderr, "NN: Truncated %s (%zd/%zu B) in %s\n", \
+                    (name), (size_t)file.gcount(), _nb, filepath); \
+            return false; \
+        } \
+    } while (0)
+
     NNWeightsGPU h_weights;
 
     // Normalization parameters
-    file.read(reinterpret_cast<char*>(h_weights.x_means), NN_INPUT_DIM * sizeof(float));
-    file.read(reinterpret_cast<char*>(h_weights.x_stds), NN_INPUT_DIM * sizeof(float));
-    file.read(reinterpret_cast<char*>(h_weights.y_means), NN_OUTPUT_DIM * sizeof(float));
-    file.read(reinterpret_cast<char*>(h_weights.y_stds), NN_OUTPUT_DIM * sizeof(float));
+    NN_READ(h_weights.x_means, NN_INPUT_DIM * sizeof(float),  "x_means");
+    NN_READ(h_weights.x_stds,  NN_INPUT_DIM * sizeof(float),  "x_stds");
+    NN_READ(h_weights.y_means, NN_OUTPUT_DIM * sizeof(float), "y_means");
+    NN_READ(h_weights.y_stds,  NN_OUTPUT_DIM * sizeof(float), "y_stds");
 
     // Layer 1
-    file.read(reinterpret_cast<char*>(h_weights.w1), NN_HIDDEN_DIM * NN_INPUT_DIM * sizeof(float));
-    file.read(reinterpret_cast<char*>(h_weights.b1), NN_HIDDEN_DIM * sizeof(float));
+    NN_READ(h_weights.w1, NN_HIDDEN_DIM * NN_INPUT_DIM  * sizeof(float), "w1");
+    NN_READ(h_weights.b1, NN_HIDDEN_DIM                 * sizeof(float), "b1");
 
     // Layer 2
-    file.read(reinterpret_cast<char*>(h_weights.w2), NN_HIDDEN_DIM * NN_HIDDEN_DIM * sizeof(float));
-    file.read(reinterpret_cast<char*>(h_weights.b2), NN_HIDDEN_DIM * sizeof(float));
+    NN_READ(h_weights.w2, NN_HIDDEN_DIM * NN_HIDDEN_DIM * sizeof(float), "w2");
+    NN_READ(h_weights.b2, NN_HIDDEN_DIM                 * sizeof(float), "b2");
 
     // Layer 3
-    file.read(reinterpret_cast<char*>(h_weights.w3), NN_OUTPUT_DIM * NN_HIDDEN_DIM * sizeof(float));
-    file.read(reinterpret_cast<char*>(h_weights.b3), NN_OUTPUT_DIM * sizeof(float));
+    NN_READ(h_weights.w3, NN_OUTPUT_DIM * NN_HIDDEN_DIM * sizeof(float), "w3");
+    NN_READ(h_weights.b3, NN_OUTPUT_DIM                 * sizeof(float), "b3");
 
-    if (!file) {
-        fprintf(stderr, "NN: Failed to read weights data\n");
-        return false;
-    }
+#undef NN_READ
 
     // Feature bounds (v2+)
     if (version >= 2) {
-        file.read(reinterpret_cast<char*>(h_weights.x_mins), NN_INPUT_DIM * sizeof(float));
-        file.read(reinterpret_cast<char*>(h_weights.x_maxs), NN_INPUT_DIM * sizeof(float));
-        if (!file) {
-            fprintf(stderr, "NN: Failed to read feature bounds\n");
+        size_t bounds_sz = NN_INPUT_DIM * sizeof(float);
+        file.read(reinterpret_cast<char*>(h_weights.x_mins), (std::streamsize)bounds_sz);
+        if ((size_t)file.gcount() != bounds_sz) {
+            fprintf(stderr, "NN: Truncated x_mins (%zd/%zu B) in %s\n",
+                    (size_t)file.gcount(), bounds_sz, filepath);
+            return false;
+        }
+        file.read(reinterpret_cast<char*>(h_weights.x_maxs), (std::streamsize)bounds_sz);
+        if ((size_t)file.gcount() != bounds_sz) {
+            fprintf(stderr, "NN: Truncated x_maxs (%zd/%zu B) in %s\n",
+                    (size_t)file.gcount(), bounds_sz, filepath);
             return false;
         }
         memcpy(g_x_mins, h_weights.x_mins, sizeof(g_x_mins));
@@ -1375,7 +1397,7 @@ int runNNFusedInferenceCtx(
     }
 
     /* GPU-level barrier: wait for last SGD on g_sgd_stream before reading weights */
-    if (g_sgd_ever_fired)
+    if (g_sgd_ever_fired.load(std::memory_order_acquire))
         cudaStreamWaitEvent(stream, g_sgd_done, 0);
 
     nnFusedInferenceKernel<<<1, NN_NUM_CONFIGS, 0, stream>>>(
@@ -1469,7 +1491,7 @@ int runNNSGDCtx(
     err = cudaStreamSynchronize(g_sgd_stream);
     if (err != cudaSuccess) return -1;
 
-    g_sgd_ever_fired = true;
+    g_sgd_ever_fired.store(true, std::memory_order_release);
 
     if (out_grad_norm) *out_grad_norm = h_result.grad_norm;
     if (out_clipped)   *out_clipped   = h_result.was_clipped;

@@ -46,6 +46,13 @@ struct CompContext {
     float*      d_sgd_grad_buffer;
     SGDOutput*  d_sgd_output;
     SGDSample*  d_sgd_samples;
+
+    /* Quantization range buffers (8B each).
+     * Replaces the static d_range_min/d_range_max globals in quantization_kernels.cu.
+     * Each slot owns its own pair so concurrent quantize_simple() calls on different
+     * streams never alias each other's min/max reduction targets. */
+    void* d_range_min;
+    void* d_range_max;
 };
 
 namespace gpucompress {
@@ -210,6 +217,7 @@ bool isNNLoaded();
  */
 bool isInputOOD(double entropy, double mad, double deriv,
                 size_t data_size, double error_bound);
+
 
 /**
  * Run neural network inference to find best compression config.

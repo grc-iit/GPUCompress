@@ -255,6 +255,28 @@ QuantizationResult quantize_simple(
 );
 
 /**
+ * @brief Thread-safe overload: uses caller-provided pre-allocated 8-byte device
+ * buffers for the min/max reduction, instead of the shared static globals.
+ *
+ * Use this overload whenever quantize_simple() may be called concurrently from
+ * multiple threads (e.g. from CompContext worker slots), passing ctx->d_range_min
+ * and ctx->d_range_max as the buffer arguments. Each call gets its own device
+ * memory so concurrent min/max reductions on different streams never alias.
+ *
+ * @param d_range_min_buf  Caller-owned device pointer, at least sizeof(double) bytes.
+ * @param d_range_max_buf  Caller-owned device pointer, at least sizeof(double) bytes.
+ */
+QuantizationResult quantize_simple(
+    void* d_input,
+    size_t num_elements,
+    size_t element_size,
+    QuantizationConfig config,
+    void* d_range_min_buf,
+    void* d_range_max_buf,
+    cudaStream_t stream = 0
+);
+
+/**
  * @brief Dequantize a device buffer back to original data type
  *
  * Reverses the quantization process using metadata from QuantizationResult.
