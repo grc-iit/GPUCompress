@@ -165,13 +165,9 @@ When exploration triggers:
 ### PERF-2: Insertion Sort on Thread 0 (31 Threads Idle)
 **File:** `src/nn/nn_gpu.cu` — `nnInferenceKernel` / `nnFusedInferenceKernel`
 **Severity:** MEDIUM (97% thread utilization waste during ranking)
+**Status:** ✅ FIXED
 
-Thread 0 does insertion sort over 32 configs (O(n²)=O(1024) ops) while threads 1-31 are idle.
-
-**Fix options:**
-1. Bitonic sort (parallel, 32-element, 5 passes of 16 comparisons = 80 ops vs 1024)
-2. Move sort to CPU (32-element CPU sort is negligible cost)
-3. For just the winner (no top-K needed), use parallel reduction (already done in `nnFusedInferenceKernel` for single winner)
+Both kernels now use parallel bitonic sort (32 threads, warp-shuffle based). All 32 threads participate in 5 passes of compare-and-swap using `__shfl_xor_sync`. Serial insertion sort (O(n²)=1024 ops on thread 0) replaced with parallel bitonic sort (O(n log²n)=80 ops across all 32 threads). Verified in commit `d704d71` (32.9x speedup).
 
 ---
 
@@ -531,7 +527,7 @@ These require minimal code changes and carry clear, verifiable benefits:
 | QW-5 | ~~Add `file.gcount()` checks in `loadNNFromBinary`~~ | nn_gpu.cu | ✅ DONE — `NN_READ` macro checks every array read; consolidated 6 header reads into 1. Verified by `test_bug5_truncated_nnwt` (7/7). | — |
 | QW-6 | Remove stderr spam (conditional on debug flag) | nn_gpu.cu, gpucompress_api.cpp | I/O overhead reduction | Low |
 | QW-7 | Batch 3 D→H copies in `runStatsKernels()` into 1 | stats_kernel.cu | PCIe efficiency | Low |
-| QW-8 | Move insertion sort to CPU (off critical GPU path) | nn_gpu.cu | Frees 31 idle threads | Low |
+| QW-8 | ~~Move insertion sort to CPU~~ — replaced with parallel bitonic sort instead | nn_gpu.cu | ✅ DONE — 32.9x speedup, commit `d704d71` | — |
 
 ---
 
