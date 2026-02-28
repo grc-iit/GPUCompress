@@ -91,6 +91,107 @@ static float g_x_maxs[NN_INPUT_DIM];
 static bool g_has_bounds = false;
 
 /* ============================================================
+ * Shared forward-pass device function
+ * ============================================================ */
+
+/**
+ * 15→128→128→4 forward pass for one (algo, quant, shuffle) config.
+ * Shared by nnInferenceKernel and nnFusedInferenceKernel to eliminate ~125
+ * lines of duplication. Stats (entropy/mad/deriv) are passed as scalars so
+ * the caller decides whether to read them from registers or device memory.
+ *
+ * Outputs rank_val (negated for lower-is-better; -INF for masked lossless),
+ * ratio, and comp_time for the shared-memory reduction that follows.
+ */
+__device__ static void nnForwardPass(
+    const NNWeightsGPU* __restrict__ weights,
+    int    tid,
+    double entropy,
+    double mad_norm,
+    double deriv_norm,
+    size_t data_size,
+    double error_bound,
+    int    criterion,
+    float* out_rank_val,
+    float* out_ratio,
+    float* out_comp_time
+) {
+    int algo_idx = tid % 8;
+    int quant    = (tid / 8) % 2;
+    int shuffle  = (tid / 16) % 2;
+
+    float input_raw[NN_INPUT_DIM];
+    for (int i = 0; i < 8; i++) input_raw[i] = (i == algo_idx) ? 1.0f : 0.0f;
+    input_raw[8] = static_cast<float>(quant);
+    input_raw[9] = static_cast<float>(shuffle);
+
+    double eb_clipped = (error_bound < 1e-7) ? 1e-7 : error_bound;
+    input_raw[10] = static_cast<float>(log10(eb_clipped));
+
+    double ds = static_cast<double>(data_size);
+    if (ds < 1.0) ds = 1.0;
+    input_raw[11] = static_cast<float>(log2(ds));
+
+    input_raw[12] = static_cast<float>(entropy);
+    input_raw[13] = static_cast<float>(mad_norm);
+    input_raw[14] = static_cast<float>(deriv_norm);
+
+    float input[NN_INPUT_DIM];
+    for (int i = 0; i < NN_INPUT_DIM; i++) {
+        float std_val = weights->x_stds[i];
+        if (std_val < 1e-8f) std_val = 1e-8f;
+        input[i] = (input_raw[i] - weights->x_means[i]) / std_val;
+    }
+
+    float hidden1[NN_HIDDEN_DIM];
+    for (int j = 0; j < NN_HIDDEN_DIM; j++) {
+        float sum = weights->b1[j];
+        for (int i = 0; i < NN_INPUT_DIM; i++)
+            sum += weights->w1[j * NN_INPUT_DIM + i] * input[i];
+        hidden1[j] = (sum > 0.0f) ? sum : 0.0f;
+    }
+
+    float hidden2[NN_HIDDEN_DIM];
+    for (int j = 0; j < NN_HIDDEN_DIM; j++) {
+        float sum = weights->b2[j];
+        for (int i = 0; i < NN_HIDDEN_DIM; i++)
+            sum += weights->w2[j * NN_HIDDEN_DIM + i] * hidden1[i];
+        hidden2[j] = (sum > 0.0f) ? sum : 0.0f;
+    }
+
+    float comp_time   = weights->b3[0];
+    float decomp_time = weights->b3[1];
+    float ratio       = weights->b3[2];
+    float psnr        = weights->b3[3];
+    for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+        comp_time   += weights->w3[0 * NN_HIDDEN_DIM + i] * hidden2[i];
+        decomp_time += weights->w3[1 * NN_HIDDEN_DIM + i] * hidden2[i];
+        ratio       += weights->w3[2 * NN_HIDDEN_DIM + i] * hidden2[i];
+        psnr        += weights->w3[3 * NN_HIDDEN_DIM + i] * hidden2[i];
+    }
+    comp_time   = expm1f(comp_time   * weights->y_stds[0] + weights->y_means[0]);
+    decomp_time = expm1f(decomp_time * weights->y_stds[1] + weights->y_means[1]);
+    ratio       = expm1f(ratio       * weights->y_stds[2] + weights->y_means[2]);
+    psnr        =        psnr        * weights->y_stds[3] + weights->y_means[3];
+
+    float rank_val;
+    bool higher_is_better;
+    switch (criterion) {
+        case NN_RANK_BY_RATIO:       rank_val = ratio;       higher_is_better = true;  break;
+        case NN_RANK_BY_COMP_TIME:   rank_val = comp_time;   higher_is_better = false; break;
+        case NN_RANK_BY_DECOMP_TIME: rank_val = decomp_time; higher_is_better = false; break;
+        case NN_RANK_BY_PSNR:        rank_val = psnr;        higher_is_better = true;  break;
+        default:                     rank_val = ratio;       higher_is_better = true;
+    }
+    if (!higher_is_better) rank_val = -rank_val;
+    if (quant == 1 && error_bound <= 0.0) rank_val = -INFINITY;
+
+    *out_rank_val  = rank_val;
+    *out_ratio     = ratio;
+    *out_comp_time = comp_time;
+}
+
+/* ============================================================
  * Neural Network Inference Kernel
  * ============================================================ */
 
@@ -134,137 +235,11 @@ __global__ void nnInferenceKernel(
     int tid = threadIdx.x;
     if (tid >= NN_NUM_CONFIGS) return;
 
-    // ---- Decode this thread's configuration ----
-    int algo_idx = tid % 8;
-    int quant    = (tid / 8) % 2;
-    int shuffle  = (tid / 16) % 2;
-
-    // ---- Build raw input features ----
-    float input_raw[NN_INPUT_DIM];
-
-    // One-hot algorithm encoding (features 0-7)
-    for (int i = 0; i < 8; i++) {
-        input_raw[i] = (i == algo_idx) ? 1.0f : 0.0f;
-    }
-
-    // Quantization binary (feature 8)
-    input_raw[8] = static_cast<float>(quant);
-
-    // Shuffle binary (feature 9)
-    input_raw[9] = static_cast<float>(shuffle);
-
-    // Error bound: log10(clip(error_bound, 1e-7)) (feature 10)
-    double eb_clipped = error_bound;
-    if (eb_clipped < 1e-7) eb_clipped = 1e-7;
-    input_raw[10] = static_cast<float>(log10(eb_clipped));
-
-    // Data size: log2(data_size) (feature 11)
-    double ds = static_cast<double>(data_size);
-    if (ds < 1.0) ds = 1.0;
-    input_raw[11] = static_cast<float>(log2(ds));
-
-    // Entropy (feature 12) - raw value, will be standardized
-    input_raw[12] = static_cast<float>(entropy);
-
-    // MAD (feature 13) - already normalized by range
-    input_raw[13] = static_cast<float>(mad_norm);
-
-    // Second derivative (feature 14) - already normalized by range
-    input_raw[14] = static_cast<float>(deriv_norm);
-
-    // ---- Standardize input features ----
-    // One-hot and binary features have mean=0, std=1 in the normalization
-    // (they were not standardized during training), but the stored means/stds
-    // handle this correctly (means=0, stds=1 for those indices)
-    float input[NN_INPUT_DIM];
-    for (int i = 0; i < NN_INPUT_DIM; i++) {
-        float std_val = weights->x_stds[i];
-        if (std_val < 1e-8f) std_val = 1e-8f;
-        input[i] = (input_raw[i] - weights->x_means[i]) / std_val;
-    }
-
-    // ---- Layer 1: Linear(15, 128) + ReLU ----
-    float hidden1[NN_HIDDEN_DIM];
-    for (int j = 0; j < NN_HIDDEN_DIM; j++) {
-        float sum = weights->b1[j];
-        for (int i = 0; i < NN_INPUT_DIM; i++) {
-            sum += weights->w1[j * NN_INPUT_DIM + i] * input[i];
-        }
-        hidden1[j] = (sum > 0.0f) ? sum : 0.0f;  // ReLU
-    }
-
-    // ---- Layer 2: Linear(128, 128) + ReLU ----
-    float hidden2[NN_HIDDEN_DIM];
-    for (int j = 0; j < NN_HIDDEN_DIM; j++) {
-        float sum = weights->b2[j];
-        for (int i = 0; i < NN_HIDDEN_DIM; i++) {
-            sum += weights->w2[j * NN_HIDDEN_DIM + i] * hidden1[i];
-        }
-        hidden2[j] = (sum > 0.0f) ? sum : 0.0f;  // ReLU
-    }
-
-    // ---- Layer 3: Linear(128, 4) ----
-    float output_norm[NN_OUTPUT_DIM];
-    for (int j = 0; j < NN_OUTPUT_DIM; j++) {
-        float sum = weights->b3[j];
-        for (int i = 0; i < NN_HIDDEN_DIM; i++) {
-            sum += weights->w3[j * NN_HIDDEN_DIM + i] * hidden2[i];
-        }
-        output_norm[j] = sum;
-    }
-
-    // ---- De-normalize outputs ----
-    // output_raw[0] = comp_time_log   → expm1() gives comp_time_ms
-    // output_raw[1] = decomp_time_log → expm1() gives decomp_time_ms
-    // output_raw[2] = ratio_log       → expm1() gives compression_ratio
-    // output_raw[3] = psnr_clamped    → direct (clamped, not logged)
-    float output_raw[NN_OUTPUT_DIM];
-    for (int j = 0; j < NN_OUTPUT_DIM; j++) {
-        output_raw[j] = output_norm[j] * weights->y_stds[j] + weights->y_means[j];
-    }
-
-    // Convert log-space back to original scale
-    float comp_time  = expm1f(output_raw[0]);  // ms
-    float decomp_time = expm1f(output_raw[1]); // ms
-    float ratio      = expm1f(output_raw[2]);  // ratio
-    float psnr       = output_raw[3];          // dB
-
-    // ---- Select ranking metric ----
-    float rank_val;
-    bool higher_is_better;
-
-    switch (criterion) {
-        case NN_RANK_BY_RATIO:
-            rank_val = ratio;
-            higher_is_better = true;
-            break;
-        case NN_RANK_BY_COMP_TIME:
-            rank_val = comp_time;
-            higher_is_better = false;
-            break;
-        case NN_RANK_BY_DECOMP_TIME:
-            rank_val = decomp_time;
-            higher_is_better = false;
-            break;
-        case NN_RANK_BY_PSNR:
-            rank_val = psnr;
-            higher_is_better = true;
-            break;
-        default:
-            rank_val = ratio;
-            higher_is_better = true;
-    }
-
-    // For "lower is better" metrics, negate so we can always do max-reduction
-    if (!higher_is_better) {
-        rank_val = -rank_val;
-    }
-
-    // Mask out quantization configs in lossless mode — their predicted
-    // ratios assume quant is applied, but it won't be (error_bound <= 0).
-    if (quant == 1 && error_bound <= 0.0) {
-        rank_val = -INFINITY;
-    }
+    // ---- Forward pass via shared device function ----
+    float rank_val, ratio, comp_time;
+    nnForwardPass(weights, tid, entropy, mad_norm, deriv_norm,
+                  data_size, error_bound, criterion,
+                  &rank_val, &ratio, &comp_time);
 
     // ---- Store per-thread predicted ratio and comp_time for later retrieval ----
     __shared__ float s_ratios[NN_NUM_CONFIGS];
@@ -361,92 +336,11 @@ __global__ void nnFusedInferenceKernel(
     double mad_norm = d_stats->mad_normalized;
     double deriv_norm = d_stats->deriv_normalized;
 
-    // Decode this thread's configuration
-    int algo_idx = tid % 8;
-    int quant    = (tid / 8) % 2;
-    int shuffle  = (tid / 16) % 2;
-
-    // Build raw input features
-    float input_raw[NN_INPUT_DIM];
-    for (int i = 0; i < 8; i++) {
-        input_raw[i] = (i == algo_idx) ? 1.0f : 0.0f;
-    }
-    input_raw[8] = static_cast<float>(quant);
-    input_raw[9] = static_cast<float>(shuffle);
-
-    double eb_clipped = error_bound;
-    if (eb_clipped < 1e-7) eb_clipped = 1e-7;
-    input_raw[10] = static_cast<float>(log10(eb_clipped));
-
-    double ds = static_cast<double>(data_size);
-    if (ds < 1.0) ds = 1.0;
-    input_raw[11] = static_cast<float>(log2(ds));
-
-    input_raw[12] = static_cast<float>(entropy);
-    input_raw[13] = static_cast<float>(mad_norm);
-    input_raw[14] = static_cast<float>(deriv_norm);
-
-    // Standardize
-    float input[NN_INPUT_DIM];
-    for (int i = 0; i < NN_INPUT_DIM; i++) {
-        float std_val = weights->x_stds[i];
-        if (std_val < 1e-8f) std_val = 1e-8f;
-        input[i] = (input_raw[i] - weights->x_means[i]) / std_val;
-    }
-
-    // Layer 1: Linear(15, 128) + ReLU
-    float hidden1[NN_HIDDEN_DIM];
-    for (int j = 0; j < NN_HIDDEN_DIM; j++) {
-        float sum = weights->b1[j];
-        for (int i = 0; i < NN_INPUT_DIM; i++) {
-            sum += weights->w1[j * NN_INPUT_DIM + i] * input[i];
-        }
-        hidden1[j] = (sum > 0.0f) ? sum : 0.0f;
-    }
-
-    // Layer 2: Linear(128, 128) + ReLU
-    float hidden2[NN_HIDDEN_DIM];
-    for (int j = 0; j < NN_HIDDEN_DIM; j++) {
-        float sum = weights->b2[j];
-        for (int i = 0; i < NN_HIDDEN_DIM; i++) {
-            sum += weights->w2[j * NN_HIDDEN_DIM + i] * hidden1[i];
-        }
-        hidden2[j] = (sum > 0.0f) ? sum : 0.0f;
-    }
-
-    // Layer 3: Linear(128, 4)
-    float output_norm[NN_OUTPUT_DIM];
-    for (int j = 0; j < NN_OUTPUT_DIM; j++) {
-        float sum = weights->b3[j];
-        for (int i = 0; i < NN_HIDDEN_DIM; i++) {
-            sum += weights->w3[j * NN_HIDDEN_DIM + i] * hidden2[i];
-        }
-        output_norm[j] = sum;
-    }
-
-    // De-normalize outputs
-    float output_raw[NN_OUTPUT_DIM];
-    for (int j = 0; j < NN_OUTPUT_DIM; j++) {
-        output_raw[j] = output_norm[j] * weights->y_stds[j] + weights->y_means[j];
-    }
-
-    float comp_time  = expm1f(output_raw[0]);
-    float decomp_time = expm1f(output_raw[1]);
-    float ratio      = expm1f(output_raw[2]);
-    float psnr       = output_raw[3];
-
-    // Select ranking metric
-    float rank_val;
-    bool higher_is_better;
-    switch (criterion) {
-        case NN_RANK_BY_RATIO:      rank_val = ratio;       higher_is_better = true;  break;
-        case NN_RANK_BY_COMP_TIME:  rank_val = comp_time;   higher_is_better = false; break;
-        case NN_RANK_BY_DECOMP_TIME:rank_val = decomp_time; higher_is_better = false; break;
-        case NN_RANK_BY_PSNR:       rank_val = psnr;        higher_is_better = true;  break;
-        default:                    rank_val = ratio;       higher_is_better = true;
-    }
-    if (!higher_is_better) rank_val = -rank_val;
-    if (quant == 1 && error_bound <= 0.0) rank_val = -INFINITY;
+    // ---- Forward pass via shared device function ----
+    float rank_val, ratio, comp_time;
+    nnForwardPass(weights, tid, entropy, mad_norm, deriv_norm,
+                  data_size, error_bound, criterion,
+                  &rank_val, &ratio, &comp_time);
 
     __shared__ float s_ratios[NN_NUM_CONFIGS];
     __shared__ float s_comp_times[NN_NUM_CONFIGS];
@@ -487,8 +381,15 @@ __global__ void nnFusedInferenceKernel(
 
             // OOD detection on continuous features (indices 10-14)
             int ood = 0;
-            float features[5] = {input_raw[10], input_raw[11], input_raw[12],
-                                 input_raw[13], input_raw[14]};
+            double eb_ood = (error_bound < 1e-7) ? 1e-7 : error_bound;
+            double ds_ood = static_cast<double>(data_size); if (ds_ood < 1.0) ds_ood = 1.0;
+            float features[5] = {
+                static_cast<float>(log10(eb_ood)),
+                static_cast<float>(log2(ds_ood)),
+                static_cast<float>(entropy),
+                static_cast<float>(mad_norm),
+                static_cast<float>(deriv_norm)
+            };
             int indices[5] = {10, 11, 12, 13, 14};
             for (int i = 0; i < 5; i++) {
                 int idx = indices[i];
@@ -521,8 +422,15 @@ __global__ void nnFusedInferenceKernel(
 
             // OOD detection
             int ood = 0;
-            float features[5] = {input_raw[10], input_raw[11], input_raw[12],
-                                 input_raw[13], input_raw[14]};
+            double eb_ood = (error_bound < 1e-7) ? 1e-7 : error_bound;
+            double ds_ood = static_cast<double>(data_size); if (ds_ood < 1.0) ds_ood = 1.0;
+            float features[5] = {
+                static_cast<float>(log10(eb_ood)),
+                static_cast<float>(log2(ds_ood)),
+                static_cast<float>(entropy),
+                static_cast<float>(mad_norm),
+                static_cast<float>(deriv_norm)
+            };
             int indices[5] = {10, 11, 12, 13, 14};
             for (int i = 0; i < 5; i++) {
                 int idx = indices[i];

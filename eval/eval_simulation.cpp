@@ -12,7 +12,6 @@
  *   ./build/eval_simulation \
  *     --data-dir eval/data/ \
  *     --weights model.nnwt \
- *     --experience exp.csv \
  *     --output results.csv \
  *     --error-bound 0.0 \
  *     --threshold 0.20
@@ -45,7 +44,7 @@ static const char* CSV_HEADER =
     "file,field,scenario,timestep,entropy,mad,second_derivative,"
     "original_size,algorithm,shuffle,quantization,error_bound,"
     "compressed_size,compression_ratio,compress_time_ms,throughput_mbps,"
-    "experience_count,experience_delta,predicted_ratio,mape,"
+    "predicted_ratio,mape,"
     "predicted_comp_time_ms,comp_time_mape,reinforced\n";
 
 // ============================================================
@@ -55,7 +54,6 @@ static const char* CSV_HEADER =
 struct EvalConfig {
     std::string data_dir;
     std::string weights;
-    std::string experience = "experience.csv";
     std::string output = "results.csv";
     double error_bound = 0.0;
     double threshold = 0.20;
@@ -196,7 +194,6 @@ static void print_usage(const char* prog) {
               << "Options:\n"
               << "  -d, --data-dir <path>      Directory with .bin files (required)\n"
               << "  -w, --weights <path>       NN weights file (.nnwt) (required)\n"
-              << "  -e, --experience <path>    Experience CSV output (default: experience.csv)\n"
               << "  -o, --output <path>        Results CSV output (default: results.csv)\n"
               << "  -b, --error-bound <float>  Quantization error bound (default: 0.0 = lossless)\n"
               << "  -t, --threshold <float>    Exploration threshold (default: 0.20)\n"
@@ -215,7 +212,6 @@ static EvalConfig parse_args(int argc, char** argv) {
     static struct option long_options[] = {
         {"data-dir",              required_argument, 0, 'd'},
         {"weights",               required_argument, 0, 'w'},
-        {"experience",            required_argument, 0, 'e'},
         {"output",                required_argument, 0, 'o'},
         {"error-bound",           required_argument, 0, 'b'},
         {"threshold",             required_argument, 0, 't'},
@@ -230,12 +226,11 @@ static EvalConfig parse_args(int argc, char** argv) {
     };
 
     int opt, option_index = 0;
-    while ((opt = getopt_long(argc, argv, "d:w:e:o:b:t:m:vh",
+    while ((opt = getopt_long(argc, argv, "d:w:o:b:t:m:vh",
                               long_options, &option_index)) != -1) {
         switch (opt) {
             case 'd': config.data_dir = optarg; break;
             case 'w': config.weights = optarg; break;
-            case 'e': config.experience = optarg; break;
             case 'o': config.output = optarg; break;
             case 'b': config.error_bound = std::atof(optarg); break;
             case 't': config.threshold = std::atof(optarg); break;
@@ -281,7 +276,6 @@ int main(int argc, char** argv) {
     std::cout << "GPUCompress Simulation Evaluation" << std::endl;
     std::cout << "  Files:       " << files.size() << std::endl;
     std::cout << "  Weights:     " << config.weights << std::endl;
-    std::cout << "  Experience:  " << config.experience << std::endl;
     std::cout << "  Output:      " << config.output << std::endl;
     std::cout << "  Error bound: " << config.error_bound << std::endl;
     std::cout << "  Threshold:   " << config.threshold << std::endl;
@@ -308,7 +302,7 @@ int main(int argc, char** argv) {
     std::cout << "  NN loaded: " << (gpucompress_nn_is_loaded() ? "yes" : "no") << std::endl;
 
     // 2. Enable active learning
-    rc = gpucompress_enable_active_learning(config.experience.c_str());
+    rc = gpucompress_enable_active_learning();
     if (rc != GPUCOMPRESS_SUCCESS) {
         std::cerr << "Error: gpucompress_enable_active_learning failed: "
                   << gpucompress_error_string((gpucompress_error_t)rc) << std::endl;
@@ -365,11 +359,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Reset experience count baseline after warm-up
-    size_t prev_experience = gpucompress_experience_count();
-
     // 5. Process each file
-    size_t total_explorations = 0;
     double total_ratio = 0.0;
     size_t files_processed = 0;
 
@@ -437,14 +427,6 @@ int main(int argc, char** argv) {
             &cfg, &stats);
         auto t1 = std::chrono::high_resolution_clock::now();
         double comp_time = std::chrono::duration<double, std::milli>(t1 - t0).count();
-
-        // Track experience delta
-        size_t curr_experience = gpucompress_experience_count();
-        size_t exp_delta = curr_experience - prev_experience;
-        prev_experience = curr_experience;
-
-        bool explored = (exp_delta > 1);
-        if (explored) total_explorations++;
 
         if (comp_rc != GPUCOMPRESS_SUCCESS) {
             std::cerr << "Warning: compress failed for " << filename
@@ -550,8 +532,6 @@ int main(int argc, char** argv) {
                 << fmt_double(ratio, 6) << ","
                 << fmt_double(comp_time, 4) << ","
                 << fmt_double(throughput, 2) << ","
-                << curr_experience << ","
-                << exp_delta << ","
                 << fmt_double(pred_ratio, 6) << ","
                 << fmt_double(mape, 6) << ","
                 << fmt_double(pred_comp_time, 4) << ","
@@ -569,11 +549,6 @@ int main(int argc, char** argv) {
     std::cout << "Evaluation Summary" << std::endl;
     std::cout << "========================================" << std::endl;
     std::cout << "  Files processed:     " << files_processed << std::endl;
-    std::cout << "  Total experience:    " << gpucompress_experience_count() << std::endl;
-    std::cout << "  Exploration events:  " << total_explorations
-              << " (" << std::fixed << std::setprecision(1)
-              << (files_processed > 0 ? 100.0 * total_explorations / files_processed : 0.0)
-              << "% of files)" << std::endl;
     std::cout << "  Mean ratio:          " << std::setprecision(4)
               << (files_processed > 0 ? total_ratio / files_processed : 0.0) << std::endl;
     std::cout << "  Mean Ratio MAPE:     " << std::setprecision(1)
@@ -584,7 +559,6 @@ int main(int argc, char** argv) {
               << "%" << std::endl;
     std::cout << "  Wall time:           " << std::setprecision(1) << wall_time << "s" << std::endl;
     std::cout << "  Output:              " << config.output << std::endl;
-    std::cout << "  Experience:          " << config.experience << std::endl;
     std::cout << "========================================" << std::endl;
 
     // 7. Generate MAPE plot

@@ -143,10 +143,8 @@ static int test_nn_inference(int& failures) {
 static int test_active_learning_and_reinforce(int& failures) {
     fprintf(stderr, "\n=== Test 2: Active Learning + Reinforcement ===\n");
 
-    const char* exp_path = "/tmp/gpucompress_test_experience.csv";
-
     // Enable active learning
-    gpucompress_error_t rc = gpucompress_enable_active_learning(exp_path);
+    gpucompress_error_t rc = gpucompress_enable_active_learning();
     CHECK(rc == GPUCOMPRESS_SUCCESS, "Active learning enabled");
     CHECK(gpucompress_active_learning_enabled() == 1, "Active learning flag is set");
 
@@ -162,7 +160,6 @@ static int test_active_learning_and_reinforce(int& failures) {
     size_t data_size = num_floats * sizeof(float);
 
     int total_sgd_fired = 0;
-    size_t total_experience = 0;
 
     for (int p = 0; p < 3; p++) {
         std::vector<float> data;
@@ -223,11 +220,7 @@ static int test_active_learning_and_reinforce(int& failures) {
         }
     }
 
-    total_experience = gpucompress_experience_count();
-    fprintf(stderr, "\n  Experience samples collected: %zu\n", total_experience);
-    fprintf(stderr, "  SGD fired count: %d / 3 patterns\n", total_sgd_fired);
-
-    CHECK(total_experience > 0, "Experience samples were collected");
+    fprintf(stderr, "\n  SGD fired count: %d / 3 patterns\n", total_sgd_fired);
 
     // Disable
     gpucompress_disable_active_learning();

@@ -65,7 +65,6 @@ set(LIB_SOURCES
     src/nn/nn_gpu.cu
     src/nn/nn_reinforce.cpp
     src/stats/stats_kernel.cu
-    src/nn/experience_buffer.cpp
 )
 
 # Set language property for .cpp files that use CUDA
@@ -75,7 +74,6 @@ set_source_files_properties(
     src/cli/decompress.cpp
     src/api/gpucompress_api.cpp
     src/nn/nn_reinforce.cpp
-    src/nn/experience_buffer.cpp
     PROPERTIES LANGUAGE CUDA
 )
 
@@ -273,20 +271,20 @@ target_link_libraries(test_quantization_roundtrip PRIVATE gpucompress m)
 # target_link_libraries(test_cli PRIVATE gpucompress CUDA::cudart)
 # set_target_properties(test_cli PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
-# add_executable(test_nn tests/test_nn.cu)  # source missing
-# target_link_libraries(test_nn PRIVATE gpucompress CUDA::cudart)
-# set_target_properties(test_nn PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+add_executable(test_nn tests/functionalityTests/test_nn.cu)
+target_link_libraries(test_nn PRIVATE gpucompress CUDA::cudart)
+set_target_properties(test_nn PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
 # add_executable(test_api tests/test_api.cu)  # source missing
 # target_link_libraries(test_api PRIVATE gpucompress CUDA::cudart)
 # set_target_properties(test_api PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
-# add_executable(test_nn_reinforce tests/test_nn_reinforce.cpp)  # source missing
-# set_source_files_properties(tests/test_nn_reinforce.cpp PROPERTIES LANGUAGE CUDA)
-# target_link_libraries(test_nn_reinforce PRIVATE gpucompress CUDA::cudart pthread)
+add_executable(test_nn_reinforce tests/functionalityTests/test_nn_reinforce.cpp)
+set_source_files_properties(tests/functionalityTests/test_nn_reinforce.cpp PROPERTIES LANGUAGE CUDA)
+target_link_libraries(test_nn_reinforce PRIVATE gpucompress CUDA::cudart pthread)
 
-# add_executable(test_nn_pipeline tests/test_nn_pipeline.cpp)  # source missing
-# target_link_libraries(test_nn_pipeline PRIVATE gpucompress pthread)
+add_executable(test_nn_pipeline tests/functionalityTests/test_nn_pipeline.cpp)
+target_link_libraries(test_nn_pipeline PRIVATE gpucompress pthread)
 
 # ============================================================
 # Executable 7: Simulation Evaluation

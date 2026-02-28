@@ -420,33 +420,17 @@ int gpucompress_online_learning_enabled(void);
  */
 void gpucompress_set_exploration(int enable);
 
-/**
- * Enable experience CSV logging. Only effective when online learning is on.
- * Off by default.
- *
- * @param csv_path Path to CSV file for storing experience samples
- * @return GPUCOMPRESS_SUCCESS or error code
- */
-gpucompress_error_t gpucompress_enable_experience_logging(const char* csv_path);
-
-/**
- * Disable experience CSV logging and close the file.
- */
-void gpucompress_disable_experience_logging(void);
-
 /* ============================================================
  * Active Learning API (backward-compatible convenience)
  * ============================================================ */
 
 /**
- * Enable active learning with experience collection.
- * Convenience function: enables online learning, exploration, and CSV logging.
+ * Enable active learning.
+ * Convenience function: enables online learning and exploration.
  *
- * @param experience_path Path to CSV file for storing experience samples
  * @return GPUCOMPRESS_SUCCESS or error code
  */
-gpucompress_error_t gpucompress_enable_active_learning(
-    const char* experience_path);
+gpucompress_error_t gpucompress_enable_active_learning(void);
 
 /**
  * Disable active learning. Calls gpucompress_disable_online_learning().
@@ -499,13 +483,6 @@ void gpucompress_set_verbose(int enable);
  */
 void gpucompress_reinforce_last_stats(float* grad_norm, int* num_samples,
                                        int* was_clipped);
-
-/**
- * Get the number of experience samples collected this session.
- *
- * @return Number of samples written since active learning was enabled
- */
-size_t gpucompress_experience_count(void);
 
 /**
  * Hot-reload neural network weights from a new .nnwt file.

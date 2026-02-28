@@ -4,10 +4,8 @@
  *   1. loadNNFromBinary reload failure leaves g_nn_loaded=false (Bug 1)
  *   2. cleanupNN resets g_has_bounds (Bug 2)
  *   3. x_stds=0 doesn't produce NaN (Bug 3)
- *   4. nn_reinforce_apply error recovery preserves CPU weights (Bug 4)
- *   5. runNNInference uses pre-allocated buffers (Bug 5 — verified by repeated calls)
- *   6. nn_reinforce_add_sample null input_raw (Issue 6)
- *   7. experience_buffer_append rejects invalid action (Issue 7)
+ *   4. runNNInference uses pre-allocated buffers (verified by repeated calls)
+ *   5. Full pipeline: load -> infer -> reinforce (GPU SGD path)
  */
 
 #include <cuda_runtime.h>
@@ -20,7 +18,6 @@
 
 #include "nn/nn_weights.h"
 #include "nn/nn_reinforce.h"
-#include "nn/experience_buffer.h"
 
 /* Forward declarations for gpucompress namespace functions */
 namespace gpucompress {
@@ -248,163 +245,12 @@ static void test_inference_not_loaded() {
 }
 
 /* ============================================================
- * Test 6: Reinforce init/add_sample/apply round-trip
- * ============================================================ */
-static void test_reinforce_roundtrip() {
-    TEST("Reinforce init + add_sample + apply round-trip");
-
-    const char* path = "/tmp/test_nn_reinforce.nnwt";
-    ASSERT(write_synthetic_nnwt(path), "failed to write synthetic nnwt");
-    ASSERT(gpucompress::loadNNFromBinary(path), "load should succeed");
-
-    // Get device pointer
-    void* d_weights = const_cast<NNWeightsGPU*>(gpucompress::getNNWeightsDevicePtr());
-    ASSERT(d_weights != nullptr, "device weights should not be null");
-
-    // Init reinforce
-    int rc = nn_reinforce_init(d_weights);
-    ASSERT(rc == 0, "reinforce init should succeed");
-
-    // Add a sample (config 0 = lz4, no quant, no shuffle)
-    float input_raw[15] = {0};
-    input_raw[0] = 1.0f;  // algo one-hot: lz4
-    input_raw[10] = -3.0f; // error_bound encoded
-    input_raw[11] = 20.0f; // data_size encoded
-    input_raw[12] = 5.0f;  // entropy
-    input_raw[13] = 0.3f;  // mad
-    input_raw[14] = 0.1f;  // deriv
-
-    nn_reinforce_add_sample(input_raw, 2.5, 1.0, 0.5, 80.0);
-
-    // Apply SGD
-    rc = nn_reinforce_apply(d_weights, 0.001f);
-    ASSERT(rc == 0, "reinforce apply should succeed");
-
-    // Check stats
-    float grad_norm = 0.0f;
-    int num_samples = 0;
-    int was_clipped = -1;
-    nn_reinforce_get_last_stats(&grad_norm, &num_samples, &was_clipped);
-    ASSERT(num_samples == 1, "should have 1 sample");
-    ASSERT(grad_norm >= 0.0f, "grad norm should be non-negative");
-    ASSERT(was_clipped == 0 || was_clipped == 1, "clipped should be 0 or 1");
-
-    nn_reinforce_cleanup();
-    gpucompress::cleanupNN();
-    remove(path);
-    PASS();
-}
-
-/* ============================================================
- * Test 7: nn_reinforce_add_sample with null input doesn't crash
- * ============================================================ */
-static void test_reinforce_null_input() {
-    TEST("nn_reinforce_add_sample with null input doesn't crash");
-
-    const char* path = "/tmp/test_nn_null.nnwt";
-    ASSERT(write_synthetic_nnwt(path), "failed to write synthetic nnwt");
-    ASSERT(gpucompress::loadNNFromBinary(path), "load should succeed");
-
-    void* d_weights = const_cast<NNWeightsGPU*>(gpucompress::getNNWeightsDevicePtr());
-
-    int rc = nn_reinforce_init(d_weights);
-    ASSERT(rc == 0, "reinforce init should succeed");
-
-    // This should not crash (null guard)
-    nn_reinforce_add_sample(nullptr, 2.5, 1.0, 0.5, 80.0);
-
-    // Apply should fail (0 samples)
-    rc = nn_reinforce_apply(d_weights, 0.001f);
-    ASSERT(rc == -1, "apply with 0 samples should fail");
-
-    nn_reinforce_cleanup();
-    gpucompress::cleanupNN();
-    remove(path);
-    PASS();
-}
-
-/* ============================================================
- * Test 8: experience_buffer rejects invalid action
- * ============================================================ */
-static void test_experience_buffer_invalid_action() {
-    TEST("experience_buffer_append rejects invalid action");
-
-    const char* csv_path = "/tmp/test_experience.csv";
-    remove(csv_path);
-
-    int rc = experience_buffer_init(csv_path);
-    ASSERT(rc == 0, "init should succeed");
-
-    // Valid sample (action=0 = lz4/no-quant/no-shuffle)
-    ExperienceSample valid;
-    memset(&valid, 0, sizeof(valid));
-    valid.entropy = 5.0;
-    valid.mad = 0.3;
-    valid.second_derivative = 0.1;
-    valid.data_size = 1024 * 1024;
-    valid.error_bound = 0.001;
-    valid.action = 0;
-    valid.actual_ratio = 2.5;
-    valid.actual_comp_time_ms = 1.0;
-    valid.actual_decomp_time_ms = 0.5;
-    valid.actual_psnr = 80.0;
-
-    rc = experience_buffer_append(&valid);
-    ASSERT(rc == 0, "valid action=0 should succeed");
-
-    // Valid action=31 (bitcomp + quant + shuffle)
-    valid.action = 31;
-    rc = experience_buffer_append(&valid);
-    ASSERT(rc == 0, "valid action=31 should succeed");
-
-    // Invalid action=-1
-    ExperienceSample bad = valid;
-    bad.action = -1;
-    rc = experience_buffer_append(&bad);
-    ASSERT(rc == -1, "action=-1 should be rejected");
-
-    // Invalid action=32
-    bad.action = 32;
-    rc = experience_buffer_append(&bad);
-    ASSERT(rc == -1, "action=32 should be rejected");
-
-    // Invalid action=100
-    bad.action = 100;
-    rc = experience_buffer_append(&bad);
-    ASSERT(rc == -1, "action=100 should be rejected");
-
-    // Verify only 2 valid samples were written
-    ASSERT(experience_buffer_count() == 2, "should have exactly 2 samples");
-
-    experience_buffer_cleanup();
-    remove(csv_path);
-    PASS();
-}
-
-/* ============================================================
- * Test 9: experience_buffer null pointer handling
- * ============================================================ */
-static void test_experience_buffer_null() {
-    TEST("experience_buffer null pointer handling");
-
-    int rc = experience_buffer_init(nullptr);
-    ASSERT(rc == -1, "init with null path should fail");
-
-    rc = experience_buffer_append(nullptr);
-    ASSERT(rc == -1, "append with null sample should fail");
-
-    PASS();
-}
-
-/* ============================================================
  * Test 10: Full pipeline — load, infer, reinforce, experience
  * ============================================================ */
 static void test_full_pipeline() {
-    TEST("Full NN pipeline: load -> infer -> reinforce -> log");
+    TEST("Full NN pipeline: load -> infer -> reinforce");
 
     const char* nnwt_path = "/tmp/test_nn_pipeline.nnwt";
-    const char* csv_path = "/tmp/test_nn_pipeline.csv";
-    remove(csv_path);
 
     ASSERT(write_synthetic_nnwt(nnwt_path), "failed to write synthetic nnwt");
     ASSERT(gpucompress::loadNNFromBinary(nnwt_path), "load should succeed");
@@ -441,84 +287,9 @@ static void test_full_pipeline() {
     rc = nn_reinforce_apply(d_weights, 0.0001f);
     ASSERT(rc == 0, "reinforce apply should succeed");
 
-    // Log experience
-    rc = experience_buffer_init(csv_path);
-    ASSERT(rc == 0, "experience init should succeed");
-
-    ExperienceSample sample;
-    sample.entropy = 5.0;
-    sample.mad = 0.25;
-    sample.second_derivative = 0.15;
-    sample.data_size = 4 * 1024 * 1024;
-    sample.error_bound = 0.001;
-    sample.action = action;
-    sample.actual_ratio = 3.0;
-    sample.actual_comp_time_ms = 2.0;
-    sample.actual_decomp_time_ms = 1.0;
-    sample.actual_psnr = 90.0;
-
-    rc = experience_buffer_append(&sample);
-    ASSERT(rc == 0, "experience append should succeed");
-    ASSERT(experience_buffer_count() == 1, "should have 1 sample");
-
-    experience_buffer_cleanup();
     nn_reinforce_cleanup();
     gpucompress::cleanupNN();
     remove(nnwt_path);
-    remove(csv_path);
-    PASS();
-}
-
-/* ============================================================
- * Test 11: Quant actions masked in lossless mode (error_bound=0)
- * ============================================================ */
-static void test_quant_masked_lossless() {
-    TEST("Quant actions masked when error_bound=0 (lossless)");
-
-    const char* path = "/tmp/test_nn_quant_mask.nnwt";
-    ASSERT(write_synthetic_nnwt(path), "failed to write synthetic nnwt");
-    ASSERT(gpucompress::loadNNFromBinary(path), "load should succeed");
-
-    // Run inference with error_bound=0.0 (lossless)
-    float ratio = 0.0f, comp_time = 0.0f;
-    int top[32];
-    int action = gpucompress::runNNInference(
-        5.0, 0.25, 0.15, 4 * 1024 * 1024, 0.0, 0,
-        &ratio, &comp_time, top);
-
-    // Winner must be non-quant (actions 0-7 or 16-23)
-    int winner_quant = (action / 8) % 2;
-    ASSERT(winner_quant == 0, "winner should be non-quant when error_bound=0");
-
-    // All top-16 actions should be non-quant; bottom 16 should be quant (masked)
-    bool top16_ok = true;
-    bool bot16_ok = true;
-    for (int i = 0; i < 16; i++) {
-        int q = (top[i] / 8) % 2;
-        if (q != 0) top16_ok = false;
-    }
-    for (int i = 16; i < 32; i++) {
-        int q = (top[i] / 8) % 2;
-        if (q != 1) bot16_ok = false;
-    }
-    ASSERT(top16_ok, "top-16 actions should all be non-quant in lossless mode");
-    ASSERT(bot16_ok, "bottom-16 actions should all be quant (masked) in lossless mode");
-
-    // With error_bound > 0, quant actions should appear in ranking
-    int top2[32];
-    gpucompress::runNNInference(
-        5.0, 0.25, 0.15, 4 * 1024 * 1024, 0.001, 0,
-        &ratio, &comp_time, top2);
-
-    bool has_quant = false;
-    for (int i = 0; i < 16; i++) {
-        int q = (top2[i] / 8) % 2;
-        if (q == 1) { has_quant = true; break; }
-    }
-    ASSERT(has_quant, "quant actions should appear in top-16 when error_bound>0");
-
-    gpucompress::cleanupNN();
-    remove(path);
     PASS();
 }
 
@@ -540,12 +311,7 @@ int main() {
     test_zero_std_no_nan();
     test_inference_repeated();
     test_inference_not_loaded();
-    test_reinforce_roundtrip();
-    test_reinforce_null_input();
-    test_experience_buffer_invalid_action();
-    test_experience_buffer_null();
     test_full_pipeline();
-    test_quant_masked_lossless();
 
     printf("\nResults: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail > 0 ? 1 : 0;

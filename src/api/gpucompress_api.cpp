@@ -492,14 +492,14 @@ extern "C" gpucompress_error_t gpucompress_compress(
             if (decoded.use_quantization)
                 preproc_to_use |= GPUCOMPRESS_PREPROC_QUANTIZE;
 
-            printf("NN: chose %s%s%s (action=%d, predicted_ratio=%.2f)\n",
+            GC_LOG("NN: chose %s%s%s (action=%d, predicted_ratio=%.2f)\n",
                    gpucompress_algorithm_name(algo_to_use),
                    (preproc_to_use & GPUCOMPRESS_PREPROC_SHUFFLE_4) ? " +shuffle" : "",
                    (preproc_to_use & GPUCOMPRESS_PREPROC_QUANTIZE)  ? " +quant"   : "",
                    action, predicted_ratio);
         } else {
             algo_to_use = GPUCOMPRESS_ALGO_LZ4;
-            printf("NN: fallback to lz4 (inference failed)\n");
+            GC_LOG("NN: fallback to lz4 (inference failed)\n");
         }
     }
 
@@ -1532,22 +1532,11 @@ extern "C" void gpucompress_set_exploration(int enable) {
     g_exploration_enabled = (enable != 0);
 }
 
-extern "C" gpucompress_error_t gpucompress_enable_experience_logging(const char* /*csv_path*/) {
-    // Stubbed out — experience logging removed in F9
-    return GPUCOMPRESS_SUCCESS;
-}
-
-extern "C" void gpucompress_disable_experience_logging(void) {
-    // Stubbed out — experience logging removed in F9
-}
-
 /* ============================================================
  * Backward-compatible Active Learning API
  * ============================================================ */
 
-extern "C" gpucompress_error_t gpucompress_enable_active_learning(
-    const char* /*experience_path*/
-) {
+extern "C" gpucompress_error_t gpucompress_enable_active_learning(void) {
     gpucompress_enable_online_learning();
     g_exploration_enabled = true;
     return GPUCOMPRESS_SUCCESS;
@@ -1582,10 +1571,6 @@ extern "C" void gpucompress_reinforce_last_stats(float* grad_norm,
 
 extern "C" void gpucompress_set_verbose(int enable) {
     g_gc_verbose = (enable != 0);
-}
-
-extern "C" size_t gpucompress_experience_count(void) {
-    return 0;  // Stubbed out — experience logging removed in F9
 }
 
 extern "C" gpucompress_error_t gpucompress_reload_nn(const char* filepath) {

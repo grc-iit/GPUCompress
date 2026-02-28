@@ -1000,9 +1000,28 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
             bool           valid;
         };
 
-        /* Per-worker device output and pinned host staging buffers */
+        /* Per-worker device output buffers */
         uint8_t *d_comp_w[N_COMP_WORKERS] = {};
-        void    *h_comp_w[N_COMP_WORKERS] = {};
+
+        /* Pinned host buffer pool — replaces per-chunk malloc/memcpy/free.
+         * Workers D→H directly into a pool buffer; IO thread returns it after
+         * writing.  N_IO_BUFS = workers(8) + io_q cap(8) ensures no starvation. */
+#define N_IO_BUFS (N_COMP_WORKERS + 8)
+        void    *io_pool_bufs[N_IO_BUFS] = {};
+        std::mutex              pool_mtx;
+        std::condition_variable pool_cv;
+        std::queue<void*>       pool_free;
+
+        auto pool_acquire = [&]() -> void* {
+            std::unique_lock<std::mutex> lk(pool_mtx);
+            pool_cv.wait(lk, [&]{ return !pool_free.empty(); });
+            void* b = pool_free.front(); pool_free.pop();
+            return b;
+        };
+        auto pool_release = [&](void* b) {
+            { std::lock_guard<std::mutex> lk(pool_mtx); pool_free.push(b); }
+            pool_cv.notify_one();
+        };
 
         /* Bounded work queue (capacity = N_COMP_WORKERS) */
         std::mutex              wq_mtx;
@@ -1025,12 +1044,14 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
         /* Stage-1 dimension arrays for gather kernel (reused across chunks) */
         hsize_t *d_dset_dims = NULL, *d_chunk_dims = NULL, *d_chunk_start = NULL;
 
-        /* ---- Allocate per-worker buffers ---- */
+        /* ---- Allocate per-worker device buffers + pinned buffer pool ---- */
         bool ok = true;
         for (int w = 0; w < N_COMP_WORKERS && ok; w++) {
-            if (cudaMallocHost(&h_comp_w[w], max_comp) != cudaSuccess ||
-                cudaMalloc   (&d_comp_w[w], max_comp) != cudaSuccess)
-                ok = false;
+            if (cudaMalloc(&d_comp_w[w], max_comp) != cudaSuccess) ok = false;
+        }
+        for (int i = 0; i < N_IO_BUFS && ok; i++) {
+            if (cudaMallocHost(&io_pool_bufs[i], max_comp) != cudaSuccess) ok = false;
+            else pool_free.push(io_pool_bufs[i]);
         }
         if (!ok) goto done_write;
 
@@ -1045,7 +1066,7 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                 io_cv.notify_one();  /* wake worker blocked on io_q.size() < 8 */
                 herr_t r = write_chunk_to_native(o->under_object, o->under_vol_id,
                                                   item.cs, item.data, item.sz, dxpl_id);
-                free(item.data);
+                pool_release(item.data);
                 if (r < 0) { std::lock_guard<std::mutex> lk(io_mtx); io_err = r; }
             }
         });
@@ -1077,20 +1098,17 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                             continue;
                         }
 
-                        /* D→H: safe — gpucompress_compress_gpu syncs ctx->stream */
-                        if (cudaMemcpy(h_comp_w[w], d_comp_w[w], comp_sz,
+                        /* Acquire a pool buffer; D→H directly into it (no extra memcpy) */
+                        void *hbuf = pool_acquire();
+                        if (cudaMemcpy(hbuf, d_comp_w[w], comp_sz,
                                        cudaMemcpyDeviceToHost) != cudaSuccess) {
+                            pool_release(hbuf);
                             worker_err.store((herr_t)-1);
                             continue;
                         }
 
-                        /* Tight malloc copy for IOItem */
-                        void *dcopy = malloc(comp_sz);
-                        if (!dcopy) { worker_err.store((herr_t)-1); continue; }
-                        memcpy(dcopy, h_comp_w[w], comp_sz);
-
                         IOItem item;
-                        item.data = dcopy;
+                        item.data = hbuf;
                         item.sz   = comp_sz;
                         item.nd   = wi.nd;
                         memcpy(item.cs, wi.cs, (size_t)wi.nd * sizeof(hsize_t));
@@ -1251,8 +1269,11 @@ done_write:
         if (d_dset_dims) free_dim_arrays(d_dset_dims, d_chunk_dims, d_chunk_start);
         for (int w = 0; w < N_COMP_WORKERS; w++) {
             if (d_comp_w[w]) cudaFree(d_comp_w[w]);
-            if (h_comp_w[w]) cudaFreeHost(h_comp_w[w]);
         }
+        for (int i = 0; i < N_IO_BUFS; i++) {
+            if (io_pool_bufs[i]) cudaFreeHost(io_pool_bufs[i]);
+        }
+#undef N_IO_BUFS
 #undef N_COMP_WORKERS
     }
 
