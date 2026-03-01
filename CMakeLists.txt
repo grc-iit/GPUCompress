@@ -657,6 +657,18 @@ if(HDF5_FOUND)
         )
         set_target_properties(test_qw4_atomic_counters PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
+        # PERF-4: batched D→H copy in runNNInference() correctness
+        add_executable(test_perf4_batched_dh tests/test_perf4_batched_dh.cu)
+        set_source_files_properties(tests/test_perf4_batched_dh.cu PROPERTIES LANGUAGE CUDA)
+        target_include_directories(test_perf4_batched_dh PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+        target_link_libraries(test_perf4_batched_dh PRIVATE
+            gpucompress CUDA::cudart m
+        )
+        set_target_properties(test_perf4_batched_dh PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
         # PERF-14: native atomicAdd(double*) correctness vs CPU reference stats
         add_executable(test_perf14_atomic_double tests/test_perf14_atomic_double.cu)
         set_source_files_properties(tests/test_perf14_atomic_double.cu PROPERTIES LANGUAGE CUDA)

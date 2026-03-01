@@ -62,26 +62,18 @@ static bool g_nn_loaded = false;
 static NNRankCriterion g_rank_criterion = NN_RANK_BY_RATIO;
 
 /** Pre-allocated inference output buffers (avoids per-call cudaMalloc) */
-static int*   d_infer_action = nullptr;
-static float* d_infer_ratio = nullptr;
-static float* d_infer_comp_time = nullptr;
-static int*   d_infer_top_actions = nullptr;
+static NNInferenceOutput* d_infer_output = nullptr;   // batched: action+ratio+comp_time+is_ood (16B)
+static int*               d_infer_top_actions = nullptr;
 
 static void allocInferenceBuffers() {
-    if (d_infer_action == nullptr)
-        cudaMalloc(&d_infer_action, sizeof(int));
-    if (d_infer_ratio == nullptr)
-        cudaMalloc(&d_infer_ratio, sizeof(float));
-    if (d_infer_comp_time == nullptr)
-        cudaMalloc(&d_infer_comp_time, sizeof(float));
+    if (d_infer_output == nullptr)
+        cudaMalloc(&d_infer_output, sizeof(NNInferenceOutput));
     if (d_infer_top_actions == nullptr)
         cudaMalloc(&d_infer_top_actions, NN_NUM_CONFIGS * sizeof(int));
 }
 
 static void freeInferenceBuffers() {
-    if (d_infer_action) { cudaFree(d_infer_action); d_infer_action = nullptr; }
-    if (d_infer_ratio) { cudaFree(d_infer_ratio); d_infer_ratio = nullptr; }
-    if (d_infer_comp_time) { cudaFree(d_infer_comp_time); d_infer_comp_time = nullptr; }
+    if (d_infer_output) { cudaFree(d_infer_output); d_infer_output = nullptr; }
     if (d_infer_top_actions) { cudaFree(d_infer_top_actions); d_infer_top_actions = nullptr; }
 }
 
@@ -222,9 +214,7 @@ __global__ void nnInferenceKernel(
     size_t data_size,
     double error_bound,
     int criterion,
-    int* __restrict__ out_action,
-    float* __restrict__ out_predicted_ratio,
-    float* __restrict__ out_predicted_comp_time,
+    NNInferenceOutput* __restrict__ out_result,
     int* __restrict__ out_top_actions
 ) {
     int tid = threadIdx.x;
@@ -289,9 +279,10 @@ __global__ void nnInferenceKernel(
         // All threads write their sorted slot in parallel; thread 0 is the winner.
         out_top_actions[tid] = my_idx;
         if (tid == 0) {
-            *out_action = my_idx;
-            if (out_predicted_ratio != nullptr)     *out_predicted_ratio    = s_ratios[my_idx];
-            if (out_predicted_comp_time != nullptr) *out_predicted_comp_time = s_comp_times[my_idx];
+            out_result->action             = my_idx;
+            out_result->predicted_ratio    = s_ratios[my_idx];
+            out_result->predicted_comp_time = s_comp_times[my_idx];
+            out_result->is_ood             = 0;  // OOD not computed in non-fused path
         }
     } else {
         // Tree reduction (32 → 16 → 8 → 4 → 2 → 1)
@@ -305,17 +296,13 @@ __global__ void nnInferenceKernel(
             __syncthreads();
         }
 
-        // Thread 0 writes the result
+        // Thread 0 writes the result as a single NNInferenceOutput
         if (tid == 0) {
-            *out_action = s_idxs[0];
-
-            // Write predicted ratio and comp_time for the winner
-            if (out_predicted_ratio != nullptr) {
-                *out_predicted_ratio = s_ratios[s_idxs[0]];
-            }
-            if (out_predicted_comp_time != nullptr) {
-                *out_predicted_comp_time = s_comp_times[s_idxs[0]];
-            }
+            int winner = s_idxs[0];
+            out_result->action              = winner;
+            out_result->predicted_ratio     = s_ratios[winner];
+            out_result->predicted_comp_time = s_comp_times[winner];
+            out_result->is_ood              = 0;  // OOD not computed in non-fused path
         }
     }
 }
@@ -1083,48 +1070,32 @@ int runNNInference(
     }
 
     // Ensure pre-allocated buffers exist
-    if (d_infer_action == nullptr) {
+    if (d_infer_output == nullptr) {
         allocInferenceBuffers();
-        if (d_infer_action == nullptr) return -1;
+        if (d_infer_output == nullptr) return -1;
     }
-
-    int h_action = 0;
 
     nnInferenceKernel<<<1, NN_NUM_CONFIGS, 0, stream>>>(
         d_nn_weights,
         entropy, mad_norm, deriv_norm,
         data_size, error_bound,
         static_cast<int>(g_rank_criterion),
-        d_infer_action,
-        out_predicted_ratio ? d_infer_ratio : nullptr,
-        out_predicted_comp_time ? d_infer_comp_time : nullptr,
+        d_infer_output,
         out_top_actions ? d_infer_top_actions : nullptr
     );
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return -1;
 
-    GC_LOG("[XFER D→H] NN inference (old): action (%zu B)\n", sizeof(int));
-    err = cudaMemcpyAsync(&h_action, d_infer_action, sizeof(int),
+    // Single D→H copy of NNInferenceOutput (16B) — replaces 3 separate transfers
+    NNInferenceOutput h_result;
+    GC_LOG("[XFER D→H] NN inference: NNInferenceOutput (%zu B)\n", sizeof(NNInferenceOutput));
+    err = cudaMemcpyAsync(&h_result, d_infer_output, sizeof(NNInferenceOutput),
                            cudaMemcpyDeviceToHost, stream);
     if (err != cudaSuccess) return -1;
 
-    if (out_predicted_ratio) {
-        GC_LOG("[XFER D→H] NN inference (old): predicted_ratio (%zu B)\n", sizeof(float));
-        err = cudaMemcpyAsync(out_predicted_ratio, d_infer_ratio, sizeof(float),
-                               cudaMemcpyDeviceToHost, stream);
-        if (err != cudaSuccess) return -1;
-    }
-
-    if (out_predicted_comp_time) {
-        GC_LOG("[XFER D→H] NN inference (old): predicted_comp_time (%zu B)\n", sizeof(float));
-        err = cudaMemcpyAsync(out_predicted_comp_time, d_infer_comp_time, sizeof(float),
-                               cudaMemcpyDeviceToHost, stream);
-        if (err != cudaSuccess) return -1;
-    }
-
     if (out_top_actions) {
-        GC_LOG("[XFER D→H] NN inference (old): top_actions (%zu B)\n", NN_NUM_CONFIGS * sizeof(int));
+        GC_LOG("[XFER D→H] NN inference: top_actions (%zu B)\n", NN_NUM_CONFIGS * sizeof(int));
         err = cudaMemcpyAsync(out_top_actions, d_infer_top_actions,
                                NN_NUM_CONFIGS * sizeof(int),
                                cudaMemcpyDeviceToHost, stream);
@@ -1134,7 +1105,10 @@ int runNNInference(
     err = cudaStreamSynchronize(stream);
     if (err != cudaSuccess) return -1;
 
-    return h_action;
+    if (out_predicted_ratio)    *out_predicted_ratio    = h_result.predicted_ratio;
+    if (out_predicted_comp_time) *out_predicted_comp_time = h_result.predicted_comp_time;
+
+    return h_result.action;
 }
 
 /**

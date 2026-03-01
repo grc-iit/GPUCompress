@@ -183,13 +183,18 @@ Thread 0 now computes `log10(eb)`, `log2(ds)`, and float-casts of entropy/MAD/de
 ### PERF-4: Multiple Small D→H Copies in `runNNInference()`
 **File:** `src/nn/nn_gpu.cu` — `runNNInference()`
 **Severity:** MEDIUM (latency on each inference call)
+**Status:** ✅ FIXED
 
-3 separate `cudaMemcpyAsync` calls for:
-- Best action (4B)
-- Predicted ratio + comp_time (8B)
-- Top-32 actions (128B)
+3 separate `cudaMemcpyAsync` calls replaced by a single 16B copy of `NNInferenceOutput`:
+- `d_infer_action` (4B) + `d_infer_ratio` (4B) + `d_infer_comp_time` (4B) → merged into `NNInferenceOutput* d_infer_output` (16B, same struct already used by fused kernel)
+- `nnInferenceKernel` signature updated: 3 separate output pointers → `NNInferenceOutput* out_result`
+- `runNNInference()` now issues one `cudaMemcpyAsync(&h_result, d_infer_output, 16B)` then extracts fields from `h_result`
 
-These should be batched into a single `cudaMemcpy` of the `NNInferenceOutput` struct (which already exists at 16B for the fused kernel).
+Verified by `tests/test_perf4_batched_dh.cu` (16/16):
+- T1: all 3 fields populated correctly (action∈[0,31], ratio>0, comp_time>0)
+- T2: no-optional-outputs call returns same action (batched copy not regressed)
+- T3: with top_actions, `out_result->action == top_actions[0]` (struct winner matches sorted list)
+- T4: cross-validated against `runNNFusedInference()` (independent kernel, same result)
 
 ---
 
