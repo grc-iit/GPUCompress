@@ -41,8 +41,13 @@ include_directories(
 )
 
 # Link directories
+# - /tmp/lib: nvcomp 5.1.0 libraries
+# - cuFile path: may vary by system; override with -DCMAKE_LIBRARY_PATH=<path>
+#   Common locations: /opt/nvidia/cuda-*/targets/x86_64-linux/lib,
+#                     /usr/local/cuda/lib64
 link_directories(
     /tmp/lib
+    /opt/nvidia/cuda-12.8/targets/x86_64-linux/lib
 )
 
 # ============================================================

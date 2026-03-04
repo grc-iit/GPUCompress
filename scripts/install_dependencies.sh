@@ -2,15 +2,19 @@
 #
 # GPUCompress Dependencies Installation Script
 #
-# This script installs all required dependencies for the GPUCompress project.
+# This script installs all required dependencies for the GPUCompress project:
+#   1. nvcomp 5.1.0       -> /tmp/include, /tmp/lib
+#   2. HDF5 2.0.0         -> /tmp/hdf5-install  (for VOL connector)
+#   3. Builds the project -> build/
+#
 # Run with: ./scripts/install_dependencies.sh
 #
 # Requirements:
-#   - Ubuntu 20.04/22.04/24.04 (x86_64)
+#   - Linux x86_64 (Ubuntu 20.04+, RHEL 9+)
 #   - NVIDIA GPU with compute capability >= 7.0
 #   - CUDA Toolkit >= 12.0 installed
 #   - NVIDIA driver >= 525.60.13
-#   - sudo privileges (for apt packages)
+#   - cmake >= 3.18, g++ >= 9.0
 #
 
 set -e  # Exit on error
@@ -39,6 +43,14 @@ NVCOMP_CUDA_VERSION="cuda12"
 NVCOMP_INSTALL_DIR="/tmp"
 NVCOMP_URL="https://developer.download.nvidia.com/compute/nvcomp/redist/nvcomp/linux-x86_64/nvcomp-linux-x86_64-${NVCOMP_VERSION}_${NVCOMP_CUDA_VERSION}-archive.tar.xz"
 
+HDF5_VERSION="2.0.0"
+HDF5_INSTALL_DIR="/tmp/hdf5-install"
+HDF5_URL="https://github.com/HDFGroup/hdf5/releases/download/${HDF5_VERSION}/hdf5-${HDF5_VERSION}.tar.gz"
+
+# Default CUDA architecture (sm_80 = Ampere A100).
+# Override: CUDA_ARCH=90 ./scripts/install_dependencies.sh
+CUDA_ARCH="${CUDA_ARCH:-80}"
+
 # ============================================================================
 # Pre-flight checks
 # ============================================================================
@@ -51,14 +63,13 @@ if [[ "$(uname -s)" != "Linux" ]] || [[ "$(uname -m)" != "x86_64" ]]; then
     exit 1
 fi
 
-# Check for NVIDIA GPU
-if ! command -v nvidia-smi &> /dev/null; then
-    echo_error "nvidia-smi not found. Please install NVIDIA drivers first."
-    exit 1
+# Check for NVIDIA GPU (nvidia-smi may not be available in containers)
+if command -v nvidia-smi &> /dev/null; then
+    echo_info "Detected GPU:"
+    nvidia-smi --query-gpu=gpu_name,compute_cap,driver_version --format=csv,noheader 2>/dev/null || true
+else
+    echo_warn "nvidia-smi not found. Continuing (may be running in a container)."
 fi
-
-echo_info "Detected GPU:"
-nvidia-smi --query-gpu=gpu_name,compute_cap,driver_version --format=csv,noheader
 
 # Check for CUDA toolkit
 if ! command -v nvcc &> /dev/null; then
@@ -76,33 +87,40 @@ if [[ "$CUDA_MAJOR" -lt 12 ]]; then
     exit 1
 fi
 
-# Check for cuFile (GDS support)
-if [[ -f "/usr/local/cuda/lib64/libcufile.so" ]]; then
-    echo_info "cuFile (GPUDirect Storage) library found"
+# Check for cuFile (GDS support) - search multiple possible locations
+CUFILE_LIB=""
+for candidate in \
+    "/usr/local/cuda/lib64/libcufile.so" \
+    "/usr/local/cuda/targets/x86_64-linux/lib/libcufile.so" \
+    "/opt/nvidia/cuda-${CUDA_VERSION}/targets/x86_64-linux/lib/libcufile.so"; do
+    if [[ -f "$candidate" ]]; then
+        CUFILE_LIB="$(dirname "$candidate")"
+        break
+    fi
+done
+
+# Broader search if not found
+if [[ -z "$CUFILE_LIB" ]]; then
+    CUFILE_PATH=$(find /opt/nvidia /usr/local/cuda -name "libcufile.so" 2>/dev/null | head -1)
+    if [[ -n "$CUFILE_PATH" ]]; then
+        CUFILE_LIB="$(dirname "$CUFILE_PATH")"
+    fi
+fi
+
+if [[ -n "$CUFILE_LIB" ]]; then
+    echo_info "cuFile (GPUDirect Storage) found at: ${CUFILE_LIB}"
 else
     echo_warn "cuFile not found - GPUDirect Storage may not work"
 fi
 
-# ============================================================================
-# Install system packages
-# ============================================================================
-
-echo_info "Installing system packages..."
-
-sudo apt-get update
-sudo apt-get install -y \
-    cmake \
-    build-essential \
-    curl \
-    xz-utils
-
 echo_info "cmake version: $(cmake --version | head -1)"
+echo_info "Target CUDA architecture: sm_${CUDA_ARCH}"
 
 # ============================================================================
 # Download and install nvcomp
 # ============================================================================
 
-echo_info "Installing nvcomp ${NVCOMP_VERSION}..."
+echo_info "=== Step 1/3: Installing nvcomp ${NVCOMP_VERSION} ==="
 
 # Create install directories
 mkdir -p "${NVCOMP_INSTALL_DIR}/include"
@@ -142,34 +160,70 @@ else
 fi
 
 # ============================================================================
-# Setup environment
+# Download, build, and install HDF5 2.0.0
 # ============================================================================
 
-echo_info "Setting up environment..."
+echo_info "=== Step 2/3: Building HDF5 ${HDF5_VERSION} (for VOL connector) ==="
 
-# Create environment setup script
-ENV_SCRIPT="/home/cc/GPUCompress/scripts/setup_env.sh"
-cat > "${ENV_SCRIPT}" << 'ENVEOF'
-#!/bin/bash
-# Source this file to set up the GPUCompress environment
-# Usage: source scripts/setup_env.sh
+HDF5_ARCHIVE="/tmp/hdf5-${HDF5_VERSION}.tar.gz"
+HDF5_SRC_DIR="/tmp/hdf5-${HDF5_VERSION}"
+HDF5_BUILD_DIR="/tmp/hdf5-build"
 
-export LD_LIBRARY_PATH=/tmp/lib:${LD_LIBRARY_PATH}
-export NVCOMP_INCLUDE_DIR=/tmp/include
-export NVCOMP_LIB_DIR=/tmp/lib
+if [[ -f "${HDF5_INSTALL_DIR}/lib/libhdf5.so" ]] && \
+   [[ -f "${HDF5_INSTALL_DIR}/include/hdf5.h" ]]; then
+    echo_info "HDF5 ${HDF5_VERSION} already installed at ${HDF5_INSTALL_DIR}, skipping build"
+else
+    # Download
+    if [[ ! -f "${HDF5_ARCHIVE}" ]]; then
+        echo_info "Downloading HDF5 ${HDF5_VERSION} source..."
+        curl -L -o "${HDF5_ARCHIVE}" "${HDF5_URL}"
+    else
+        echo_info "Using cached HDF5 source archive"
+    fi
 
-echo "GPUCompress environment configured:"
-echo "  LD_LIBRARY_PATH includes: /tmp/lib"
-echo "  NVCOMP_INCLUDE_DIR: ${NVCOMP_INCLUDE_DIR}"
-echo "  NVCOMP_LIB_DIR: ${NVCOMP_LIB_DIR}"
-ENVEOF
-chmod +x "${ENV_SCRIPT}"
+    # Extract
+    if [[ ! -d "${HDF5_SRC_DIR}" ]]; then
+        echo_info "Extracting HDF5 source..."
+        cd /tmp
+        tar xzf "${HDF5_ARCHIVE}"
+    fi
+
+    # Build (C library only, minimal config for speed)
+    echo_info "Configuring HDF5 build..."
+    rm -rf "${HDF5_BUILD_DIR}"
+    mkdir -p "${HDF5_BUILD_DIR}"
+    cd "${HDF5_BUILD_DIR}"
+
+    cmake "${HDF5_SRC_DIR}" \
+        -DCMAKE_INSTALL_PREFIX="${HDF5_INSTALL_DIR}" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DHDF5_BUILD_TOOLS=OFF \
+        -DHDF5_BUILD_EXAMPLES=OFF \
+        -DBUILD_TESTING=OFF \
+        -DHDF5_BUILD_CPP_LIB=OFF \
+        -DHDF5_BUILD_FORTRAN=OFF \
+        -DHDF5_BUILD_JAVA=OFF \
+        -DHDF5_BUILD_HL_LIB=ON
+
+    echo_info "Building HDF5 (this may take a few minutes)..."
+    make -j$(nproc)
+    make install
+
+    # Verify
+    if [[ -f "${HDF5_INSTALL_DIR}/lib/libhdf5.so" ]] && \
+       [[ -f "${HDF5_INSTALL_DIR}/include/hdf5.h" ]]; then
+        echo_info "HDF5 ${HDF5_VERSION} installed successfully at ${HDF5_INSTALL_DIR}"
+    else
+        echo_error "HDF5 installation failed"
+        exit 1
+    fi
+fi
 
 # ============================================================================
 # Build project
 # ============================================================================
 
-echo_info "Building GPUCompress..."
+echo_info "=== Step 3/3: Building GPUCompress ==="
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "${SCRIPT_DIR}")"
@@ -179,7 +233,18 @@ rm -rf build
 mkdir -p build
 cd build
 
-cmake ..
+# Pass CUDA architecture explicitly to avoid Cray PE overriding to sm_52.
+# On Cray PE systems, the CC/cc wrappers can silently override the default
+# CUDA architecture, breaking atomicAdd(double*, double) which requires sm_60+.
+CMAKE_EXTRA_ARGS=""
+if [[ -n "$CUFILE_LIB" ]]; then
+    CMAKE_EXTRA_ARGS="-DCMAKE_LIBRARY_PATH=${CUFILE_LIB}"
+fi
+
+cmake .. \
+    -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH} \
+    ${CMAKE_EXTRA_ARGS}
+
 make -j$(nproc)
 
 # ============================================================================
@@ -188,17 +253,40 @@ make -j$(nproc)
 
 echo_info "Verifying build..."
 
-if [[ -x "./gpu_compress" ]] && [[ -x "./gpu_decompress" ]]; then
-    echo_info "Build successful!"
+FAIL=0
+for target in gpu_compress gpu_decompress; do
+    if [[ -x "./${target}" ]]; then
+        echo_info "  ${target} ... OK"
+    else
+        echo_error "  ${target} ... MISSING"
+        FAIL=1
+    fi
+done
+
+for lib in libgpucompress.so libH5Zgpucompress.so libH5VLgpucompress.so; do
+    if [[ -f "./${lib}" ]] || [[ -L "./${lib}" ]]; then
+        echo_info "  ${lib} ... OK"
+    else
+        echo_warn "  ${lib} ... not built (may be expected if HDF5 not found by cmake)"
+    fi
+done
+
+if [[ "$FAIL" -eq 0 ]]; then
     echo ""
     echo "============================================================"
     echo "  GPUCompress Installation Complete"
     echo "============================================================"
     echo ""
-    echo "Built executables:"
-    echo "  - build/gpu_compress"
-    echo "  - build/gpu_decompress"
-    echo "  - build/test_quantization"
+    echo "Dependencies installed:"
+    echo "  - nvcomp ${NVCOMP_VERSION}       -> /tmp/include, /tmp/lib"
+    echo "  - HDF5 ${HDF5_VERSION}           -> ${HDF5_INSTALL_DIR}"
+    echo ""
+    echo "Built targets:"
+    echo "  - build/gpu_compress             (CLI compression)"
+    echo "  - build/gpu_decompress           (CLI decompression)"
+    echo "  - build/libgpucompress.so        (shared library)"
+    echo "  - build/libH5Zgpucompress.so     (HDF5 filter plugin)"
+    echo "  - build/libH5VLgpucompress.so    (HDF5 VOL connector)"
     echo ""
     echo "Before running, set up the environment:"
     echo "  source scripts/setup_env.sh"
