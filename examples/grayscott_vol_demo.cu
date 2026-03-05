@@ -2,14 +2,81 @@
  * grayscott_vol_demo.cu
  *
  * Demonstrates the full GPUCompress pipeline with Gray-Scott reaction-diffusion:
- *   GPU simulation → NN compression → HDF5 via VOL → read-back & verify
+ *   GPU simulation → NN compression → HDF5 via VOL → read-back → write
+ *   decompressed copy → bitwise verify
  *
- * The V field is snapshotted at regular intervals and written through the
- * GPUCompress VOL connector.  The NN selects compression algorithm per chunk.
- * Each snapshot is read back and verified bitwise on GPU.
+ * Produces two HDF5 files:
+ *   1. /tmp/grayscott_compressed.h5   — written via VOL (NN-compressed chunks)
+ *   2. /tmp/grayscott_decompressed.h5 — plain HDF5 (uncompressed, after round-trip)
+ *
+ * Verification: GPU kernel compares original vs decompressed bitwise.
+ * You can also compare the two files externally with h5diff.
  *
  * Usage:
- *   ./grayscott_vol_demo [model.nnwt] [--L 128] [--steps 5000] [--plotgap 1000]
+ *   ./grayscott_vol_demo [model.nnwt] [--L 128] [--steps 1000] [--chunk_mb 64]
+ *
+ * Options:
+ *   model.nnwt   Path to NN weights. Omit to fall back to LZ4.
+ *   --L N        Grid side length. Dataset size = N³ × 4 bytes.
+ *   --steps N    Total simulation time-steps (default: 1000).
+ *   --plotgap N  Snapshot every N steps (default: 0 = single snapshot at end).
+ *   --chunk_mb M Chunk size in MB (auto-calculates chunk_z from L).
+ *   --chunk_z Z  Set Z-dimension of chunk directly (alternative to --chunk_mb).
+ *   --F val      Feed rate (default: 0.04). Controls pattern type.
+ *   --k val      Kill rate (default: 0.06075). Controls pattern type.
+ *
+ * Dataset size reference:
+ *   --L 128  →    8 MB        --L 640  →   1 GB
+ *   --L 256  →   64 MB        --L 1000 →   4 GB
+ *   --L 512  →  512 MB        --L 1260 →   8 GB
+ *
+ * Examples:
+ *   # 8 MB dataset, default chunks (4 × 2 MB)
+ *   ./grayscott_vol_demo model.nnwt --L 128 --steps 1000
+ *
+ *   # 64 MB dataset, 4 MB chunks (16 chunks)
+ *   ./grayscott_vol_demo model.nnwt --L 256 --chunk_mb 4 --steps 1000
+ *
+ *   # 1 GB dataset, 64 MB chunks (16 chunks)
+ *   ./grayscott_vol_demo model.nnwt --L 640 --chunk_mb 64 --steps 1000
+ *
+ *   # 4 GB dataset, 64 MB chunks (63 chunks)
+ *   ./grayscott_vol_demo model.nnwt --L 1000 --chunk_mb 64 --steps 1000
+ *
+ *   # 8 GB dataset, 64 MB chunks (126 chunks) — needs ~30 GB GPU mem
+ *   ./grayscott_vol_demo model.nnwt --L 1260 --chunk_mb 64 --steps 1000
+ *
+ *   # 4 GB dataset, 4 MB chunks (many small chunks, more NN decisions)
+ *   ./grayscott_vol_demo model.nnwt --L 1000 --chunk_mb 4 --steps 1000
+ *
+ *   # Multiple snapshots: 5 snapshots of 64 MB each (plotgap = steps/n_snapshots)
+ *   ./grayscott_vol_demo model.nnwt --L 256 --steps 5000 --plotgap 1000
+ *
+ *   # 10 snapshots of 1 GB, 64 MB chunks
+ *   ./grayscott_vol_demo model.nnwt --L 640 --chunk_mb 64 --steps 10000 --plotgap 1000
+ *
+ *   # 20 snapshots of 4 GB, 64 MB chunks (long run)
+ *   ./grayscott_vol_demo model.nnwt --L 1000 --chunk_mb 64 --steps 20000 --plotgap 1000
+ *
+ * Gray-Scott pattern reference (F, k):
+ *   --F 0.04   --k 0.06075   Spots (default) — isolated blobs, large flat regions
+ *   --F 0.035  --k 0.065     Stripes/labyrinth — winding connected structures
+ *   --F 0.012  --k 0.05      Spots + waves — propagating fronts
+ *   --F 0.025  --k 0.05      Solitons — pulsating spots
+ *   --F 0.03   --k 0.055     Coral/worms — branching structures, higher entropy
+ *   --F 0.014  --k 0.045     Chaos — turbulent, high entropy, harder to compress
+ *   --F 0.04   --k 0.065     Sparse spots — very compressible, mostly empty
+ *   --F 0.025  --k 0.06      Mitosis — splitting spots
+ *
+ * Examples with different patterns:
+ *   # Stripes (higher entropy than spots)
+ *   ./grayscott_vol_demo model.nnwt --L 160 --chunk_mb 4 --F 0.035 --k 0.065
+ *
+ *   # Chaos (hardest to compress)
+ *   ./grayscott_vol_demo model.nnwt --L 160 --chunk_mb 4 --F 0.014 --k 0.045
+ *
+ *   # Sparse spots (easiest to compress)
+ *   ./grayscott_vol_demo model.nnwt --L 160 --chunk_mb 4 --F 0.04 --k 0.065
  */
 
 #include <stdio.h>
@@ -52,12 +119,17 @@ static const char *algo_name(uint8_t id) {
 
 /* ---- CLI parsing -------------------------------------------------- */
 static void parse_args(int argc, char **argv,
-                       const char **weights, int *L, int *steps, int *plotgap)
+                       const char **weights, int *L, int *steps, int *plotgap,
+                       int *chunk_z, int *chunk_mb, float *F, float *k)
 {
-    *weights = NULL;
-    *L       = 128;
-    *steps   = 5000;
-    *plotgap = 1000;
+    *weights  = NULL;
+    *L        = 128;
+    *steps    = 1000;
+    *plotgap  = 0;   /* 0 = single snapshot at end */
+    *chunk_z  = 0;   /* 0 = auto */
+    *chunk_mb = 0;   /* 0 = not set */
+    *F        = 0.04f;
+    *k        = 0.06075f;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--L") == 0 && i + 1 < argc) {
@@ -66,6 +138,14 @@ static void parse_args(int argc, char **argv,
             *steps = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--plotgap") == 0 && i + 1 < argc) {
             *plotgap = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--chunk_z") == 0 && i + 1 < argc) {
+            *chunk_z = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--chunk_mb") == 0 && i + 1 < argc) {
+            *chunk_mb = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--F") == 0 && i + 1 < argc) {
+            *F = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--k") == 0 && i + 1 < argc) {
+            *k = (float)atof(argv[++i]);
         } else if (argv[i][0] != '-' && *weights == NULL) {
             *weights = argv[i];
         }
@@ -76,24 +156,38 @@ static void parse_args(int argc, char **argv,
 int main(int argc, char **argv)
 {
     const char *weights;
-    int L, total_steps, plotgap;
-    parse_args(argc, argv, &weights, &L, &total_steps, &plotgap);
+    int L, steps, plotgap, chunk_z, chunk_mb;
+    float F, k;
+    parse_args(argc, argv, &weights, &L, &steps, &plotgap, &chunk_z, &chunk_mb, &F, &k);
 
-    int n_snapshots = total_steps / plotgap;
-    if (n_snapshots < 1) n_snapshots = 1;
+    int n_snapshots = 1;
+    if (plotgap > 0) {
+        n_snapshots = steps / plotgap;
+        if (n_snapshots < 1) n_snapshots = 1;
+    } else {
+        plotgap = steps;  /* single snapshot: run all steps then snapshot */
+    }
+
     size_t n_elem  = (size_t)L * L * L;
     size_t nbytes  = n_elem * sizeof(float);
-    int chunk_z    = L / 4;
+    if (chunk_mb > 0) {
+        chunk_z = (int)((size_t)chunk_mb * 1024 * 1024 / ((size_t)L * L * sizeof(float)));
+        if (chunk_z < 1) chunk_z = 1;
+        if (chunk_z > L) chunk_z = L;
+    } else if (chunk_z <= 0) {
+        chunk_z = L / 4;
+    }
     if (chunk_z < 1) chunk_z = 1;
-    int n_chunks   = (L + chunk_z - 1) / chunk_z;  /* chunks along Z */
+    int n_chunks   = (L + chunk_z - 1) / chunk_z;
 
     printf("=== grayscott_vol_demo: Gray-Scott → NN Compression → HDF5 ===\n");
     printf("    Grid    : %d³ = %zu floats (%.1f MB)\n",
            L, n_elem, nbytes / (1024.0 * 1024.0));
-    printf("    Chunks  : %d × %d × %d  (%d chunks along Z)\n",
-           L, L, chunk_z, n_chunks);
-    printf("    Steps   : %d  plotgap=%d  snapshots=%d\n",
-           total_steps, plotgap, n_snapshots);
+    double chunk_size_mb = (double)L * L * chunk_z * sizeof(float) / (1024.0 * 1024.0);
+    printf("    Chunks  : %d × %d × %d  (%d chunks, %.1f MB each)\n",
+           L, L, chunk_z, n_chunks, chunk_size_mb);
+    printf("    Steps   : %d  plotgap=%d  snapshots=%d\n", steps, plotgap, n_snapshots);
+    printf("    Pattern : F=%.4f  k=%.5f\n", F, k);
     printf("    Model   : %s\n\n",
            weights ? weights : "(none — NN will fall back to LZ4)");
 
@@ -116,28 +210,26 @@ int main(int argc, char **argv)
     H5VLclose(native_id);
     H5VL_gpucompress_set_trace(0);
 
-    /* ---- 2. Create Gray-Scott simulation ---- */
+    /* ---- 2. Create simulation ---- */
     GrayScottSettings s = gray_scott_default_settings();
     s.L = L;
+    s.F = F;
+    s.k = k;
     gpucompress_grayscott_t sim = NULL;
     gpucompress_grayscott_create(&sim, &s);
     gpucompress_grayscott_init(sim);
 
-    /* ---- 3. Create HDF5 file with 3D chunked dataset for V ---- */
-    const char *fname = "/tmp/grayscott_vol_demo.h5";
+    /* ---- 3. Create HDF5 file with per-snapshot datasets ---- */
+    const char *comp_fname   = "/tmp/grayscott_compressed.h5";
+    const char *decomp_fname = "/tmp/grayscott_decompressed.h5";
+
     hsize_t dims[3]  = { (hsize_t)L, (hsize_t)L, (hsize_t)L };
     hsize_t cdims[3] = { (hsize_t)L, (hsize_t)L, (hsize_t)chunk_z };
 
-    hid_t fid   = H5Fcreate(fname, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
-    hid_t space = H5Screate_simple(3, dims, NULL);
-    hid_t dcpl  = H5Pcreate(H5P_DATASET_CREATE);
-    H5Pset_chunk(dcpl, 3, cdims);
-    H5Pset_gpucompress(dcpl, GPUCOMPRESS_ALGO_AUTO, 0, 4, 0.0);
+    hid_t comp_fid   = H5Fcreate(comp_fname, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+    hid_t plain_fapl = H5Pcreate(H5P_FILE_ACCESS);
+    hid_t decomp_fid = H5Fcreate(decomp_fname, H5F_ACC_TRUNC, H5P_DEFAULT, plain_fapl);
 
-    hid_t dset_v = H5Dcreate2(fid, "V", H5T_NATIVE_FLOAT, space,
-                               H5P_DEFAULT, dcpl, H5P_DEFAULT);
-
-    /* ---- Readback buffer ---- */
     float *d_readback = NULL;
     cudaMalloc(&d_readback, nbytes);
 
@@ -148,46 +240,60 @@ int main(int argc, char **argv)
 
     /* ---- 4. Snapshot loop ---- */
     for (int snap = 0; snap < n_snapshots; snap++) {
+        /* Simulate plotgap steps */
+        double sim_t0 = now_sec();
         gpucompress_grayscott_run(sim, plotgap);
         cudaDeviceSynchronize();
+        double sim_dt = now_sec() - sim_t0;
 
         int cur_step = (snap + 1) * plotgap;
         float *d_u = NULL, *d_v = NULL;
         gpucompress_grayscott_get_device_ptrs(sim, &d_u, &d_v);
 
-        printf("\n╔══ Snapshot %d/%d  (step %d) ═══════════════════════════════╗\n",
-               snap + 1, n_snapshots, cur_step);
+        char dset_name[32];
+        snprintf(dset_name, sizeof(dset_name), "V_%04d", snap);
 
-        /* --- Write V field --- */
-        H5VL_gpucompress_reset_stats();
-        double t0 = now_sec();
-        herr_t rc = H5Dwrite(dset_v, H5T_NATIVE_FLOAT,
-                             H5S_ALL, H5S_ALL, H5P_DEFAULT, d_v);
-        double dt = now_sec() - t0;
+        printf("\n╔══ Snapshot %d/%d  (step %d, sim %.3f s) ═══════════════════╗\n",
+               snap + 1, n_snapshots, cur_step, sim_dt);
 
-        int n_comp = 0;
-        H5VL_gpucompress_get_stats(NULL, NULL, &n_comp, NULL);
-        if (rc < 0 || n_comp != n_chunks) total_failures++;
-        printf("  Write : %s  %.3f s  %.1f MB/s  (%d chunks compressed)\n",
-               (rc >= 0 && n_comp == n_chunks) ? "OK  " : "FAIL",
-               dt, (nbytes / (1024.0 * 1024.0)) / dt, n_comp);
-
-        /* --- Per-chunk algorithm report --- */
+        /* --- Write compressed --- */
         {
-            int tally[9][2] = {};   /* [algo_id][shuffle] */
+            hid_t space = H5Screate_simple(3, dims, NULL);
+            hid_t dcpl  = H5Pcreate(H5P_DATASET_CREATE);
+            H5Pset_chunk(dcpl, 3, cdims);
+            H5Pset_gpucompress(dcpl, GPUCOMPRESS_ALGO_AUTO, 0, 4, 0.0);
+
+            hid_t dset = H5Dcreate2(comp_fid, dset_name, H5T_NATIVE_FLOAT, space,
+                                     H5P_DEFAULT, dcpl, H5P_DEFAULT);
+
+            H5VL_gpucompress_reset_stats();
+            double t0 = now_sec();
+            herr_t rc = H5Dwrite(dset, H5T_NATIVE_FLOAT,
+                                 H5S_ALL, H5S_ALL, H5P_DEFAULT, d_v);
+            double dt = now_sec() - t0;
+
+            int n_comp = 0;
+            H5VL_gpucompress_get_stats(NULL, NULL, &n_comp, NULL);
+            if (rc < 0 || n_comp != n_chunks) total_failures++;
+            printf("  Write : %s  %.3f s  %.1f MB/s  (%d chunks)\n",
+                   (rc >= 0 && n_comp == n_chunks) ? "OK  " : "FAIL",
+                   dt, (nbytes / (1024.0 * 1024.0)) / dt, n_comp);
+
+            /* Per-chunk algo report */
+            int tally[9][2] = {};
             size_t total_comp = 0;
             int all_ok = 1;
 
             for (int c = 0; c < n_chunks; c++) {
                 hsize_t off[3] = { 0, 0, (hsize_t)c * chunk_z };
                 hsize_t csz = 0;
-                H5Dget_chunk_storage_size(dset_v, off, &csz);
+                H5Dget_chunk_storage_size(dset, off, &csz);
                 total_comp += csz;
 
                 void    *raw   = malloc(csz);
                 uint32_t filt  = 0;
                 size_t   bufsz = csz;
-                H5Dread_chunk(dset_v, H5P_DEFAULT, off, &filt, raw, &bufsz);
+                H5Dread_chunk(dset, H5P_DEFAULT, off, &filt, raw, &bufsz);
 
                 CompressionHeader *hdr = (CompressionHeader *)raw;
                 if (!hdr->isValid()) { all_ok = 0; total_failures++; free(raw); continue; }
@@ -198,7 +304,6 @@ int main(int argc, char **argv)
                 uint8_t aid = hdr->getAlgorithmId();
                 int shuf = hdr->hasShuffleApplied() ? 1 : 0;
                 if (aid < 9) tally[aid][shuf]++;
-
                 free(raw);
             }
 
@@ -214,24 +319,45 @@ int main(int argc, char **argv)
                 if (n0) printf("  %s×%d",       algo_name(a), n0);
             }
             printf("\n");
+
+            H5Dclose(dset); H5Sclose(space); H5Pclose(dcpl);
         }
 
-        /* --- Read-back + bitwise verify --- */
+        /* --- Read back (decompress) --- */
         cudaMemset(d_readback, 0xCD, nbytes);
+        {
+            hid_t dset = H5Dopen2(comp_fid, dset_name, H5P_DEFAULT);
 
-        H5VL_gpucompress_reset_stats();
-        double t1 = now_sec();
-        herr_t rrc = H5Dread(dset_v, H5T_NATIVE_FLOAT,
-                             H5S_ALL, H5S_ALL, H5P_DEFAULT, d_readback);
-        double rdt = now_sec() - t1;
+            H5VL_gpucompress_reset_stats();
+            double t0 = now_sec();
+            herr_t rc = H5Dread(dset, H5T_NATIVE_FLOAT,
+                                H5S_ALL, H5S_ALL, H5P_DEFAULT, d_readback);
+            double dt = now_sec() - t0;
 
-        int n_decomp = 0;
-        H5VL_gpucompress_get_stats(NULL, NULL, NULL, &n_decomp);
-        if (rrc < 0 || n_decomp != n_chunks) total_failures++;
-        printf("  Read  : %s  %.3f s  %.1f MB/s\n",
-               (rrc >= 0 && n_decomp == n_chunks) ? "OK  " : "FAIL",
-               rdt, (nbytes / (1024.0 * 1024.0)) / rdt);
+            int n_decomp = 0;
+            H5VL_gpucompress_get_stats(NULL, NULL, NULL, &n_decomp);
+            if (rc < 0 || n_decomp != n_chunks) total_failures++;
+            printf("  Read  : %s  %.3f s  %.1f MB/s\n",
+                   (rc >= 0 && n_decomp == n_chunks) ? "OK  " : "FAIL",
+                   dt, (nbytes / (1024.0 * 1024.0)) / dt);
 
+            H5Dclose(dset);
+        }
+
+        /* --- Write decompressed to plain HDF5 --- */
+        {
+            float *h_buf = (float *)malloc(nbytes);
+            cudaMemcpy(h_buf, d_readback, nbytes, cudaMemcpyDeviceToHost);
+
+            hid_t space = H5Screate_simple(3, dims, NULL);
+            hid_t dset  = H5Dcreate2(decomp_fid, dset_name, H5T_NATIVE_FLOAT, space,
+                                      H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+            H5Dwrite(dset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, h_buf);
+            H5Dclose(dset); H5Sclose(space);
+            free(h_buf);
+        }
+
+        /* --- Bitwise verify --- */
         cudaMemset(d_err, 0, sizeof(int));
         unsigned int grid = ((unsigned int)n_elem + 255) / 256;
         verify_kernel<<<grid, 256>>>(d_v, d_readback, (unsigned int)n_elem, d_err);
@@ -247,16 +373,20 @@ int main(int argc, char **argv)
         printf("╚═══════════════════════════════════════════════════════════════╝\n");
     }
 
-    /* ---- 5. Cleanup ---- */
-    printf("\n=== Overall: %d failure(s) ===\n", total_failures);
-    printf("Output file: %s\n", fname);
+    /* ---- Summary ---- */
+    printf("\n=== Summary: %d snapshot(s), %d failure(s) ===\n",
+           n_snapshots, total_failures);
+    printf("  Compressed file  : %s  (%d datasets: V_0000..V_%04d)\n",
+           comp_fname, n_snapshots, n_snapshots - 1);
+    printf("  Decompressed file: %s\n", decomp_fname);
+    printf("  Lossless match   : %s\n", total_failures == 0 ? "YES" : "NO");
 
+    /* ---- Cleanup ---- */
     cudaFree(d_err);
     cudaFree(d_readback);
-    H5Dclose(dset_v);
-    H5Sclose(space);
-    H5Pclose(dcpl);
-    H5Fclose(fid);
+    H5Fclose(comp_fid);
+    H5Pclose(plain_fapl);
+    H5Fclose(decomp_fid);
     H5Pclose(fapl);
     H5VLclose(vol_id);
     gpucompress_grayscott_destroy(sim);

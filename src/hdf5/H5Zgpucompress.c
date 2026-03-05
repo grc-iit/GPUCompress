@@ -280,6 +280,10 @@ static size_t H5Z_filter_gpucompress(
 
         /* Decompress */
         new_size = original_size;
+        if (is_verbose()) {
+            printf("[H5Zgpucompress] decompress chunk %zu bytes -> %zu bytes\n",
+                   nbytes, original_size);
+        }
         err = gpucompress_decompress(*buf, nbytes, new_buf, &new_size);
 
         if (err != GPUCOMPRESS_SUCCESS) {

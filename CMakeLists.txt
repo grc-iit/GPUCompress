@@ -831,6 +831,19 @@ if(HDF5_FOUND)
         )
         set_target_properties(grayscott_vol_demo PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
+        # Algorithm sweep: all 8 algos on same data, compare ratios vs NN pick
+        add_executable(algo_sweep_verify examples/algo_sweep_verify.cu)
+        set_source_files_properties(examples/algo_sweep_verify.cu PROPERTIES LANGUAGE CUDA)
+        target_include_directories(algo_sweep_verify PRIVATE
+            ${HDF5_VOL_INCLUDE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+        target_link_libraries(algo_sweep_verify PRIVATE
+            gpucompress H5VLgpucompress H5Zgpucompress ${HDF5_VOL_LIB} CUDA::cudart m
+        )
+        set_target_properties(algo_sweep_verify PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
         # Quick algorithm × pattern sweep (no HDF5)
         add_executable(quick_algo_sweep tests/quick_algo_sweep.cu)
         set_source_files_properties(tests/quick_algo_sweep.cu PROPERTIES LANGUAGE CUDA)

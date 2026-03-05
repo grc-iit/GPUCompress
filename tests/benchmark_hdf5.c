@@ -46,7 +46,7 @@
 #define WINDOW_SIZE    256
 
 #define DEFAULT_CHUNK_MB   4
-#define DEFAULT_DATASET_MB 16384   /* 16 GB */
+#define DEFAULT_DATASET_MB 8192   /* 16 GB */
 #define DEFAULT_SWEEP_MB   128     /* small sweep dataset */
 
 #define TMP_HDF5       "/tmp/bm_hdf5_tmp.h5"
