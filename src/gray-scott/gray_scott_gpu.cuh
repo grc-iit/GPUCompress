@@ -13,9 +13,9 @@
  * ============================================================ */
 
 /** Flat index for 3D grid: x fastest (ZYX order). */
-__device__ __host__ static inline int gs_idx(int x, int y, int z, int L)
+__device__ __host__ static inline size_t gs_idx(int x, int y, int z, int L)
 {
-    return x + y * L + z * L * L;
+    return (size_t)x + (size_t)y * L + (size_t)z * L * L;
 }
 
 /** Periodic boundary wrap — branchless, avoids expensive modulo. */

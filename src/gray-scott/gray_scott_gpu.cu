@@ -14,9 +14,9 @@
 __global__ void gs_init_kernel(float* u, float* v, int L,
                                float noise, unsigned long long seed)
 {
-    const int N = L * L * L;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N;
-         i += blockDim.x * gridDim.x)
+    const size_t N = (size_t)L * L * L;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < N;
+         i += (size_t)blockDim.x * gridDim.x)
     {
         int x = i % L;
         int y = (i / L) % L;
@@ -54,9 +54,9 @@ __global__ void gs_step_kernel(const float* u_in, const float* v_in,
                                float F, float k, float dt,
                                float noise, unsigned long long noise_seed)
 {
-    const int N = L * L * L;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N;
-         i += blockDim.x * gridDim.x)
+    const size_t N = (size_t)L * L * L;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < N;
+         i += (size_t)blockDim.x * gridDim.x)
     {
         int x = i % L;
         int y = (i / L) % L;
@@ -67,12 +67,12 @@ __global__ void gs_step_kernel(const float* u_in, const float* v_in,
         float vc = v_in[i];
 
         /* 6-point Laplacian with periodic BCs */
-        int xm = gs_idx(gs_wrap(x - 1, L), y, z, L);
-        int xp = gs_idx(gs_wrap(x + 1, L), y, z, L);
-        int ym = gs_idx(x, gs_wrap(y - 1, L), z, L);
-        int yp = gs_idx(x, gs_wrap(y + 1, L), z, L);
-        int zm = gs_idx(x, y, gs_wrap(z - 1, L), L);
-        int zp = gs_idx(x, y, gs_wrap(z + 1, L), L);
+        size_t xm = gs_idx(gs_wrap(x - 1, L), y, z, L);
+        size_t xp = gs_idx(gs_wrap(x + 1, L), y, z, L);
+        size_t ym = gs_idx(x, gs_wrap(y - 1, L), z, L);
+        size_t yp = gs_idx(x, gs_wrap(y + 1, L), z, L);
+        size_t zm = gs_idx(x, y, gs_wrap(z - 1, L), L);
+        size_t zp = gs_idx(x, y, gs_wrap(z + 1, L), L);
 
         float lap_u = (u_in[xm] + u_in[xp] +
                        u_in[ym] + u_in[yp] +

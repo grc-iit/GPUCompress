@@ -34,14 +34,14 @@ struct gpucompress_grayscott {
     float* d_u2;
     float* d_v2;
     int    current_step;
-    int    N;          /* L^3 */
+    size_t N;          /* L^3 */
     size_t nbytes;     /* N * sizeof(float) */
 };
 
-static int gs_grid_size(int N)
+static int gs_grid_size(size_t N)
 {
-    int blocks = (N + GS_BLOCK_SIZE - 1) / GS_BLOCK_SIZE;
-    return (blocks < 65535) ? blocks : 65535;
+    size_t blocks = (N + GS_BLOCK_SIZE - 1) / GS_BLOCK_SIZE;
+    return (blocks < 65535) ? (int)blocks : 65535;
 }
 
 /* ============================================================
@@ -61,8 +61,8 @@ gpucompress_error_t gpucompress_grayscott_create(
 
     sim->settings     = *settings;
     sim->current_step = 0;
-    sim->N            = settings->L * settings->L * settings->L;
-    sim->nbytes       = (size_t)sim->N * sizeof(float);
+    sim->N            = (size_t)settings->L * settings->L * settings->L;
+    sim->nbytes       = sim->N * sizeof(float);
 
     cudaError_t err;
     err = cudaMalloc(&sim->d_u,  sim->nbytes); if (err) { delete sim; return GPUCOMPRESS_ERROR_CUDA_FAILED; }

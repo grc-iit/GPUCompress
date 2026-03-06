@@ -61,16 +61,38 @@ __global__ void reduce_sum_kernel(const float* data, double* result, int N)
     if (tid == 0) atomicAdd(result, sdata[0]);
 }
 
-__global__ void reduce_minmax_kernel(const float* data, float* d_min, float* d_max, int N)
+/*
+ * Encode float as unsigned int that preserves ordering for atomicMin/Max.
+ * Positive floats: flip sign bit (0x80000000) so they sort above negatives.
+ * Negative floats: flip all bits so magnitude ordering is correct.
+ */
+__device__ static inline unsigned int float_to_ordered_uint(float v)
 {
-    __shared__ float smin[256], smax[256];
+    unsigned int bits = __float_as_uint(v);
+    unsigned int mask = (bits & 0x80000000u) ? 0xFFFFFFFFu : 0x80000000u;
+    return bits ^ mask;
+}
+
+__device__ __host__ static inline float ordered_uint_to_float(unsigned int bits)
+{
+    unsigned int mask = (bits & 0x80000000u) ? 0x80000000u : 0xFFFFFFFFu;
+    unsigned int fbits = bits ^ mask;
+    float result;
+    memcpy(&result, &fbits, sizeof(float));
+    return result;
+}
+
+__global__ void reduce_minmax_kernel(const float* data, unsigned int* d_min,
+                                     unsigned int* d_max, int N)
+{
+    __shared__ unsigned int smin[256], smax[256];
     int tid = threadIdx.x;
-    float vmin =  1e30f;
-    float vmax = -1e30f;
+    unsigned int vmin = 0xFFFFFFFFu;
+    unsigned int vmax = 0u;
     for (int i = blockIdx.x * blockDim.x + tid; i < N; i += blockDim.x * gridDim.x) {
-        float val = data[i];
-        if (val < vmin) vmin = val;
-        if (val > vmax) vmax = val;
+        unsigned int v = float_to_ordered_uint(data[i]);
+        if (v < vmin) vmin = v;
+        if (v > vmax) vmax = v;
     }
     smin[tid] = vmin;
     smax[tid] = vmax;
@@ -83,8 +105,8 @@ __global__ void reduce_minmax_kernel(const float* data, float* d_min, float* d_m
         __syncthreads();
     }
     if (tid == 0) {
-        atomicMin((int*)d_min, __float_as_int(smin[0]));
-        atomicMax((int*)d_max, __float_as_int(smax[0]));
+        atomicMin(d_min, smin[0]);
+        atomicMax(d_max, smax[0]);
     }
 }
 
@@ -104,23 +126,24 @@ static double gpu_sum(const float* d_data, int N)
 
 static void gpu_minmax(const float* d_data, int N, float& out_min, float& out_max)
 {
-    /* For atomicMin/Max on float-as-int to work correctly with positive floats,
-       init min to +large and max to -large using float→int reinterpretation. */
-    float init_min =  1e30f;
-    float init_max = -1e30f;
-    float* d_min;
-    float* d_max;
-    CHECK_CUDA(cudaMalloc(&d_min, sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_max, sizeof(float)));
-    CHECK_CUDA(cudaMemcpy(d_min, &init_min, sizeof(float), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_max, &init_max, sizeof(float), cudaMemcpyHostToDevice));
+    unsigned int init_min = 0xFFFFFFFFu;  /* ordered-uint for +inf */
+    unsigned int init_max = 0u;           /* ordered-uint for -inf */
+    unsigned int* d_min;
+    unsigned int* d_max;
+    CHECK_CUDA(cudaMalloc(&d_min, sizeof(unsigned int)));
+    CHECK_CUDA(cudaMalloc(&d_max, sizeof(unsigned int)));
+    CHECK_CUDA(cudaMemcpy(d_min, &init_min, sizeof(unsigned int), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_max, &init_max, sizeof(unsigned int), cudaMemcpyHostToDevice));
     int blocks = (N + 255) / 256;
     if (blocks > 1024) blocks = 1024;
     reduce_minmax_kernel<<<blocks, 256>>>(d_data, d_min, d_max, N);
-    CHECK_CUDA(cudaMemcpy(&out_min, d_min, sizeof(float), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(&out_max, d_max, sizeof(float), cudaMemcpyDeviceToHost));
+    unsigned int h_min, h_max;
+    CHECK_CUDA(cudaMemcpy(&h_min, d_min, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(&h_max, d_max, sizeof(unsigned int), cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaFree(d_min));
     CHECK_CUDA(cudaFree(d_max));
+    out_min = ordered_uint_to_float(h_min);
+    out_max = ordered_uint_to_float(h_max);
 }
 
 /* ============================================================
