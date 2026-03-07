@@ -127,3 +127,4 @@ endforeach()
 # VOL Benchmarks
 # ============================================================
 add_vol_demo(benchmark_grayscott_vol       benchmarks/benchmark_grayscott_vol.cu)
+add_vol_demo(benchmark_nn_adaptiveness     benchmarks/nn_adaptiveness/benchmark_nn_adaptiveness.cu)

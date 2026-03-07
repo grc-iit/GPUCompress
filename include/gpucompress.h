@@ -455,6 +455,14 @@ int gpucompress_active_learning_enabled(void);
 void gpucompress_set_exploration_threshold(double threshold);
 
 /**
+ * Override the number of alternative configs explored (K) during Level-2
+ * exploration.  Pass k <= 0 or k > 31 to restore the dynamic default.
+ *
+ * @param k  Number of alternatives to try (1-31), or -1 for dynamic default.
+ */
+void gpucompress_set_exploration_k(int k);
+
+/**
  * Set SGD reinforcement parameters.
  * SGD is always active when online learning is on — the enable param is ignored.
  *

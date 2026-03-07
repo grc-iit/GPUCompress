@@ -96,6 +96,7 @@ const char* VERSION_STRING = "1.0.0";
 bool g_online_learning_enabled = false;   // master switch
 bool g_exploration_enabled = false;       // OFF by default
 double g_exploration_threshold = 0.20;    // 20% MAPE
+int g_exploration_k_override = -1;        // -1 = use dynamic default
 
 /** Last NN action and exploration state (for query after compress).
  *  Under concurrent use values are undefined per-call; per-call stats struct
@@ -741,7 +742,9 @@ extern "C" gpucompress_error_t gpucompress_compress(
             // Determine K (number of alternatives to try)
             // OOD increases K but no longer forces exploration independently
             int K;
-            if (is_ood) {
+            if (g_exploration_k_override > 0) {
+                K = g_exploration_k_override;
+            } else if (is_ood) {
                 K = 31;  // OOD: try all 32 configs (minus original)
             } else if (error_pct > 0.50) {
                 K = 9;
@@ -1596,6 +1599,10 @@ extern "C" void gpucompress_set_exploration_threshold(double threshold) {
     }
 }
 
+extern "C" void gpucompress_set_exploration_k(int k) {
+    g_exploration_k_override = (k > 0 && k <= 31) ? k : -1;
+}
+
 extern "C" void gpucompress_set_reinforcement(int /*enable*/, float learning_rate,
                                                float mape_threshold,
                                                float /*ct_mape_threshold*/) {
@@ -1929,7 +1936,9 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
         if (g_exploration_enabled && error_pct > g_exploration_threshold) {
             exploration_triggered = true;
             int K;
-            if (is_ood) {
+            if (g_exploration_k_override > 0) {
+                K = g_exploration_k_override;
+            } else if (is_ood) {
                 K = 31;
             } else if (error_pct > 0.50) {
                 K = 9;
