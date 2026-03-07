@@ -27,6 +27,7 @@
 #include <vector>
 
 #include <cuda_runtime.h>
+#include "xfer_tracker.h"
 
 /* Public HDF5 headers */
 #include <hdf5.h>
@@ -375,6 +376,7 @@ static inline cudaError_t vol_memcpy(void *dst, const void *src,
         case cudaMemcpyDeviceToDevice: s_d2d_bytes += bytes; s_d2d_count++; break;
         default: break;
     }
+    XFER_TRACK("VOL vol_memcpy", bytes, kind);
     return cudaMemcpy(dst, src, bytes, kind);
 }
 
@@ -1108,6 +1110,7 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
 
                         /* Acquire a pool buffer; D→H directly into it (no extra memcpy) */
                         void *hbuf = pool_acquire();
+                        XFER_TRACK("VOL write: D->H compressed chunk to pool", comp_sz, cudaMemcpyDeviceToHost);
                         if (cudaMemcpy(hbuf, d_comp_w[w], comp_sz,
                                        cudaMemcpyDeviceToHost) != cudaSuccess) {
                             pool_release(hbuf);
@@ -1350,6 +1353,7 @@ gpu_fallback_dh_write(H5VL_gpucompress_t *o,
         if (!h_tmp) return -1;
     }
 
+    XFER_TRACK("VOL fallback-write: D->H entire dataset to host staging", total_bytes, cudaMemcpyDeviceToHost);
     cudaError_t ce = cudaMemcpy(h_tmp, d_buf, total_bytes, cudaMemcpyDeviceToHost);
     assert(ce == cudaSuccess && "VOL fallback-write: D->H cudaMemcpy failed");
     if (ce != cudaSuccess) {
@@ -1434,6 +1438,7 @@ gpu_fallback_hd_read(H5VL_gpucompress_t *o,
     assert(ret >= 0 && "VOL fallback-read: H5VLdataset_read failed");
 
     if (ret >= 0) {
+        XFER_TRACK("VOL fallback-read: H->D entire dataset from host staging", total_bytes, cudaMemcpyHostToDevice);
         cudaError_t ce = cudaMemcpy(d_buf, h_tmp, total_bytes, cudaMemcpyHostToDevice);
         assert(ce == cudaSuccess && "VOL fallback-read: H→D cudaMemcpy failed");
         if (ce != cudaSuccess) ret = -1;

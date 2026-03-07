@@ -20,6 +20,7 @@ set(LIB_SOURCES
     src/gray-scott/gray_scott_gpu.cu
     src/gray-scott/gray_scott_sim.cu
     src/vpic/vpic_adapter.cu
+    src/xfer_tracker.cpp
 )
 
 # Set language property for .cpp files that use CUDA
@@ -72,6 +73,7 @@ if(CUFILE_LIBRARY)
 
     add_executable(gpu_compress
         src/cli/compress.cpp
+        src/xfer_tracker.cpp
         ${PREPROCESSING_SOURCES}
         ${FACTORY_SOURCES}
     )
@@ -80,6 +82,7 @@ if(CUFILE_LIBRARY)
 
     add_executable(gpu_decompress
         src/cli/decompress.cpp
+        src/xfer_tracker.cpp
         ${PREPROCESSING_SOURCES}
         ${FACTORY_SOURCES}
     )
@@ -88,15 +91,3 @@ if(CUFILE_LIBRARY)
 else()
     message(STATUS "cuFile not found — skipping CLI tools (gpu_compress, gpu_decompress)")
 endif()
-
-# ============================================================
-# Benchmark executable
-# ============================================================
-add_executable(benchmark scripts/benchmark.cpp)
-target_link_libraries(benchmark PRIVATE gpucompress pthread)
-
-# ============================================================
-# Evaluation pipeline
-# ============================================================
-add_executable(eval_simulation eval/eval_simulation.cpp)
-target_link_libraries(eval_simulation PRIVATE gpucompress pthread)

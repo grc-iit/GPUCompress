@@ -43,8 +43,8 @@
  *   --F 0.04  --k 0.065    Sparse spots (very compressible)
  *
  * Output:
- *   tests/benchmark_grayscott_vol_results/benchmark_grayscott_vol.csv
- *   tests/benchmark_grayscott_vol_results/benchmark_grayscott_vol_chunks.csv
+ *   benchmarks/grayscott/benchmark_grayscott_vol.csv
+ *   benchmarks/grayscott/benchmark_grayscott_vol_chunks.csv
  */
 
 #include <stdio.h>
@@ -84,7 +84,7 @@
 #define TMP_NN_RL    "/tmp/bm_gs_nn_rl.h5"
 #define TMP_NN_RLEXP "/tmp/bm_gs_nn_rlexp.h5"
 
-#define OUT_DIR     "tests/benchmark_grayscott_vol_results"
+#define OUT_DIR     "benchmarks/grayscott"
 #define OUT_CSV     OUT_DIR "/benchmark_grayscott_vol.csv"
 #define OUT_CHUNKS  OUT_DIR "/benchmark_grayscott_vol_chunks.csv"
 
@@ -236,6 +236,21 @@ typedef struct {
     int    sgd_fires;
     int    explorations;
     int    n_chunks;
+
+    /* Per-phase timing breakdown (summed across chunks) */
+    double total_nn_inference_ms;
+    double total_preprocessing_ms;
+    double total_compression_ms;
+    double total_exploration_ms;
+    double total_sgd_ms;
+
+    /* Per-phase ratio distribution */
+    double ratio_min;
+    double ratio_max;
+    double ratio_stddev;
+
+    /* NN prediction accuracy */
+    double mean_prediction_error_pct;  /* MAPE */
 } PhaseResult;
 
 /* ============================================================
@@ -465,24 +480,35 @@ static void write_aggregate_csv(PhaseResult *res, int n_phases,
 
     fprintf(f, "phase,L,steps,F,k,chunk_z,n_chunks,"
                "sim_ms,write_ms,read_ms,file_mib,orig_mib,ratio,"
-               "write_mibps,read_mibps,mismatches,sgd_fires,explorations\n");
+               "write_mibps,read_mibps,mismatches,sgd_fires,explorations,"
+               "total_nn_inference_ms,total_preprocessing_ms,total_compression_ms,"
+               "total_exploration_ms,total_sgd_ms,"
+               "ratio_min,ratio_max,ratio_stddev,mean_prediction_error_pct\n");
     for (int i = 0; i < n_phases; i++) {
         PhaseResult *r = &res[i];
         fprintf(f, "%s,%d,%d,%.4f,%.5f,%d,%d,"
                    "%.2f,%.2f,%.2f,%.2f,%.2f,%.4f,"
-                   "%.1f,%.1f,%llu,%d,%d\n",
+                   "%.1f,%.1f,%llu,%d,%d,"
+                   "%.2f,%.2f,%.2f,%.2f,%.2f,"
+                   "%.4f,%.4f,%.4f,%.2f\n",
                 r->phase, L, steps, F, k, chunk_z, r->n_chunks,
                 r->sim_ms, r->write_ms, r->read_ms,
                 (double)r->file_bytes / (1 << 20),
                 (double)r->orig_bytes / (1 << 20), r->ratio,
                 r->write_mbps, r->read_mbps,
-                r->mismatches, r->sgd_fires, r->explorations);
+                r->mismatches, r->sgd_fires, r->explorations,
+                r->total_nn_inference_ms, r->total_preprocessing_ms,
+                r->total_compression_ms,
+                r->total_exploration_ms, r->total_sgd_ms,
+                r->ratio_min, r->ratio_max, r->ratio_stddev,
+                r->mean_prediction_error_pct);
     }
     fclose(f);
     printf("\nAggregate CSV written to: %s\n", OUT_CSV);
 }
 
-static void write_chunk_csv(const char *phase_name, int n_chunks)
+static void write_chunk_csv(const char *phase_name, int n_chunks,
+                            PhaseResult *r)
 {
     FILE *f;
     static int header_written = 0;
@@ -490,7 +516,10 @@ static void write_chunk_csv(const char *phase_name, int n_chunks)
     if (!header_written) {
         f = fopen(OUT_CHUNKS, "w");
         if (!f) { perror("fopen " OUT_CHUNKS); return; }
-        fprintf(f, "phase,chunk,nn_action,explored,sgd_fired\n");
+        fprintf(f, "phase,chunk,nn_action,explored,sgd_fired,"
+                   "nn_inference_ms,preprocessing_ms,compression_ms,"
+                   "exploration_ms,sgd_update_ms,"
+                   "actual_ratio,predicted_ratio\n");
         fclose(f);
         header_written = 1;
     }
@@ -498,18 +527,68 @@ static void write_chunk_csv(const char *phase_name, int n_chunks)
     f = fopen(OUT_CHUNKS, "a");
     if (!f) { perror("fopen " OUT_CHUNKS); return; }
 
+    /* Aggregate accumulators */
+    double sum_nn = 0, sum_pp = 0, sum_comp = 0, sum_expl = 0, sum_sgd = 0;
+    double r_min = 1e30, r_max = 0, r_sum = 0, r_sum2 = 0;
+    double mape_sum = 0;
+    int    mape_count = 0;
+    int    n_valid = 0;
+
     int n_hist = gpucompress_get_chunk_history_count();
     for (int i = 0; i < n_hist && i < n_chunks; i++) {
         gpucompress_chunk_diag_t d;
         if (gpucompress_get_chunk_diag(i, &d) == 0) {
-            fprintf(f, "%s,%d,%d,%d,%d\n",
+            fprintf(f, "%s,%d,%d,%d,%d,"
+                       "%.3f,%.3f,%.3f,%.3f,%.3f,"
+                       "%.4f,%.4f\n",
                     phase_name, i,
-                    d.nn_action, d.exploration_triggered, d.sgd_fired);
+                    d.nn_action, d.exploration_triggered, d.sgd_fired,
+                    d.nn_inference_ms, d.preprocessing_ms, d.compression_ms,
+                    d.exploration_ms, d.sgd_update_ms,
+                    d.actual_ratio, d.predicted_ratio);
+
+            sum_nn   += d.nn_inference_ms;
+            sum_pp   += d.preprocessing_ms;
+            sum_comp += d.compression_ms;
+            sum_expl += d.exploration_ms;
+            sum_sgd  += d.sgd_update_ms;
+
+            if (d.actual_ratio > 0) {
+                if (d.actual_ratio < r_min) r_min = d.actual_ratio;
+                if (d.actual_ratio > r_max) r_max = d.actual_ratio;
+                r_sum  += d.actual_ratio;
+                r_sum2 += (double)d.actual_ratio * d.actual_ratio;
+                n_valid++;
+            }
+            if (d.predicted_ratio > 0 && d.actual_ratio > 0) {
+                mape_sum += fabs((double)d.predicted_ratio - d.actual_ratio)
+                            / d.actual_ratio;
+                mape_count++;
+            }
         } else {
-            fprintf(f, "%s,%d,-1,0,0\n", phase_name, i);
+            fprintf(f, "%s,%d,-1,0,0,0,0,0,0,0,0,0\n", phase_name, i);
         }
     }
     fclose(f);
+
+    /* Fill aggregate fields in PhaseResult */
+    if (r) {
+        r->total_nn_inference_ms  = sum_nn;
+        r->total_preprocessing_ms = sum_pp;
+        r->total_compression_ms   = sum_comp;
+        r->total_exploration_ms   = sum_expl;
+        r->total_sgd_ms           = sum_sgd;
+        r->ratio_min = (n_valid > 0) ? r_min : 0;
+        r->ratio_max = (n_valid > 0) ? r_max : 0;
+        if (n_valid > 1) {
+            double mean = r_sum / n_valid;
+            r->ratio_stddev = sqrt((r_sum2 / n_valid) - mean * mean);
+        } else {
+            r->ratio_stddev = 0;
+        }
+        r->mean_prediction_error_pct = (mape_count > 0)
+            ? (mape_sum / mape_count) * 100.0 : 0;
+    }
 }
 
 /* ============================================================
@@ -525,31 +604,38 @@ static void print_summary(PhaseResult *res, int n_phases,
     int n_chunks      = (L + chunk_z - 1) / chunk_z;
 
     printf("\n");
-    printf("╔═══════════════════════════════════════════════════════════════════════════╗\n");
-    printf("║  Gray-Scott VOL Benchmark Summary                                       ║\n");
-    printf("║  Grid: %d^3 (%.0f MB)  Chunks: %d x %.1f MB  Steps: %d               \n",
+    printf("╔══════════════════════════════════════════════════════════════════════════════════════════════════════════════╗\n");
+    printf("║  Gray-Scott VOL Benchmark Summary                                                                         ║\n");
+    printf("║  Grid: %d^3 (%.0f MB)  Chunks: %d x %.1f MB  Steps: %d\n",
            L, dataset_mb, n_chunks, chunk_mb, steps);
-    printf("║  Pattern: F=%.4f  k=%.5f                                              \n", F, k);
-    printf("╠══════════════╦══════════╦══════════╦═══════╦══════════╦══════╦═════════════╣\n");
-    printf("║  Phase       ║  Sim     ║ Write    ║ Read  ║ Ratio   ║ File ║ Verify      ║\n");
-    printf("║              ║  (ms)    ║ (MiB/s)  ║(MiB/s)║         ║(MiB) ║             ║\n");
-    printf("╠══════════════╬══════════╬══════════╬═══════╬═════════╬══════╬═════════════╣\n");
+    printf("║  Pattern: F=%.4f  k=%.5f\n", F, k);
+    printf("╠══════════════╦════════╦════════╦═══════╦═══════╦══════╦════════╦════════╦════════╦════════╦════════╦════════╣\n");
+    printf("║  Phase       ║  Sim   ║ Write  ║ Read  ║ Ratio ║ File ║ NN Inf ║Preproc ║ Comp   ║ Expl   ║  SGD   ║Verify ║\n");
+    printf("║              ║  (ms)  ║(MiB/s) ║(MiB/s)║       ║(MiB) ║  (ms)  ║  (ms)  ║  (ms)  ║  (ms)  ║  (ms)  ║       ║\n");
+    printf("╠══════════════╬════════╬════════╬═══════╬═══════╬══════╬════════╬════════╬════════╬════════╬════════╬════════╣\n");
     for (int i = 0; i < n_phases; i++) {
         PhaseResult *r = &res[i];
         const char *verdict = (r->mismatches == 0) ? "PASS" : "FAIL";
-        printf("║  %-12s║ %8.0f ║ %8.0f ║ %5.0f ║ %5.2fx  ║ %4.0f ║ %-11s ║\n",
+        printf("║  %-12s║ %6.0f ║ %6.0f ║ %5.0f ║%5.2fx ║ %4.0f ║ %6.1f ║ %6.1f ║ %6.1f ║ %6.1f ║ %6.1f ║ %-6s ║\n",
                r->phase, r->sim_ms, r->write_mbps, r->read_mbps,
-               r->ratio, (double)r->file_bytes / (1 << 20), verdict);
+               r->ratio, (double)r->file_bytes / (1 << 20),
+               r->total_nn_inference_ms, r->total_preprocessing_ms,
+               r->total_compression_ms, r->total_exploration_ms,
+               r->total_sgd_ms, verdict);
     }
-    printf("╚══════════════╩══════════╩══════════╩═══════╩═════════╩══════╩═════════════╝\n");
+    printf("╚══════════════╩════════╩════════╩═══════╩═══════╩══════╩════════╩════════╩════════╩════════╩════════╩════════╝\n");
 
-    /* NN phase SGD/exploration summary */
+    /* NN phase detailed breakdown */
     for (int i = 0; i < n_phases; i++) {
         if (strncmp(res[i].phase, "nn", 2) == 0 && res[i].n_chunks > 0) {
-            printf("\n  %-14s SGD fired: %d/%d chunks  Explorations: %d/%d chunks",
-                   res[i].phase,
-                   res[i].sgd_fires,   res[i].n_chunks,
-                   res[i].explorations, res[i].n_chunks);
+            PhaseResult *r = &res[i];
+            printf("\n  %-14s SGD: %d/%d chunks  Expl: %d/%d chunks"
+                   "  Ratio: %.2f-%.2fx (sd=%.3f)  MAPE: %.1f%%",
+                   r->phase,
+                   r->sgd_fires,   r->n_chunks,
+                   r->explorations, r->n_chunks,
+                   r->ratio_min, r->ratio_max, r->ratio_stddev,
+                   r->mean_prediction_error_pct);
             printf("\n");
         }
     }
@@ -682,7 +768,7 @@ int main(int argc, char **argv)
                        &results[n_phases]);
     H5Pclose(dcpl_static);
     if (rc) any_fail = 1;
-    write_chunk_csv("static", n_chunks);
+    write_chunk_csv("static", n_chunks, &results[n_phases]);
     n_phases++;
 
     /* ── Phase 3: nn (VOL, ALGO_AUTO, inference-only) ─────────────── */
@@ -696,7 +782,7 @@ int main(int argc, char **argv)
                        &results[n_phases]);
     H5Pclose(dcpl_nn);
     if (rc) any_fail = 1;
-    write_chunk_csv("nn", n_chunks);
+    write_chunk_csv("nn", n_chunks, &results[n_phases]);
     n_phases++;
 
     /* ── Phase 4: nn-rl (ALGO_AUTO + SGD, no exploration) ─────────── */
@@ -712,7 +798,7 @@ int main(int argc, char **argv)
     H5Pclose(dcpl_rl);
     gpucompress_disable_online_learning();
     if (rc) any_fail = 1;
-    write_chunk_csv("nn-rl", n_chunks);
+    write_chunk_csv("nn-rl", n_chunks, &results[n_phases]);
     n_phases++;
 
     /* ── Phase 5: nn-rl+exp50 (ALGO_AUTO + SGD + exploration) ────── */
@@ -729,7 +815,7 @@ int main(int argc, char **argv)
     H5Pclose(dcpl_rlexp);
     gpucompress_disable_online_learning();
     if (rc) any_fail = 1;
-    write_chunk_csv("nn-rl+exp50", n_chunks);
+    write_chunk_csv("nn-rl+exp50", n_chunks, &results[n_phases]);
     n_phases++;
 
     /* ── Summary ───────────────────────────────────────────────────── */

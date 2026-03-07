@@ -15,6 +15,7 @@
 
 extern bool g_gc_verbose;
 #define GC_LOG(fmt, ...) do { if (g_gc_verbose) fprintf(stderr, fmt, ##__VA_ARGS__); } while(0)
+#include "xfer_tracker.h"
 
 // ============================================================================
 // Constants and Configuration
@@ -210,7 +211,9 @@ static int compute_data_range_typed(
     if (err != cudaSuccess) { cudaFree(d_temp); return -1; }
 
     T h_min, h_max;
+    XFER_TRACK("quantize data_range: D->H min", sizeof(T), cudaMemcpyDeviceToHost);
     cudaMemcpyAsync(&h_min, d_buf_min, sizeof(T), cudaMemcpyDeviceToHost, stream);
+    XFER_TRACK("quantize data_range: D->H max", sizeof(T), cudaMemcpyDeviceToHost);
     cudaMemcpyAsync(&h_max, d_buf_max, sizeof(T), cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
 
@@ -658,8 +661,10 @@ bool verify_error_bound(
     int zero = 0;
     double init_max = 0.0;
     GC_LOG("[XFER H→D] verify error bound: init violations=0 (%zu B)\n", sizeof(int));
+    XFER_TRACK("verify_error_bound: H->D init violations=0", sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpyAsync(d_violations, &zero, sizeof(int), cudaMemcpyHostToDevice, stream);
     GC_LOG("[XFER H→D] verify error bound: init max_error=0 (%zu B)\n", sizeof(double));
+    XFER_TRACK("verify_error_bound: H->D init max_error=0", sizeof(double), cudaMemcpyHostToDevice);
     cudaMemcpyAsync(d_max_error, &init_max, sizeof(double), cudaMemcpyHostToDevice, stream);
 
     int num_blocks = min((int)((num_elements + BLOCK_SIZE - 1) / BLOCK_SIZE), 1024);
@@ -679,8 +684,10 @@ bool verify_error_bound(
     int h_violations;
     double h_max_error;
     GC_LOG("[XFER D→H] verify error bound: violation count (%zu B)\n", sizeof(int));
+    XFER_TRACK("verify_error_bound: D->H violation count", sizeof(int), cudaMemcpyDeviceToHost);
     cudaMemcpyAsync(&h_violations, d_violations, sizeof(int), cudaMemcpyDeviceToHost, stream);
     GC_LOG("[XFER D→H] verify error bound: max_error (%zu B)\n", sizeof(double));
+    XFER_TRACK("verify_error_bound: D->H max_error", sizeof(double), cudaMemcpyDeviceToHost);
     cudaMemcpyAsync(&h_max_error, d_max_error, sizeof(double), cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
 

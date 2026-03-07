@@ -10,6 +10,7 @@
 
 #include "gpucompress_grayscott.h"
 #include "gray-scott/gray_scott_gpu.cuh"
+#include "xfer_tracker.h"
 
 #define GS_BLOCK_SIZE 256
 
@@ -145,8 +146,8 @@ gpucompress_error_t gpucompress_grayscott_copy_to_host(
 {
     if (!handle) return GPUCOMPRESS_ERROR_INVALID_INPUT;
     GS_CHECK_CUDA(cudaDeviceSynchronize());
-    if (h_u) { GS_CHECK_CUDA(cudaMemcpy(h_u, handle->d_u, handle->nbytes, cudaMemcpyDeviceToHost)); }
-    if (h_v) { GS_CHECK_CUDA(cudaMemcpy(h_v, handle->d_v, handle->nbytes, cudaMemcpyDeviceToHost)); }
+    if (h_u) { XFER_TRACK("grayscott: D->H copy_to_host u field", handle->nbytes, cudaMemcpyDeviceToHost); GS_CHECK_CUDA(cudaMemcpy(h_u, handle->d_u, handle->nbytes, cudaMemcpyDeviceToHost)); }
+    if (h_v) { XFER_TRACK("grayscott: D->H copy_to_host v field", handle->nbytes, cudaMemcpyDeviceToHost); GS_CHECK_CUDA(cudaMemcpy(h_v, handle->d_v, handle->nbytes, cudaMemcpyDeviceToHost)); }
     return GPUCOMPRESS_SUCCESS;
 }
 

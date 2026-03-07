@@ -18,6 +18,7 @@
 #include <cctype>
 
 #include <cuda_runtime.h>
+#include "xfer_tracker.h"
 #include <cufile.h>
 // #include <nvtx3/nvToolsExt.h>  // Commented out - profiling disabled
 
@@ -635,6 +636,7 @@ int main(int argc, char* argv[]) {
         compare_buffers<<<2 * sm_count, 1024, 0, stream>>>(
             d_input, d_verify_data, d_invalid, file_size);
 
+        XFER_TRACK("CLI verify: D->H invalid flag", sizeof(int), cudaMemcpyDeviceToHost);
         CUDA_CHECK(cudaMemcpyAsync(&h_invalid, d_invalid, sizeof(int),
                                     cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));

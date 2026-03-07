@@ -528,10 +528,21 @@ int gpucompress_get_last_sgd_fired(void);
  * Per-chunk diagnostic snapshot recorded during H5Dwrite(H5S_ALL).
  */
 typedef struct {
-    int nn_action;
-    int nn_original_action;
-    int exploration_triggered;
-    int sgd_fired;
+    int    nn_action;
+    int    nn_original_action;
+    int    exploration_triggered;
+    int    sgd_fired;
+
+    /* Per-chunk timing breakdown (ms, 0.0 if not applicable) */
+    float  nn_inference_ms;      /* stats kernels + NN forward pass       */
+    float  preprocessing_ms;     /* quantization + byte shuffle           */
+    float  compression_ms;       /* primary nvCOMP kernel only            */
+    float  exploration_ms;       /* exploration loop (0 if not triggered) */
+    float  sgd_update_ms;        /* SGD weight update (0 if not fired)    */
+
+    /* Per-chunk ratio and prediction accuracy */
+    float  actual_ratio;         /* input_size / compressed_size          */
+    float  predicted_ratio;      /* NN-predicted ratio (0 if not AUTO)    */
 } gpucompress_chunk_diag_t;
 
 /**

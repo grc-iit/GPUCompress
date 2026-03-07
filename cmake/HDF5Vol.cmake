@@ -49,7 +49,7 @@ macro(add_vol_demo TARGET_NAME SOURCE_FILE)
 endmacro()
 
 # ---- VOL Library ----
-add_library(H5VLgpucompress SHARED src/hdf5/H5VLgpucompress.cu)
+add_library(H5VLgpucompress SHARED src/hdf5/H5VLgpucompress.cu src/xfer_tracker.cpp)
 set_source_files_properties(src/hdf5/H5VLgpucompress.cu PROPERTIES LANGUAGE CUDA)
 target_include_directories(H5VLgpucompress PRIVATE
     ${HDF5_VOL_INCLUDE}
@@ -77,6 +77,7 @@ add_vol_test(test_vol_comprehensive   tests/hdf5/test_vol_comprehensive.cu)
 add_vol_test(test_vol_8mb             tests/hdf5/test_vol_8mb.cu)
 target_link_libraries(test_vol_8mb PRIVATE H5Zgpucompress)
 add_vol_test(test_correctness_vol     tests/hdf5/test_correctness_vol.cu)
+add_vol_test(test_vol_xfer_audit     tests/hdf5/test_vol_xfer_audit.cu)
 
 # ============================================================
 # VOL Regression Tests
@@ -125,4 +126,4 @@ endforeach()
 # ============================================================
 # VOL Benchmarks
 # ============================================================
-add_vol_demo(benchmark_grayscott_vol       tests/benchmarks/benchmark_grayscott_vol.cu)
+add_vol_demo(benchmark_grayscott_vol       benchmarks/benchmark_grayscott_vol.cu)

@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <cstring>
+#include "xfer_tracker.h"
 
 /**
  * @brief Magic number to identify our compressed format
@@ -217,6 +218,7 @@ inline cudaError_t writeHeaderToDevice(
     const CompressionHeader& header,
     cudaStream_t stream = 0
 ) {
+    XFER_TRACK("writeHeaderToDevice: H->D CompressionHeader", sizeof(CompressionHeader), cudaMemcpyHostToDevice);
     return cudaMemcpyAsync(d_buffer, &header, sizeof(CompressionHeader),
                            cudaMemcpyHostToDevice, stream);
 }
@@ -233,6 +235,7 @@ inline cudaError_t readHeaderFromDevice(
     CompressionHeader& header,
     cudaStream_t stream = 0
 ) {
+    XFER_TRACK("readHeaderFromDevice: D->H CompressionHeader", sizeof(CompressionHeader), cudaMemcpyDeviceToHost);
     cudaError_t err = cudaMemcpyAsync(&header, d_buffer, sizeof(CompressionHeader),
                                       cudaMemcpyDeviceToHost, stream);
     if (err != cudaSuccess) return err;

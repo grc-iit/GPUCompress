@@ -18,6 +18,7 @@
 #include <utility>
 #include <vector>
 #include <algorithm>
+#include <chrono>
 
 #include "gpucompress.h"
 #include "api/internal.hpp"
@@ -28,6 +29,7 @@
 #include "stats/stats_cpu.h"
 
 #include "nvcomp.hpp"
+#include "xfer_tracker.h"
 #include "nvcomp/nvcompManagerFactory.hpp"
 
 using namespace nvcomp;
@@ -162,8 +164,9 @@ const char* ERROR_MESSAGES[] = {
 
 namespace gpucompress {
 
+// Layout: [AutoStatsGPU | histogram(256 uint) | init_flag(int)]
 static constexpr size_t kPoolStatsWSZ =
-    sizeof(AutoStatsGPU) + 256 * sizeof(unsigned int);
+    sizeof(AutoStatsGPU) + 256 * sizeof(unsigned int) + sizeof(int);
 
 int initCompContextPool() {
     std::lock_guard<std::mutex> lk(g_pool_mutex);
@@ -321,6 +324,9 @@ extern "C" void gpucompress_cleanup(void) {
     int old_ref = g_ref_count.fetch_sub(1);
 
     if (old_ref <= 1) {
+        // Dump transfer summary before shutdown
+        xfer_tracker_dump();
+
         // Last reference, cleanup
         g_online_learning_enabled = false;
         g_exploration_enabled = false;
@@ -411,6 +417,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
 
     // Copy input to GPU
     GC_LOG("[XFER H→D] compress: input data (%zu B)\n", input_size);
+    XFER_TRACK("compress: H->D input data", input_size, cudaMemcpyHostToDevice);
     cuda_err = cudaMemcpyAsync(d_input, input, input_size, cudaMemcpyHostToDevice, stream);
     if (cuda_err != cudaSuccess) {
         cudaFree(d_input);
@@ -436,12 +443,20 @@ extern "C" gpucompress_error_t gpucompress_compress(
     bool is_ood = false;
     AutoStatsGPU* d_stats_ptr = nullptr;
 
+    /* Per-chunk timing breakdown */
+    float diag_nn_inference_ms  = 0.0f;
+    float diag_preprocessing_ms = 0.0f;
+    float diag_compression_ms   = 0.0f;
+    float diag_exploration_ms   = 0.0f;
+    float diag_sgd_ms           = 0.0f;
+
     if (cfg.algorithm == GPUCOMPRESS_ALGO_AUTO) {
         size_t num_elements = input_size / sizeof(float);
         int action = 0;
         int rc = -1;
 
         if (num_elements > 0 && gpucompress_nn_is_loaded_impl()) {
+            auto t_nn_start = std::chrono::steady_clock::now();
             // Fused stats→NN: run stats kernels (no D→H, no sync)
             d_stats_ptr = gpucompress::runStatsKernelsNoSync(d_input, input_size, stream);
 
@@ -462,16 +477,19 @@ extern "C" gpucompress_error_t gpucompress_compress(
                 }
             }
 
-            // Conditional stats D→H only when user wants stats output or online learning needs them
-            if (d_stats_ptr && (stats != nullptr || g_online_learning_enabled)) {
+            // Conditional stats D→H only when user wants stats output
+            if (d_stats_ptr && stats != nullptr) {
                 GC_LOG("[XFER D→H] stats: entropy (%zu B)\n", sizeof(double));
+                XFER_TRACK("compress/auto: D->H stats entropy", sizeof(double), cudaMemcpyDeviceToHost);
                 cudaMemcpyAsync(&entropy, &d_stats_ptr->entropy, sizeof(double),
                                 cudaMemcpyDeviceToHost, stream);
                 // mad_normalized and deriv_normalized are contiguous
                 GC_LOG("[XFER D→H] stats: mad_normalized (%zu B)\n", sizeof(double));
+                XFER_TRACK("compress/auto: D->H stats mad", sizeof(double), cudaMemcpyDeviceToHost);
                 cudaMemcpyAsync(&mad, &d_stats_ptr->mad_normalized, sizeof(double),
                                 cudaMemcpyDeviceToHost, stream);
                 GC_LOG("[XFER D→H] stats: deriv_normalized (%zu B)\n", sizeof(double));
+                XFER_TRACK("compress/auto: D->H stats deriv", sizeof(double), cudaMemcpyDeviceToHost);
                 cudaMemcpyAsync(&second_derivative, &d_stats_ptr->deriv_normalized, sizeof(double),
                                 cudaMemcpyDeviceToHost, stream);
                 cudaStreamSynchronize(stream);
@@ -483,6 +501,9 @@ extern "C" gpucompress_error_t gpucompress_compress(
                 nn_original_action = action;
                 g_last_nn_action.store(action);
             }
+
+            diag_nn_inference_ms = std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - t_nn_start).count();
         }
 
         if (rc == 0) {
@@ -511,6 +532,8 @@ extern "C" gpucompress_error_t gpucompress_compress(
     uint8_t* d_quantized = nullptr;
     uint8_t* d_shuffled = nullptr;
     QuantizationResult quant_result;
+
+    auto t_preproc_start = std::chrono::steady_clock::now();
 
     // Apply quantization if requested
     if ((preproc_to_use & GPUCOMPRESS_PREPROC_QUANTIZE) && cfg.error_bound > 0.0) {
@@ -553,6 +576,10 @@ extern "C" gpucompress_error_t gpucompress_compress(
     }
 
     cuda_err = cudaStreamSynchronize(stream);
+    if (d_quantized || d_shuffled) {
+        diag_preprocessing_ms = std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - t_preproc_start).count();
+    }
     if (cuda_err != cudaSuccess) {
         if (d_quantized) cudaFree(d_quantized);
         if (d_shuffled) cudaFree(d_shuffled);
@@ -612,6 +639,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
         cudaEventSynchronize(g_t_stop);
         cudaEventElapsedTime(&primary_comp_time_ms, g_t_start, g_t_stop);
     }
+    diag_compression_ms = primary_comp_time_ms;
 
     // Get compressed size
     size_t compressed_size = compressor->get_compressed_output_size(d_compressed);
@@ -660,6 +688,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
     // Copy only compressed payload from GPU to host (skip header region)
     uint8_t* host_payload = static_cast<uint8_t*>(output) + header_size;
     GC_LOG("[XFER D→H] compress: payload (%zu B)\n", compressed_size);
+    XFER_TRACK("compress: D->H compressed payload", compressed_size, cudaMemcpyDeviceToHost);
     cuda_err = cudaMemcpyAsync(host_payload, d_compressed, compressed_size,
                                cudaMemcpyDeviceToHost, stream);
     if (cuda_err != cudaSuccess) {
@@ -686,6 +715,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
     *output_size = total_size;
 
     // Active learning: Level 1 passive collection + Level 2 exploration
+    auto t_explore_start = std::chrono::steady_clock::now();
     if (cfg.algorithm == GPUCOMPRESS_ALGO_AUTO && nn_was_used &&
         g_online_learning_enabled) {
         double actual_ratio = static_cast<double>(input_size) /
@@ -888,8 +918,10 @@ extern "C" gpucompress_error_t gpucompress_compress(
                                                 std::vector<float> h_orig(num_floats);
                                                 std::vector<float> h_dec(num_floats);
                                                 GC_LOG("[XFER D→H] explore PSNR: original data (%zu B)\n", input_size);
+                                                XFER_TRACK("explore PSNR: D->H original (UNNECESSARY if GPU PSNR kernel existed)", input_size, cudaMemcpyDeviceToHost);
                                                 cudaMemcpy(h_orig.data(), d_input, input_size, cudaMemcpyDeviceToHost);
                                                 GC_LOG("[XFER D→H] explore PSNR: decompressed data (%zu B)\n", input_size);
+                                                XFER_TRACK("explore PSNR: D->H decompressed (UNNECESSARY if GPU PSNR kernel existed)", input_size, cudaMemcpyDeviceToHost);
                                                 cudaMemcpy(h_dec.data(), d_rt_result, input_size, cudaMemcpyDeviceToHost);
 
                                                 double mse = 0.0;
@@ -969,6 +1001,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
                                     // Write header + compressed data to host output
                                     memcpy(output, &alt_hdr, sizeof(CompressionHeader));
                                     GC_LOG("[XFER D→H] explore winner: alt compressed payload (%zu B)\n", alt_comp_size);
+                                    XFER_TRACK("explore winner: D->H alt payload", alt_comp_size, cudaMemcpyDeviceToHost);
                                     cudaMemcpy(
                                         static_cast<uint8_t*>(output) + header_sz,
                                         d_alt_out, alt_comp_size,
@@ -1008,7 +1041,13 @@ extern "C" gpucompress_error_t gpucompress_compress(
 
         }
 
+        if (exploration_triggered) {
+            diag_exploration_ms = std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - t_explore_start).count();
+        }
+
         // Online reinforcement: fire GPU SGD only when ratio MAPE exceeds threshold.
+        auto t_sgd_start = std::chrono::steady_clock::now();
         if (error_pct > static_cast<double>(g_reinforce_mape_threshold) && d_stats_ptr) {
             // Sort explored samples by ratio (descending) and feed top 3 to GPU SGD.
             std::sort(explored_samples.begin(), explored_samples.end(),
@@ -1034,6 +1073,10 @@ extern "C" gpucompress_error_t gpucompress_compress(
                     &sgd_grad_norm, &sgd_clipped, &sgd_count) == 0) {
                 sgd_fired = true;
             }
+        }
+        if (sgd_fired) {
+            diag_sgd_ms = std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - t_sgd_start).count();
         }
     }
 
@@ -1083,6 +1126,15 @@ extern "C" gpucompress_error_t gpucompress_compress(
             h->nn_original_action    = nn_original_action;
             h->exploration_triggered = exploration_triggered ? 1 : 0;
             h->sgd_fired             = sgd_fired ? 1 : 0;
+            h->nn_inference_ms       = diag_nn_inference_ms;
+            h->preprocessing_ms      = diag_preprocessing_ms;
+            h->compression_ms        = diag_compression_ms;
+            h->exploration_ms        = diag_exploration_ms;
+            h->sgd_update_ms         = diag_sgd_ms;
+            h->actual_ratio          = (compressed_size > 0)
+                ? static_cast<float>(input_size) / static_cast<float>(compressed_size)
+                : 0.0f;
+            h->predicted_ratio       = predicted_ratio;
         }
     }
 
@@ -1142,6 +1194,7 @@ extern "C" gpucompress_error_t gpucompress_decompress(
     // Copy only the compressed payload to GPU (skip header)
     const uint8_t* host_payload = static_cast<const uint8_t*>(input) + header_size;
     GC_LOG("[XFER H→D] decompress: compressed payload (%zu B)\n", compressed_size);
+    XFER_TRACK("decompress: H->D compressed payload", compressed_size, cudaMemcpyHostToDevice);
     cuda_err = cudaMemcpyAsync(d_compressed_data, host_payload, compressed_size,
                                cudaMemcpyHostToDevice, stream);
     if (cuda_err != cudaSuccess) {
@@ -1234,6 +1287,7 @@ extern "C" gpucompress_error_t gpucompress_decompress(
 
     // Copy result to host
     GC_LOG("[XFER D→H] decompress: result (%" PRIu64 " B)\n", (uint64_t)header.original_size);
+    XFER_TRACK("decompress: D->H decompressed result", header.original_size, cudaMemcpyDeviceToHost);
     cuda_err = cudaMemcpyAsync(output, d_result, header.original_size,
                                cudaMemcpyDeviceToHost, stream);
     if (cuda_err != cudaSuccess) {
@@ -1312,6 +1366,7 @@ extern "C" gpucompress_error_t gpucompress_calculate_entropy(
 
     // Copy to GPU
     GC_LOG("[XFER H→D] compute_stats: input data (%zu B)\n", size);
+    XFER_TRACK("calculate_entropy: H->D input data", size, cudaMemcpyHostToDevice);
     cuda_err = cudaMemcpyAsync(d_data, data, size, cudaMemcpyHostToDevice, stream);
     if (cuda_err != cudaSuccess) {
         cudaFree(d_data);
@@ -1386,6 +1441,7 @@ extern "C" gpucompress_error_t gpucompress_compute_stats(
     if (cuda_err != cudaSuccess) {
         return GPUCOMPRESS_ERROR_OUT_OF_MEMORY;
     }
+    XFER_TRACK("compute_stats: H->D input data", size, cudaMemcpyHostToDevice);
     cuda_err = cudaMemcpy(d_data, data, size, cudaMemcpyHostToDevice);
     if (cuda_err != cudaSuccess) {
         cudaFree(d_data);
@@ -1616,12 +1672,22 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
     bool is_ood = false;
     AutoStatsGPU* d_stats_ptr = nullptr;
 
+    /* Per-chunk timing breakdown */
+    bool timing_ok = (ctx->t_start != nullptr && ctx->t_stop != nullptr);
+    float diag_nn_inference_ms  = 0.0f;
+    float diag_preprocessing_ms = 0.0f;
+    float diag_compression_ms   = 0.0f;
+    float diag_exploration_ms   = 0.0f;
+    float diag_sgd_ms           = 0.0f;
+
     if (algo_to_use == GPUCOMPRESS_ALGO_AUTO) {
         size_t num_elements = input_size / sizeof(float);
         int action = 0;
         int rc = -1;
 
         if (num_elements > 0 && gpucompress_nn_is_loaded_impl()) {
+            auto t_nn_start = std::chrono::steady_clock::now();
+
             /* d_input is already on GPU — use ctx-aware overload */
             d_stats_ptr = gpucompress::runStatsKernelsNoSync(d_input, input_size, stream, ctx);
 
@@ -1639,12 +1705,15 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
                 if (rc == 0) is_ood = (fused_ood != 0);
             }
 
-            /* Conditional stats D→H only when caller requests stats or online learning */
-            if (d_stats_ptr && (stats != nullptr || g_online_learning_enabled)) {
+            /* Conditional stats D→H only when caller requests stats output */
+            if (d_stats_ptr && stats != nullptr) {
+                XFER_TRACK("compress_gpu/auto: D->H stats entropy", sizeof(double), cudaMemcpyDeviceToHost);
                 cudaMemcpyAsync(&entropy, &d_stats_ptr->entropy, sizeof(double),
                                 cudaMemcpyDeviceToHost, stream);
+                XFER_TRACK("compress_gpu/auto: D->H stats mad", sizeof(double), cudaMemcpyDeviceToHost);
                 cudaMemcpyAsync(&mad, &d_stats_ptr->mad_normalized, sizeof(double),
                                 cudaMemcpyDeviceToHost, stream);
+                XFER_TRACK("compress_gpu/auto: D->H stats deriv", sizeof(double), cudaMemcpyDeviceToHost);
                 cudaMemcpyAsync(&second_derivative, &d_stats_ptr->deriv_normalized, sizeof(double),
                                 cudaMemcpyDeviceToHost, stream);
                 cudaStreamSynchronize(stream);
@@ -1656,6 +1725,9 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
                 nn_original_action = action;
                 g_last_nn_action.store(action);
             }
+
+            diag_nn_inference_ms = std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - t_nn_start).count();
         }
 
         if (rc == 0) {
@@ -1677,6 +1749,8 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
     uint8_t* d_quantized = nullptr;
     uint8_t* d_shuffled  = nullptr;
     QuantizationResult quant_result;
+
+    auto t_preproc_start = std::chrono::steady_clock::now();
 
     if ((preproc_to_use & GPUCOMPRESS_PREPROC_QUANTIZE) && cfg.error_bound > 0.0) {
         size_t num_elements = input_size / sizeof(float);
@@ -1709,6 +1783,12 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
     cudaError_t cuda_err = (d_quantized || d_shuffled)
         ? cudaStreamSynchronize(stream)
         : cudaSuccess;
+
+    if (d_quantized || d_shuffled) {
+        diag_preprocessing_ms = std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - t_preproc_start).count();
+    }
+
     if (cuda_err != cudaSuccess) {
         if (d_quantized) cudaFree(d_quantized);
         if (d_shuffled)  cudaFree(d_shuffled);
@@ -1752,9 +1832,6 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
     }
 
     float primary_comp_time_ms = 0.0f;
-    bool timing_ok = (ctx->t_start != nullptr && ctx->t_stop != nullptr);
-    /* Only record/sync timing events when the result will actually be used
-     * (stats output requested or online learning enabled). */
     bool need_timing = timing_ok && (stats != nullptr || g_online_learning_enabled);
     if (need_timing) cudaEventRecord(ctx->t_start, stream);
 
@@ -1772,6 +1849,7 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
         cudaEventSynchronize(ctx->t_stop);
         cudaEventElapsedTime(&primary_comp_time_ms, ctx->t_start, ctx->t_stop);
     }
+    diag_compression_ms = primary_comp_time_ms;
 
     size_t compressed_size = compressor->get_compressed_output_size(d_comp_target);
     size_t total_size      = header_size + compressed_size;
@@ -1802,15 +1880,19 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
 
     if (d_temp_out) {
         /* Write header into temp buffer, then D→D copy full result to caller */
+        XFER_TRACK("compress_gpu: H->D header to temp", sizeof(CompressionHeader), cudaMemcpyHostToDevice);
         cuda_err = cudaMemcpyAsync(d_temp_out, &header, sizeof(CompressionHeader),
                                    cudaMemcpyHostToDevice, stream);
-        if (cuda_err == cudaSuccess)
+        if (cuda_err == cudaSuccess) {
+            XFER_TRACK("compress_gpu: D->D temp->output (header+payload)", total_size, cudaMemcpyDeviceToDevice);
             cuda_err = cudaMemcpyAsync(d_out, d_temp_out, total_size,
                                        cudaMemcpyDeviceToDevice, stream);
+        }
         if (cuda_err == cudaSuccess)
             cuda_err = cudaStreamSynchronize(stream);
         cudaFree(d_temp_out);
     } else {
+        XFER_TRACK("compress_gpu: H->D header (64B struct from host)", sizeof(CompressionHeader), cudaMemcpyHostToDevice);
         cuda_err = cudaMemcpyAsync(d_out, &header, sizeof(CompressionHeader),
                                    cudaMemcpyHostToDevice, stream);
         if (cuda_err == cudaSuccess)
@@ -1825,6 +1907,8 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
     *output_size = total_size;
 
     /* ---- Exploration + SGD (mirrors gpucompress_compress, GPU-path adaptations noted) ---- */
+    auto t_explore_start = std::chrono::steady_clock::now();
+
     if (cfg.algorithm == GPUCOMPRESS_ALGO_AUTO && nn_was_used &&
         g_online_learning_enabled) {
         double actual_ratio = static_cast<double>(input_size) /
@@ -2011,7 +2095,9 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
                                                 size_t num_floats = input_size / sizeof(float);
                                                 std::vector<float> h_orig(num_floats);
                                                 std::vector<float> h_dec(num_floats);
+                                                XFER_TRACK("explore_gpu PSNR: D->H original (UNNECESSARY - could use GPU kernel)", input_size, cudaMemcpyDeviceToHost);
                                                 cudaMemcpy(h_orig.data(), d_input, input_size, cudaMemcpyDeviceToHost);
+                                                XFER_TRACK("explore_gpu PSNR: D->H decompressed (UNNECESSARY - could use GPU kernel)", input_size, cudaMemcpyDeviceToHost);
                                                 cudaMemcpy(h_dec.data(), d_rt_result, input_size, cudaMemcpyDeviceToHost);
 
                                                 double mse = 0.0;
@@ -2085,8 +2171,10 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
                                     }
 
                                     /* GPU path: write header H→D, payload D→D */
+                                    XFER_TRACK("explore_gpu winner: H->D alt header", sizeof(CompressionHeader), cudaMemcpyHostToDevice);
                                     cudaMemcpyAsync(d_out, &alt_hdr, sizeof(CompressionHeader),
                                                     cudaMemcpyHostToDevice, stream);
+                                    XFER_TRACK("explore_gpu winner: D->D alt payload", alt_comp_size, cudaMemcpyDeviceToDevice);
                                     cudaMemcpyAsync(d_out + hdr_sz, d_alt_out, alt_comp_size,
                                                     cudaMemcpyDeviceToDevice, stream);
                                     cudaStreamSynchronize(stream);
@@ -2111,7 +2199,13 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
             }
         }
 
+        if (exploration_triggered) {
+            diag_exploration_ms = std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - t_explore_start).count();
+        }
+
         /* GPU SGD: fire only when ratio MAPE exceeds threshold */
+        auto t_sgd_start = std::chrono::steady_clock::now();
         if (error_pct > static_cast<double>(g_reinforce_mape_threshold) && d_stats_ptr) {
             std::sort(explored_samples.begin(), explored_samples.end(),
                       [](const ExploredResult& a, const ExploredResult& b) {
@@ -2139,6 +2233,10 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
                     sgd_fired = true;
                 }
             }
+        }
+        if (sgd_fired) {
+            diag_sgd_ms = std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - t_sgd_start).count();
         }
     }
 
@@ -2188,6 +2286,15 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
             h->nn_original_action    = nn_original_action;
             h->exploration_triggered = exploration_triggered ? 1 : 0;
             h->sgd_fired             = sgd_fired ? 1 : 0;
+            h->nn_inference_ms       = diag_nn_inference_ms;
+            h->preprocessing_ms      = diag_preprocessing_ms;
+            h->compression_ms        = diag_compression_ms;
+            h->exploration_ms        = diag_exploration_ms;
+            h->sgd_update_ms         = diag_sgd_ms;
+            h->actual_ratio          = (compressed_size > 0)
+                ? static_cast<float>(input_size) / static_cast<float>(compressed_size)
+                : 0.0f;
+            h->predicted_ratio       = predicted_ratio;
         }
     }
 
@@ -2277,6 +2384,7 @@ extern "C" gpucompress_error_t gpucompress_decompress_gpu(
     }
 
     /* D→D copy to caller's output buffer */
+    XFER_TRACK("decompress_gpu: D->D result to output", header.original_size, cudaMemcpyDeviceToDevice);
     cuda_err = cudaMemcpyAsync(d_output, d_result, header.original_size,
                                cudaMemcpyDeviceToDevice, stream);
     if (cuda_err == cudaSuccess)

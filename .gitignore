@@ -5,7 +5,7 @@ libs/
 *.so
 *.a
 *.dylib
-
+.claude/
 # CMake
 CMakeCache.txt
 CMakeFiles/

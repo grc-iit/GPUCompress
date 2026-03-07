@@ -30,6 +30,7 @@
 #include "stats/auto_stats_gpu.h"
 #include "nn/nn_weights.h"
 #include "api/internal.hpp"
+#include "xfer_tracker.h"
 
 /* SGD synchronization globals — defined in gpucompress_api.cpp at file scope */
 extern cudaStream_t g_sgd_stream;
@@ -942,6 +943,7 @@ bool loadNNFromBinary(const char* filepath) {
     }
 
     GC_LOG("[XFER H→D] NN weights load (%zu B)\n", sizeof(NNWeightsGPU));
+    XFER_TRACK("NN: H->D weight load (one-time)", sizeof(NNWeightsGPU), cudaMemcpyHostToDevice);
     cudaError_t err = cudaMemcpy(d_nn_weights, &h_weights, sizeof(NNWeightsGPU),
                                   cudaMemcpyHostToDevice);
     if (err != cudaSuccess) {
@@ -1104,12 +1106,14 @@ int runNNInference(
     // Single D→H copy of NNInferenceOutput (16B) — replaces 3 separate transfers
     NNInferenceOutput h_result;
     GC_LOG("[XFER D→H] NN inference: NNInferenceOutput (%zu B)\n", sizeof(NNInferenceOutput));
+    XFER_TRACK("NN inference: D->H NNInferenceOutput", sizeof(NNInferenceOutput), cudaMemcpyDeviceToHost);
     err = cudaMemcpyAsync(&h_result, d_infer_output, sizeof(NNInferenceOutput),
                            cudaMemcpyDeviceToHost, stream);
     if (err != cudaSuccess) return -1;
 
     if (out_top_actions) {
         GC_LOG("[XFER D→H] NN inference: top_actions (%zu B)\n", NN_NUM_CONFIGS * sizeof(int));
+        XFER_TRACK("NN inference: D->H top_actions", NN_NUM_CONFIGS * sizeof(int), cudaMemcpyDeviceToHost);
         err = cudaMemcpyAsync(out_top_actions, d_infer_top_actions,
                                NN_NUM_CONFIGS * sizeof(int),
                                cudaMemcpyDeviceToHost, stream);
@@ -1165,12 +1169,14 @@ int runNNFusedInference(
     // Single D→H of NNInferenceOutput (16B)
     NNInferenceOutput h_result;
     GC_LOG("[XFER D→H] NN fused inference: NNInferenceOutput (%zu B)\n", sizeof(NNInferenceOutput));
+    XFER_TRACK("NN fused inference: D->H NNInferenceOutput", sizeof(NNInferenceOutput), cudaMemcpyDeviceToHost);
     err = cudaMemcpyAsync(&h_result, d_fused_infer_output, sizeof(NNInferenceOutput),
                            cudaMemcpyDeviceToHost, stream);
     if (err != cudaSuccess) return -1;
 
     if (out_top_actions) {
         GC_LOG("[XFER D→H] NN fused inference: top_actions (%zu B)\n", NN_NUM_CONFIGS * sizeof(int));
+        XFER_TRACK("NN fused inference: D->H top_actions", NN_NUM_CONFIGS * sizeof(int), cudaMemcpyDeviceToHost);
         err = cudaMemcpyAsync(out_top_actions, d_fused_top_actions,
                                NN_NUM_CONFIGS * sizeof(int),
                                cudaMemcpyDeviceToHost, stream);
@@ -1217,6 +1223,7 @@ int runNNSGD(
     // H→D: copy samples (tiny: num_samples * 20B)
     GC_LOG("[XFER H→D] SGD samples (%d × %zu B = %zu B)\n",
             num_samples, sizeof(SGDSample), (size_t)num_samples * sizeof(SGDSample));
+    XFER_TRACK("SGD: H->D training samples", num_samples * sizeof(SGDSample), cudaMemcpyHostToDevice);
     cudaError_t err = cudaMemcpyAsync(d_sgd_samples, samples,
                                        num_samples * sizeof(SGDSample),
                                        cudaMemcpyHostToDevice, stream);
@@ -1240,6 +1247,7 @@ int runNNSGD(
     // D→H: copy SGDOutput (12B)
     SGDOutput h_result;
     GC_LOG("[XFER D→H] SGD output: grad_norm + clipped + count (%zu B)\n", sizeof(SGDOutput));
+    XFER_TRACK("SGD: D->H SGDOutput", sizeof(SGDOutput), cudaMemcpyDeviceToHost);
     err = cudaMemcpyAsync(&h_result, d_sgd_output, sizeof(SGDOutput),
                            cudaMemcpyDeviceToHost, stream);
     if (err != cudaSuccess) return -1;
@@ -1297,11 +1305,13 @@ int runNNFusedInferenceCtx(
     if (err != cudaSuccess) return -1;
 
     NNInferenceOutput h_result;
+    XFER_TRACK("NN fused inference (ctx): D->H NNInferenceOutput", sizeof(NNInferenceOutput), cudaMemcpyDeviceToHost);
     err = cudaMemcpyAsync(&h_result, ctx->d_fused_infer_output, sizeof(NNInferenceOutput),
                            cudaMemcpyDeviceToHost, stream);
     if (err != cudaSuccess) return -1;
 
     if (out_top_actions) {
+        XFER_TRACK("NN fused inference (ctx): D->H top_actions", NN_NUM_CONFIGS * sizeof(int), cudaMemcpyDeviceToHost);
         err = cudaMemcpyAsync(out_top_actions, ctx->d_fused_top_actions,
                                NN_NUM_CONFIGS * sizeof(int),
                                cudaMemcpyDeviceToHost, stream);
@@ -1343,6 +1353,7 @@ int runNNSGDCtx(
     if (num_samples > NN_MAX_SGD_SAMPLES) num_samples = NN_MAX_SGD_SAMPLES;
 
     /* H→D: copy samples on g_sgd_stream */
+    XFER_TRACK("SGD (ctx): H->D training samples", num_samples * sizeof(SGDSample), cudaMemcpyHostToDevice);
     cudaError_t err = cudaMemcpyAsync(ctx->d_sgd_samples, samples,
                                        num_samples * sizeof(SGDSample),
                                        cudaMemcpyHostToDevice, g_sgd_stream);
@@ -1368,6 +1379,7 @@ int runNNSGDCtx(
 
     /* D→H: copy SGDOutput (12B) */
     SGDOutput h_result;
+    XFER_TRACK("SGD (ctx): D->H SGDOutput", sizeof(SGDOutput), cudaMemcpyDeviceToHost);
     err = cudaMemcpyAsync(&h_result, ctx->d_sgd_output, sizeof(SGDOutput),
                            cudaMemcpyDeviceToHost, g_sgd_stream);
     if (err != cudaSuccess) return -1;

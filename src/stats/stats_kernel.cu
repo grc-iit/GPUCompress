@@ -19,6 +19,7 @@
 
 #include "stats/auto_stats_gpu.h"
 #include "api/internal.hpp"
+#include "xfer_tracker.h"
 #define GC_LOG(fmt, ...) do { if (g_gc_verbose) fprintf(stderr, fmt, ##__VA_ARGS__); } while(0)
 
 namespace gpucompress {
@@ -30,8 +31,11 @@ namespace gpucompress {
 static void*          g_d_stats_workspace = nullptr;
 static AutoStatsGPU*  g_d_stats           = nullptr;
 static unsigned int*  g_d_stats_histogram = nullptr;
+// Layout: [AutoStatsGPU | histogram(256 uint) | init_flag(int)]
 static constexpr size_t kStatsWorkspaceSize =
-    sizeof(AutoStatsGPU) + 256 * sizeof(unsigned int);
+    sizeof(AutoStatsGPU) + 256 * sizeof(unsigned int) + sizeof(int);
+
+static int* g_d_stats_init_flag = nullptr;
 
 static int ensureStatsWorkspace() {
     if (g_d_stats_workspace != nullptr) return 0;
@@ -40,7 +44,15 @@ static int ensureStatsWorkspace() {
     g_d_stats = static_cast<AutoStatsGPU*>(g_d_stats_workspace);
     g_d_stats_histogram = reinterpret_cast<unsigned int*>(
         static_cast<uint8_t*>(g_d_stats_workspace) + sizeof(AutoStatsGPU));
+    g_d_stats_init_flag = reinterpret_cast<int*>(
+        static_cast<uint8_t*>(g_d_stats_workspace) + sizeof(AutoStatsGPU) + 256 * sizeof(unsigned int));
     return 0;
+}
+
+/** Get init flag pointer from a CompContext workspace (same layout). */
+static inline int* getInitFlagPtr(void* workspace) {
+    return reinterpret_cast<int*>(
+        static_cast<uint8_t*>(workspace) + sizeof(AutoStatsGPU) + 256 * sizeof(unsigned int));
 }
 
 void freeStatsWorkspace() {
@@ -92,11 +104,36 @@ constexpr int STATS_MAX_BLOCKS = 1024;
  * Uses warp shuffle reduction -> shared memory inter-warp reduction
  * -> atomic global reduction.
  */
+
 __global__ void statsPass1Kernel(
     const float* __restrict__ data,
     size_t num_elements,
-    AutoStatsGPU* __restrict__ stats
+    AutoStatsGPU* __restrict__ stats,
+    int* __restrict__ d_init_flag   // pointer to g_stats_init_ready
 ) {
+    // Block 0 thread 0 initializes the stats struct on-device,
+    // eliminating the H->D cudaMemcpy that was previously required.
+    // The workspace is already zeroed by cudaMemsetAsync, so we only
+    // need to set the three non-zero sentinel/metadata fields.
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        stats->vmin = FLT_MAX;
+        stats->vmax = -FLT_MAX;
+        stats->num_elements = num_elements;
+        __threadfence();              // stores visible to all SMs
+        atomicExch(d_init_flag, 1);   // signal: sentinels are ready
+    }
+
+    // Other blocks: spin-wait until block 0 has written the sentinels.
+    // This is a short spin (nanoseconds) — block 0 writes 3 values then signals.
+    if (blockIdx.x != 0) {
+        if (threadIdx.x == 0) {
+            while (atomicAdd(d_init_flag, 0) == 0) { /* spin */ }
+        }
+        __syncthreads();   // propagate to all threads in this block
+    } else {
+        __syncthreads();   // block 0 threads wait for thread 0's init
+    }
+
     // Per-thread accumulators
     double t_sum = 0.0;
     double t_deriv = 0.0;
@@ -313,29 +350,18 @@ AutoStatsGPU* runStatsKernelsNoSync(
     AutoStatsGPU* d_stats = g_d_stats;
     unsigned int* d_histogram = g_d_stats_histogram;
 
-    // Initialize workspace to zero
+    // Initialize workspace to zero — statsPass1Kernel thread 0 sets
+    // the non-zero sentinels (vmin, vmax, num_elements) on-device.
     GC_LOG("[XFER INIT] stats workspace: memset zero (%zu B)\n", kStatsWorkspaceSize);
     cudaError_t err = cudaMemsetAsync(g_d_stats_workspace, 0, kStatsWorkspaceSize, stream);
-    if (err != cudaSuccess) return nullptr;
-
-    // CRITICAL: h_init sets vmin=FLT_MAX, vmax=-FLT_MAX
-    AutoStatsGPU h_init;
-    memset(&h_init, 0, sizeof(h_init));
-    h_init.vmin = FLT_MAX;
-    h_init.vmax = -FLT_MAX;
-    h_init.num_elements = num_elements;
-    h_init.error_level = 0;
-
-    GC_LOG("[XFER H→D] stats init: vmin/vmax/num_elements (%zu B)\n", sizeof(AutoStatsGPU));
-    err = cudaMemcpyAsync(d_stats, &h_init, sizeof(AutoStatsGPU),
-                          cudaMemcpyHostToDevice, stream);
     if (err != cudaSuccess) return nullptr;
 
     int num_blocks = static_cast<int>((num_elements + STATS_BLOCK_SIZE - 1) / STATS_BLOCK_SIZE);
     if (num_blocks > STATS_MAX_BLOCKS) num_blocks = STATS_MAX_BLOCKS;
 
     statsPass1Kernel<<<num_blocks, STATS_BLOCK_SIZE, 0, stream>>>(
-        static_cast<const float*>(d_input), num_elements, d_stats);
+        static_cast<const float*>(d_input), num_elements, d_stats,
+        g_d_stats_init_flag);
 
     launchEntropyKernelsAsync(d_input, input_size, d_histogram,
                               &d_stats->entropy, stream);
@@ -366,25 +392,17 @@ AutoStatsGPU* runStatsKernelsNoSync(
     AutoStatsGPU* d_stats    = ctx->d_stats;
     unsigned int* d_histogram = ctx->d_histogram;
 
+    // Zero workspace — statsPass1Kernel initializes non-zero fields on-device.
     cudaError_t err = cudaMemsetAsync(ctx->d_stats_workspace, 0, kStatsWorkspaceSize, stream);
-    if (err != cudaSuccess) return nullptr;
-
-    AutoStatsGPU h_init;
-    memset(&h_init, 0, sizeof(h_init));
-    h_init.vmin         = FLT_MAX;
-    h_init.vmax         = -FLT_MAX;
-    h_init.num_elements = num_elements;
-    h_init.error_level  = 0;
-
-    err = cudaMemcpyAsync(d_stats, &h_init, sizeof(AutoStatsGPU),
-                          cudaMemcpyHostToDevice, stream);
     if (err != cudaSuccess) return nullptr;
 
     int num_blocks = static_cast<int>((num_elements + STATS_BLOCK_SIZE - 1) / STATS_BLOCK_SIZE);
     if (num_blocks > STATS_MAX_BLOCKS) num_blocks = STATS_MAX_BLOCKS;
 
+    int* d_init_flag = getInitFlagPtr(ctx->d_stats_workspace);
     statsPass1Kernel<<<num_blocks, STATS_BLOCK_SIZE, 0, stream>>>(
-        static_cast<const float*>(d_input), num_elements, d_stats);
+        static_cast<const float*>(d_input), num_elements, d_stats,
+        d_init_flag);
 
     launchEntropyKernelsAsync(d_input, input_size, d_histogram,
                               &d_stats->entropy, stream);
@@ -430,6 +448,7 @@ static int runStatsKernels(
     StatsResultBlock h_result;
 
     GC_LOG("[XFER D→H] stats: entropy+mad+deriv (24 B)\n");
+    XFER_TRACK("stats pipeline: D->H entropy+mad+deriv (24B)", sizeof(StatsResultBlock), cudaMemcpyDeviceToHost);
     cudaError_t err = cudaMemcpyAsync(&h_result, &d_stats->entropy,
                                       sizeof(StatsResultBlock),
                                       cudaMemcpyDeviceToHost, stream);

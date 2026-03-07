@@ -62,6 +62,16 @@ target_include_directories(test_stats PRIVATE
 target_link_libraries(test_stats PRIVATE gpucompress CUDA::cudart)
 set_target_properties(test_stats PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
+# Transfer tracker + on-device stats init test
+add_executable(test_xfer_stats_init tests/unit/test_xfer_stats_init.cu)
+set_source_files_properties(tests/unit/test_xfer_stats_init.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(test_xfer_stats_init PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_xfer_stats_init PRIVATE gpucompress CUDA::cudart)
+set_target_properties(test_xfer_stats_init PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
 # CLI test
 add_executable(test_cli tests/unit/test_cli.cu)
 target_include_directories(test_cli PRIVATE
