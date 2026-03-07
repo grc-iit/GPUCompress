@@ -211,7 +211,7 @@ int main(int argc, char* argv[]) {
     size_t file_size = st.st_size;
     
     printf("Input file: %s\n", input_file);
-    printf("File size: %lu bytes (%.2f MB)\n", file_size, file_size / (1024.0 * 1024.0));
+    printf("File size: %zu bytes (%.2f MB)\n", file_size, file_size / (1024.0 * 1024.0));
     printf("[END] Step 1: Open input file for reading\n");
 
     // ========== Step 2: Initialize GPU ==========
@@ -229,7 +229,7 @@ int main(int argc, char* argv[]) {
     
     uint8_t* d_input;
     CUDA_CHECK(cudaMalloc(&d_input, aligned_input_size));
-    printf("\nAllocated %lu bytes (%.2f MB) on GPU for input\n",
+    printf("\nAllocated %zu bytes (%.2f MB) on GPU for input\n",
            aligned_input_size, aligned_input_size / (1024.0 * 1024.0));
     printf("[END] Step 3: Allocate GPU memory for input data\n");
 
@@ -287,6 +287,10 @@ int main(int argc, char* argv[]) {
         close(fd_input);
         return -1;
     }
+    if ((size_t)bytes_read < file_size) {
+        fprintf(stderr, "Warning: cuFileRead partial read: got %ld of %zu bytes\n",
+                bytes_read, file_size);
+    }
     printf("Read %ld bytes directly to GPU (bypassed CPU!)\n", bytes_read);
     printf("[END] Step 5: Read data from file to GPU using GDS\n");
 
@@ -305,6 +309,11 @@ int main(int argc, char* argv[]) {
         printf("Element size: %zu bytes (%s)\n", quant_element_size,
                quant_element_size == 4 ? "float32" : "float64");
 
+        if (file_size % quant_element_size != 0) {
+            fprintf(stderr, "Warning: file size (%zu) is not a multiple of element size (%zu), "
+                    "trailing %zu bytes will be ignored\n",
+                    file_size, quant_element_size, file_size % quant_element_size);
+        }
         size_t num_elements = file_size / quant_element_size;
 
         QuantizationConfig quant_config(
@@ -411,12 +420,12 @@ int main(int argc, char* argv[]) {
     // Pointer to compressed data section (after header)
     uint8_t* d_compressed = d_output_buffer + header_size;
     
-    printf("Max compressed size: %lu bytes (%.2f MB)\n", 
+    printf("Max compressed size: %zu bytes (%.2f MB)\n", 
            max_compressed_size, max_compressed_size / (1024.0 * 1024.0));
-    printf("Header size: %lu bytes\n", header_size);
-    printf("Max total size (header + compressed): %lu bytes (%.2f MB)\n",
+    printf("Header size: %zu bytes\n", header_size);
+    printf("Max total size (header + compressed): %zu bytes (%.2f MB)\n",
            max_total_size, max_total_size / (1024.0 * 1024.0));
-    printf("Aligned total size for GDS: %lu bytes (%.2f MB)\n",
+    printf("Aligned total size for GDS: %zu bytes (%.2f MB)\n",
            aligned_total_size, aligned_total_size / (1024.0 * 1024.0));
     printf("[END] Step 6: Setup compression\n");
 
@@ -429,7 +438,7 @@ int main(int argc, char* argv[]) {
     // Get actual compressed size
     const size_t compressed_size = compressor->get_compressed_output_size(d_compressed);
 
-    printf("Compressed %lu bytes -> %lu bytes\n", data_size_for_compression, compressed_size);
+    printf("Compressed %zu bytes -> %zu bytes\n", data_size_for_compression, compressed_size);
     printf("  Compression ratio: %.2fx\n", (double)data_size_for_compression / compressed_size);
     if (quant_type != QuantizationType::NONE) {
         printf("  Total reduction (with quantization): %.2fx\n", (double)file_size / compressed_size);
@@ -477,9 +486,9 @@ int main(int argc, char* argv[]) {
     // Calculate total size to write (header + compressed data)
     size_t total_output_size = header_size + compressed_size;
     size_t final_aligned_size = ((total_output_size + 4095) / 4096) * 4096;
-    printf("\nTotal output size: %lu bytes (%.2f MB)\n", 
+    printf("\nTotal output size: %zu bytes (%.2f MB)\n", 
            total_output_size, total_output_size / (1024.0 * 1024.0));
-    printf("Aligned for GDS write: %lu bytes\n", final_aligned_size);
+    printf("Aligned for GDS write: %zu bytes\n", final_aligned_size);
     printf("[END] Step 7.3: Write compression header with metadata\n");
 
     // ========== Step 7.5: Verify compression with decompression ==========
@@ -489,7 +498,7 @@ int main(int argc, char* argv[]) {
     // Configure decompression using the same compressor manager
     DecompressionConfig decomp_config = compressor->configure_decompression(d_compressed);
 
-    printf("Decompressed size: %lu bytes\n", decomp_config.decomp_data_size);
+    printf("Decompressed size: %zu bytes\n", decomp_config.decomp_data_size);
 
     // Allocate buffer for decompressed data
     uint8_t* d_decompressed;
@@ -605,7 +614,7 @@ int main(int argc, char* argv[]) {
         if (error_bound_ok) {
             printf("PASSED: Error bound verified!\n");
             printf("  Max error: %.6e (bound: %.6e)\n", max_error, error_bound);
-            printf("  All %lu elements within specified error bound\n", num_elements);
+            printf("  All %zu elements within specified error bound\n", num_elements);
             verification_passed = true;
         } else {
             printf("FAILED: Error bound violated!\n");
@@ -644,7 +653,7 @@ int main(int argc, char* argv[]) {
             } else {
                 printf("PASSED: Decompressed data matches original input perfectly!\n");
             }
-            printf("  Data integrity verified: %lu bytes verified byte-by-byte\n", file_size);
+            printf("  Data integrity verified: %zu bytes verified byte-by-byte\n", file_size);
             verification_passed = true;
         }
 
@@ -653,10 +662,10 @@ int main(int argc, char* argv[]) {
     printf("[END] Step 7.8: Verify data integrity\n");
     printf("[END] Step 7.5: Verify compression with decompression\n");
 
-    // Clean up verification resources
+    // Clean up verification resources (free each independently)
     if (d_dequantized) CUDA_CHECK(cudaFree(d_dequantized));
-    else if (d_unshuffled) CUDA_CHECK(cudaFree(d_unshuffled));
-    else CUDA_CHECK(cudaFree(d_decompressed));
+    if (d_unshuffled) CUDA_CHECK(cudaFree(d_unshuffled));
+    if (d_decompressed) CUDA_CHECK(cudaFree(d_decompressed));
 
     if (!verification_passed) {
         if (d_quantized) CUDA_CHECK(cudaFree(d_quantized));
@@ -722,7 +731,7 @@ int main(int argc, char* argv[]) {
     // Write entire buffer (header + compressed data) from GPU to file using GDS
     ssize_t bytes_written = cuFileWrite(cf_handle_out, d_output_buffer, final_aligned_size, 0, 0);
     if (bytes_written != (ssize_t)final_aligned_size) {
-        printf("Error: cuFileWrite returned %ld instead of %lu\n", bytes_written, final_aligned_size);
+        printf("Error: cuFileWrite returned %ld instead of %zu\n", bytes_written, final_aligned_size);
         if (output_buf_registered) cuFileBufDeregister(d_output_buffer);
         cuFileHandleDeregister(cf_handle_out);
         close(fd_out);

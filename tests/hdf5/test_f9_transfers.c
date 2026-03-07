@@ -65,8 +65,8 @@ int main(int argc, char **argv) {
     hsize_t cdims[1] = { chunk_floats };
     H5Pset_chunk(dcpl, 1, cdims);
 
-    unsigned int cd_values[3] = { GPUCOMPRESS_ALGO_AUTO, GPUCOMPRESS_PREPROC_NONE, 0 };
-    H5Pset_filter(dcpl, H5Z_FILTER_GPUCOMPRESS, H5Z_FLAG_MANDATORY, 3, cd_values);
+    unsigned int cd_values[5] = { GPUCOMPRESS_ALGO_AUTO, GPUCOMPRESS_PREPROC_NONE, 0, 0, 0 };
+    H5Pset_filter(dcpl, H5Z_FILTER_GPUCOMPRESS, H5Z_FLAG_MANDATORY, 5, cd_values);
 
     hid_t dset = H5Dcreate2(fid, "data", H5T_IEEE_F32LE, space,
                              H5P_DEFAULT, dcpl, H5P_DEFAULT);

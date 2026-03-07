@@ -12,10 +12,12 @@
 
 set -euo pipefail
 
-LIBS_DIR=/u/imuradli/GPUCompress/libs
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+LIBS_DIR="$PROJECT_DIR/libs"
 export LD_LIBRARY_PATH=${LIBS_DIR}:/tmp/lib:/tmp/hdf5-install/lib:${LD_LIBRARY_PATH:-}
-WEIGHTS=/u/imuradli/GPUCompress/neural_net/weights/model.nnwt
-cd /u/imuradli/GPUCompress
+WEIGHTS="$PROJECT_DIR/neural_net/weights/model.nnwt"
+cd "$PROJECT_DIR"
 
 echo "========================================"
 echo " GPUCompress Test Suite"
@@ -113,12 +115,7 @@ echo " Benchmarks (60s timeout each)"
 echo "========================================"
 echo ""
 
-run_test "benchmark_hdf5"         "./build/benchmark_hdf5 ${WEIGHTS}" 180
-run_test "benchmark_lz4_vs_nocomp" "./build/benchmark_lz4_vs_nocomp" 60
-run_test "benchmark_gpu_resident" "./build/benchmark_gpu_resident ${WEIGHTS}" 60
-run_test "benchmark_vol_gpu"      "./build/benchmark_vol_gpu ${WEIGHTS}" 60
-run_test "benchmark_algo_sweep"   "./build/benchmark_algo_sweep" 120
-run_test "quick_algo_sweep"       "./build/quick_algo_sweep" 60
+run_test "benchmark_grayscott_vol" "./build/benchmark_grayscott_vol" 180
 
 echo ""
 echo "========================================"

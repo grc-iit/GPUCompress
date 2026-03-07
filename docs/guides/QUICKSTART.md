@@ -44,16 +44,36 @@ Override CUDA architecture if needed (default is sm_80 for A100):
 CUDA_ARCH=90 bash scripts/install_dependencies.sh   # H100
 ```
 
-### Manual clean rebuild
+---
 
-If you need to rebuild from scratch (e.g., stale CMake cache):
+## 3. Build
+
+### Standard build
 
 ```bash
 cd /u/imuradli/GPUCompress
+cmake -B build -DCMAKE_CUDA_ARCHITECTURES=80
+cmake --build build -j$(nproc)
+```
+
+### Build with custom dependency paths
+
+nvCOMP and HDF5 paths are configurable via CMake cache variables:
+
+```bash
+cmake -B build \
+  -DCMAKE_CUDA_ARCHITECTURES=80 \
+  -DNVCOMP_PREFIX=/path/to/nvcomp \
+  -DHDF5_VOL_PREFIX=/path/to/hdf5
+cmake --build build -j$(nproc)
+```
+
+### Clean rebuild
+
+```bash
 rm -rf build
-mkdir build && cd build
-cmake -DCMAKE_CUDA_ARCHITECTURES=80 ..
-make -j$(nproc)
+cmake -B build -DCMAKE_CUDA_ARCHITECTURES=80
+cmake --build build -j$(nproc)
 ```
 
 > **Important:** Always pass `-DCMAKE_CUDA_ARCHITECTURES=80` (or higher) explicitly.
@@ -61,7 +81,7 @@ make -j$(nproc)
 
 ---
 
-## 3. Set Up Environment
+## 4. Set Up Environment
 
 ```bash
 source scripts/setup_env.sh
@@ -70,21 +90,42 @@ source scripts/setup_env.sh
 Or manually:
 
 ```bash
-export LD_LIBRARY_PATH=/tmp/lib:/tmp/hdf5-install/lib:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=/tmp/lib:/tmp/hdf5-install/lib:$PWD/build:$LD_LIBRARY_PATH
 ```
 
 ---
 
-## 4. Verify the Build
+## 5. Verify the Build
 
 ```bash
-ls build/gpu_compress build/gpu_decompress
 ls build/libgpucompress.so build/libH5Zgpucompress.so build/libH5VLgpucompress.so
 ```
 
+CLI tools (`gpu_compress`, `gpu_decompress`) are only built if cuFile/GDS is available:
+
+```bash
+ls build/gpu_compress build/gpu_decompress 2>/dev/null || echo "CLI tools not built (cuFile not found — this is OK)"
+```
+
 ---
 
-## 5. Run Tests
+## 6. Run Tests
+
+### Shell-based tests (no GPU required)
+
+Static analysis regression tests that verify code fixes:
+
+```bash
+bash tests/run_all_tests.sh
+```
+
+### Full test suite (GPU required)
+
+Includes CUDA runtime tests, unit tests, HDF5 tests, and VOL tests:
+
+```bash
+bash tests/run_all_tests.sh --gpu
+```
 
 ### Quick smoke test
 
@@ -92,14 +133,6 @@ ls build/libgpucompress.so build/libH5Zgpucompress.so build/libH5VLgpucompress.s
 ./build/test_quantization_roundtrip
 ./build/test_nn_pipeline
 ```
-
-### Full test suite (unit + HDF5 + VOL + benchmarks)
-
-```bash
-bash scripts/run_tests.sh
-```
-
-This runs all tests with timeouts and prints a PASS/FAIL summary.
 
 ### Individual test categories
 
@@ -116,6 +149,9 @@ This runs all tests with timeouts and prints a PASS/FAIL summary.
 ./build/test_bug5_truncated_nnwt
 ./build/test_bug7_concurrent_quantize
 ./build/test_bug8_sgd_concurrent
+./build/test_perf2_sort_speedup
+./build/test_perf4_batched_dh
+./build/test_perf14_atomic_double
 ```
 
 **HDF5 filter:**
@@ -124,6 +160,7 @@ This runs all tests with timeouts and prints a PASS/FAIL summary.
 ./build/test_hdf5_configs
 ./build/test_h5z_8mb
 ./build/test_f9_transfers
+./build/test_design6_chunk_tracker
 ```
 
 **VOL connector:**
@@ -138,18 +175,28 @@ This runs all tests with timeouts and prints a PASS/FAIL summary.
 
 ---
 
-## 6. Run Demos
+## 7. Run Gray-Scott Benchmark
 
-### Gray-Scott simulation + NN compression
+Runs a Gray-Scott reaction-diffusion simulation on the GPU, then benchmarks
+writing the 3D field to HDF5 via the GPUCompress VOL connector under five
+compression phases (no-comp, static, nn, nn-rl, nn-rl+exploration).
 
 ```bash
-./build/grayscott_vol_demo neural_net/weights/model.nnwt --L 128 --steps 1000 --chunk_mb 4
+./build/benchmark_grayscott_vol neural_net/weights/model.nnwt
 ```
 
-This produces:
-- `/tmp/grayscott_compressed.h5` — NN-compressed via VOL
-- `/tmp/grayscott_decompressed.h5` — plain HDF5 after round-trip
-- Bitwise GPU verification (PASS/FAIL per snapshot)
+**Options:**
+
+```bash
+# 64 MB dataset, 4 MB chunks (default)
+./build/benchmark_grayscott_vol neural_net/weights/model.nnwt --L 256 --chunk-mb 4
+
+# 4 GB dataset, 64 MB chunks
+./build/benchmark_grayscott_vol neural_net/weights/model.nnwt --L 1000 --chunk-mb 64
+
+# Custom simulation parameters
+./build/benchmark_grayscott_vol neural_net/weights/model.nnwt --L 512 --steps 1000 --F 0.04 --k 0.06075
+```
 
 **Dataset size reference:**
 
@@ -162,52 +209,6 @@ This produces:
 | 1000  | 4 GB        |
 | 1260  | 8 GB        |
 
-**More examples:**
-
-```bash
-# 64 MB dataset, 4 MB chunks
-./build/grayscott_vol_demo neural_net/weights/model.nnwt --L 256 --chunk_mb 4
-
-# 1 GB dataset, 64 MB chunks
-./build/grayscott_vol_demo neural_net/weights/model.nnwt --L 640 --chunk_mb 64
-
-# 5 snapshots of 64 MB
-./build/grayscott_vol_demo neural_net/weights/model.nnwt --L 256 --steps 5000 --plotgap 1000
-
-# 8 GB dataset (needs ~30 GB GPU memory)
-./build/grayscott_vol_demo neural_net/weights/model.nnwt --L 1260 --chunk_mb 64
-```
-
-### Algorithm sweep (verify NN's choice)
-
-```bash
-./build/algo_sweep_verify neural_net/weights/model.nnwt --L 256 --chunk_mb 4
-```
-
-Runs all 8 compression algorithms on the same data and compares against NN's pick.
-
-### Verify compressed vs decompressed files
-
-```bash
-HDF5_PLUGIN_PATH=$PWD/build \
-h5diff /tmp/grayscott_compressed.h5 /tmp/grayscott_decompressed.h5
-```
-
-No output means the files match exactly.
-
----
-
-## 7. Run Benchmarks
-
-```bash
-./build/benchmark neural_net/weights/model.nnwt
-./build/benchmark_hdf5 neural_net/weights/model.nnwt
-./build/benchmark_gpu_resident neural_net/weights/model.nnwt
-./build/benchmark_vol_gpu neural_net/weights/model.nnwt
-./build/benchmark_algo_sweep
-./build/benchmark_lz4_vs_nocomp
-```
-
 ---
 
 ## 8. VPIC Benchmark (Real Harris Sheet Simulation)
@@ -215,19 +216,16 @@ No output means the files match exactly.
 Runs a real VPIC-Kokkos Harris sheet reconnection simulation, then benchmarks
 GPU-resident field compression through the GPUCompress VOL connector.
 
-| Parameter | Value |
-|-----------|-------|
-| Grid cells | 128³ + ghost cells (~2.2M voxels) |
-| Vars/cell | 16 floats |
-| Dataset size | ~133 MB |
-| Chunk size | 4 MB |
-| Warmup | 100 simulation steps |
+### Prerequisites
+
+- VPIC-Kokkos built with CUDA support at `/u/imuradli/vpic-kokkos`
+- GPUCompress already built
 
 ### Build the deck
 
 ```bash
-cd /u/imuradli/vpic-kokkos/build-compress
-./bin/vpic /u/imuradli/GPUCompress/tests/benchmarks/vpic_benchmark_deck.cxx
+cd /u/imuradli/vpic-kokkos
+bash /u/imuradli/GPUCompress/scripts/build_vpic_benchmark.sh
 ```
 
 ### Run the deck
@@ -256,6 +254,7 @@ export GPUCOMPRESS_WEIGHTS=/u/imuradli/GPUCompress/neural_net/weights/model.nnwt
 | `libnvcomp.so.5: cannot open shared object file` | `export LD_LIBRARY_PATH=/tmp/lib:$LD_LIBRARY_PATH` |
 | `libhdf5.so.320: cannot open shared object file` | `export LD_LIBRARY_PATH=/tmp/hdf5-install/lib:$LD_LIBRARY_PATH` |
 | `atomicAdd(double*, double)` compile error | `cmake -B build -DCMAKE_CUDA_ARCHITECTURES=80` |
+| `cuFile not found — skipping CLI tools` | Normal on systems without GDS. Library and tests still work. |
 | Dependencies missing on new node | Re-run `bash scripts/install_dependencies.sh` |
 | tmux session lost | `tmux attach -t gpu` |
 | h5diff can't read compressed file | `export HDF5_PLUGIN_PATH=$PWD/build` |

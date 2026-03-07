@@ -87,7 +87,7 @@ def load_library(lib_path):
     lib.gpucompress_algorithm_name.argtypes = [ctypes.c_int]
 
     lib.gpucompress_enable_active_learning.restype = ctypes.c_int
-    lib.gpucompress_enable_active_learning.argtypes = [ctypes.c_char_p]
+    lib.gpucompress_enable_active_learning.argtypes = []
     lib.gpucompress_disable_active_learning.restype = None
 
     lib.gpucompress_set_exploration_threshold.restype = None
@@ -138,8 +138,7 @@ def run_evaluation(lib, hf):
         sys.exit(1)
 
     # Enable active learning + reinforcement
-    exp_path = os.path.join(PROJECT_ROOT, "eval", "experience_workload.csv")
-    lib.gpucompress_enable_active_learning(exp_path.encode())
+    lib.gpucompress_enable_active_learning()
     lib.gpucompress_set_exploration_threshold(EXPLORATION_THRESH)
     lib.gpucompress_set_reinforcement(1, REINFORCE_LR, REINFORCE_MAPE, 0.0)
 

@@ -72,12 +72,15 @@ static void write_gpu_to_hdf5(const char* filename, const char* dset_name,
     if (fid < 0) return;
 
     hid_t space = H5Screate_simple(1, dims, NULL);
+    if (space < 0) { H5Fclose(fid); return; }
     hid_t dcpl  = H5Pcreate(H5P_DATASET_CREATE);
+    if (dcpl < 0) { H5Sclose(space); H5Fclose(fid); return; }
     H5Pset_chunk(dcpl, 1, cdims);
     H5Pset_gpucompress(dcpl, GPUCOMPRESS_ALGO_AUTO, 0, 4, 0.0);
 
     hid_t dset = H5Dcreate2(fid, dset_name, H5T_NATIVE_FLOAT, space,
                              H5P_DEFAULT, dcpl, H5P_DEFAULT);
+    if (dset < 0) { H5Pclose(dcpl); H5Sclose(space); H5Fclose(fid); return; }
 
     // d_data is a CUDA device pointer — the VOL connector detects this
     // and compresses on the GPU, then writes pre-compressed chunks
@@ -156,7 +159,7 @@ begin_initialization {
 
     // Diagnostics: write compressed HDF5 every 10 steps (5 snapshots total)
     global->diag_interval = 10;
-    global->chunk_bytes   = 4 * 1024 * 1024;  // 64 MB chunks
+    global->chunk_bytes   = 4 * 1024 * 1024;  // 4 MiB chunks
 
     // Grid setup
     define_units(c, eps0);
@@ -234,17 +237,20 @@ begin_initialization {
     VpicSettings fs = vpic_default_settings();
     fs.data_type = VPIC_DATA_FIELDS;
     fs.n_cells   = grid->nv;
-    gpucompress_vpic_create(&global->vpic_fields_h, &fs);
+    if (gpucompress_vpic_create(&global->vpic_fields_h, &fs) != GPUCOMPRESS_SUCCESS)
+        sim_log("WARNING: gpucompress_vpic_create failed for fields");
 
     VpicSettings hs = vpic_default_settings();
     hs.data_type = VPIC_DATA_HYDRO;
     hs.n_cells   = grid->nv;
-    gpucompress_vpic_create(&global->vpic_hydro_h, &hs);
+    if (gpucompress_vpic_create(&global->vpic_hydro_h, &hs) != GPUCOMPRESS_SUCCESS)
+        sim_log("WARNING: gpucompress_vpic_create failed for hydro");
 
     VpicSettings ps = vpic_default_settings();
     ps.data_type   = VPIC_DATA_PARTICLES;
     ps.n_particles = 0;
-    gpucompress_vpic_create(&global->vpic_particles_h, &ps);
+    if (gpucompress_vpic_create(&global->vpic_particles_h, &ps) != GPUCOMPRESS_SUCCESS)
+        sim_log("WARNING: gpucompress_vpic_create failed for particles");
 
     size_t field_bytes = (size_t)grid->nv * 16 * sizeof(float);
     size_t hydro_bytes = (size_t)grid->nv * 14 * sizeof(float);

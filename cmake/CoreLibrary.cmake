@@ -63,23 +63,31 @@ set_target_properties(gpucompress PROPERTIES
 )
 
 # ============================================================
-# CLI Executables
+# CLI Executables (require cuFile/GDS for direct GPU I/O)
 # ============================================================
-add_executable(gpu_compress
-    src/cli/compress.cpp
-    ${PREPROCESSING_SOURCES}
-    ${FACTORY_SOURCES}
-)
-target_link_libraries(gpu_compress PRIVATE nvcomp cufile CUDA::cudart)
-set_target_properties(gpu_compress PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+find_library(CUFILE_LIBRARY cufile HINTS /usr/local/cuda/lib64 /opt/nvidia/cuda-12.8/targets/x86_64-linux/lib)
 
-add_executable(gpu_decompress
-    src/cli/decompress.cpp
-    ${PREPROCESSING_SOURCES}
-    ${FACTORY_SOURCES}
-)
-target_link_libraries(gpu_decompress PRIVATE nvcomp cufile CUDA::cudart)
-set_target_properties(gpu_decompress PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+if(CUFILE_LIBRARY)
+    message(STATUS "cuFile found: ${CUFILE_LIBRARY}")
+
+    add_executable(gpu_compress
+        src/cli/compress.cpp
+        ${PREPROCESSING_SOURCES}
+        ${FACTORY_SOURCES}
+    )
+    target_link_libraries(gpu_compress PRIVATE nvcomp ${CUFILE_LIBRARY} CUDA::cudart)
+    set_target_properties(gpu_compress PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+    add_executable(gpu_decompress
+        src/cli/decompress.cpp
+        ${PREPROCESSING_SOURCES}
+        ${FACTORY_SOURCES}
+    )
+    target_link_libraries(gpu_decompress PRIVATE nvcomp ${CUFILE_LIBRARY} CUDA::cudart)
+    set_target_properties(gpu_decompress PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+else()
+    message(STATUS "cuFile not found — skipping CLI tools (gpu_compress, gpu_decompress)")
+endif()
 
 # ============================================================
 # Benchmark executable

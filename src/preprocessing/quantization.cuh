@@ -406,4 +406,7 @@ inline bool is_quant_enabled(uint32_t flags) {
     return (flags & 0x100) != 0;
 }
 
+/** Free static d_range_min/d_range_max GPU buffers. Call from gpucompress_cleanup(). */
+void free_range_bufs();
+
 #endif // QUANTIZATION_CUH

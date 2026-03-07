@@ -472,6 +472,10 @@ static herr_t
 free_obj(H5VL_gpucompress_t *o)
 {
     hid_t err_id = H5Eget_current_stack();
+    if (o->dcpl_id != H5I_INVALID_HID) {
+        H5Pclose(o->dcpl_id);
+        o->dcpl_id = H5I_INVALID_HID;
+    }
     H5Idec_ref(o->under_vol_id);
     H5Eset_current_stack(err_id);
     free(o);
@@ -542,10 +546,11 @@ H5VL_gpucompress_info_to_str(const void *_info, char **str)
     H5VLget_value(info->under_vol_id, &uval);
     H5VLconnector_info_to_str(info->under_vol_info, info->under_vol_id, &us);
     if (us) ulen = strlen(us);
-    size_t sz = 32 + ulen;
+    size_t sz = 64 + ulen;
     *str = (char*)H5allocate_memory(sz, (bool)0);
     snprintf(*str, sz, "under_vol=%u;under_info={%s}",
              (unsigned)uval, us ? us : "");
+    if (us) H5free_memory(us);
     return 0;
 }
 
@@ -1783,7 +1788,7 @@ H5VL_gpucompress_dataset_read(size_t count, void *dset[],
         }
     }
 
-    if (req && *req)
+    if (req && *req && count > 0)
         *req = new_obj(*req, ((H5VL_gpucompress_t*)dset[0])->under_vol_id);
     return 0;
 }
@@ -1827,7 +1832,7 @@ H5VL_gpucompress_dataset_write(size_t count, void *dset[],
         }
     }
 
-    if (req && *req)
+    if (req && *req && count > 0)
         *req = new_obj(*req, ((H5VL_gpucompress_t*)dset[0])->under_vol_id);
     return 0;
 }

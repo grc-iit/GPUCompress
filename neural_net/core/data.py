@@ -76,8 +76,8 @@ def encode_and_split(df: pd.DataFrame, val_fraction: float = 0.2,
     # Compression ratio: log1p
     df['ratio_log'] = np.log1p(df['compression_ratio'].clip(lower=0)).astype(np.float32)
 
-    # PSNR: clamp inf to 120, keep as-is
-    df['psnr_clamped'] = df['psnr_db'].replace([np.inf, -np.inf], 120.0).clip(upper=120.0).astype(np.float32)
+    # PSNR: clamp inf and NaN to 120, keep as-is
+    df['psnr_clamped'] = df['psnr_db'].replace([np.inf, -np.inf], 120.0).fillna(120.0).clip(upper=120.0).astype(np.float32)
 
     # ---- Split by file ----
     files = sorted(df['file'].unique())
@@ -160,15 +160,19 @@ def encode_and_split(df: pd.DataFrame, val_fraction: float = 0.2,
     }
 
 
-def compute_stats_cpu(raw_bytes):
+def compute_stats_cpu(raw_bytes, dtype=np.float32):
     """Compute entropy, MAD, and second_derivative on CPU.
 
     Mirrors the GPU implementation in stats_kernel.cu and entropy_kernel.cu:
       - Entropy: byte-level Shannon entropy (256-bin histogram, log2) in bits
       - MAD: mean absolute deviation from mean, normalized by data range
       - Second derivative: mean |x[i+1] - 2*x[i] + x[i-1]|, normalized by data range
+
+    Args:
+        raw_bytes: raw byte buffer of the data
+        dtype: numpy dtype of the underlying data (default np.float32)
     """
-    arr = np.frombuffer(raw_bytes, dtype=np.float32)
+    arr = np.frombuffer(raw_bytes, dtype=dtype)
 
     # Entropy: byte-level histogram (same as GPU's 256-bin approach)
     byte_data = np.frombuffer(raw_bytes, dtype=np.uint8)

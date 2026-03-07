@@ -31,10 +31,13 @@ extern "C" {
 #ifdef H5_VERS_MAJOR
 #include <hdf5.h>
 #else
-/* Forward declarations for when HDF5 headers not included */
-typedef int hid_t;
-typedef int herr_t;
-typedef int htri_t;
+/* Forward declarations for when HDF5 headers not included.
+ * HDF5 1.14+ uses int64_t for hid_t; older versions use int.
+ * Default to int64_t for forward compatibility. */
+#include <stdint.h>
+typedef int64_t hid_t;
+typedef int     herr_t;
+typedef int     htri_t;
 #endif
 
 /* ============================================================

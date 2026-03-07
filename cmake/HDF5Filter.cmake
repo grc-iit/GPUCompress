@@ -28,6 +28,7 @@ target_link_libraries(H5Zgpucompress
     PRIVATE
     gpucompress
     ${HDF5_C_LIBRARIES}
+    pthread
 )
 
 set_target_properties(H5Zgpucompress PROPERTIES
@@ -87,3 +88,16 @@ target_link_libraries(test_h5z_8mb PRIVATE
     gpucompress H5Zgpucompress ${HDF5_C_LIBRARIES} CUDA::cudart m
 )
 set_target_properties(test_h5z_8mb PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+# H-8: filter globals race test
+add_executable(test_h8_filter_globals_race tests/regression/test_h8_filter_globals_race.cu)
+set_source_files_properties(tests/regression/test_h8_filter_globals_race.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(test_h8_filter_globals_race PRIVATE
+    ${HDF5_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_h8_filter_globals_race PRIVATE
+    gpucompress H5Zgpucompress ${HDF5_C_LIBRARIES} CUDA::cudart pthread m
+)
+set_target_properties(test_h8_filter_globals_race PROPERTIES CUDA_SEPARABLE_COMPILATION ON)

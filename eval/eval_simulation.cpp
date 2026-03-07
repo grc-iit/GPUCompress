@@ -45,7 +45,7 @@ static const char* CSV_HEADER =
     "original_size,algorithm,shuffle,quantization,error_bound,"
     "compressed_size,compression_ratio,compress_time_ms,throughput_mbps,"
     "predicted_ratio,mape,"
-    "predicted_comp_time_ms,comp_time_mape,reinforced\n";
+    "predicted_comp_time_ms,comp_time_mape,reinforced,experience_delta\n";
 
 // ============================================================
 // CLI configuration
@@ -55,6 +55,7 @@ struct EvalConfig {
     std::string data_dir;
     std::string weights;
     std::string output = "results.csv";
+    std::string experience;  // experience CSV output path (optional)
     double error_bound = 0.0;
     double threshold = 0.20;
     int max_files = 0;
@@ -208,11 +209,12 @@ static void print_usage(const char* prog) {
 
 static EvalConfig parse_args(int argc, char** argv) {
     EvalConfig config;
-    enum { OPT_REINFORCE = 256, OPT_REINFORCE_LR, OPT_REINFORCE_THRESH, OPT_REINFORCE_CT_THRESH };
+    enum { OPT_REINFORCE = 256, OPT_REINFORCE_LR, OPT_REINFORCE_THRESH, OPT_REINFORCE_CT_THRESH, OPT_EXPERIENCE };
     static struct option long_options[] = {
         {"data-dir",              required_argument, 0, 'd'},
         {"weights",               required_argument, 0, 'w'},
         {"output",                required_argument, 0, 'o'},
+        {"experience",            required_argument, 0, OPT_EXPERIENCE},
         {"error-bound",           required_argument, 0, 'b'},
         {"threshold",             required_argument, 0, 't'},
         {"max-files",             required_argument, 0, 'm'},
@@ -235,6 +237,7 @@ static EvalConfig parse_args(int argc, char** argv) {
             case 'b': config.error_bound = std::atof(optarg); break;
             case 't': config.threshold = std::atof(optarg); break;
             case 'm': config.max_files = std::atoi(optarg); break;
+            case OPT_EXPERIENCE: config.experience = optarg; break;
             case OPT_REINFORCE: config.reinforce = true; break;
             case OPT_REINFORCE_LR: config.reinforce_lr = std::atof(optarg); break;
             case OPT_REINFORCE_THRESH: config.reinforce_threshold = std::atof(optarg); break;
@@ -529,7 +532,8 @@ int main(int argc, char** argv) {
                 << fmt_double(mape, 6) << ","
                 << fmt_double(pred_comp_time, 4) << ","
                 << fmt_double(comp_time_mape, 6) << ","
-                << (reinforced ? 1 : 0) << "\n";
+                << (reinforced ? 1 : 0) << ","
+                << (reinforced ? 1 : 0) << "\n";  // experience_delta: 1 if SGD updated weights
     }
 
     csv_out.close();
@@ -556,10 +560,30 @@ int main(int argc, char** argv) {
 
     // 7. Generate MAPE plot
     {
-        std::string plot_cmd = "python3 eval/plot_mape.py " + config.output + " eval/mape_reinforcement.png 2>/dev/null &";
-        std::cout << "\nGenerating MAPE plot..." << std::endl;
-        int plot_rc = system(plot_cmd.c_str());
-        (void)plot_rc;
+        // Validate config.output to prevent shell command injection (H-11).
+        // Only allow alphanumeric characters, dots, dashes, underscores, and
+        // forward slashes — reject anything that could be a shell metacharacter.
+        bool output_safe = true;
+        for (char c : config.output) {
+            if (!std::isalnum(static_cast<unsigned char>(c)) &&
+                c != '.' && c != '-' && c != '_' && c != '/') {
+                output_safe = false;
+                break;
+            }
+        }
+        if (config.output.empty()) {
+            output_safe = false;
+        }
+
+        if (output_safe) {
+            std::string plot_cmd = "python3 eval/plot_mape.py " + config.output + " eval/mape_reinforcement.png 2>/dev/null &";
+            std::cout << "\nGenerating MAPE plot..." << std::endl;
+            int plot_rc = system(plot_cmd.c_str());
+            (void)plot_rc;
+        } else {
+            std::cerr << "Warning: skipping MAPE plot generation — output path "
+                      << "contains disallowed characters." << std::endl;
+        }
     }
 
     gpucompress_disable_active_learning();

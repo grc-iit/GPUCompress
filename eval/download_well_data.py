@@ -32,24 +32,28 @@ REPO_TYPE = "dataset"
 
 
 def ensure_dependencies():
-    """Install missing dependencies."""
+    """Check that required dependencies are installed."""
+    missing = []
     try:
         import h5py  # noqa: F401
     except ImportError:
-        print("Installing h5py...")
-        os.system(f"{sys.executable} -m pip install h5py -q")
+        missing.append("h5py")
 
     try:
         import huggingface_hub  # noqa: F401
     except ImportError:
-        print("Installing huggingface_hub...")
-        os.system(f"{sys.executable} -m pip install huggingface_hub -q")
+        missing.append("huggingface_hub")
 
     try:
         import fsspec  # noqa: F401
     except ImportError:
-        print("Installing fsspec...")
-        os.system(f"{sys.executable} -m pip install fsspec -q")
+        missing.append("fsspec")
+
+    if missing:
+        raise ImportError(
+            f"Missing required package(s): {', '.join(missing)}. "
+            f"Install with: pip install {' '.join(missing)}"
+        )
 
 
 def resolve_hdf5_path(scenario: int) -> str:

@@ -99,7 +99,7 @@ int main(int argc, char* argv[]) {
     size_t file_size = st.st_size;
     
     printf("Input file (compressed): %s\n", input_file);
-    printf("Compressed file size: %lu bytes (%.2f MB)\n", file_size, file_size / (1024.0 * 1024.0));
+    printf("Compressed file size: %zu bytes (%.2f MB)\n", file_size, file_size / (1024.0 * 1024.0));
 
     // ========== Step 2: Initialize GPU ==========
     
@@ -113,7 +113,7 @@ int main(int argc, char* argv[]) {
     
     uint8_t* d_compressed;
     CUDA_CHECK(cudaMalloc(&d_compressed, aligned_input_size));
-    printf("\nAllocated %lu bytes (%.2f MB) on GPU for compressed input\n", 
+    printf("\nAllocated %zu bytes (%.2f MB) on GPU for compressed input\n", 
            aligned_input_size, aligned_input_size / (1024.0 * 1024.0));
     
     // ========== Step 4: Initialize GDS (cuFile) ==========
@@ -196,7 +196,7 @@ int main(int argc, char* argv[]) {
     // Validate file_size can hold header + claimed compressed data
     size_t header_size = sizeof(CompressionHeader);
     if (file_size < header_size + header.compressed_size) {
-        printf("Error: File truncated — file is %lu bytes but header claims %lu + %lu = %lu bytes\n",
+        printf("Error: File truncated — file is %zu bytes but header claims %zu + %zu = %zu bytes\n",
                file_size, header_size, (size_t)header.compressed_size,
                header_size + (size_t)header.compressed_size);
         if (input_buf_registered) cuFileBufDeregister(d_compressed);
@@ -225,11 +225,11 @@ int main(int argc, char* argv[]) {
     // Verify decompressed size matches header (only when no quantization,
     // since quantized data is expected to be smaller than original_size)
     if (!header.hasQuantizationApplied() && decompressed_size != header.original_size) {
-        printf("Warning: Decompressed size (%lu) doesn't match header original size (%lu)\n",
+        printf("Warning: Decompressed size (%zu) doesn't match header original size (%zu)\n",
                decompressed_size, header.original_size);
     }
     
-    printf("Decompressed size: %lu bytes (%.2f MB)\n",
+    printf("Decompressed size: %zu bytes (%.2f MB)\n",
         decompressed_size, decompressed_size / (1024.0 * 1024.0));
     
     // Align decompressed output to 4KB for GDS
@@ -238,7 +238,7 @@ int main(int argc, char* argv[]) {
     uint8_t* d_decompressed;
     CUDA_CHECK(cudaMalloc(&d_decompressed, aligned_decompressed_size));
     
-    printf("Aligned decompressed size for GDS: %lu bytes (%.2f MB)\n",
+    printf("Aligned decompressed size for GDS: %zu bytes (%.2f MB)\n",
         aligned_decompressed_size, aligned_decompressed_size / (1024.0 * 1024.0));
     
 
@@ -248,7 +248,7 @@ int main(int argc, char* argv[]) {
     decompressor->decompress(d_decompressed, d_compressed_data, decomp_config);
     CUDA_CHECK(cudaStreamSynchronize(stream));  // Ensure decompression completes
 
-    printf("✓ Decompressed %lu bytes -> %lu bytes\n", header.compressed_size, decompressed_size);
+    printf("✓ Decompressed %zu bytes -> %zu bytes\n", header.compressed_size, decompressed_size);
     printf("  Decompression ratio: %.2fx\n", (double)decompressed_size / header.compressed_size);
     
     // ========== Step 7.5: Apply unshuffle if shuffle was used ==========
@@ -419,7 +419,7 @@ int main(int argc, char* argv[]) {
     // Use final_output_size which is the true original size
     ssize_t bytes_written = cuFileWrite(cf_handle_out, d_final_output, final_output_size, 0, 0);
     if (bytes_written != (ssize_t)final_output_size) {
-        printf("Error: cuFileWrite returned %ld instead of %lu\n", bytes_written, final_output_size);
+        printf("Error: cuFileWrite returned %ld instead of %zu\n", bytes_written, final_output_size);
         if (output_buf_registered) cuFileBufDeregister(d_final_output);
         cuFileHandleDeregister(cf_handle_out);
         close(fd_out);

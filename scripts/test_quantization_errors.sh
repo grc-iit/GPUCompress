@@ -9,7 +9,7 @@
 
 set -e
 
-PROJECT_DIR="/home/cc/GPUCompress"
+PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="$PROJECT_DIR/build"
 TEST_DIR="$PROJECT_DIR/test_data"
 
@@ -99,22 +99,24 @@ run_quantization_test() {
 
     echo ""
     echo "--- Value Comparison Analysis ---"
-    python3 << PYEOF
+    INPUT_FILE="$input_file" RESTORED_FILE="$restored_file" ERROR_BOUND="$error_bound" CSV_FILE="$csv_file" \
+    python3 << 'PYEOF'
 import struct
 import sys
 import csv
+import os
 
 # Read original and restored data
-with open("$input_file", "rb") as f:
+with open(os.environ["INPUT_FILE"], "rb") as f:
     orig_bytes = f.read()
-with open("$restored_file", "rb") as f:
+with open(os.environ["RESTORED_FILE"], "rb") as f:
     rest_bytes = f.read()
 
 n = len(orig_bytes) // 4
 orig = struct.unpack(f'{n}f', orig_bytes)
 rest = struct.unpack(f'{n}f', rest_bytes)
 
-error_bound = $error_bound
+error_bound = float(os.environ["ERROR_BOUND"])
 
 # Compute errors for each element
 errors = [abs(o - r) for o, r in zip(orig, rest)]
@@ -132,7 +134,7 @@ data_max = max(orig)
 data_range = data_max - data_min
 
 # Write ALL values to CSV
-csv_file = "$csv_file"
+csv_file = os.environ["CSV_FILE"]
 with open(csv_file, 'w', newline='') as f:
     writer = csv.writer(f)
     writer.writerow(['index', 'original', 'restored', 'difference', 'abs_error', 'within_bound'])

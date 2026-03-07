@@ -20,8 +20,8 @@ extern bool g_gc_verbose;
 // Constants and Configuration
 // ============================================================================
 
-#define WARP_SIZE 32
 #define BLOCK_SIZE 256
+#define WARP_SIZE 32  // Used by verify_error_bound_kernel
 
 // Pre-allocated GPU scalars for min/max reduction (avoids per-call malloc/free).
 // 8 bytes each — large enough for both float and double paths.
@@ -38,150 +38,14 @@ static int ensure_range_bufs() {
     return 0;
 }
 
-// ============================================================================
-// Min/Max Reduction Kernels for Data Range Computation
-// ============================================================================
-
-// Float min/max using CAS-based atomics (correct for negative values)
-__global__ void compute_min_max_float_kernel(
-    const float* input,
-    size_t num_elements,
-    float* d_min,
-    float* d_max
-) {
-    __shared__ float s_min[BLOCK_SIZE / WARP_SIZE];
-    __shared__ float s_max[BLOCK_SIZE / WARP_SIZE];
-
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t stride = gridDim.x * blockDim.x;
-
-    float thread_min = FLT_MAX;
-    float thread_max = -FLT_MAX;
-
-    // Grid-stride loop
-    for (size_t i = idx; i < num_elements; i += stride) {
-        float val = input[i];
-        thread_min = fminf(thread_min, val);
-        thread_max = fmaxf(thread_max, val);
-    }
-
-    // Warp-level reduction
-    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-        thread_min = fminf(thread_min, __shfl_down_sync(0xffffffff, thread_min, offset));
-        thread_max = fmaxf(thread_max, __shfl_down_sync(0xffffffff, thread_max, offset));
-    }
-
-    // First thread of each warp writes to shared memory
-    int lane = threadIdx.x % WARP_SIZE;
-    int warp_id = threadIdx.x / WARP_SIZE;
-
-    if (lane == 0) {
-        s_min[warp_id] = thread_min;
-        s_max[warp_id] = thread_max;
-    }
-    __syncthreads();
-
-    // First warp reduces shared memory results
-    if (warp_id == 0 && lane < (BLOCK_SIZE / WARP_SIZE)) {
-        thread_min = s_min[lane];
-        thread_max = s_max[lane];
-
-        for (int offset = (BLOCK_SIZE / WARP_SIZE) / 2; offset > 0; offset /= 2) {
-            thread_min = fminf(thread_min, __shfl_down_sync(0xffffffff, thread_min, offset));
-            thread_max = fmaxf(thread_max, __shfl_down_sync(0xffffffff, thread_max, offset));
-        }
-
-        if (lane == 0) {
-            // Atomic min for floats using CAS
-            // Must use float comparison (not bit comparison) to handle negative values
-            float old_min = *d_min;
-            while (thread_min < old_min) {
-                unsigned int assumed = __float_as_uint(old_min);
-                unsigned int result = atomicCAS((unsigned int*)d_min, assumed, __float_as_uint(thread_min));
-                if (result == assumed) break;
-                old_min = __uint_as_float(result);
-            }
-
-            // Atomic max for floats
-            float old_max = *d_max;
-            while (thread_max > old_max) {
-                unsigned int assumed = __float_as_uint(old_max);
-                unsigned int result = atomicCAS((unsigned int*)d_max, assumed, __float_as_uint(thread_max));
-                if (result == assumed) break;
-                old_max = __uint_as_float(result);
-            }
-        }
-    }
+void free_range_bufs() {
+    if (d_range_min) { cudaFree(d_range_min); d_range_min = nullptr; }
+    if (d_range_max) { cudaFree(d_range_max); d_range_max = nullptr; }
 }
 
-// Double precision version
-__global__ void compute_min_max_double_kernel(
-    const double* input,
-    size_t num_elements,
-    double* d_min,
-    double* d_max
-) {
-    __shared__ double s_min[BLOCK_SIZE / WARP_SIZE];
-    __shared__ double s_max[BLOCK_SIZE / WARP_SIZE];
-
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t stride = gridDim.x * blockDim.x;
-
-    double thread_min = DBL_MAX;
-    double thread_max = -DBL_MAX;
-
-    // Grid-stride loop
-    for (size_t i = idx; i < num_elements; i += stride) {
-        double val = input[i];
-        thread_min = fmin(thread_min, val);
-        thread_max = fmax(thread_max, val);
-    }
-
-    // Warp-level reduction
-    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-        thread_min = fmin(thread_min, __shfl_down_sync(0xffffffff, thread_min, offset));
-        thread_max = fmax(thread_max, __shfl_down_sync(0xffffffff, thread_max, offset));
-    }
-
-    int lane = threadIdx.x % WARP_SIZE;
-    int warp_id = threadIdx.x / WARP_SIZE;
-
-    if (lane == 0) {
-        s_min[warp_id] = thread_min;
-        s_max[warp_id] = thread_max;
-    }
-    __syncthreads();
-
-    if (warp_id == 0 && lane < (BLOCK_SIZE / WARP_SIZE)) {
-        thread_min = s_min[lane];
-        thread_max = s_max[lane];
-
-        for (int offset = (BLOCK_SIZE / WARP_SIZE) / 2; offset > 0; offset /= 2) {
-            thread_min = fmin(thread_min, __shfl_down_sync(0xffffffff, thread_min, offset));
-            thread_max = fmax(thread_max, __shfl_down_sync(0xffffffff, thread_max, offset));
-        }
-
-        if (lane == 0) {
-            // Atomic min/max for doubles using CAS
-            unsigned long long* d_min_ull = (unsigned long long*)d_min;
-            unsigned long long* d_max_ull = (unsigned long long*)d_max;
-
-            unsigned long long old_min = *d_min_ull;
-            while (__longlong_as_double(old_min) > thread_min) {
-                unsigned long long assumed = old_min;
-                old_min = atomicCAS(d_min_ull, assumed, __double_as_longlong(thread_min));
-                if (old_min == assumed) break;
-            }
-
-            unsigned long long old_max = *d_max_ull;
-            while (__longlong_as_double(old_max) < thread_max) {
-                unsigned long long assumed = old_max;
-                old_max = atomicCAS(d_max_ull, assumed, __double_as_longlong(thread_max));
-                if (old_max == assumed) break;
-            }
-        }
-    }
-}
+// ============================================================================
+// Min/Max Reduction via CUB DeviceReduce
+// ============================================================================
 
 // ============================================================================
 // LINEAR QUANTIZATION KERNELS
@@ -310,14 +174,53 @@ __global__ void verify_error_bound_kernel(
 // ============================================================================
 
 /**
- * Compute min/max of data on GPU using caller-provided device buffers.
+ * Compute min/max of data on GPU using CUB DeviceReduce.
  *
  * d_buf_min / d_buf_max must each be at least sizeof(double) bytes.
- * Using per-call or per-CompContext buffers (never shared statics) makes this
- * function safe to call concurrently from multiple CUDA streams.
+ * CUB handles all the warp/block reduction internally.
  *
  * Returns 0 on success, -1 on error.
  */
+template<typename T>
+static int compute_data_range_typed(
+    T* d_input,
+    size_t num_elements,
+    double& data_min,
+    double& data_max,
+    T* d_buf_min,
+    T* d_buf_max,
+    cudaStream_t stream
+) {
+    // Query temp storage size (same for min and max)
+    size_t temp_bytes = 0;
+    cudaError_t err = cub::DeviceReduce::Min(nullptr, temp_bytes, d_input, d_buf_min,
+                                              (int)num_elements, stream);
+    if (err != cudaSuccess) return -1;
+
+    void* d_temp = nullptr;
+    err = cudaMalloc(&d_temp, temp_bytes);
+    if (err != cudaSuccess) return -1;
+
+    err = cub::DeviceReduce::Min(d_temp, temp_bytes, d_input, d_buf_min,
+                                  (int)num_elements, stream);
+    if (err != cudaSuccess) { cudaFree(d_temp); return -1; }
+
+    err = cub::DeviceReduce::Max(d_temp, temp_bytes, d_input, d_buf_max,
+                                  (int)num_elements, stream);
+    if (err != cudaSuccess) { cudaFree(d_temp); return -1; }
+
+    T h_min, h_max;
+    cudaMemcpyAsync(&h_min, d_buf_min, sizeof(T), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(&h_max, d_buf_max, sizeof(T), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+
+    cudaFree(d_temp);
+
+    data_min = static_cast<double>(h_min);
+    data_max = static_cast<double>(h_max);
+    return 0;
+}
+
 static int compute_data_range(
     void* d_input,
     size_t num_elements,
@@ -328,44 +231,15 @@ static int compute_data_range(
     void* d_buf_max,
     cudaStream_t stream
 ) {
-    int num_blocks = min((int)((num_elements + BLOCK_SIZE - 1) / BLOCK_SIZE), 1024);
-
     if (element_size == 4) {
-        float* d_min = static_cast<float*>(d_buf_min);
-        float* d_max = static_cast<float*>(d_buf_max);
-
-        float init_min = FLT_MAX;
-        float init_max = -FLT_MAX;
-        cudaMemcpyAsync(d_min, &init_min, sizeof(float), cudaMemcpyHostToDevice, stream);
-        cudaMemcpyAsync(d_max, &init_max, sizeof(float), cudaMemcpyHostToDevice, stream);
-
-        compute_min_max_float_kernel<<<num_blocks, BLOCK_SIZE, 0, stream>>>(
-            static_cast<float*>(d_input), num_elements, d_min, d_max);
-
-        float h_min, h_max;
-        cudaMemcpyAsync(&h_min, d_min, sizeof(float), cudaMemcpyDeviceToHost, stream);
-        cudaMemcpyAsync(&h_max, d_max, sizeof(float), cudaMemcpyDeviceToHost, stream);
-        cudaStreamSynchronize(stream);
-
-        data_min = h_min;
-        data_max = h_max;
+        return compute_data_range_typed<float>(
+            static_cast<float*>(d_input), num_elements, data_min, data_max,
+            static_cast<float*>(d_buf_min), static_cast<float*>(d_buf_max), stream);
     } else {
-        double* d_min_d = static_cast<double*>(d_buf_min);
-        double* d_max_d = static_cast<double*>(d_buf_max);
-
-        double init_min = DBL_MAX;
-        double init_max = -DBL_MAX;
-        cudaMemcpyAsync(d_min_d, &init_min, sizeof(double), cudaMemcpyHostToDevice, stream);
-        cudaMemcpyAsync(d_max_d, &init_max, sizeof(double), cudaMemcpyHostToDevice, stream);
-
-        compute_min_max_double_kernel<<<num_blocks, BLOCK_SIZE, 0, stream>>>(
-            static_cast<double*>(d_input), num_elements, d_min_d, d_max_d);
-
-        cudaMemcpyAsync(&data_min, d_min_d, sizeof(double), cudaMemcpyDeviceToHost, stream);
-        cudaMemcpyAsync(&data_max, d_max_d, sizeof(double), cudaMemcpyDeviceToHost, stream);
-        cudaStreamSynchronize(stream);
+        return compute_data_range_typed<double>(
+            static_cast<double*>(d_input), num_elements, data_min, data_max,
+            static_cast<double*>(d_buf_min), static_cast<double*>(d_buf_max), stream);
     }
-    return 0;
 }
 
 /**

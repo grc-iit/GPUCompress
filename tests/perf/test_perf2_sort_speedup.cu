@@ -68,13 +68,18 @@ __global__ void kernel_bitonic_sort(const float *d_vals_in,
             for (int j = k >> 1; j >= 1; j >>= 1) {
                 float other_val = __shfl_xor_sync(0xFFFFFFFFu, my_val, j);
                 int   other_idx = __shfl_xor_sync(0xFFFFFFFFu, my_idx, j);
-                int   ixj = tid ^ j;
-                if (ixj > tid) {
-                    if (((tid & k) == 0 && my_val < other_val) ||
-                        ((tid & k) != 0 && my_val > other_val)) {
-                        my_val = other_val;
-                        my_idx = other_idx;
-                    }
+                bool  is_lower  = ((tid ^ j) > tid);
+                bool  swap;
+                if (is_lower) {
+                    swap = ((tid & k) == 0) ? (my_val < other_val)
+                                            : (my_val > other_val);
+                } else {
+                    swap = ((tid & k) == 0) ? (my_val > other_val)
+                                            : (my_val < other_val);
+                }
+                if (swap) {
+                    my_val = other_val;
+                    my_idx = other_idx;
                 }
             }
         }

@@ -7,8 +7,9 @@ if(NOT HDF5_FOUND)
     return()
 endif()
 
-set(HDF5_VOL_INCLUDE /tmp/hdf5-install/include)
-set(HDF5_VOL_LIB     /tmp/hdf5-install/lib/libhdf5.so)
+set(HDF5_VOL_PREFIX "/tmp/hdf5-install" CACHE PATH "HDF5 2.x install prefix for VOL connector")
+set(HDF5_VOL_INCLUDE "${HDF5_VOL_PREFIX}/include" CACHE PATH "HDF5 VOL include directory")
+set(HDF5_VOL_LIB     "${HDF5_VOL_PREFIX}/lib/libhdf5.so" CACHE PATH "HDF5 VOL library path")
 
 if(NOT EXISTS "${HDF5_VOL_LIB}")
     message(STATUS "HDF5 VOL connector: skipped (HDF5 2.x not found at ${HDF5_VOL_LIB})")
@@ -85,15 +86,42 @@ add_vol_test(test_qw4_atomic_counters       tests/regression/test_qw4_atomic_cou
 target_link_libraries(test_qw4_atomic_counters PRIVATE pthread)
 add_vol_test(test_perf16_gather_stream      tests/perf/test_perf16_gather_stream.cu)
 target_link_libraries(test_perf16_gather_stream PRIVATE pthread)
+add_vol_test(test_h6_transfer_counter_race  tests/regression/test_h6_transfer_counter_race.cu)
+target_link_libraries(test_h6_transfer_counter_race PRIVATE pthread)
+add_vol_test(test_h7_null_calloc            tests/regression/test_h7_null_calloc.cu)
+
+# calloc fault injection interposer (plain C, no CUDA)
+add_library(calloc_fault SHARED tests/regression/calloc_fault.c)
+target_link_libraries(calloc_fault PRIVATE dl)
+set_target_properties(calloc_fault PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    PREFIX ""       # produce calloc_fault.so, not libcalloc_fault.so
+)
 
 # ============================================================
-# Examples / Demos
+# Examples / Demos (only build if source files exist)
 # ============================================================
-add_vol_test(sample_gpu_compress_roundtrip  examples/sample_gpu_compress_roundtrip.cu)
-add_vol_demo(demo_gpu_pipeline              examples/demo_gpu_pipeline.cu)
-add_vol_demo(nn_vol_demo                    examples/nn_vol_demo.cu)
-add_vol_demo(grayscott_vol_demo             examples/grayscott_vol_demo.cu)
-add_vol_demo(vpic_vol_demo                  examples/vpic_vol_demo.cu)
+foreach(_demo
+    sample_gpu_compress_roundtrip:examples/sample_gpu_compress_roundtrip.cu:test
+    demo_gpu_pipeline:examples/demo_gpu_pipeline.cu:demo
+    nn_vol_demo:examples/nn_vol_demo.cu:demo
+    grayscott_vol_demo:examples/grayscott_vol_demo.cu:demo
+    vpic_vol_demo:examples/vpic_vol_demo.cu:demo
+)
+    string(REPLACE ":" ";" _parts ${_demo})
+    list(GET _parts 0 _target)
+    list(GET _parts 1 _source)
+    list(GET _parts 2 _type)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_source}")
+        if(_type STREQUAL "test")
+            add_vol_test(${_target} ${_source})
+        else()
+            add_vol_demo(${_target} ${_source})
+        endif()
+    else()
+        message(STATUS "  Skipping ${_target}: ${_source} not found")
+    endif()
+endforeach()
 # ============================================================
 # VOL Benchmarks
 # ============================================================

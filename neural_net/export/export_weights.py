@@ -175,12 +175,28 @@ def verify_export(path: str, model, x_means, x_stds, y_means, y_stds,
         remaining = f.read()
         assert len(remaining) == 0, f"Extra {len(remaining)} bytes at end"
 
-    # Numerical test: run a sample input through both
+    # Numerical test: manual forward pass with exported weights vs PyTorch reference output
     test_input = torch.randn(1, 15)
     with torch.no_grad():
         expected_output = model(test_input).numpy()[0]
 
-    print(f"  Verification PASSED")
+    # Manual forward pass using exported numpy weights to verify correctness
+    x = (test_input.numpy()[0] - xm) / np.clip(xs, 1e-8, None)
+    dims = [(15, 128), (128, 128), (128, 4)]
+    with open(path, 'rb') as f2:
+        f2.read(24)  # skip header
+        f2.read((15 + 15 + 4 + 4) * 4)  # skip norm params
+        for i, (fan_in, fan_out) in enumerate(dims):
+            w = np.frombuffer(f2.read(fan_out * fan_in * 4), dtype=np.float32).reshape(fan_out, fan_in)
+            b = np.frombuffer(f2.read(fan_out * 4), dtype=np.float32)
+            x = w @ x + b
+            if i < len(dims) - 1:
+                x = np.maximum(x, 0)  # ReLU
+    manual_output = x * ys + ym
+    max_diff = np.max(np.abs(manual_output - expected_output))
+    assert max_diff < 1e-5, f"Manual forward pass mismatch: max_diff={max_diff}"
+
+    print(f"  Verification PASSED (manual forward pass max_diff={max_diff:.2e})")
     print(f"  Test inference: {expected_output}")
 
 

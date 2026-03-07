@@ -14,10 +14,11 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra")
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
 set(CMAKE_CUDA_FLAGS_DEBUG "-g -G -O0")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")
-set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -use_fast_math")
+set(CMAKE_CUDA_FLAGS_RELEASE "-O3")
 
 # Target the actual GPU architecture (sm_80 = Ampere A100).
 # Override at configure time: cmake -B build -DCMAKE_CUDA_ARCHITECTURES=90
@@ -31,20 +32,23 @@ find_package(CUDAToolkit REQUIRED)
 # Optional: Find HDF5 for filter plugin
 find_package(HDF5 COMPONENTS C)
 
+# External dependency prefix (nvcomp, etc.)
+set(NVCOMP_PREFIX "/tmp" CACHE PATH "nvcomp install prefix (include/ and lib/)")
+
 # Include directories
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    /tmp/include
+    ${NVCOMP_PREFIX}/include
     /usr/local/cuda/include
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
 # Link directories
-# - /tmp/lib: nvcomp 5.1.0 libraries
+# - nvcomp 5.1.0 libraries
 # - cuFile path: may vary by system; override with -DCMAKE_LIBRARY_PATH=<path>
 link_directories(
-    /tmp/lib
+    ${NVCOMP_PREFIX}/lib
     /opt/nvidia/cuda-12.8/targets/x86_64-linux/lib
 )
 

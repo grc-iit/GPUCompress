@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <cstring>
+#include <strings.h>
 #include <cstdio>
 #include <cinttypes>
 #include <cmath>
@@ -326,6 +327,7 @@ extern "C" void gpucompress_cleanup(void) {
         gpucompress_nn_cleanup_impl();
         gpucompress_free_stats_workspace();
         gpucompress::destroyCompContextPool();
+        free_range_bufs();
         if (g_sgd_stream) { cudaStreamDestroy(g_sgd_stream); g_sgd_stream = nullptr; }
         if (g_sgd_done)   { cudaEventDestroy(g_sgd_done);   g_sgd_done   = nullptr; }
         g_sgd_ever_fired.store(false, std::memory_order_relaxed);
@@ -821,33 +823,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
                             double alt_decomp_ms = 0.0;
                             double alt_psnr = 0.0;
                             {
-                                // Build a temporary header+compressed buffer on GPU for decompression
-                                size_t hdr_sz = GPUCOMPRESS_HEADER_SIZE;
-                                uint8_t* d_rt_buf = nullptr;
-                                if (cudaMalloc(&d_rt_buf, hdr_sz + alt_comp_size) == cudaSuccess) {
-                                    // Build header for this alternative
-                                    CompressionHeader rt_hdr;
-                                    rt_hdr.magic = COMPRESSION_MAGIC;
-                                    rt_hdr.version = COMPRESSION_HEADER_VERSION;
-                                    rt_hdr.shuffle_element_size = alt_shuf_size;
-                                    rt_hdr.original_size = input_size;
-                                    rt_hdr.compressed_size = alt_comp_size;
-                                    if (d_alt_quant && alt_quant_result.isValid()) {
-                                        rt_hdr.setQuantizationFlags(
-                                            static_cast<uint32_t>(alt_quant_result.type),
-                                            alt_quant_result.actual_precision, true);
-                                        rt_hdr.quant_error_bound = alt_quant_result.error_bound;
-                                        rt_hdr.quant_scale = alt_quant_result.scale_factor;
-                                        rt_hdr.data_min = alt_quant_result.data_min;
-                                        rt_hdr.data_max = alt_quant_result.data_max;
-                                    } else {
-                                        rt_hdr.quant_flags = 0;
-                                        rt_hdr.quant_error_bound = 0.0;
-                                        rt_hdr.quant_scale = 0.0;
-                                        rt_hdr.data_min = 0.0;
-                                        rt_hdr.data_max = 0.0;
-                                    }
-
+                                {
                                     // Decompress on GPU
                                     auto rt_decomp = createDecompressionManager(d_alt_out, stream);
                                     if (rt_decomp) {
@@ -862,7 +838,6 @@ extern "C" gpucompress_error_t gpucompress_compress(
                                             } catch (...) {
                                                 // Decompress failed, leave decomp_time and psnr at 0
                                                 cudaFree(d_rt_decompressed);
-                                                cudaFree(d_rt_buf);
                                                 goto skip_roundtrip;
                                             }
 
@@ -941,7 +916,6 @@ extern "C" gpucompress_error_t gpucompress_compress(
                                             cudaFree(d_rt_decompressed);
                                         }
                                     }
-                                    cudaFree(d_rt_buf);
                                 }
                             }
                             skip_roundtrip:
@@ -1497,7 +1471,7 @@ extern "C" gpucompress_algorithm_t gpucompress_algorithm_from_string(const char*
     }
 
     for (int i = 0; i <= 8; i++) {
-        if (strcmp(name, ALGORITHM_NAMES[i]) == 0) {
+        if (strcasecmp(name, ALGORITHM_NAMES[i]) == 0) {
             return static_cast<gpucompress_algorithm_t>(i);
         }
     }
@@ -1980,31 +1954,7 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
                             double alt_decomp_ms = 0.0;
                             double alt_psnr = 0.0;
                             {
-                                size_t hdr_sz = GPUCOMPRESS_HEADER_SIZE;
-                                uint8_t* d_rt_buf = nullptr;
-                                if (cudaMalloc(&d_rt_buf, hdr_sz + alt_comp_size) == cudaSuccess) {
-                                    CompressionHeader rt_hdr;
-                                    rt_hdr.magic = COMPRESSION_MAGIC;
-                                    rt_hdr.version = COMPRESSION_HEADER_VERSION;
-                                    rt_hdr.shuffle_element_size = alt_shuf_size;
-                                    rt_hdr.original_size = input_size;
-                                    rt_hdr.compressed_size = alt_comp_size;
-                                    if (d_alt_quant && alt_quant_result.isValid()) {
-                                        rt_hdr.setQuantizationFlags(
-                                            static_cast<uint32_t>(alt_quant_result.type),
-                                            alt_quant_result.actual_precision, true);
-                                        rt_hdr.quant_error_bound = alt_quant_result.error_bound;
-                                        rt_hdr.quant_scale = alt_quant_result.scale_factor;
-                                        rt_hdr.data_min = alt_quant_result.data_min;
-                                        rt_hdr.data_max = alt_quant_result.data_max;
-                                    } else {
-                                        rt_hdr.quant_flags = 0;
-                                        rt_hdr.quant_error_bound = 0.0;
-                                        rt_hdr.quant_scale = 0.0;
-                                        rt_hdr.data_min = 0.0;
-                                        rt_hdr.data_max = 0.0;
-                                    }
-
+                                {
                                     auto rt_decomp = createDecompressionManager(d_alt_out, stream);
                                     if (rt_decomp) {
                                         DecompressionConfig rt_dc = rt_decomp->configure_decompression(d_alt_out);
@@ -2017,7 +1967,6 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
                                                 rt_decomp->decompress(d_rt_decompressed, d_alt_out, rt_dc);
                                             } catch (...) {
                                                 cudaFree(d_rt_decompressed);
-                                                cudaFree(d_rt_buf);
                                                 goto gpu_skip_roundtrip;
                                             }
 
@@ -2088,7 +2037,6 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
                                             cudaFree(d_rt_decompressed);
                                         }
                                     }
-                                    cudaFree(d_rt_buf);
                                 }
                             }
                             gpu_skip_roundtrip:

@@ -110,6 +110,18 @@ target_include_directories(test_quantization PRIVATE
 target_link_libraries(test_quantization PRIVATE gpucompress CUDA::cudart CUDA::curand)
 set_target_properties(test_quantization PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
+# Quantization CUB min/max verification
+add_executable(test_quantization_cub
+    tests/unit/test_quantization_cub.cu
+)
+set_source_files_properties(tests/unit/test_quantization_cub.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(test_quantization_cub PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_quantization_cub PRIVATE gpucompress CUDA::cudart)
+set_target_properties(test_quantization_cub PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
 # ============================================================
 # Neural Network Tests
 # ============================================================
@@ -193,6 +205,106 @@ target_include_directories(test_bug8_sgd_concurrent PRIVATE
 )
 target_link_libraries(test_bug8_sgd_concurrent PRIVATE gpucompress CUDA::cudart pthread)
 set_target_properties(test_bug8_sgd_concurrent PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+# ============================================================
+# Performance Regression Tests (no HDF5 dependency)
+# ============================================================
+
+add_executable(test_m1m2_global_races tests/regression/test_m1m2_global_races.cu)
+set_source_files_properties(tests/regression/test_m1m2_global_races.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(test_m1m2_global_races PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_link_libraries(test_m1m2_global_races PRIVATE gpucompress CUDA::cudart pthread)
+set_target_properties(test_m1m2_global_races PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+add_executable(test_m4_chunk_history_realloc tests/regression/test_m4_chunk_history_realloc.cu)
+set_source_files_properties(tests/regression/test_m4_chunk_history_realloc.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(test_m4_chunk_history_realloc PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_link_libraries(test_m4_chunk_history_realloc PRIVATE gpucompress CUDA::cudart)
+set_target_properties(test_m4_chunk_history_realloc PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+add_executable(test_m5_header_overread tests/regression/test_m5_header_overread.cu)
+set_source_files_properties(tests/regression/test_m5_header_overread.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(test_m5_header_overread PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_link_libraries(test_m5_header_overread PRIVATE gpucompress CUDA::cudart)
+set_target_properties(test_m5_header_overread PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+add_executable(test_m6_integer_overflow tests/regression/test_m6_integer_overflow.cu)
+set_source_files_properties(tests/regression/test_m6_integer_overflow.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(test_m6_integer_overflow PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_link_libraries(test_m6_integer_overflow PRIVATE gpucompress CUDA::cudart)
+set_target_properties(test_m6_integer_overflow PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+add_executable(test_m7_header_async tests/regression/test_m7_header_async.cu)
+set_source_files_properties(tests/regression/test_m7_header_async.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(test_m7_header_async PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_link_libraries(test_m7_header_async PRIVATE gpucompress CUDA::cudart)
+set_target_properties(test_m7_header_async PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+add_executable(test_m8m9_warp_mask tests/regression/test_m8m9_warp_mask.cu)
+set_source_files_properties(tests/regression/test_m8m9_warp_mask.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(test_m8m9_warp_mask PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_link_libraries(test_m8m9_warp_mask PRIVATE gpucompress CUDA::cudart)
+set_target_properties(test_m8m9_warp_mask PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+add_executable(test_m10_stats_workspace_race tests/regression/test_m10_stats_workspace_race.cu)
+set_source_files_properties(tests/regression/test_m10_stats_workspace_race.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(test_m10_stats_workspace_race PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_link_libraries(test_m10_stats_workspace_race PRIVATE gpucompress CUDA::cudart pthread)
+set_target_properties(test_m10_stats_workspace_race PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+add_executable(test_m11_chunk_arrays_raii tests/regression/test_m11_chunk_arrays_raii.cu)
+set_source_files_properties(tests/regression/test_m11_chunk_arrays_raii.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(test_m11_chunk_arrays_raii PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_link_libraries(test_m11_chunk_arrays_raii PRIVATE gpucompress CUDA::cudart)
+set_target_properties(test_m11_chunk_arrays_raii PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+add_executable(test_m12_range_bufs_race tests/regression/test_m12_range_bufs_race.cu)
+set_source_files_properties(tests/regression/test_m12_range_bufs_race.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(test_m12_range_bufs_race PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_link_libraries(test_m12_range_bufs_race PRIVATE gpucompress CUDA::cudart)
+set_target_properties(test_m12_range_bufs_race PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+add_executable(test_m13_compute_range_errors tests/regression/test_m13_compute_range_errors.cu)
+set_source_files_properties(tests/regression/test_m13_compute_range_errors.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(test_m13_compute_range_errors PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_link_libraries(test_m13_compute_range_errors PRIVATE gpucompress CUDA::cudart)
+set_target_properties(test_m13_compute_range_errors PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+add_executable(test_m3_pool_init_failure tests/regression/test_m3_pool_init_failure.cu)
+set_source_files_properties(tests/regression/test_m3_pool_init_failure.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(test_m3_pool_init_failure PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_link_libraries(test_m3_pool_init_failure PRIVATE gpucompress CUDA::cudart)
+set_target_properties(test_m3_pool_init_failure PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+add_executable(test_h14_cleanup_order tests/regression/test_h14_cleanup_order.cu)
+set_source_files_properties(tests/regression/test_h14_cleanup_order.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(test_h14_cleanup_order PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_link_libraries(test_h14_cleanup_order PRIVATE gpucompress CUDA::cudart)
+set_target_properties(test_h14_cleanup_order PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
 # ============================================================
 # Performance Regression Tests (no HDF5 dependency)

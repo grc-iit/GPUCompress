@@ -131,7 +131,8 @@ static void test_nbytes()
         s.data_type = cases[c].type;
 
         gpucompress_vpic_t handle = NULL;
-        gpucompress_vpic_create(&handle, &s);
+        gpucompress_error_t verr = gpucompress_vpic_create(&handle, &s);
+        TEST_ASSERT(verr == GPUCOMPRESS_SUCCESS && handle != NULL, "vpic_create failed");
 
         /* Attach with NULL pointers just to set element count */
         gpucompress_vpic_attach(handle, NULL, NULL, 0);
@@ -187,7 +188,8 @@ static void roundtrip_test(vpic_data_type_t dtype, size_t n_elem,
     VpicSettings s = vpic_default_settings();
     s.data_type = dtype;
     gpucompress_vpic_t handle = NULL;
-    gpucompress_vpic_create(&handle, &s);
+    gpucompress_error_t verr = gpucompress_vpic_create(&handle, &s);
+    TEST_ASSERT(verr == GPUCOMPRESS_SUCCESS && handle != NULL, "vpic_create failed");
     gpucompress_vpic_attach(handle, d_data, NULL, n_elem);
 
     /* Get pointers back */
