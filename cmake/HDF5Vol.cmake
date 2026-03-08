@@ -78,6 +78,7 @@ add_vol_test(test_vol_8mb             tests/hdf5/test_vol_8mb.cu)
 target_link_libraries(test_vol_8mb PRIVATE H5Zgpucompress)
 add_vol_test(test_correctness_vol     tests/hdf5/test_correctness_vol.cu)
 add_vol_test(test_vol_xfer_audit     tests/hdf5/test_vol_xfer_audit.cu)
+add_vol_test(test_vol_pipeline_comprehensive  tests/hdf5/test_vol_pipeline_comprehensive.cu)
 
 # ============================================================
 # VOL Regression Tests

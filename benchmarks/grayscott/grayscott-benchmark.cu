@@ -83,7 +83,7 @@
 #define TMP_NN_RL    "/tmp/bm_gs_nn_rl.h5"
 #define TMP_NN_RLEXP "/tmp/bm_gs_nn_rlexp.h5"
 
-#define OUT_DIR     "tests/benchmark_grayscott_vol_results"
+#define OUT_DIR     "benchmarks/grayscott/results"
 #define OUT_CSV     OUT_DIR "/benchmark_grayscott_vol.csv"
 #define OUT_CHUNKS  OUT_DIR "/benchmark_grayscott_vol_chunks.csv"
 #define OUT_UB_CSV  OUT_DIR "/upper_bound.csv"

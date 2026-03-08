@@ -755,8 +755,8 @@ begin_diagnostics {
 
     // Write CSV results
     {
-        const char* csv_dir  = "benchmark_vpic_deck_results";
-        const char* csv_path = "benchmark_vpic_deck_results/benchmark_vpic_deck.csv";
+        const char* csv_dir  = GPU_DIR "/benchmarks/vpic-kokkos/results";
+        const char* csv_path = GPU_DIR "/benchmarks/vpic-kokkos/results/benchmark_vpic_deck.csv";
         mkdir(csv_dir, 0755);
         FILE* csv = fopen(csv_path, "w");
         if (csv) {

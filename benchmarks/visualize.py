@@ -77,11 +77,13 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)  # benchmarks/ -> GPUCompress/
 
 DEFAULT_GS_PATHS = [
+    os.path.join(PROJECT_ROOT, "benchmarks/grayscott/results/benchmark_grayscott_vol.csv"),
     os.path.join(PROJECT_ROOT, "tests/benchmark_grayscott_vol_results/benchmark_grayscott_vol.csv"),
     os.path.join(PROJECT_ROOT, "benchmarks/grayscott/benchmark_grayscott_vol.csv"),
 ]
 
 DEFAULT_VPIC_PATHS = [
+    os.path.join(PROJECT_ROOT, "benchmarks/vpic-kokkos/results/benchmark_vpic_deck.csv"),
     os.path.join(PROJECT_ROOT, "benchmarks/vpic-kokkos/benchmark_vpic_deck_results/benchmark_vpic_deck.csv"),
     os.path.join(PROJECT_ROOT, "benchmarks/vpic-kokkos/benchmark_vpic_deck.csv"),
     os.path.join(PROJECT_ROOT, "benchmarks/vpic/benchmark_vpic_deck.csv"),
@@ -261,8 +263,19 @@ def plot_nn_stats(ax, phases, rows):
     ax.set_ylim(0, max(max(sgd_pct, default=0), max(expl_pct, default=0)) * 1.3 + 5)
     ax.set_title("NN Adaptation: SGD Fires & Explorations", fontsize=11,
                  fontweight="bold")
-    ax.legend(fontsize=8)
+    ax.legend(fontsize=8, loc="upper left")
     ax.grid(axis="y", alpha=0.3)
+
+    # Hyperparameter annotation box
+    param_text = (
+        "SGD:  LR=0.4, MAPE thresh=20%\n"
+        "Explore:  MAPE thresh=50%, K=5"
+    )
+    ax.text(0.98, 0.97, param_text, transform=ax.transAxes,
+            fontsize=7.5, verticalalignment="top", horizontalalignment="right",
+            bbox=dict(boxstyle="round,pad=0.4", facecolor="#f8f9fa",
+                      edgecolor="#aab0b5", alpha=0.9),
+            family="monospace")
 
 
 def plot_verification(ax, phases, rows):
@@ -395,7 +408,7 @@ def main():
                 f"Chunks: {n_ch} x {chunk_mb:.0f} MB | "
                 f"Steps: {steps} | F={F_val}, k={k_val}")
 
-        out_dir = os.path.join(args.output_dir or script_dir, "grayscott")
+        out_dir = args.output_dir or os.path.join(script_dir, "grayscott", "results")
         out_png = os.path.join(out_dir, "benchmark_grayscott.png")
         make_figure("Gray-Scott Simulation", rows, out_png, meta)
 
@@ -411,7 +424,7 @@ def main():
                 f"Chunks: {n_ch} x {chunk_mb:.0f} MB | "
                 f"Source: Real VPIC Harris Sheet Simulation")
 
-        out_dir = os.path.join(args.output_dir or script_dir, "vpic")
+        out_dir = args.output_dir or os.path.join(script_dir, "vpic-kokkos", "results")
         out_png = os.path.join(out_dir, "benchmark_vpic.png")
         make_figure("VPIC Harris Sheet Reconnection", rows, out_png, meta)
 
