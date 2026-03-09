@@ -647,7 +647,7 @@ int main(int argc, char **argv)
     int total_runs = 2 + n_lrs * n_mapes;  /* oracle + baseline + SGD */
 
     printf("╔═══════════════════════════════════════════════════════════════════════════╗\n");
-    printf("║  Gray-Scott Adaptiveness Benchmark: Oracle vs Baseline vs SGD            ║\n");
+    printf("║  Gray-Scott Adaptiveness Benchmark: Exhaustive vs Baseline vs SGD         ║\n");
     printf("╚═══════════════════════════════════════════════════════════════════════════╝\n\n");
     printf("  Grid     : %d^3 = %zu floats (%.1f MB)\n", L, n_floats, dataset_mb);
     printf("  Chunks   : %d x %d x %d  (%d chunks, %.1f MB each)\n",
@@ -655,7 +655,7 @@ int main(int argc, char **argv)
     printf("  Steps    : %d\n", steps);
     printf("  Pattern  : F=%.4f  k=%.5f\n", F, k);
     printf("  Weights  : %s\n", weights_path);
-    printf("  Total runs: %d (1 oracle + 1 baseline + %d SGD)\n\n",
+    printf("  Total runs: %d (1 exhaustive + 1 baseline + %d SGD)\n\n",
            total_runs, n_lrs * n_mapes);
 
     /* Create output directory */
@@ -724,7 +724,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "  Oracle pass failed\n");
         any_fail = 1;
     }
-    printf("\n  Oracle aggregate ratio: %.2fx\n", oracle_ratio);
+    printf("\n  Exhaustive aggregate ratio: %.2fx\n", oracle_ratio);
     printf("  Upper-bound CSV written to: %s\n", OUT_UB_CSV);
 
     /* ────────────────────────────────────────────────────────────────────
@@ -751,7 +751,7 @@ int main(int argc, char **argv)
     write_chunk_csv("baseline", n_chunks, &baseline_res);
 
     double baseline_ratio = baseline_res.ratio;
-    printf("\n  Baseline ratio: %.2fx  (oracle: %.2fx, gap: %.1f%%)\n",
+    printf("\n  Baseline ratio: %.2fx  (exhaustive: %.2fx, gap: %.1f%%)\n",
            baseline_ratio, oracle_ratio,
            oracle_ratio > 0 ? (1.0 - baseline_ratio / oracle_ratio) * 100.0 : 0);
 
@@ -761,7 +761,7 @@ int main(int argc, char **argv)
     FILE *f_sgd = fopen(OUT_SGD_CSV, "w");
     if (f_sgd) {
         fprintf(f_sgd, "lr,mape_threshold,n_chunks,final_mape,convergence_chunks,"
-                        "ratio,ratio_vs_oracle,sgd_fire_rate,"
+                        "ratio,ratio_vs_exhaustive,sgd_fire_rate,"
                         "total_write_ms,total_sgd_ms,"
                         "total_nn_inference_ms,total_compression_ms,"
                         "ratio_min,ratio_max,ratio_stddev,"
@@ -864,7 +864,7 @@ int main(int argc, char **argv)
 
             double sgd_fire_rate = (sgd_res.n_chunks > 0)
                 ? (double)sgd_res.sgd_fires / sgd_res.n_chunks : 0;
-            double ratio_vs_oracle = (oracle_ratio > 0)
+            double ratio_vs_exhaustive = (oracle_ratio > 0)
                 ? sgd_res.ratio / oracle_ratio : 0;
 
             if (f_sgd) {
@@ -874,7 +874,7 @@ int main(int argc, char **argv)
                                "%.4f,%.4f,%.4f,%.1f,%.2f,%llu\n",
                         lr, mape, sgd_res.n_chunks,
                         final_mape_val, convergence_chunks,
-                        sgd_res.ratio, ratio_vs_oracle, sgd_fire_rate,
+                        sgd_res.ratio, ratio_vs_exhaustive, sgd_fire_rate,
                         sgd_res.write_ms, sgd_res.total_sgd_ms,
                         sgd_res.total_nn_inference_ms, sgd_res.total_compression_ms,
                         sgd_res.ratio_min, sgd_res.ratio_max, sgd_res.ratio_stddev,
@@ -909,11 +909,11 @@ int main(int argc, char **argv)
            L, dataset_mb, n_chunks, cmb, steps);
     printf("║  Pattern: F=%.4f  k=%.5f\n", F, k);
     printf("╠═══════════════════════════════════════════════════════════════════════════╣\n");
-    printf("║  Oracle (best-static):   %.2fx\n", oracle_ratio);
-    printf("║  Baseline (NN only):     %.2fx  (%.1f%% of oracle)\n",
+    printf("║  Exhaustive (best-static):   %.2fx\n", oracle_ratio);
+    printf("║  Baseline (NN only):         %.2fx  (%.1f%% of exhaustive)\n",
            baseline_ratio, oracle_ratio > 0 ? baseline_ratio / oracle_ratio * 100.0 : 0);
     if (n_lrs > 0) {
-        printf("║  Best SGD (lr=%.2f mt=%.2f): %.2fx  (%.1f%% of oracle)\n",
+        printf("║  Best SGD (lr=%.2f mt=%.2f):   %.2fx  (%.1f%% of exhaustive)\n",
                best_sgd_lr, best_sgd_mt, best_sgd_ratio,
                oracle_ratio > 0 ? best_sgd_ratio / oracle_ratio * 100.0 : 0);
     }
@@ -926,7 +926,7 @@ int main(int argc, char **argv)
             fprintf(f, "phase,ratio,sim_ms,write_ms,read_ms,file_mib,orig_mib,"
                        "write_mibps,read_mibps,mismatches,sgd_fires,n_chunks,"
                        "ratio_min,ratio_max,ratio_stddev,mean_prediction_error_pct\n");
-            fprintf(f, "oracle,%.4f,%.2f,0,0,0,%.2f,0,0,0,0,%d,0,0,0,0\n",
+            fprintf(f, "exhaustive,%.4f,%.2f,0,0,0,%.2f,0,0,0,0,%d,0,0,0,0\n",
                     oracle_ratio, sim_ms, dataset_mb, n_chunks);
             baseline_res.sim_ms = sim_ms;
             fprintf(f, "baseline,%.4f,%.2f,%.2f,%.2f,%.2f,%.2f,"

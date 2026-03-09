@@ -99,15 +99,6 @@ target_include_directories(test_shuffle PRIVATE
 target_link_libraries(test_shuffle PRIVATE gpucompress CUDA::cudart)
 set_target_properties(test_shuffle PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
-# CPU stats test
-add_executable(test_cpu_stats tests/unit/test_cpu_stats.cu)
-target_include_directories(test_cpu_stats PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-)
-target_link_libraries(test_cpu_stats PRIVATE gpucompress CUDA::cudart)
-set_target_properties(test_cpu_stats PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-
 # Quantization suite
 add_executable(test_quantization
     tests/unit/quantization/test_quantization_suite.cu

@@ -328,6 +328,24 @@ __global__ void nnInferenceKernel(
  * ============================================================ */
 
 /**
+ * OOD detection on the 5 continuous features (indices 10-14).
+ * Returns 1 if any feature is >10% outside the training range.
+ */
+__device__ static inline int detect_ood(
+    const float s_enc[5], const NNWeightsGPU* __restrict__ weights)
+{
+    for (int i = 0; i < 5; i++) {
+        int idx = 10 + i;
+        float range = weights->x_maxs[idx] - weights->x_mins[idx];
+        float margin = range * 0.10f;
+        if (s_enc[i] < weights->x_mins[idx] - margin ||
+            s_enc[i] > weights->x_maxs[idx] + margin)
+            return 1;
+    }
+    return 0;
+}
+
+/**
  * Fused GPU kernel: same as nnInferenceKernel but reads stats from
  * AutoStatsGPU device pointer instead of scalar params.
  * Thread 0 also performs OOD detection on the 5 continuous features.
@@ -408,22 +426,7 @@ __global__ void nnFusedInferenceKernel(
             out_result->predicted_ratio = s_ratios[winner];
             out_result->predicted_comp_time = s_comp_times[winner];
 
-            // OOD detection on continuous features (indices 10-14)
-            // Reuse s_enc[] — already computed before the forward pass.
-            int ood = 0;
-            float features[5] = { s_enc[0], s_enc[1], s_enc[2], s_enc[3], s_enc[4] };
-            int indices[5] = {10, 11, 12, 13, 14};
-            for (int i = 0; i < 5; i++) {
-                int idx = indices[i];
-                float range = weights->x_maxs[idx] - weights->x_mins[idx];
-                float margin = range * 0.10f;
-                if (features[i] < weights->x_mins[idx] - margin ||
-                    features[i] > weights->x_maxs[idx] + margin) {
-                    ood = 1;
-                    break;
-                }
-            }
-            out_result->is_ood = ood;
+            out_result->is_ood = detect_ood(s_enc, weights);
         }
     } else {
         // Tree reduction
@@ -442,21 +445,7 @@ __global__ void nnFusedInferenceKernel(
             out_result->predicted_ratio = s_ratios[winner];
             out_result->predicted_comp_time = s_comp_times[winner];
 
-            // OOD detection — reuse s_enc[] computed before the forward pass.
-            int ood = 0;
-            float features[5] = { s_enc[0], s_enc[1], s_enc[2], s_enc[3], s_enc[4] };
-            int indices[5] = {10, 11, 12, 13, 14};
-            for (int i = 0; i < 5; i++) {
-                int idx = indices[i];
-                float range = weights->x_maxs[idx] - weights->x_mins[idx];
-                float margin = range * 0.10f;
-                if (features[i] < weights->x_mins[idx] - margin ||
-                    features[i] > weights->x_maxs[idx] + margin) {
-                    ood = 1;
-                    break;
-                }
-            }
-            out_result->is_ood = ood;
+            out_result->is_ood = detect_ood(s_enc, weights);
         }
     }
 }
@@ -484,15 +473,8 @@ static void freeFusedInferenceBuffers() {
  * GPU SGD Kernel
  * ============================================================ */
 
-// Total gradient buffer size in floats
-static constexpr int SGD_GRAD_SIZE =
-    NN_HIDDEN_DIM * NN_INPUT_DIM +   // dw1: 1920
-    NN_HIDDEN_DIM +                    // db1: 128
-    NN_HIDDEN_DIM * NN_HIDDEN_DIM +   // dw2: 16384
-    NN_HIDDEN_DIM +                    // db2: 128
-    NN_OUTPUT_DIM * NN_HIDDEN_DIM +   // dw3: 512
-    NN_OUTPUT_DIM;                     // db3: 4
-// = 19076 floats = ~76KB
+// Total gradient buffer size in floats (from nn_weights.h)
+static constexpr int SGD_GRAD_SIZE = NN_SGD_GRAD_SIZE; // 19076 floats = ~76KB
 
 // Offsets into gradient buffer
 static constexpr int SGD_OFF_DW1 = 0;
@@ -1003,10 +985,9 @@ bool isInputOOD(double entropy, double mad, double deriv,
         static_cast<float>(mad),            // index 13
         static_cast<float>(deriv)           // index 14
     };
-    int indices[5] = {10, 11, 12, 13, 14};
 
     for (int i = 0; i < 5; i++) {
-        int idx = indices[i];
+        int idx = 10 + i;
         float range = g_x_maxs[idx] - g_x_mins[idx];
         float margin = range * 0.10f;  // 10% margin
         if (features[i] < g_x_mins[idx] - margin ||
@@ -1051,13 +1032,6 @@ const NNWeightsGPU* getNNWeightsDevicePtr() {
  */
 void setNNRankCriterion(NNRankCriterion criterion) {
     g_rank_criterion = criterion;
-}
-
-/**
- * Get current ranking criterion.
- */
-NNRankCriterion getNNRankCriterion() {
-    return g_rank_criterion;
 }
 
 /**

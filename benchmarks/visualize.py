@@ -55,11 +55,11 @@ def g(row, *keys, default=0.0):
 
 # ── Constants ──────────────────────────────────────────────────────────
 
-PHASE_ORDER = ["no-comp", "oracle", "nn", "nn-rl", "nn-rl+exp50"]
+PHASE_ORDER = ["no-comp", "exhaustive", "nn", "nn-rl", "nn-rl+exp50"]
 
 PHASE_COLORS = {
     "no-comp":     "#95a5a6",
-    "oracle":      "#8e44ad",
+    "exhaustive":  "#8e44ad",
     "nn":          "#2ecc71",
     "nn-rl":       "#e67e22",
     "nn-rl+exp50": "#e74c3c",
@@ -67,7 +67,7 @@ PHASE_COLORS = {
 
 PHASE_LABELS = {
     "no-comp":     "No Comp",
-    "oracle":      "Oracle\n(Exhaustive)",
+    "exhaustive":  "Exhaustive\nSearch",
     "nn":          "NN\n(Inference)",
     "nn-rl":       "NN+SGD",
     "nn-rl+exp50": "NN+SGD\n+Explore",
@@ -99,9 +99,16 @@ def find_csv(candidates):
 
 # ── Plotting functions ─────────────────────────────────────────────────
 
+_PHASE_ALIASES = {"oracle": "exhaustive"}
+
+
 def _ordered(rows):
     """Return rows ordered by PHASE_ORDER."""
-    by_phase = {r["phase"]: r for r in rows}
+    by_phase = {}
+    for r in rows:
+        phase = _PHASE_ALIASES.get(r["phase"], r["phase"])
+        r["phase"] = phase
+        by_phase[phase] = r
     phases = [p for p in PHASE_ORDER if p in by_phase]
     return phases, [by_phase[p] for p in phases]
 
@@ -327,7 +334,7 @@ def make_figure(source_name, rows, output_path, meta_text=""):
     fig.text(0.5, 0.99, f"GPUCompress 5-Phase Benchmark: {source_name}",
              ha="center", fontsize=15, fontweight="bold", va="top")
     fig.text(0.5, 0.97,
-             "End-to-end compression pipeline comparison: no compression, oracle (exhaustive search),\n"
+             "End-to-end compression pipeline comparison: no compression, exhaustive search,\n"
              "NN inference-only, NN + online SGD, and NN + SGD + exploration.\n"
              "Measures compression ratio, read/write throughput, timing breakdown, and data verification.",
              ha="center", fontsize=9, color="#555", va="top", style="italic")
@@ -377,11 +384,22 @@ def make_figure(source_name, rows, output_path, meta_text=""):
 def main():
     parser = argparse.ArgumentParser(
         description="Unified GPUCompress benchmark visualizer")
+    parser.add_argument("csvs", nargs="*",
+                        help="Positional CSV paths (auto-classified as gs/vpic)")
     parser.add_argument("--gs-csv", help="Gray-Scott aggregate CSV path")
     parser.add_argument("--vpic-csv", help="VPIC aggregate CSV path")
     parser.add_argument("--output-dir",
                         help="Output directory (default: same as CSV)")
     args = parser.parse_args()
+
+    # Classify positional CSVs by path keywords
+    for csv_path in args.csvs:
+        if "vpic" in csv_path.lower():
+            if not args.vpic_csv:
+                args.vpic_csv = csv_path
+        else:
+            if not args.gs_csv:
+                args.gs_csv = csv_path
 
     gs_path = args.gs_csv or find_csv(DEFAULT_GS_PATHS)
     vpic_path = args.vpic_csv or find_csv(DEFAULT_VPIC_PATHS)

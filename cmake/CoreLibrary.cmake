@@ -14,7 +14,6 @@ set(PREPROCESSING_SOURCES
 set(LIB_SOURCES
     src/api/gpucompress_api.cpp
     src/stats/entropy_kernel.cu
-    src/stats/stats_cpu.cpp
     src/nn/nn_gpu.cu
     src/stats/stats_kernel.cu
     src/gray-scott/gray_scott_gpu.cu

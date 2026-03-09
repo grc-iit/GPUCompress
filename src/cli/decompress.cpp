@@ -14,8 +14,6 @@
 #include <sys/stat.h>
 #include <string>
 #include <memory>
-#include <algorithm>
-#include <cctype>
 #include <cuda_runtime.h>
 #include <cufile.h>
 

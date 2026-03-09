@@ -86,6 +86,8 @@ def load_csv(path):
         for row in reader:
             ts = int(row["timestep"]) if has_timestep else 0
             phase = row["phase"]
+            if phase == "oracle":
+                phase = "exhaustive"
             chunk = int(row["chunk"])
             algo = row.get("action_final", "")
             if not algo:
@@ -121,9 +123,9 @@ def plot_single_timestep(data, timesteps, out_path, title=None):
     n_phases = len(phase_names)
     has_ratio = any(r[3] > 0 for recs in phases.values() for r in recs)
 
-    oracle_ratios = None
-    if "oracle" in phases:
-        oracle_ratios = [r[3] for r in phases["oracle"]]
+    exhaustive_ratios = None
+    if "exhaustive" in phases:
+        exhaustive_ratios = [r[3] for r in phases["exhaustive"]]
 
     if has_ratio:
         fig, axes = plt.subplots(n_phases, 2, figsize=(18, 3.0 * n_phases + 1.5),
@@ -173,12 +175,12 @@ def plot_single_timestep(data, timesteps, out_path, title=None):
         if ax_ratio is not None and has_ratio:
             x = np.arange(n_chunks)
             ax_ratio.bar(x, ratios, color=colors, edgecolor="white", linewidth=0.3, width=1.0)
-            if oracle_ratios is not None and phase != "oracle" and len(oracle_ratios) == n_chunks:
-                ax_ratio.plot(x, oracle_ratios, color="goldenrod", linewidth=1.5,
-                              alpha=0.85, label="oracle best", zorder=5)
+            if exhaustive_ratios is not None and phase != "exhaustive" and len(exhaustive_ratios) == n_chunks:
+                ax_ratio.plot(x, exhaustive_ratios, color="goldenrod", linewidth=1.5,
+                              alpha=0.85, label="exhaustive best", zorder=5)
             all_y = list(ratios)
-            if oracle_ratios and phase != "oracle":
-                all_y += list(oracle_ratios)
+            if exhaustive_ratios and phase != "exhaustive":
+                all_y += list(exhaustive_ratios)
             all_y_sorted = sorted(all_y)
             p95 = all_y_sorted[min(len(all_y_sorted) - 1, int(0.95 * len(all_y_sorted)))]
             y_ceil = p95 * 1.5
@@ -225,9 +227,9 @@ def plot_multi_timestep(data, timesteps, out_path, title=None):
     from matplotlib.colors import ListedColormap, BoundaryNorm
 
     # Collect oracle data (t=0 baseline)
-    oracle_key = (0, "oracle")
-    oracle_recs = data.get(oracle_key, [])
-    n_chunks = len(oracle_recs) if oracle_recs else 0
+    exhaustive_key = (0, "exhaustive")
+    exhaustive_recs = data.get(exhaustive_key, [])
+    n_chunks = len(exhaustive_recs) if exhaustive_recs else 0
 
     # Collect nn-rl+exp50 across all timesteps
     adapt_phase = "nn-rl+exp50"
@@ -263,10 +265,10 @@ def plot_multi_timestep(data, timesteps, out_path, title=None):
     ratio_rows = []
 
     # Oracle row
-    if oracle_recs:
-        row_labels.append("oracle (t=0)")
-        heatmap_rows.append([algo_to_idx.get(r[2], 0) for r in oracle_recs])
-        ratio_rows.append([r[3] for r in oracle_recs])
+    if exhaustive_recs:
+        row_labels.append("exhaustive (t=0)")
+        heatmap_rows.append([algo_to_idx.get(r[2], 0) for r in exhaustive_recs])
+        ratio_rows.append([r[3] for r in exhaustive_recs])
 
     # nn at t=0
     nn_key = (0, "nn")
@@ -322,7 +324,7 @@ def plot_multi_timestep(data, timesteps, out_path, title=None):
         ax_heat.axhline(n_baseline - 0.5, color="white", linewidth=2)
 
     # Ratio heatmap
-    oracle_rats = np.array(ratio_rows[0]) if oracle_recs else None
+    exhaustive_rats = np.array(ratio_rows[0]) if exhaustive_recs else None
     # Use p95 for vmax to avoid outlier tail chunks
     all_rats = rmap[rmap > 0]
     if len(all_rats) > 0:
@@ -355,10 +357,10 @@ def plot_multi_timestep(data, timesteps, out_path, title=None):
     # Also generate per-timestep ratio trend line
     out_dir = os.path.dirname(out_path)
     trend_path = os.path.join(out_dir, "chunks_ratio_trend.png")
-    plot_ratio_trend(data, adapt_ts, oracle_recs, n_chunks, trend_path, title)
+    plot_ratio_trend(data, adapt_ts, exhaustive_recs, n_chunks, trend_path, title)
 
 
-def plot_ratio_trend(data, adapt_ts, oracle_recs, n_chunks, out_path, title=None):
+def plot_ratio_trend(data, adapt_ts, exhaustive_recs, n_chunks, out_path, title=None):
     """Line plot: mean compression ratio per timestep vs oracle baseline."""
     adapt_phase = "nn-rl+exp50"
     mean_ratios = []
@@ -371,15 +373,15 @@ def plot_ratio_trend(data, adapt_ts, oracle_recs, n_chunks, out_path, title=None
         sgd_counts.append(sum(1 for r in recs if r[5]))
         expl_counts.append(sum(1 for r in recs if r[6]))
 
-    oracle_mean = 0
-    if oracle_recs:
-        oracle_mean = np.mean([r[3] for r in oracle_recs if r[3] > 0])
+    exhaustive_mean = 0
+    if exhaustive_recs:
+        exhaustive_mean = np.mean([r[3] for r in exhaustive_recs if r[3] > 0])
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
 
     ax1.plot(adapt_ts, mean_ratios, "o-", color="#9467bd", linewidth=2, label="nn-rl+exp50")
-    if oracle_mean > 0:
-        ax1.axhline(oracle_mean, color="goldenrod", linewidth=1.5, linestyle="--", label=f"oracle ({oracle_mean:.1f}x)")
+    if exhaustive_mean > 0:
+        ax1.axhline(exhaustive_mean, color="goldenrod", linewidth=1.5, linestyle="--", label=f"exhaustive ({exhaustive_mean:.1f}x)")
     ax1.set_ylabel("Mean compression ratio")
     ax1.legend(fontsize=9)
     ax1.grid(alpha=0.3)
@@ -398,13 +400,43 @@ def plot_ratio_trend(data, adapt_ts, oracle_recs, n_chunks, out_path, title=None
     print(f"Saved: {out_path}")
 
 
+# ── Auto-detection ────────────────────────────────────────────────
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+
+DEFAULT_CHUNK_PATHS = [
+    os.path.join(PROJECT_ROOT, "benchmarks/grayscott/results/benchmark_grayscott_vol_chunks.csv"),
+    os.path.join(PROJECT_ROOT, "benchmarks/vpic-kokkos/results/benchmark_vpic_deck_chunks.csv"),
+    os.path.join(PROJECT_ROOT, "benchmarks/grayscott/benchmark_grayscott_vol_chunks.csv"),
+    os.path.join(PROJECT_ROOT, "benchmarks/vpic-kokkos/benchmark_vpic_deck_chunks.csv"),
+]
+
+
+def find_chunk_csv():
+    for p in DEFAULT_CHUNK_PATHS:
+        if os.path.exists(p):
+            return p
+    return None
+
+
 # ── Main ─────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="Visualize per-chunk algorithm selection")
-    parser.add_argument("csv", help="Path to benchmark chunks CSV")
+    parser.add_argument("csv", nargs="?", default=None,
+                        help="Path to benchmark chunks CSV (auto-detected if omitted)")
     parser.add_argument("--out", default=None, help="Output image path (default: <csv_dir>/chunks_viz.png)")
     parser.add_argument("--title", default=None, help="Figure title")
     args = parser.parse_args()
+
+    if args.csv is None:
+        args.csv = find_chunk_csv()
+        if args.csv is None:
+            print("ERROR: No chunk CSV found. Expected locations:", file=sys.stderr)
+            for p in DEFAULT_CHUNK_PATHS:
+                print(f"  {p}", file=sys.stderr)
+            print("\nRun benchmarks first, or pass a CSV path as argument.", file=sys.stderr)
+            sys.exit(1)
+        print(f"Auto-detected: {args.csv}")
 
     if args.out is None:
         csv_dir = os.path.dirname(os.path.abspath(args.csv))

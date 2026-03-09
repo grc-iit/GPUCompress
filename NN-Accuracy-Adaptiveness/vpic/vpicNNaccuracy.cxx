@@ -6,17 +6,17 @@
  * performance at each diagnostic timestep as the plasma physics evolves.
  *
  * NN Baseline and NN+SGD compress every simulation step (realistic I/O).
- * Oracle runs at the diagnostic interval (+ first and last step).
+ * Exhaustive runs at the diagnostic interval (+ first and last step).
  *
  * Strategies:
- *   0. Oracle       : exhaustive best-config per chunk (at diag interval)
+ *   0. Exhaustive   : exhaustive best-config per chunk (at diag interval)
  *   1. NN Baseline  : ALGO_AUTO inference-only (every step)
  *   2. NN + SGD     : ALGO_AUTO with online learning (every step, persistent)
  *
  * OUTPUT:
  *   benchmarks/vpic/sim_timestep_metrics.csv   — per-timestep ratio/MAPE
  *   benchmarks/vpic/sim_chunk_metrics.csv      — per-chunk per-timestep detail
- *   benchmarks/vpic/sim_upper_bound.csv        — oracle exhaustive results
+ *   benchmarks/vpic/sim_upper_bound.csv        — exhaustive search results
  *   benchmarks/vpic/sim_aggregate.csv          — aggregate summary
  */
 
@@ -46,7 +46,7 @@
 //   VPIC_NX                    — grid side length         (default: 128)
 //   GPUCOMPRESS_SGD_LR         — SGD learning rate       (default: 0.5)
 //   GPUCOMPRESS_SGD_MAPE       — MAPE threshold          (default: 0.25)
-//   GPUCOMPRESS_DIAG_INTERVAL  — oracle + logging every N steps (default: 20)
+//   GPUCOMPRESS_DIAG_INTERVAL  — exhaustive + logging every N steps (default: 20)
 //   GPUCOMPRESS_NUM_STEPS      — total simulation steps  (default: 1000)
 //   GPUCOMPRESS_CHUNK_MB       — chunk size in MB        (default: 8)
 // ============================================================
@@ -657,7 +657,7 @@ begin_initialization {
     }
 
     sim_log("╔═══════════════════════════════════════════════════════════════════════════╗");
-    sim_log("║  Simulation-Based VPIC Benchmark: Oracle + NN + SGD Per-Timestep         ║");
+    sim_log("║  Simulation-Based VPIC Benchmark: Exhaustive + NN + SGD Per-Timestep     ║");
     sim_log("╚═══════════════════════════════════════════════════════════════════════════╝");
     sim_log("");
     sim_log("  Grid        : " << grid_n << "x" << grid_n << "x" << grid_n
@@ -665,7 +665,7 @@ begin_initialization {
     sim_log("  Fields      : " << field_bytes / (1024*1024) << " MB");
     sim_log("  Chunks      : " << global->chunk_bytes / (1024*1024) << " MB each ("
             << (field_bytes / global->chunk_bytes) << " chunks)");
-    sim_log("  Diag every  : " << global->diag_interval << " steps (oracle + logging)");
+    sim_log("  Diag every  : " << global->diag_interval << " steps (exhaustive + logging)");
     sim_log("  Total steps : " << global->num_steps);
     sim_log("  SGD         : lr=" << global->sgd_lr << " mt=" << global->sgd_mape_thresh);
     sim_log("  Weights     : " << (weights_path ? weights_path : "(fallback)"));
@@ -677,7 +677,7 @@ begin_initialization {
 // Diagnostics: NN passes every step, oracle at interval
 //
 // - NN Baseline and NN+SGD compress every step (realistic I/O)
-// - Oracle runs at diag_interval steps (+ first & last)
+// - Exhaustive runs at diag_interval steps (+ first & last)
 // ============================================================
 begin_diagnostics {
     if (!global->gpucompress_ready) return;
@@ -709,7 +709,7 @@ begin_diagnostics {
                 << ") ────────");
     }
 
-    /* ── Oracle: only at diag interval, first step, and last step ── */
+    /* ── Exhaustive: only at diag interval, first step, and last step ── */
     if (is_diag) {
         FILE* f_ub = fopen(OUT_UB_CSV, "a");
         oracle_ratio = run_oracle_pass(d_fields, n_floats,
@@ -720,14 +720,14 @@ begin_diagnostics {
         StepResult r;
         memset(&r, 0, sizeof(r));
         r.timestep = ts;
-        snprintf(r.phase, sizeof(r.phase), "oracle");
+        snprintf(r.phase, sizeof(r.phase), "exhaustive");
         r.ratio = oracle_ratio;
         r.n_chunks = n_chunks;
         r.orig_bytes = n_floats * sizeof(float);
         results[n_results++] = r;
 
         if (is_diag) {
-            printf("  oracle    : ratio=%.2fx\n", oracle_ratio);
+            printf("  exhaustive: ratio=%.2fx\n", oracle_ratio);
         }
     }
 
@@ -817,7 +817,7 @@ begin_diagnostics {
             fprintf(f, "phase,ratio,write_ms,read_ms,file_mib,orig_mib,"
                        "write_mibps,read_mibps,mismatches,sgd_fires,n_chunks,"
                        "ratio_min,ratio_max,ratio_stddev,mean_prediction_error_pct\n");
-            fprintf(f, "oracle,%.4f,0,0,0,%.2f,0,0,0,0,%d,0,0,0,0\n",
+            fprintf(f, "exhaustive,%.4f,0,0,0,%.2f,0,0,0,0,%d,0,0,0,0\n",
                     oracle_ratio,
                     (double)(n_floats * sizeof(float)) / (1 << 20),
                     n_chunks);
@@ -853,7 +853,7 @@ begin_diagnostics {
         sim_log("║  Simulation Benchmark Complete                                           ║");
         sim_log("╠═══════════════════════════════════════════════════════════════════════════╣");
         sim_log("  Total steps      : " << global->num_steps);
-        sim_log("  Oracle intervals : " << global->diag_count);
+        sim_log("  Exhaustive intervals : " << global->diag_count);
         sim_log("  Timestep CSV     : " << OUT_TIMESTEP);
         sim_log("  Per-chunk CSV    : " << OUT_CHUNKS);
         sim_log("  Upper bound CSV  : " << OUT_UB_CSV);

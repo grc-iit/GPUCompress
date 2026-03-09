@@ -162,6 +162,7 @@ struct PhaseResult {
     int    sgd_fires;
     int    explorations;
     int    n_chunks;
+    double mape_pct;
 };
 
 // ============================================================
@@ -315,7 +316,7 @@ static int run_oracle_pass(const float* d_data, float* d_read_buf,
                 char algo_str[40];
                 snprintf(algo_str, sizeof(algo_str), "%s%s",
                          best_algo, best_shuffle ? "+shuf" : "");
-                fprintf(cf, "oracle,%d,%s,%s,%.4f,0.0000,0,0,"
+                fprintf(cf, "exhaustive,%d,%s,%s,%.4f,0.0000,0,0,"
                             "0.000,0.000,%.3f,0.000,0.000\n",
                         c + 1, algo_str, algo_str, best_ratio, best_comp_ms);
                 fclose(cf);
@@ -327,7 +328,7 @@ static int run_oracle_pass(const float* d_data, float* d_read_buf,
         ? (double)total_bytes / (double)total_best_compressed : 1.0;
 
     /* ── Stage 2: E2E write — compress per-chunk best + D2H + disk ── */
-    printf("  [oracle] E2E write (per-chunk best -> D2H -> disk)... "); fflush(stdout);
+    printf("  [exhaustive] E2E write (per-chunk best -> D2H -> disk)... "); fflush(stdout);
     remove(TMP_ORACLE);
     int fd = open(TMP_ORACLE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) { perror("open"); free(best_algos); free(best_shuffles);
@@ -368,7 +369,7 @@ static int run_oracle_pass(const float* d_data, float* d_read_buf,
     drop_pagecache(TMP_ORACLE);
 
     /* ── Stage 3: E2E read — disk → H2D → decompress → verify ────── */
-    printf("  [oracle] E2E read  (disk -> H2D -> decompress)... "); fflush(stdout);
+    printf("  [exhaustive] E2E read  (disk -> H2D -> decompress)... "); fflush(stdout);
     fd = open(TMP_ORACLE, O_RDONLY);
     if (fd < 0) { perror("open"); free(best_algos); free(best_shuffles);
                    free(h_comp_buf); cudaFree(d_comp_buf); return 1; }
@@ -396,7 +397,7 @@ static int run_oracle_pass(const float* d_data, float* d_read_buf,
     unsigned long long mm = cpu_compare(h_orig, h_read, n_floats);
 
     memset(r, 0, sizeof(*r));
-    snprintf(r->phase, sizeof(r->phase), "oracle");
+    snprintf(r->phase, sizeof(r->phase), "exhaustive");
     r->orig_bytes = total_bytes;
     r->file_bytes = total_file_bytes;
     r->ratio      = oracle_ratio;
@@ -407,7 +408,7 @@ static int run_oracle_pass(const float* d_data, float* d_read_buf,
     r->mismatches = mm;
     r->n_chunks   = n_chunks;
 
-    printf("  [oracle] ratio=%.2fx  write=%.0f MiB/s  read=%.0f MiB/s  "
+    printf("  [exhaustive] ratio=%.2fx  write=%.0f MiB/s  read=%.0f MiB/s  "
            "file=%.0f MiB  mismatches=%llu\n",
            r->ratio, r->write_mbps, r->read_mbps,
            (double)total_file_bytes / (1 << 20), mm);
@@ -487,6 +488,8 @@ static int run_phase(const char* phase_name, const char* tmp_file,
     // Collect per-chunk diagnostics and write to CSV
     int sgd_fires    = 0;
     int explorations = 0;
+    double ape_sum   = 0.0;
+    int    ape_cnt   = 0;
     int n_hist       = gpucompress_get_chunk_history_count();
     FILE *chunk_csv  = NULL;
     if (n_hist > 0) {
@@ -508,6 +511,11 @@ static int run_phase(const char* phase_name, const char* tmp_file,
         if (gpucompress_get_chunk_diag(i, &d) == 0) {
             sgd_fires    += d.sgd_fired;
             explorations += d.exploration_triggered;
+            if (d.predicted_ratio > 0 && d.actual_ratio > 0) {
+                ape_sum += fabs(d.predicted_ratio - d.actual_ratio)
+                           / d.actual_ratio;
+                ape_cnt++;
+            }
             char final_str[40], orig_str[40];
             action_to_str(d.nn_action, final_str, sizeof(final_str));
             action_to_str(d.nn_original_action, orig_str, sizeof(orig_str));
@@ -543,6 +551,7 @@ static int run_phase(const char* phase_name, const char* tmp_file,
     r->sgd_fires    = sgd_fires;
     r->explorations = explorations;
     r->n_chunks     = n_chunks;
+    r->mape_pct     = (ape_cnt > 0) ? 100.0 * ape_sum / ape_cnt : 0.0;
     snprintf(r->phase, sizeof(r->phase), "%s", phase_name);
 
     printf("  [%s] ratio=%.2fx  write=%.0f MiB/s  read=%.0f MiB/s  "
@@ -765,7 +774,7 @@ begin_diagnostics {
 
     sim_log("");
     sim_log("╔═══════════════════════════════════════════════════════════════════════════╗");
-    sim_log("║  VPIC Benchmark: No-Comp vs Oracle vs NN+SGD (Real Harris Sheet Data)   ║");
+    sim_log("║  VPIC Benchmark: No-Comp vs Exhaustive vs NN+SGD (Real Harris Sheet)    ║");
     sim_log("╚═══════════════════════════════════════════════════════════════════════════╝");
     sim_log("");
     sim_log("  Step " << step() << ": field data on GPU, " << nbytes_f / (1024*1024)
@@ -795,7 +804,7 @@ begin_diagnostics {
     }
 
     // ── Phase 2: oracle (exhaustive search + end-to-end I/O) ──────
-    sim_log("── Phase 2/5: oracle (exhaustive 8 algos × 2 shuffle per chunk) ──");
+    sim_log("── Phase 2/5: exhaustive search (8 algos × 2 shuffle per chunk) ──");
     {
         int rc = run_oracle_pass(d_fields, global->d_read,
                                  global->h_orig, global->h_read,
@@ -870,10 +879,11 @@ begin_diagnostics {
 
     for (int i = 0; i < n_phases; i++) {
         if (strncmp(results[i].phase, "nn", 2) == 0 && results[i].n_chunks > 0) {
-            printf("\n  %-14s SGD fired: %d/%d chunks  Explorations: %d/%d chunks\n",
+            printf("\n  %-14s SGD fired: %d/%d chunks  Explorations: %d/%d chunks  MAPE: %.1f%%\n",
                    results[i].phase,
                    results[i].sgd_fires,   results[i].n_chunks,
-                   results[i].explorations, results[i].n_chunks);
+                   results[i].explorations, results[i].n_chunks,
+                   results[i].mape_pct);
         }
     }
 
@@ -885,16 +895,18 @@ begin_diagnostics {
         FILE* csv = fopen(csv_path, "w");
         if (csv) {
             fprintf(csv, "source,phase,write_ms,read_ms,file_mib,orig_mib,ratio,"
-                         "write_mibps,read_mibps,mismatches,sgd_fires,explorations,n_chunks\n");
+                         "write_mibps,read_mibps,mismatches,sgd_fires,explorations,n_chunks,"
+                         "mean_prediction_error_pct\n");
             for (int i = 0; i < n_phases; i++) {
                 PhaseResult* rr = &results[i];
                 fprintf(csv, "vpic,%s,%.2f,%.2f,%.2f,%.2f,%.4f,"
-                             "%.1f,%.1f,%llu,%d,%d,%d\n",
+                             "%.1f,%.1f,%llu,%d,%d,%d,%.2f\n",
                         rr->phase, rr->write_ms, rr->read_ms,
                         (double)rr->file_bytes / (1 << 20),
                         (double)rr->orig_bytes / (1 << 20), rr->ratio,
                         rr->write_mbps, rr->read_mbps,
-                        rr->mismatches, rr->sgd_fires, rr->explorations, rr->n_chunks);
+                        rr->mismatches, rr->sgd_fires, rr->explorations, rr->n_chunks,
+                        rr->mape_pct);
             }
             fclose(csv);
         }

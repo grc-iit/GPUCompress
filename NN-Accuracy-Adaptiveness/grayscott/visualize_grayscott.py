@@ -3,10 +3,10 @@
 Gray-Scott Adaptiveness Benchmark Visualizer.
 
 Reads CSV results from benchmark_grayscott_vol and produces:
-  1. Summary bar chart: Oracle vs Baseline vs Best SGD aggregate ratios
+  1. Summary bar chart: Exhaustive vs Baseline vs Best SGD aggregate ratios
   2. SGD heatmap: LR vs MAPE threshold, color = compression ratio
   3. SGD convergence: Per-chunk MAPE curves, one PNG per LR
-  4. Per-chunk ratio comparison: Oracle vs Baseline vs Best SGD line plots
+  4. Per-chunk ratio comparison: Exhaustive vs Baseline vs Best SGD line plots
   5. Per-chunk config & ratio: 3-subplot breakdown (oracle/baseline/SGD)
   6. Upper-bound configs: Side-by-side bars per chunk
   7. Config cross-check: Heatmap showing algorithm choice alignment
@@ -159,11 +159,11 @@ def _ratio_formatter(val, _):
 # -- Plot 1: Summary Bar Chart ------------------------------------------------
 
 def plot_summary(agg_rows, sgd_rows, output_dir):
-    """Bar chart: Oracle vs Baseline vs Best SGD aggregate ratios."""
+    """Bar chart: Exhaustive vs Baseline vs Best SGD aggregate ratios."""
     oracle_ratio = 0
     baseline_ratio = 0
     for r in agg_rows:
-        if r.get("phase") == "oracle":
+        if r.get("phase") in ("oracle", "exhaustive"):
             oracle_ratio = g(r, "ratio")
         elif r.get("phase") == "baseline":
             baseline_ratio = g(r, "ratio")
@@ -175,7 +175,7 @@ def plot_summary(agg_rows, sgd_rows, output_dir):
         best_sgd_ratio = g(best, "ratio")
         best_sgd_label = f"lr={g(best,'lr'):.2f}, mt={g(best,'mape_threshold'):.2f}"
 
-    labels = ["Oracle\n(best-static)"]
+    labels = ["Exhaustive\n(best-static)"]
     values = [oracle_ratio]
     colors = ["#e74c3c"]
 
@@ -201,7 +201,7 @@ def plot_summary(agg_rows, sgd_rows, output_dir):
     fig.suptitle("Gray-Scott NN Adaptiveness: Aggregate Compression Ratio", fontsize=14,
                  fontweight="bold", y=1.02)
     fig.text(0.5, 0.99,
-             "Compares oracle (exhaustive per-chunk search), NN baseline (inference-only),\n"
+             "Compares exhaustive (per-chunk search), NN baseline (inference-only),\n"
              "and best SGD config (online learning) on Gray-Scott reaction-diffusion data.",
              ha="center", fontsize=8.5, color="#555", va="top", style="italic")
     ax.set_title("")
@@ -209,7 +209,7 @@ def plot_summary(agg_rows, sgd_rows, output_dir):
 
     if oracle_ratio > 0 and baseline_ratio > 0:
         pct = baseline_ratio / oracle_ratio * 100
-        ax.text(0.98, 0.95, f"Baseline = {pct:.1f}% of Oracle",
+        ax.text(0.98, 0.95, f"Baseline = {pct:.1f}% of Exhaustive",
                 transform=ax.transAxes, ha="right", va="top", fontsize=9,
                 color="#555", style="italic")
 
@@ -382,7 +382,7 @@ def plot_sgd_convergence(chunks_rows, sgd_rows, output_dir):
 # -- Plot 4: Per-Chunk Ratio Comparison ----------------------------------------
 
 def plot_per_chunk_comparison(chunks_rows, sgd_rows, ub_rows, output_dir):
-    """Line plot: Oracle vs Baseline vs Best SGD per-chunk ratios."""
+    """Line plot: Exhaustive vs Baseline vs Best SGD per-chunk ratios."""
     ub_best = _get_ub_best_per_chunk(ub_rows)
     bl = _get_chunks_by_phase(chunks_rows, "baseline")
 
@@ -411,7 +411,7 @@ def plot_per_chunk_comparison(chunks_rows, sgd_rows, ub_rows, output_dir):
     if ub_best:
         ax.plot(x, [ub_best.get(i, (0, "", ""))[0] for i in all_indices],
                 color="#e74c3c", linewidth=2.0, alpha=0.9,
-                label="Oracle (best-static)", marker="o", markersize=3, zorder=4)
+                label="Exhaustive (best-static)", marker="o", markersize=3, zorder=4)
     if bl:
         ax.plot(x, [bl.get(i, (0, "", ""))[0] for i in all_indices],
                 color="#2980b9", linewidth=2.0, alpha=0.9,
@@ -426,7 +426,7 @@ def plot_per_chunk_comparison(chunks_rows, sgd_rows, ub_rows, output_dir):
     fig.suptitle("Per-Chunk Compression Ratio: Gray-Scott Data", fontsize=14,
                  fontweight="bold", y=1.02)
     fig.text(0.5, 0.99,
-             "Compression ratio for each data chunk — oracle upper bound vs NN baseline vs best SGD.\n"
+             "Compression ratio for each data chunk — exhaustive upper bound vs NN baseline vs best SGD.\n"
              "Shows how well the NN tracks the optimal per-chunk compression across the dataset.",
              ha="center", fontsize=8.5, color="#555", va="top", style="italic")
     ax.set_title("")
@@ -490,7 +490,7 @@ def plot_per_chunk_config(chunks_rows, sgd_rows, ub_rows, output_dir):
     tag_colors = {t: config_cmap(i % 10) for i, t in enumerate(tag_list)}
 
     series = [
-        ("Oracle (best-static)", ub_best, "#e74c3c", "o"),
+        ("Exhaustive (best-static)", ub_best, "#e74c3c", "o"),
         ("Baseline (NN inference-only)", bl, "#2980b9", "s"),
         (f"Best SGD ({sgd_label})" if sgd_label else "Best SGD", best_sgd, "#27ae60", "^"),
     ]
@@ -634,7 +634,7 @@ def plot_upper_bound_configs(ub_rows, chunks_rows, sgd_rows, output_dir):
     # Legend
     legend_handles = [
         plt.Rectangle((0, 0), 1, 1, fc=UB_COLOR, alpha=0.85,
-                       edgecolor="white", label="Oracle (best-static)"),
+                       edgecolor="white", label="Exhaustive (best-static)"),
         plt.Rectangle((0, 0), 1, 1, fc=NN_COLOR, alpha=0.85,
                        edgecolor="white", label="Baseline (NN inference-only)"),
     ]
@@ -665,14 +665,14 @@ def plot_upper_bound_configs(ub_rows, chunks_rows, sgd_rows, output_dir):
 
     ax.set_xlabel("Chunk Index")
     ax.set_ylabel("Compression Ratio")
-    title = "Oracle vs Baseline"
+    title = "Exhaustive vs Baseline"
     if has_sgd:
         title += f" vs Best SGD ({sgd_label})"
     title += ": Per Chunk"
     fig.suptitle(title, fontsize=13, fontweight="bold", y=1.02)
     fig.text(0.5, 0.99,
-             "Side-by-side compression ratio per chunk. Annotations show the oracle's best-static\n"
-             "algorithm config. Compares how close baseline and SGD get to the oracle upper bound.",
+             "Side-by-side compression ratio per chunk. Annotations show the exhaustive search's best-static\n"
+             "algorithm config. Compares how close baseline and SGD get to the exhaustive upper bound.",
              ha="center", fontsize=8.5, color="#555", va="top", style="italic")
     ax.set_title("")
 
@@ -693,7 +693,7 @@ def plot_upper_bound_configs(ub_rows, chunks_rows, sgd_rows, output_dir):
 # -- Plot 7: Config Cross-Check -----------------------------------------------
 
 def plot_config_crosscheck(ub_rows, chunks_rows, sgd_rows, output_dir):
-    """Heatmap showing algorithm choice per chunk for Oracle vs Baseline vs SGD."""
+    """Heatmap showing algorithm choice per chunk for Exhaustive vs Baseline vs SGD."""
     ub_best = _get_ub_best_per_chunk(ub_rows)
     if not ub_best:
         return
@@ -719,7 +719,7 @@ def plot_config_crosscheck(ub_rows, chunks_rows, sgd_rows, output_dir):
     rows_data = [("Baseline", bl)]
     if has_sgd:
         rows_data.append((sgd_label, best_sgd))
-    rows_data.append(("Oracle", ub_best))
+    rows_data.append(("Exhaustive", ub_best))
 
     n_rows = len(rows_data)
     row_ub = n_rows - 1
@@ -769,7 +769,7 @@ def plot_config_crosscheck(ub_rows, chunks_rows, sgd_rows, output_dir):
                  fontsize=13, fontweight="bold", y=1.03)
     fig.text(0.5, 1.01,
              "Each row shows the algorithm chosen per chunk. Red 'x' marks chunks where the method\n"
-             "disagrees with the oracle. Fewer mismatches = better NN prediction accuracy.",
+             "disagrees with the exhaustive search. Fewer mismatches = better NN prediction accuracy.",
              ha="center", fontsize=8.5, color="#555", va="top", style="italic")
     ax.set_title("")
 
@@ -790,13 +790,13 @@ def plot_config_crosscheck(ub_rows, chunks_rows, sgd_rows, output_dir):
     nn_match = sum(1 for ci in chunk_indices
                    if ub_best.get(ci, (0, "", ""))[1] ==
                       bl.get(ci, (0, "", ""))[1])
-    print(f"    Baseline vs Oracle match: {nn_match}/{n_total} "
+    print(f"    Baseline vs Exhaustive match: {nn_match}/{n_total} "
           f"({100 * nn_match / n_total:.1f}%)")
     if has_sgd:
         sgd_match = sum(1 for ci in chunk_indices
                         if ub_best.get(ci, (0, "", ""))[1] ==
                            best_sgd.get(ci, (0, "", ""))[1])
-        print(f"    Best SGD vs Oracle match: {sgd_match}/{n_total} "
+        print(f"    Best SGD vs Exhaustive match: {sgd_match}/{n_total} "
               f"({100 * sgd_match / n_total:.1f}%)")
 
 
@@ -846,7 +846,7 @@ def plot_fig1_avg_mape(chunks_rows, sgd_rows, output_dir):
     # Oracle line (perfect prediction = 0 MAPE, show as small constant for log)
     oracle_val = 0.01
     ax.axhline(y=oracle_val, color="#e74c3c", linestyle="--", linewidth=1.5,
-               alpha=0.7, label="Oracle (perfect prediction)", zorder=2)
+               alpha=0.7, label="Exhaustive (perfect prediction)", zorder=2)
 
     # Baseline MAPE
     bl_vals = [bl_mape.get(i, np.nan) for i in all_indices]
@@ -1016,14 +1016,14 @@ def plot_chunk_mape_comparison(chunks_rows, sgd_rows, output_dir):
 # -- Plot 10: Compression Ratio Aggregate Comparison ---------------------------
 
 def plot_fig4_compression_ratio(agg_rows, sgd_rows, output_dir):
-    """Bar chart: Oracle vs Baseline vs Best SGD aggregate compression ratio."""
+    """Bar chart: Exhaustive vs Baseline vs Best SGD aggregate compression ratio."""
     oracle_ratio, oracle_file, oracle_orig = 0, 0, 0
     baseline_ratio, baseline_file = 0, 0
     best_sgd_ratio, best_sgd_file = 0, 0
 
     for r in agg_rows:
         phase = r.get("phase")
-        if phase == "oracle":
+        if phase in ("oracle", "exhaustive"):
             oracle_ratio = g(r, "ratio")
             oracle_file = g(r, "file_mib")
             oracle_orig = g(r, "orig_mib")
@@ -1047,7 +1047,7 @@ def plot_fig4_compression_ratio(agg_rows, sgd_rows, output_dir):
     colors = []
     file_sizes = []
 
-    labels.append("Oracle\n(best-static)")
+    labels.append("Exhaustive\n(best-static)")
     values.append(oracle_ratio)
     colors.append("#e74c3c")
     file_sizes.append(oracle_file)
@@ -1067,7 +1067,7 @@ def plot_fig4_compression_ratio(agg_rows, sgd_rows, output_dir):
     bars = ax.bar(labels, values, color=colors, edgecolor="white",
                   linewidth=1.5, alpha=0.85, width=0.5)
 
-    # Annotate with ratio, file size, and % of oracle
+    # Annotate with ratio, file size, and % of exhaustive
     for bar, val, fsize in zip(bars, values, file_sizes):
         x_center = bar.get_x() + bar.get_width() / 2
         y_top = bar.get_height()
@@ -1082,11 +1082,11 @@ def plot_fig4_compression_ratio(agg_rows, sgd_rows, output_dir):
                     ha="center", va="center", fontsize=9, color="white",
                     fontweight="bold")
 
-        # % of oracle
+        # % of exhaustive
         if oracle_ratio > 0 and val > 0:
             pct = val / oracle_ratio * 100
             ax.text(x_center, y_top + 0.35,
-                    f"({pct:.1f}% of oracle)",
+                    f"({pct:.1f}% of exhaustive)",
                     ha="center", va="bottom", fontsize=8,
                     color="#555", style="italic")
 
@@ -1101,11 +1101,11 @@ def plot_fig4_compression_ratio(agg_rows, sgd_rows, output_dir):
                           ec="#ccc", alpha=0.9))
 
     ax.set_ylabel("Compression Ratio", fontsize=12)
-    fig.suptitle("Compression Ratio: Oracle vs Baseline vs Best SGD",
+    fig.suptitle("Compression Ratio: Exhaustive vs Baseline vs Best SGD",
                  fontsize=14, fontweight="bold", y=1.02)
     fig.text(0.5, 0.99,
              "Aggregate compression ratio comparison across the full Gray-Scott dataset.\n"
-             "Shows how close the NN-based methods get to the exhaustive oracle upper bound.",
+             "Shows how close the NN-based methods get to the exhaustive exhaustive upper bound.",
              ha="center", fontsize=8.5, color="#555", va="top", style="italic")
     ax.set_title("")
     ax.grid(True, alpha=0.3, axis="y")

@@ -723,7 +723,7 @@ def plot_upper_bound_configs(ub_rows, chunks_rows, sgd_rows, output_dir):
     title += ": Per Chunk"
     fig.suptitle(title, fontsize=13, fontweight="bold", y=1.02)
     fig.text(0.5, 0.99,
-             "Side-by-side ratio per chunk with oracle annotations. Pattern bands show data transitions.\n"
+             "Side-by-side ratio per chunk with exhaustive annotations. Pattern bands show data transitions.\n"
              "Compares how close NN baseline and SGD approach the exhaustive-search upper bound.",
              ha="center", fontsize=8.5, color="#555", va="top", style="italic")
     ax.set_title("")
@@ -1010,9 +1010,9 @@ def plot_fig1_avg_mape(chunks_rows, sgd_rows, output_dir):
 
     _draw_pattern_bands(ax, n_chunks)
 
-    # Oracle reference line
+    # Exhaustive reference line
     ax.axhline(y=0.1, color="gray", linestyle="--", alpha=0.5, linewidth=1.0,
-               label="Oracle (~0% error)")
+               label="Exhaustive (~0% error)")
 
     # Baseline
     if bl_idx:

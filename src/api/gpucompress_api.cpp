@@ -26,7 +26,6 @@
 #include "compression/compression_header.h"
 #include "preprocessing/byte_shuffle.cuh"
 #include "preprocessing/quantization.cuh"
-#include "stats/stats_cpu.h"
 
 #include "nvcomp.hpp"
 #include "xfer_tracker.h"
@@ -241,7 +240,6 @@ CompContext* acquireCompContext() {
             return &g_comp_pool[i];
         }
     }
-    return nullptr; // unreachable
 }
 
 void releaseCompContext(CompContext* ctx) {
@@ -762,7 +760,6 @@ extern "C" gpucompress_error_t gpucompress_compress(
 
             // Try top-K alternative configs
             double best_ratio = actual_ratio;
-            (void)best_ratio;  // Updated in loop, used for tracking
 
             for (int i = 1; i <= K && i < 32; i++) {
                 int alt_action = top_actions[i];
@@ -1131,8 +1128,8 @@ extern "C" gpucompress_error_t gpucompress_compress(
             h->compression_ms        = diag_compression_ms;
             h->exploration_ms        = diag_exploration_ms;
             h->sgd_update_ms         = diag_sgd_ms;
-            h->actual_ratio          = (total_size > 0)
-                ? static_cast<float>(input_size) / static_cast<float>(total_size)
+            h->actual_ratio          = (compressed_size > 0)
+                ? static_cast<float>(input_size) / static_cast<float>(compressed_size)
                 : 0.0f;
             h->predicted_ratio       = predicted_ratio;
         }
@@ -1584,6 +1581,7 @@ extern "C" gpucompress_error_t gpucompress_enable_active_learning(void) {
 
 extern "C" void gpucompress_disable_active_learning(void) {
     gpucompress_disable_online_learning();
+    g_exploration_enabled = false;
 }
 
 extern "C" int gpucompress_active_learning_enabled(void) {
@@ -1952,7 +1950,6 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
                     K);
 
             double best_ratio = actual_ratio;
-            (void)best_ratio;
 
             for (int i = 1; i <= K && i < 32; i++) {
                 int alt_action = top_actions[i];
@@ -2294,8 +2291,8 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
             h->compression_ms        = diag_compression_ms;
             h->exploration_ms        = diag_exploration_ms;
             h->sgd_update_ms         = diag_sgd_ms;
-            h->actual_ratio          = (total_size > 0)
-                ? static_cast<float>(input_size) / static_cast<float>(total_size)
+            h->actual_ratio          = (compressed_size > 0)
+                ? static_cast<float>(input_size) / static_cast<float>(compressed_size)
                 : 0.0f;
             h->predicted_ratio       = predicted_ratio;
         }

@@ -245,13 +245,8 @@ static size_t H5Z_filter_gpucompress(
     if (cd_nelmts >= 2) {
         config.preprocessing = cd_values[1];
     }
-    if (cd_nelmts >= 3) {
-        /* Override preprocessing with explicit shuffle size (float32 only) */
-        unsigned int shuffle_size = cd_values[2];
-        if (shuffle_size == 4) {
-            config.preprocessing &= ~GPUCOMPRESS_PREPROC_SHUFFLE_4;
-            config.preprocessing |= GPUCOMPRESS_PREPROC_SHUFFLE_4;
-        }
+    if (cd_nelmts >= 3 && cd_values[2] == 4) {
+        config.preprocessing |= GPUCOMPRESS_PREPROC_SHUFFLE_4;
     }
     if (cd_nelmts >= 5) {
         config.error_bound = unpack_double(cd_values[3], cd_values[4]);

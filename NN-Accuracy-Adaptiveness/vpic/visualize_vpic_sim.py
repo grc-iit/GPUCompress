@@ -7,7 +7,7 @@ Produces 10 paper-quality figures demonstrating online SGD adaptation.
 Reads:
   sim_chunk_metrics.csv    — per-chunk per-timestep predicted/actual ratios
   sim_timestep_metrics.csv — per-timestep aggregated metrics
-  sim_upper_bound.csv      — oracle per-chunk best config/ratio
+  sim_upper_bound.csv      — exhaustive per-chunk best config/ratio
 """
 
 import argparse
@@ -123,7 +123,14 @@ ALGO_COLORS = {
     "cascaded": "#f39c12", "bitcomp": "#34495e",
 }
 
-PHASE_COLORS = {"oracle": "#e74c3c", "nn_baseline": "#2980b9", "nn_sgd": "#27ae60"}
+PHASE_COLORS = {"oracle": "#e74c3c", "exhaustive": "#e74c3c", "nn_baseline": "#2980b9", "nn_sgd": "#27ae60"}
+
+
+def _phase_matches(row_phase, target_phase):
+    """Check phase match with backward compatibility (oracle -> exhaustive)."""
+    if target_phase in ("oracle", "exhaustive"):
+        return row_phase in ("oracle", "exhaustive")
+    return row_phase == target_phase
 
 
 def _parse_nn_action(action_str):
@@ -150,7 +157,7 @@ def _config_label(algo, quant, shuffle):
 # -- Figure 1: Average MAPE Over Simulation Time ------------------------------
 
 def fig1_avg_mape(chunk_rows, output_dir):
-    """Average MAPE for Oracle, Baseline, SGD over timesteps."""
+    """Average MAPE for Exhaustive, Baseline, SGD over timesteps."""
     sgd = _build_chunk_mape(chunk_rows, "nn_sgd")
     bl = _build_chunk_mape(chunk_rows, "nn_baseline")
 
@@ -165,7 +172,7 @@ def fig1_avg_mape(chunk_rows, output_dir):
 
     # Oracle: MAPE = 0
     ax.axhline(y=0, color="#e74c3c", linewidth=2.5, linestyle="-", alpha=0.8,
-               label="Oracle (MAPE = 0%)", zorder=2)
+               label="Exhaustive (MAPE = 0%)", zorder=2)
 
     # Baseline
     bl_avgs = [np.mean(_mape_at_timestep(bl, all_chunks, ts))
@@ -256,7 +263,7 @@ def fig2_all_vs_stable(chunk_rows, output_dir):
 
         # Oracle
         ax.axhline(y=0, color="#e74c3c", linewidth=1.5, linestyle="--",
-                   alpha=0.6, label="Oracle (0%)", zorder=2)
+                   alpha=0.6, label="Exhaustive (0%)", zorder=2)
 
         # Annotate each data point
         for i, ts in enumerate(timesteps):
@@ -376,17 +383,17 @@ def fig3_per_chunk_reduction(chunk_rows, output_dir):
 # -- Figure 4: Compression Ratio Over Simulation Time -------------------------
 
 def fig4_compression_ratio(ts_rows, output_dir):
-    """Per-timestep compression ratio for Oracle, Baseline, SGD."""
+    """Per-timestep compression ratio for Exhaustive, Baseline, SGD."""
     fig, ax = plt.subplots(figsize=(14, 6))
 
     phases = [
-        ("oracle",      "#e74c3c", "D", "Oracle (best-static)", 2.5),
+        ("exhaustive",  "#e74c3c", "D", "Exhaustive (best-static)", 2.5),
         ("nn_baseline", "#2980b9", "s", "NN Baseline",          2.5),
         ("nn_sgd",      "#27ae60", "^", "NN + SGD (online)",    2.5),
     ]
 
     for phase, color, marker, label, lw in phases:
-        data = [r for r in ts_rows if r.get("phase") == phase]
+        data = [r for r in ts_rows if _phase_matches(r.get("phase", ""), phase)]
         data.sort(key=lambda r: g(r, "timestep"))
         if not data:
             continue
@@ -408,11 +415,11 @@ def fig4_compression_ratio(ts_rows, output_dir):
     # Overall averages in text box
     avgs = {}
     for phase, _, _, label, _ in phases:
-        vals = [g(r, "ratio") for r in ts_rows if r.get("phase") == phase]
+        vals = [g(r, "ratio") for r in ts_rows if _phase_matches(r.get("phase", ""), phase)]
         if vals:
             # Use total_orig / total_compressed for correct aggregate
-            orig = [g(r, "orig_mib") for r in ts_rows if r.get("phase") == phase]
-            compressed = [g(r, "file_mib") for r in ts_rows if r.get("phase") == phase]
+            orig = [g(r, "orig_mib") for r in ts_rows if _phase_matches(r.get("phase", ""), phase)]
+            compressed = [g(r, "file_mib") for r in ts_rows if _phase_matches(r.get("phase", ""), phase)]
             total_orig = sum(orig)
             total_comp = sum(compressed)
             if total_comp > 0:
@@ -434,7 +441,7 @@ def fig4_compression_ratio(ts_rows, output_dir):
     fig.suptitle("Compression Ratio Over Simulation Time",
                  fontsize=14, fontweight="bold", y=1.02)
     fig.text(0.5, 0.99,
-             "Actual compression ratio at each simulation timestep for oracle, NN baseline, and NN + SGD.\n"
+             "Actual compression ratio at each simulation timestep for exhaustive, NN baseline, and NN + SGD.\n"
              "Shows whether SGD's improved predictions translate to better end-to-end compression.",
              ha="center", fontsize=8.5, color="#555", va="top", style="italic")
     ax.set_title("")
@@ -451,16 +458,16 @@ def fig4_compression_ratio(ts_rows, output_dir):
 # -- Plot 5: Aggregate Summary Bar Chart --------------------------------------
 
 def plot_summary(ts_rows, output_dir):
-    """Aggregate bar chart: Oracle vs Baseline vs SGD compression ratios."""
+    """Aggregate bar chart: Exhaustive vs Baseline vs SGD compression ratios."""
     phases = [
-        ("oracle", "Oracle", PHASE_COLORS["oracle"]),
+        ("exhaustive", "Exhaustive", PHASE_COLORS["exhaustive"]),
         ("nn_baseline", "Baseline", PHASE_COLORS["nn_baseline"]),
         ("nn_sgd", "SGD", PHASE_COLORS["nn_sgd"]),
     ]
 
     means = {}
     for phase, label, _ in phases:
-        vals = [g(r, "ratio") for r in ts_rows if r.get("phase") == phase]
+        vals = [g(r, "ratio") for r in ts_rows if _phase_matches(r.get("phase", ""), phase)]
         if vals:
             means[label] = np.mean(vals)
 
@@ -485,7 +492,7 @@ def plot_summary(ts_rows, output_dir):
                  fontsize=14, fontweight="bold", y=1.02)
     fig.text(0.5, 0.99,
              "Mean compression ratio across all simulation timesteps for each phase.\n"
-             "Higher is better. Oracle uses exhaustive per-chunk search.",
+             "Higher is better. Exhaustive uses per-chunk search over all configs.",
              ha="center", fontsize=8.5, color="#555", va="top", style="italic")
     ax.set_title("")
     ax.grid(True, alpha=0.3, axis="y")
@@ -497,10 +504,10 @@ def plot_summary(ts_rows, output_dir):
     print(f"  Saved: {path}")
 
 
-# -- Plot 6: Per-Chunk Comparison (Oracle/Baseline/SGD) -----------------------
+# -- Plot 6: Per-Chunk Comparison (Exhaustive/Baseline/SGD) -------------------
 
 def plot_per_chunk_comparison(chunk_rows, ub_rows, output_dir):
-    """Line plot: Oracle vs Baseline vs SGD per-chunk ratios at last timestep."""
+    """Line plot: Exhaustive vs Baseline vs SGD per-chunk ratios at last timestep."""
     if not chunk_rows:
         return
 
@@ -536,7 +543,7 @@ def plot_per_chunk_comparison(chunk_rows, ub_rows, output_dir):
     fig, ax = plt.subplots(figsize=(max(12, len(all_chunks) * 0.6), 6))
 
     series = [
-        (oracle_by_chunk, PHASE_COLORS["oracle"], "D", "Oracle"),
+        (oracle_by_chunk, PHASE_COLORS["exhaustive"], "D", "Exhaustive"),
         (bl_by_chunk, PHASE_COLORS["nn_baseline"], "s", "Baseline"),
         (sgd_by_chunk, PHASE_COLORS["nn_sgd"], "^", "SGD"),
     ]
@@ -560,8 +567,8 @@ def plot_per_chunk_comparison(chunk_rows, ub_rows, output_dir):
     fig.suptitle("Per-Chunk Compression Ratio: VPIC Data",
                  fontsize=14, fontweight="bold", y=1.02)
     fig.text(0.5, 0.99,
-             f"Oracle, Baseline, and SGD compression ratios per chunk at timestep {last_ts}.\n"
-             "Compares how closely NN-chosen configs match oracle per-chunk performance.",
+             f"Exhaustive, Baseline, and SGD compression ratios per chunk at timestep {last_ts}.\n"
+             "Compares how closely NN-chosen configs match exhaustive per-chunk performance.",
              ha="center", fontsize=8.5, color="#555", va="top", style="italic")
     ax.set_title("")
     ax.legend(fontsize=10, loc="upper right", framealpha=0.95)
@@ -577,7 +584,7 @@ def plot_per_chunk_comparison(chunk_rows, ub_rows, output_dir):
 # -- Plot 7: Per-Chunk Config Breakdown (3 panels) ----------------------------
 
 def plot_per_chunk_config(chunk_rows, ub_rows, output_dir):
-    """3-panel config breakdown (Oracle/Baseline/SGD) at last timestep."""
+    """3-panel config breakdown (Exhaustive/Baseline/SGD) at last timestep."""
     if not chunk_rows:
         return
 
@@ -617,7 +624,7 @@ def plot_per_chunk_config(chunk_rows, ub_rows, output_dir):
                              sharex=True)
 
     panels = [
-        (axes[0], oracle_configs, "Oracle (exhaustive search)"),
+        (axes[0], oracle_configs, "Exhaustive (best-static search)"),
         (axes[1], bl_configs, "NN Baseline (no learning)"),
         (axes[2], sgd_configs, "NN + SGD (online learning)"),
     ]
@@ -666,7 +673,7 @@ def plot_per_chunk_config(chunk_rows, ub_rows, output_dir):
 # -- Plot 8: Upper-Bound Configs (side-by-side bars) --------------------------
 
 def plot_upper_bound_configs(chunk_rows, ub_rows, output_dir):
-    """Side-by-side bars: Oracle vs Baseline vs SGD per chunk at last timestep."""
+    """Side-by-side bars: Exhaustive vs Baseline vs SGD per chunk at last timestep."""
     if not chunk_rows:
         return
 
@@ -711,8 +718,8 @@ def plot_upper_bound_configs(chunk_rows, ub_rows, output_dir):
     bl_vals = [bl.get(c, 0) for c in all_chunks]
     sgd_vals = [sgd.get(c, 0) for c in all_chunks]
 
-    ax.bar(x - w, or_vals, w, color=PHASE_COLORS["oracle"], alpha=0.85,
-           edgecolor="white", linewidth=0.5, label="Oracle", zorder=3)
+    ax.bar(x - w, or_vals, w, color=PHASE_COLORS["exhaustive"], alpha=0.85,
+           edgecolor="white", linewidth=0.5, label="Exhaustive", zorder=3)
     ax.bar(x, bl_vals, w, color=PHASE_COLORS["nn_baseline"], alpha=0.85,
            edgecolor="white", linewidth=0.5, label="Baseline", zorder=3)
     ax.bar(x + w, sgd_vals, w, color=PHASE_COLORS["nn_sgd"], alpha=0.85,
@@ -732,11 +739,11 @@ def plot_upper_bound_configs(chunk_rows, ub_rows, output_dir):
     ax.legend(fontsize=10, loc="upper right", framealpha=0.95)
     ax.grid(True, alpha=0.3, axis="y")
 
-    fig.suptitle("Oracle vs Baseline vs SGD: Per Chunk",
+    fig.suptitle("Exhaustive vs Baseline vs SGD: Per Chunk",
                  fontsize=14, fontweight="bold", y=1.02)
     fig.text(0.5, 0.99,
-             f"Per-chunk compression ratios at timestep {last_ts} with oracle config annotations.\n"
-             "Compares exhaustive search (oracle) against NN-driven selection.",
+             f"Per-chunk compression ratios at timestep {last_ts} with exhaustive config annotations.\n"
+             "Compares exhaustive search against NN-driven selection.",
              ha="center", fontsize=8.5, color="#555", va="top", style="italic")
     ax.set_title("")
 
@@ -789,7 +796,7 @@ def plot_config_crosscheck(chunk_rows, ub_rows, output_dir):
     algo_list = list(ALGO_NAMES_BY_ID.values())
     algo_to_id = {name: i for i, name in enumerate(algo_list)}
 
-    rows_label = ["Baseline", "SGD", "Oracle"]
+    rows_label = ["Baseline", "SGD", "Exhaustive"]
     rows_data = [bl_algo, sgd_algo, oracle_algo]
 
     grid = np.full((3, len(all_chunks)), np.nan)
@@ -837,8 +844,8 @@ def plot_config_crosscheck(chunk_rows, ub_rows, output_dir):
     fig.suptitle("Config Cross-Check: Per-Chunk Algorithm Selection",
                  fontsize=14, fontweight="bold", y=1.06)
     fig.text(0.5, 1.02,
-             f"Algorithm chosen per chunk at timestep {last_ts}. Red 'x' marks mismatches vs oracle.\n"
-             "Rows bottom-to-top: Baseline, SGD, Oracle.",
+             f"Algorithm chosen per chunk at timestep {last_ts}. Red 'x' marks mismatches vs exhaustive.\n"
+             "Rows bottom-to-top: Baseline, SGD, Exhaustive.",
              ha="center", fontsize=8.5, color="#555", va="top", style="italic")
     ax.set_title("")
 

@@ -474,10 +474,8 @@ static herr_t
 free_obj(H5VL_gpucompress_t *o)
 {
     hid_t err_id = H5Eget_current_stack();
-    if (o->dcpl_id != H5I_INVALID_HID) {
+    if (o->dcpl_id != H5I_INVALID_HID)
         H5Pclose(o->dcpl_id);
-        o->dcpl_id = H5I_INVALID_HID;
-    }
     H5Idec_ref(o->under_vol_id);
     H5Eset_current_stack(err_id);
     free(o);
@@ -1097,8 +1095,9 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                         if (!wi.valid) break;
 
                         size_t comp_sz = max_comp;
+                        gpucompress_stats_t wstats = {};
                         gpucompress_error_t ce = gpucompress_compress_gpu(
-                            wi.src, wi.sz, d_comp_w[w], &comp_sz, &cfg, NULL, NULL);
+                            wi.src, wi.sz, d_comp_w[w], &comp_sz, &cfg, &wstats, NULL);
 
                         /* Free per-chunk owned buffer after compression completes */
                         if (wi.d_owned) { cudaFree(wi.d_owned); wi.d_owned = NULL; }
@@ -1109,6 +1108,8 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                             worker_err.store((herr_t)-1);
                             continue;
                         }
+
+                        s_chunks_comp++;
 
                         /* Acquire a pool buffer; D→H directly into it (no extra memcpy) */
                         void *hbuf = pool_acquire();
@@ -1199,15 +1200,13 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                             wi.sz      = actual_bytes;
                             wi.d_owned = NULL;
                         } else {
-                            /* Partial boundary: pad with zeros into fresh device buffer */
+                            /* Partial boundary: copy only actual_bytes (no zero-padding) */
                             uint8_t *d_owned = NULL;
-                            if (cudaMalloc(&d_owned, chunk_bytes) != cudaSuccess)
+                            if (cudaMalloc(&d_owned, actual_bytes) != cudaSuccess)
                                 { ret = -1; break; }
-                            cudaMemset(d_owned, 0, chunk_bytes);
                             vol_memcpy(d_owned, raw, actual_bytes, cudaMemcpyDeviceToDevice);
-                            /* cudaMemset/cudaMemcpy are synchronous — no extra sync needed */
                             wi.src     = d_owned;
-                            wi.sz      = chunk_bytes;
+                            wi.sz      = actual_bytes;
                             wi.d_owned = d_owned;
                         }
                     } else {
@@ -1247,8 +1246,6 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                           wq.push(wi);
                       else if (wi.d_owned) { cudaFree(wi.d_owned); wi.d_owned = NULL; } }
                     wq_ready_cv.notify_one();
-
-                    s_chunks_comp++;
                 } /* chunk loop */
                 cudaStreamDestroy(gather_stream);
             } /* Stage 1 scope */

@@ -15,7 +15,7 @@
 #   VPIC_NX                     Grid side length        (default: 128)
 #   GPUCOMPRESS_SGD_LR          SGD learning rate       (default: 0.5)
 #   GPUCOMPRESS_SGD_MAPE        MAPE threshold          (default: 0.25)
-#   GPUCOMPRESS_DIAG_INTERVAL   Oracle + logging every N steps (default: 20)
+#   GPUCOMPRESS_DIAG_INTERVAL   Exhaustive + logging every N steps (default: 20)
 #   GPUCOMPRESS_NUM_STEPS       Total simulation steps  (default: 1000)
 #   GPUCOMPRESS_CHUNK_MB        Chunk size in MB        (default: 8)
 # ============================================================

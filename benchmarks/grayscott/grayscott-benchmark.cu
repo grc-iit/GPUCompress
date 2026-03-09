@@ -309,6 +309,7 @@ typedef struct {
     int    sgd_fires;
     int    explorations;
     int    n_chunks;
+    double mape_pct;
 } PhaseResult;
 
 /* ============================================================
@@ -453,7 +454,7 @@ static int run_oracle_pass(const float *d_data, int L, int chunk_z,
                 char algo_str[40];
                 snprintf(algo_str, sizeof(algo_str), "%s%s",
                          best_algo, best_shuffle ? "+shuf" : "");
-                fprintf(cf, "oracle,%d,%s,%s,%.4f,0.0000,0,0,"
+                fprintf(cf, "exhaustive,%d,%s,%s,%.4f,0.0000,0,0,"
                             "0.000,0.000,%.3f,0.000,0.000\n",
                         c, algo_str, algo_str, best_ratio, best_comp_ms);
                 fclose(cf);
@@ -465,7 +466,7 @@ static int run_oracle_pass(const float *d_data, int L, int chunk_z,
         ? (double)total_bytes / (double)total_best_compressed : 1.0;
 
     /* ── Stage 2: End-to-end write — compress per-chunk best + disk ── */
-    printf("[oracle] E2E write (per-chunk best → D2H → disk)... "); fflush(stdout);
+    printf("[exhaustive] E2E write (per-chunk best → D2H → disk)... "); fflush(stdout);
     remove(tmp_file);
     int fd = open(tmp_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) { perror("open"); free(best_algos); free(best_shuffles);
@@ -491,7 +492,6 @@ static int run_oracle_pass(const float *d_data, int L, int chunk_z,
         gpucompress_stats_t stats;
         gpucompress_compress_gpu(d_chunk_buf, chunk_bytes,
                                 d_comp_buf, &comp_size, &cfg, &stats, NULL);
-        cudaDeviceSynchronize();
 
         /* D→H + write to disk */
         cudaMemcpy(h_comp_buf, d_comp_buf, comp_size, cudaMemcpyDeviceToHost);
@@ -507,7 +507,7 @@ static int run_oracle_pass(const float *d_data, int L, int chunk_z,
     drop_pagecache(tmp_file);
 
     /* ── Stage 3: End-to-end read — disk → H2D → decompress → verify ─ */
-    printf("[oracle] E2E read  (disk → H2D → decompress)... "); fflush(stdout);
+    printf("[exhaustive] E2E read  (disk → H2D → decompress)... "); fflush(stdout);
     fd = open(tmp_file, O_RDONLY);
     if (fd < 0) { perror("open"); free(best_algos); free(best_shuffles);
                    free(h_comp_buf); cudaFree(d_chunk_buf); cudaFree(d_comp_buf); return 1; }
@@ -544,7 +544,7 @@ static int run_oracle_pass(const float *d_data, int L, int chunk_z,
 
     /* Fill result */
     memset(r, 0, sizeof(*r));
-    snprintf(r->phase, sizeof(r->phase), "oracle");
+    snprintf(r->phase, sizeof(r->phase), "exhaustive");
     r->sim_ms      = 0;  /* set by caller */
     r->write_ms    = write_ms;
     r->read_ms     = read_ms;
@@ -556,7 +556,7 @@ static int run_oracle_pass(const float *d_data, int L, int chunk_z,
     r->mismatches  = mm;
     r->n_chunks    = n_chunks;
 
-    printf("[oracle] ratio=%.2fx  write=%.0f MiB/s  read=%.0f MiB/s  "
+    printf("[exhaustive] ratio=%.2fx  write=%.0f MiB/s  read=%.0f MiB/s  "
            "file=%.0f MiB  mismatches=%llu\n",
            r->ratio, r->write_mbps, r->read_mbps,
            (double)total_file_bytes / (1 << 20), mm);
@@ -600,6 +600,7 @@ static int run_phase_nocomp(float *d_v, float *d_read,
     double t0 = now_ms();
     herr_t wrc = H5Dwrite(dset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, d_v);
     assert(wrc >= 0 && "[no-comp] H5Dwrite failed");
+    cudaDeviceSynchronize();
     H5Dclose(dset);
     H5Fclose(file);
     double t1 = now_ms();
@@ -641,6 +642,7 @@ static int run_phase_nocomp(float *d_v, float *d_read,
     r->sgd_fires   = 0;
     r->explorations = 0;
     r->n_chunks    = n_chunks;
+    r->mape_pct    = 0.0;
     snprintf(r->phase, sizeof(r->phase), "no-comp");
 
     printf("[no-comp] ratio=%.2fx  write=%.0f MiB/s  read=%.0f MiB/s  "
@@ -718,12 +720,19 @@ static int run_phase_vol(float *d_v, float *d_read,
     /* Collect per-chunk diagnostics */
     int sgd_fires  = 0;
     int explorations = 0;
+    double ape_sum = 0.0;
+    int    ape_cnt = 0;
     int n_hist     = gpucompress_get_chunk_history_count();
     for (int i = 0; i < n_hist; i++) {
         gpucompress_chunk_diag_t d;
         if (gpucompress_get_chunk_diag(i, &d) == 0) {
             sgd_fires    += d.sgd_fired;
             explorations += d.exploration_triggered;
+            if (d.predicted_ratio > 0 && d.actual_ratio > 0) {
+                ape_sum += fabs(d.predicted_ratio - d.actual_ratio)
+                           / d.actual_ratio;
+                ape_cnt++;
+            }
         }
     }
 
@@ -740,6 +749,7 @@ static int run_phase_vol(float *d_v, float *d_read,
     r->sgd_fires   = sgd_fires;
     r->explorations = explorations;
     r->n_chunks    = n_chunks;
+    r->mape_pct    = (ape_cnt > 0) ? 100.0 * ape_sum / ape_cnt : 0.0;
     snprintf(r->phase, sizeof(r->phase), "%s", phase_name);
 
     printf("[%s] ratio=%.2fx  write=%.0f MiB/s  read=%.0f MiB/s  "
@@ -762,18 +772,20 @@ static void write_aggregate_csv(PhaseResult *res, int n_phases,
 
     fprintf(f, "phase,L,steps,F,k,chunk_z,n_chunks,"
                "sim_ms,write_ms,read_ms,file_mib,orig_mib,ratio,"
-               "write_mibps,read_mibps,mismatches,sgd_fires,explorations\n");
+               "write_mibps,read_mibps,mismatches,sgd_fires,explorations,"
+               "mean_prediction_error_pct\n");
     for (int i = 0; i < n_phases; i++) {
         PhaseResult *r = &res[i];
         fprintf(f, "%s,%d,%d,%.4f,%.5f,%d,%d,"
                    "%.2f,%.2f,%.2f,%.2f,%.2f,%.4f,"
-                   "%.1f,%.1f,%llu,%d,%d\n",
+                   "%.1f,%.1f,%llu,%d,%d,%.2f\n",
                 r->phase, L, steps, F, k, chunk_z, r->n_chunks,
                 r->sim_ms, r->write_ms, r->read_ms,
                 (double)r->file_bytes / (1 << 20),
                 (double)r->orig_bytes / (1 << 20), r->ratio,
                 r->write_mbps, r->read_mbps,
-                r->mismatches, r->sgd_fires, r->explorations);
+                r->mismatches, r->sgd_fires, r->explorations,
+                r->mape_pct);
     }
     fclose(f);
     printf("\nAggregate CSV written to: %s\n", OUT_CSV);
@@ -848,10 +860,11 @@ static void print_summary(PhaseResult *res, int n_phases,
     /* NN phase SGD/exploration summary */
     for (int i = 0; i < n_phases; i++) {
         if (strncmp(res[i].phase, "nn", 2) == 0 && res[i].n_chunks > 0) {
-            printf("\n  %-14s SGD fired: %d/%d chunks  Explorations: %d/%d chunks",
+            printf("\n  %-14s SGD fired: %d/%d chunks  Explorations: %d/%d chunks  MAPE: %.1f%%",
                    res[i].phase,
                    res[i].sgd_fires,   res[i].n_chunks,
-                   res[i].explorations, res[i].n_chunks);
+                   res[i].explorations, res[i].n_chunks,
+                   res[i].mape_pct);
             printf("\n");
         }
     }
@@ -915,7 +928,7 @@ int main(int argc, char **argv)
     double cmb         = (double)L * L * chunk_z * sizeof(float) / (1024.0 * 1024.0);
 
     printf("╔═══════════════════════════════════════════════════════════════════════════╗\n");
-    printf("║  Gray-Scott VOL Benchmark: No-Comp vs Oracle vs NN+SGD                  ║\n");
+    printf("║  Gray-Scott VOL Benchmark: No-Comp vs Exhaustive vs NN+SGD              ║\n");
     printf("╚═══════════════════════════════════════════════════════════════════════════╝\n\n");
     printf("  Grid     : %d^3 = %zu floats (%.1f MB)\n", L, n_floats, dataset_mb);
     printf("  Chunks   : %d x %d x %d  (%d chunks, %.1f MB each)\n",
@@ -985,7 +998,7 @@ int main(int argc, char **argv)
     n_phases++;
 
     /* ── Phase 2: oracle (exhaustive search + end-to-end I/O) ────── */
-    printf("\n── Phase 2/5: oracle (exhaustive 8 algos × 2 shuffle per chunk) ──\n");
+    printf("\n── Phase 2/5: exhaustive search (8 algos × 2 shuffle per chunk) ──\n");
     {
         FILE *f_ub = fopen(OUT_UB_CSV, "w");
         if (f_ub) {
@@ -1042,7 +1055,7 @@ int main(int argc, char **argv)
     gpucompress_set_reinforcement(1, REINFORCE_LR, REINFORCE_MAPE, REINFORCE_MAPE);
     gpucompress_set_exploration(1);
     gpucompress_set_exploration_threshold(0.50);
-    gpucompress_set_exploration_k(2);  // Keep K small to avoid GPU OOM with large chunks
+    gpucompress_set_exploration_k(1);  // K=1 to avoid GPU OOM with large chunks + 8 workers
     hid_t dcpl_rlexp = make_dcpl_auto(L, chunk_z);
     rc = run_phase_vol(d_v, d_read, d_count,
                        n_floats, L, chunk_z,
