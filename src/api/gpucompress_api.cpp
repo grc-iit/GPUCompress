@@ -968,6 +968,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
                             if (alt_ratio > best_ratio) {
                                 best_ratio = alt_ratio;
                                 g_last_nn_action.store(alt_action);
+                                diag_compression_ms = alt_ct_ms;
 
                                 // Copy better result to output
                                 size_t header_sz = GPUCOMPRESS_HEADER_SIZE;
@@ -2144,6 +2145,7 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
                             if (alt_ratio > best_ratio) {
                                 best_ratio = alt_ratio;
                                 g_last_nn_action.store(alt_action);
+                                diag_compression_ms = alt_ct_ms;
 
                                 size_t hdr_sz = GPUCOMPRESS_HEADER_SIZE;
                                 size_t alt_total = hdr_sz + alt_comp_size;

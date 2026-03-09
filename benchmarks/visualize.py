@@ -269,7 +269,7 @@ def plot_nn_stats(ax, phases, rows):
     # Hyperparameter annotation box
     param_text = (
         "SGD:  LR=0.4, MAPE thresh=20%\n"
-        "Explore:  MAPE thresh=50%, K=5"
+        "Explore:  MAPE thresh=50%, K=2"
     )
     ax.text(0.98, 0.97, param_text, transform=ax.transAxes,
             fontsize=7.5, verticalalignment="top", horizontalalignment="right",
@@ -323,15 +323,20 @@ def make_figure(source_name, rows, output_path, meta_text=""):
         print(f"  {source_name}: no valid phases found, skipping.")
         return
 
-    fig = plt.figure(figsize=(16, 14))
-    fig.suptitle(f"GPUCompress Benchmark: {source_name}",
-                 fontsize=14, fontweight="bold", y=0.98)
+    fig = plt.figure(figsize=(16, 15))
+    fig.text(0.5, 0.99, f"GPUCompress 5-Phase Benchmark: {source_name}",
+             ha="center", fontsize=15, fontweight="bold", va="top")
+    fig.text(0.5, 0.97,
+             "End-to-end compression pipeline comparison: no compression, oracle (exhaustive search),\n"
+             "NN inference-only, NN + online SGD, and NN + SGD + exploration.\n"
+             "Measures compression ratio, read/write throughput, timing breakdown, and data verification.",
+             ha="center", fontsize=9, color="#555", va="top", style="italic")
     if meta_text:
-        fig.text(0.5, 0.96, meta_text, ha="center", fontsize=10,
-                 color="#555", style="italic")
+        fig.text(0.5, 0.945, meta_text, ha="center", fontsize=10,
+                 color="#333", va="top", fontfamily="monospace")
 
     gs = gridspec.GridSpec(3, 2, hspace=0.50, wspace=0.30,
-                           top=0.93, bottom=0.04, left=0.08, right=0.96)
+                           top=0.90, bottom=0.04, left=0.08, right=0.96)
 
     # Row 1
     ax1 = fig.add_subplot(gs[0, 0])

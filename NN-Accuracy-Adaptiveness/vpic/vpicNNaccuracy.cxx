@@ -6,11 +6,10 @@
  * performance at each diagnostic timestep as the plasma physics evolves.
  *
  * NN Baseline and NN+SGD compress every simulation step (realistic I/O).
- * All three strategies run every simulation step for a fair comparison.
- * Verbose logging only at the diagnostic interval.
+ * Oracle runs at the diagnostic interval (+ first and last step).
  *
  * Strategies:
- *   0. Oracle       : exhaustive best-config per chunk (every step)
+ *   0. Oracle       : exhaustive best-config per chunk (at diag interval)
  *   1. NN Baseline  : ALGO_AUTO inference-only (every step)
  *   2. NN + SGD     : ALGO_AUTO with online learning (every step, persistent)
  *
@@ -44,15 +43,16 @@
 // ============================================================
 // Constants (defaults, overridable via environment variables)
 //
+//   VPIC_NX                    — grid side length         (default: 128)
 //   GPUCOMPRESS_SGD_LR         — SGD learning rate       (default: 0.5)
 //   GPUCOMPRESS_SGD_MAPE       — MAPE threshold          (default: 0.25)
-//   GPUCOMPRESS_DIAG_INTERVAL  — diagnostic interval     (default: 34)
+//   GPUCOMPRESS_DIAG_INTERVAL  — oracle + logging every N steps (default: 20)
 //   GPUCOMPRESS_NUM_STEPS      — total simulation steps  (default: 1000)
 //   GPUCOMPRESS_CHUNK_MB       — chunk size in MB        (default: 8)
 // ============================================================
 #define DEFAULT_SGD_LR          0.5f
 #define DEFAULT_SGD_MAPE_THRESH 0.25f
-#define DEFAULT_DIAG_INTERVAL   34
+#define DEFAULT_DIAG_INTERVAL   20
 #define DEFAULT_NUM_STEPS       1000
 #define DEFAULT_CHUNK_MB        8
 
@@ -62,7 +62,7 @@
 #define TMP_NN       "/tmp/bm_vpic_sim_nn.h5"
 #define TMP_SGD      "/tmp/bm_vpic_sim_sgd.h5"
 
-#define OUT_DIR       "benchmarks/vpic"
+#define OUT_DIR       "NN-Accuracy-Adaptiveness/vpic/results"
 #define OUT_TIMESTEP  OUT_DIR "/sim_timestep_metrics.csv"
 #define OUT_CHUNKS    OUT_DIR "/sim_chunk_metrics.csv"
 #define OUT_UB_CSV    OUT_DIR "/sim_upper_bound.csv"
@@ -136,6 +136,28 @@ static unsigned long long cpu_compare(const float* a, const float* b, size_t n)
         if (ua != ub) mm++;
     }
     return mm;
+}
+
+// ============================================================
+// NN action → human-readable string
+// ============================================================
+static const char* ACTION_ALGO_NAMES[] = {
+    "lz4", "snappy", "deflate", "gdeflate",
+    "zstd", "ans", "cascaded", "bitcomp"
+};
+
+static void action_to_str(int action, char *buf, size_t bufsz)
+{
+    if (action < 0 || action > 31) {
+        snprintf(buf, bufsz, "act%d", action);
+        return;
+    }
+    int algo    = action % 8;
+    int quant   = (action / 8) % 2;
+    int shuffle = (action / 16) % 2;
+    int n = snprintf(buf, bufsz, "%s", ACTION_ALGO_NAMES[algo]);
+    if (shuffle) n += snprintf(buf + n, bufsz - n, "+shuf");
+    if (quant)   snprintf(buf + n, bufsz - n, "+quant");
 }
 
 // ============================================================
@@ -332,11 +354,13 @@ static void write_chunk_detail(int timestep, const char* phase_name, int n_chunk
     for (int i = 0; i < n_hist && i < n_chunks; i++) {
         gpucompress_chunk_diag_t d;
         if (gpucompress_get_chunk_diag(i, &d) == 0) {
-            fprintf(f, "%d,%s,%d,%d,%d,%d,"
+            char action_str[40];
+            action_to_str(d.nn_action, action_str, sizeof(action_str));
+            fprintf(f, "%d,%s,%d,%s,%d,"
                        "%.3f,%.3f,%.3f,%.3f,"
                        "%.4f,%.4f\n",
                     timestep, phase_name, i,
-                    d.nn_action, d.exploration_triggered, d.sgd_fired,
+                    action_str, d.sgd_fired,
                     d.nn_inference_ms, d.preprocessing_ms,
                     d.compression_ms, d.sgd_update_ms,
                     d.actual_ratio, d.predicted_ratio);
@@ -442,13 +466,19 @@ begin_initialization {
     double Ti_Te   = 1;
     double wpe_wce = 3;
 
-    /* Grid: 128x128x128 — ~134 MB field data */
+    /* Grid size configurable via VPIC_NX env var (default 128)
+     * Field data = (nx+2)^3 * 16 * 4 bytes
+     *   64 → ~18 MB   128 → ~134 MB   160 → ~264 MB   256 → ~1.1 GB */
+    const char* env_nx = getenv("VPIC_NX");
+    int grid_n = env_nx ? atoi(env_nx) : 128;
+    if (grid_n < 16) grid_n = 16;
+
     double Lx   = 32*L;
     double Ly   = 32*L;
     double Lz   = 32*L;
-    double nx   = 128;
-    double ny   = 128;
-    double nz   = 128;
+    double nx   = grid_n;
+    double ny   = grid_n;
+    double nz   = grid_n;
     double nppc = 2;
 
     double damp      = 0.001;
@@ -611,7 +641,7 @@ begin_initialization {
     {
         FILE* f = fopen(OUT_CHUNKS, "w");
         if (f) {
-            fprintf(f, "timestep,phase,chunk,nn_action,explored,sgd_fired,"
+            fprintf(f, "timestep,phase,chunk,nn_action,sgd_fired,"
                        "nn_inference_ms,preprocessing_ms,compression_ms,"
                        "sgd_update_ms,actual_ratio,predicted_ratio\n");
             fclose(f);
@@ -630,11 +660,12 @@ begin_initialization {
     sim_log("║  Simulation-Based VPIC Benchmark: Oracle + NN + SGD Per-Timestep         ║");
     sim_log("╚═══════════════════════════════════════════════════════════════════════════╝");
     sim_log("");
-    sim_log("  Grid        : " << (int)nx << "x" << (int)ny << "x" << (int)nz
-            << " = " << grid->nv << " voxels");
+    sim_log("  Grid        : " << grid_n << "x" << grid_n << "x" << grid_n
+            << " = " << grid->nv << " voxels (VPIC_NX=" << grid_n << ")");
     sim_log("  Fields      : " << field_bytes / (1024*1024) << " MB");
-    sim_log("  Chunks      : " << global->chunk_bytes / (1024*1024) << " MB each");
-    sim_log("  Diag every  : " << global->diag_interval << " steps");
+    sim_log("  Chunks      : " << global->chunk_bytes / (1024*1024) << " MB each ("
+            << (field_bytes / global->chunk_bytes) << " chunks)");
+    sim_log("  Diag every  : " << global->diag_interval << " steps (oracle + logging)");
     sim_log("  Total steps : " << global->num_steps);
     sim_log("  SGD         : lr=" << global->sgd_lr << " mt=" << global->sgd_mape_thresh);
     sim_log("  Weights     : " << (weights_path ? weights_path : "(fallback)"));
@@ -646,8 +677,7 @@ begin_initialization {
 // Diagnostics: NN passes every step, oracle at interval
 //
 // - NN Baseline and NN+SGD compress every step (realistic I/O)
-// - All three strategies run every step
-//   (expensive exhaustive search, for reference only)
+// - Oracle runs at diag_interval steps (+ first & last)
 // ============================================================
 begin_diagnostics {
     if (!global->gpucompress_ready) return;
@@ -655,7 +685,8 @@ begin_diagnostics {
 
     int ts = step();
     int is_last = (ts >= global->num_steps);
-    int is_diag = (ts % global->diag_interval == 0);
+    int is_diag = (ts == 1) || is_last
+                  || (ts % global->diag_interval == 0);
 
     /* Attach live GPU field data */
     vpic_attach_fields(global->vpic_fields_h, field_array->k_f_d);
@@ -674,13 +705,12 @@ begin_diagnostics {
 
     if (is_diag) {
         global->diag_count++;
-        int total_diag = global->num_steps / global->diag_interval;
-        sim_log("── Step " << ts << " (" << global->diag_count
-                << "/" << total_diag << ") ────────");
+        sim_log("── Step " << ts << " (diag " << global->diag_count
+                << ") ────────");
     }
 
-    /* ── Oracle: every step ── */
-    {
+    /* ── Oracle: only at diag interval, first step, and last step ── */
+    if (is_diag) {
         FILE* f_ub = fopen(OUT_UB_CSV, "a");
         oracle_ratio = run_oracle_pass(d_fields, n_floats,
                                        chunk_floats, n_chunks,

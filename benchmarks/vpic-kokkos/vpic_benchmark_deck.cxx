@@ -62,9 +62,11 @@
 #define N_PHASES 5
 
 #define TMP_NOCOMP   "/tmp/bm_vpic_nocomp.h5"
+#define TMP_ORACLE   "/tmp/bm_vpic_oracle.bin"
 #define TMP_NN       "/tmp/bm_vpic_nn.h5"
 #define TMP_NN_RL    "/tmp/bm_vpic_nn_rl.h5"
 #define TMP_NN_RLEXP "/tmp/bm_vpic_nn_rlexp.h5"
+#define CHUNKS_CSV   GPU_DIR "/benchmarks/vpic-kokkos/results/benchmark_vpic_chunks.csv"
 
 // ============================================================
 // Globals: persist across timesteps
@@ -76,7 +78,7 @@ begin_globals {
     hid_t              vol_fapl;          // File access property list with VOL
     hid_t              vol_id;            // VOL connector ID
     int                gpucompress_ready; // 1 if init succeeded
-    int                benchmark_done;    // 1 after benchmark has run
+    int                benchmark_done;    // 1 after all benchmark steps complete
 
     // Buffers for benchmark
     float*             d_read;            // GPU read-back buffer
@@ -125,6 +127,23 @@ static void pack_double_cd(double v, unsigned int* lo, unsigned int* hi)
     memcpy(&bits, &v, sizeof(bits));
     *lo = (unsigned int)(bits & 0xFFFFFFFFu);
     *hi = (unsigned int)(bits >> 32);
+}
+
+// ============================================================
+// Helper: decode NN action to readable string
+// ============================================================
+static const char* ACTION_ALGO_NAMES[] = {
+    "lz4", "snappy", "deflate", "gdeflate", "zstd", "ans", "cascaded", "bitcomp"
+};
+
+static void action_to_str(int action, char *buf, size_t bufsz)
+{
+    if (action < 0) { snprintf(buf, bufsz, "none"); return; }
+    int algo  = action % 8;
+    int quant = (action / 8) % 2;
+    int shuf  = (action / 16) % 2;
+    snprintf(buf, bufsz, "%s%s%s", ACTION_ALGO_NAMES[algo],
+             shuf ? "+shuf" : "", quant ? "+quant" : "");
 }
 
 // ============================================================
@@ -203,29 +222,30 @@ static unsigned long long cpu_compare(const float* a, const float* b, size_t n)
 // Oracle: exhaustive best-config per chunk (1D flat data)
 // Tries 8 algos × 2 shuffle = 16 configs per chunk.
 // ============================================================
-static int run_oracle_pass(const float* d_data, size_t n_floats,
-                           size_t chunk_floats, int n_chunks,
-                           PhaseResult* r)
+static int run_oracle_pass(const float* d_data, float* d_read_buf,
+                           float* h_orig, float* h_read,
+                           size_t n_floats, size_t chunk_floats,
+                           int n_chunks, PhaseResult* r)
 {
-    size_t chunk_bytes = chunk_floats * sizeof(float);
+    size_t chunk_bytes  = chunk_floats * sizeof(float);
     size_t out_buf_size = chunk_bytes + 65536;
-    size_t total_bytes = n_floats * sizeof(float);
+    size_t total_bytes  = n_floats * sizeof(float);
 
     void* d_comp_buf = NULL;
-    void* d_decomp_buf = NULL;
+    void* h_comp_buf = NULL;
     if (cudaMalloc(&d_comp_buf, out_buf_size) != cudaSuccess) return 1;
-    if (cudaMalloc(&d_decomp_buf, chunk_bytes) != cudaSuccess) {
-        cudaFree(d_comp_buf); return 1;
-    }
+    h_comp_buf = malloc(out_buf_size);
+    if (!h_comp_buf) { cudaFree(d_comp_buf); return 1; }
 
     static const char* ALGO_NAMES[] = {
         "auto", "lz4", "snappy", "deflate", "gdeflate",
         "zstd", "ans", "cascaded", "bitcomp"
     };
 
-    size_t total_original = 0, total_best_compressed = 0;
-    double total_best_comp_ms = 0;
-    double total_best_decomp_ms = 0;
+    /* ── Stage 1: Exhaustive search — find best config per chunk ─── */
+    int* best_algos    = (int*)calloc(n_chunks, sizeof(int));
+    int* best_shuffles = (int*)calloc(n_chunks, sizeof(int));
+    size_t total_best_compressed = 0;
 
     for (int c = 0; c < n_chunks; c++) {
         size_t offset = (size_t)c * chunk_floats;
@@ -272,63 +292,132 @@ static int run_oracle_pass(const float* d_data, size_t n_floats,
             }
         }
 
-        /* Re-compress with best config for decompression benchmark */
-        gpucompress_config_t best_cfg = gpucompress_default_config();
-        best_cfg.algorithm = (gpucompress_algorithm_t)best_algo_enum;
-        best_cfg.preprocessing = 0;
-        if (best_shuffle) best_cfg.preprocessing |= GPUCOMPRESS_PREPROC_SHUFFLE_4;
-        best_cfg.error_bound = 0.0;
+        best_algos[c]    = best_algo_enum;
+        best_shuffles[c] = best_shuffle;
+        total_best_compressed += best_compressed;
 
-        size_t comp_size = out_buf_size;
-        gpucompress_stats_t best_stats;
-        gpucompress_compress_gpu(d_chunk, this_bytes,
-                                d_comp_buf, &comp_size, &best_cfg, &best_stats, NULL);
-
-        /* Decompress and measure time */
-        size_t decomp_size = chunk_bytes;
-        cudaDeviceSynchronize();
-        double dt0 = now_ms();
-        gpucompress_decompress_gpu(d_comp_buf, comp_size,
-                                   d_decomp_buf, &decomp_size, NULL);
-        cudaDeviceSynchronize();
-        double decomp_ms = now_ms() - dt0;
-
-        printf("  chunk %3d/%d: best=%s%s  ratio=%.2fx  comp=%.1f MiB/s (%.2f ms)  decomp=%.1f MiB/s (%.2f ms)\n",
+        printf("  chunk %3d/%d: best=%s%s  ratio=%.2fx  comp=%.1f MiB/s (%.2f ms)\n",
                c + 1, n_chunks, best_algo,
                best_shuffle ? "+shuf" : "      ",
-               best_ratio, best_throughput, best_comp_ms,
-               decomp_ms > 0 ? ((double)this_bytes / (1 << 20)) / (decomp_ms / 1000.0) : 0,
-               decomp_ms);
+               best_ratio, best_throughput, best_comp_ms);
 
-        total_original += this_bytes;
-        total_best_compressed += best_compressed;
-        total_best_comp_ms += best_comp_ms;
-        total_best_decomp_ms += decomp_ms;
+        /* Write oracle row to per-chunk CSV */
+        {
+            struct stat csv_st;
+            bool need_hdr = (stat(CHUNKS_CSV, &csv_st) != 0 || csv_st.st_size == 0);
+            FILE *cf = fopen(CHUNKS_CSV, "a");
+            if (cf) {
+                if (need_hdr)
+                    fprintf(cf, "phase,chunk,action_final,action_orig,actual_ratio,"
+                                "predicted_ratio,sgd_fired,exploration_triggered,"
+                                "nn_inference_ms,preprocessing_ms,compression_ms,"
+                                "exploration_ms,sgd_update_ms\n");
+                char algo_str[40];
+                snprintf(algo_str, sizeof(algo_str), "%s%s",
+                         best_algo, best_shuffle ? "+shuf" : "");
+                fprintf(cf, "oracle,%d,%s,%s,%.4f,0.0000,0,0,"
+                            "0.000,0.000,%.3f,0.000,0.000\n",
+                        c + 1, algo_str, algo_str, best_ratio, best_comp_ms);
+                fclose(cf);
+            }
+        }
     }
+
+    double oracle_ratio = (total_best_compressed > 0)
+        ? (double)total_bytes / (double)total_best_compressed : 1.0;
+
+    /* ── Stage 2: E2E write — compress per-chunk best + D2H + disk ── */
+    printf("  [oracle] E2E write (per-chunk best -> D2H -> disk)... "); fflush(stdout);
+    remove(TMP_ORACLE);
+    int fd = open(TMP_ORACLE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { perror("open"); free(best_algos); free(best_shuffles);
+                   free(h_comp_buf); cudaFree(d_comp_buf); return 1; }
+
+    size_t total_file_bytes = 0;
+    double t_write_start = now_ms();
+    for (int c = 0; c < n_chunks; c++) {
+        size_t offset = (size_t)c * chunk_floats;
+        size_t this_floats = chunk_floats;
+        if (offset + this_floats > n_floats)
+            this_floats = n_floats - offset;
+        size_t this_bytes = this_floats * sizeof(float);
+        const float* d_chunk = d_data + offset;
+
+        gpucompress_config_t cfg = gpucompress_default_config();
+        cfg.algorithm = (gpucompress_algorithm_t)best_algos[c];
+        cfg.preprocessing = 0;
+        if (best_shuffles[c]) cfg.preprocessing |= GPUCOMPRESS_PREPROC_SHUFFLE_4;
+        cfg.error_bound = 0.0;
+
+        size_t comp_size = out_buf_size;
+        gpucompress_stats_t stats;
+        gpucompress_compress_gpu(d_chunk, this_bytes,
+                                d_comp_buf, &comp_size, &cfg, &stats, NULL);
+        cudaDeviceSynchronize();
+
+        cudaMemcpy(h_comp_buf, d_comp_buf, comp_size, cudaMemcpyDeviceToHost);
+        write(fd, &comp_size, sizeof(comp_size));
+        write(fd, h_comp_buf, comp_size);
+        total_file_bytes += sizeof(comp_size) + comp_size;
+    }
+    fdatasync(fd);
+    close(fd);
+    double write_ms = now_ms() - t_write_start;
+    printf("%.0f ms\n", write_ms);
+
+    drop_pagecache(TMP_ORACLE);
+
+    /* ── Stage 3: E2E read — disk → H2D → decompress → verify ────── */
+    printf("  [oracle] E2E read  (disk -> H2D -> decompress)... "); fflush(stdout);
+    fd = open(TMP_ORACLE, O_RDONLY);
+    if (fd < 0) { perror("open"); free(best_algos); free(best_shuffles);
+                   free(h_comp_buf); cudaFree(d_comp_buf); return 1; }
+
+    double t_read_start = now_ms();
+    for (int c = 0; c < n_chunks; c++) {
+        size_t offset = (size_t)c * chunk_floats;
+        size_t comp_size = 0;
+        read(fd, &comp_size, sizeof(comp_size));
+        read(fd, h_comp_buf, comp_size);
+
+        cudaMemcpy(d_comp_buf, h_comp_buf, comp_size, cudaMemcpyHostToDevice);
+        size_t decomp_size = chunk_bytes;
+        gpucompress_decompress_gpu(d_comp_buf, comp_size,
+                                   d_read_buf + offset, &decomp_size, NULL);
+        cudaDeviceSynchronize();
+    }
+    close(fd);
+    double read_ms = now_ms() - t_read_start;
+    printf("%.0f ms\n", read_ms);
+
+    /* CPU bitwise verification */
+    cudaMemcpy(h_orig, d_data, total_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_read, d_read_buf, total_bytes, cudaMemcpyDeviceToHost);
+    unsigned long long mm = cpu_compare(h_orig, h_read, n_floats);
 
     memset(r, 0, sizeof(*r));
     snprintf(r->phase, sizeof(r->phase), "oracle");
     r->orig_bytes = total_bytes;
-    r->file_bytes = (total_best_compressed > 0) ? total_best_compressed : total_bytes;
-    r->ratio = (total_best_compressed > 0)
-        ? (double)total_original / (double)total_best_compressed : 1.0;
-    r->write_ms = total_best_comp_ms;
-    r->read_ms  = total_best_decomp_ms;
-    r->write_mbps = (total_best_comp_ms > 0)
-        ? ((double)total_original / (1 << 20)) / (total_best_comp_ms / 1000.0) : 0;
-    r->read_mbps = (total_best_decomp_ms > 0)
-        ? ((double)total_original / (1 << 20)) / (total_best_decomp_ms / 1000.0) : 0;
-    r->mismatches = 0;
-    r->n_chunks = n_chunks;
+    r->file_bytes = total_file_bytes;
+    r->ratio      = oracle_ratio;
+    r->write_ms   = write_ms;
+    r->read_ms    = read_ms;
+    r->write_mbps = (double)total_bytes / (1 << 20) / (write_ms / 1000.0);
+    r->read_mbps  = (double)total_bytes / (1 << 20) / (read_ms / 1000.0);
+    r->mismatches = mm;
+    r->n_chunks   = n_chunks;
 
     printf("  [oracle] ratio=%.2fx  write=%.0f MiB/s  read=%.0f MiB/s  "
-           "comp=%.0f ms  decomp=%.0f ms\n",
+           "file=%.0f MiB  mismatches=%llu\n",
            r->ratio, r->write_mbps, r->read_mbps,
-           total_best_comp_ms, total_best_decomp_ms);
+           (double)total_file_bytes / (1 << 20), mm);
 
+    remove(TMP_ORACLE);
+    free(best_algos);
+    free(best_shuffles);
+    free(h_comp_buf);
     cudaFree(d_comp_buf);
-    cudaFree(d_decomp_buf);
-    return 0;
+    return (mm == 0) ? 0 : 1;
 }
 
 // ============================================================
@@ -383,9 +472,9 @@ static int run_phase(const char* phase_name, const char* tmp_file,
     herr_t rret = H5Dread(dset, H5T_NATIVE_FLOAT,
                           H5S_ALL, H5S_ALL, H5P_DEFAULT, d_read);
     cudaDeviceSynchronize();
-    double t3   = now_ms();
     H5Dclose(dset);
     H5Fclose(file);
+    double t3   = now_ms();
     printf("%.0f ms\n", t3 - t2);
 
     if (rret < 0) { fprintf(stderr, "  [%s] H5Dread failed\n", phase_name); return 1; }
@@ -395,17 +484,51 @@ static int run_phase(const char* phase_name, const char* tmp_file,
     cudaMemcpy(h_read, d_read, n_floats * sizeof(float), cudaMemcpyDeviceToHost);
     unsigned long long mm = cpu_compare(h_orig, h_read, n_floats);
 
-    // Collect per-chunk diagnostics
+    // Collect per-chunk diagnostics and write to CSV
     int sgd_fires    = 0;
     int explorations = 0;
     int n_hist       = gpucompress_get_chunk_history_count();
+    FILE *chunk_csv  = NULL;
+    if (n_hist > 0) {
+        printf("    chunk | action (final)       | action (orig)        | ratio  | pred   | sgd | expl\n");
+        printf("    ------+----------------------+----------------------+--------+--------+-----+-----\n");
+        // Open chunks CSV: create with header on first phase, append on subsequent
+        struct stat st;
+        bool need_header = (stat(CHUNKS_CSV, &st) != 0 || st.st_size == 0);
+        chunk_csv = fopen(CHUNKS_CSV, "a");
+        if (chunk_csv && need_header) {
+            fprintf(chunk_csv, "phase,chunk,action_final,action_orig,actual_ratio,"
+                               "predicted_ratio,sgd_fired,exploration_triggered,"
+                               "nn_inference_ms,preprocessing_ms,compression_ms,"
+                               "exploration_ms,sgd_update_ms\n");
+        }
+    }
     for (int i = 0; i < n_hist; i++) {
         gpucompress_chunk_diag_t d;
         if (gpucompress_get_chunk_diag(i, &d) == 0) {
             sgd_fires    += d.sgd_fired;
             explorations += d.exploration_triggered;
+            char final_str[40], orig_str[40];
+            action_to_str(d.nn_action, final_str, sizeof(final_str));
+            action_to_str(d.nn_original_action, orig_str, sizeof(orig_str));
+            printf("    %5d | %-20s | %-20s | %5.2fx | %5.2fx | %s | %s\n",
+                   i + 1, final_str, orig_str,
+                   (double)d.actual_ratio, (double)d.predicted_ratio,
+                   d.sgd_fired ? "yes" : "  -",
+                   d.exploration_triggered ? "yes" : "  -");
+            if (chunk_csv) {
+                fprintf(chunk_csv, "%s,%d,%s,%s,%.4f,%.4f,%d,%d,"
+                                   "%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                        phase_name, i + 1, final_str, orig_str,
+                        (double)d.actual_ratio, (double)d.predicted_ratio,
+                        d.sgd_fired, d.exploration_triggered,
+                        (double)d.nn_inference_ms, (double)d.preprocessing_ms,
+                        (double)d.compression_ms, (double)d.exploration_ms,
+                        (double)d.sgd_update_ms);
+            }
         }
     }
+    if (chunk_csv) fclose(chunk_csv);
 
     size_t fbytes = get_file_size(tmp_file);
 
@@ -504,14 +627,14 @@ begin_initialization {
     int chunk_mb = env_chunk ? atoi(env_chunk) : 2;
     if (chunk_mb < 1) chunk_mb = 1;
 
-    // Run warmup steps to develop physics, then benchmark
+    // Run warmup steps to develop physics, then one benchmark step
     num_step        = warmup + 1;
     status_interval = 50;
     clean_div_e_interval = 10;
     clean_div_b_interval = 10;
 
-    global->sim_steps     = warmup;
-    global->chunk_bytes   = (size_t)chunk_mb * 1024 * 1024;
+    global->sim_steps      = warmup;
+    global->chunk_bytes    = (size_t)chunk_mb * 1024 * 1024;
     global->benchmark_done = 0;
 
     // Grid setup
@@ -622,14 +745,12 @@ begin_initialization {
 };
 
 // ============================================================
-// Diagnostics: run benchmark after warmup steps
+// Diagnostics: run benchmark across multiple timesteps
 // ============================================================
 begin_diagnostics {
     if (global->benchmark_done) return;
     if (step() < global->sim_steps) return;
     if (!global->gpucompress_ready) return;
-
-    global->benchmark_done = 1;
 
     // Attach GPU-resident field data
     vpic_attach_fields(global->vpic_fields_h, field_array->k_f_d);
@@ -652,6 +773,9 @@ begin_diagnostics {
             << global->chunk_bytes / (1024*1024) << " MB");
     sim_log("");
 
+    // Truncate per-chunk CSV for fresh run
+    remove(CHUNKS_CSV);
+
     PhaseResult results[N_PHASES];
     int n_phases = 0;
     int any_fail = 0;
@@ -670,10 +794,12 @@ begin_diagnostics {
         n_phases++;
     }
 
-    // ── Phase 2: oracle (exhaustive best-config per chunk) ────────
+    // ── Phase 2: oracle (exhaustive search + end-to-end I/O) ──────
     sim_log("── Phase 2/5: oracle (exhaustive 8 algos × 2 shuffle per chunk) ──");
     {
-        int rc = run_oracle_pass(d_fields, n_floats, chunk_floats, n_chunks,
+        int rc = run_oracle_pass(d_fields, global->d_read,
+                                 global->h_orig, global->h_read,
+                                 n_floats, chunk_floats, n_chunks,
                                  &results[n_phases]);
         if (rc) any_fail = 1;
         n_phases++;
@@ -715,6 +841,7 @@ begin_diagnostics {
     gpucompress_set_reinforcement(1, REINFORCE_LR, REINFORCE_MAPE, REINFORCE_MAPE);
     gpucompress_set_exploration(1);
     gpucompress_set_exploration_threshold(0.50);
+    gpucompress_set_exploration_k(2);
     {
         hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats);
         int rc = run_phase("nn-rl+exp50", TMP_NN_RLEXP,
@@ -733,15 +860,14 @@ begin_diagnostics {
     printf("║              ║ (MiB/s)  ║ (MiB/s)  ║       ║          ║             ║\n");
     printf("╠══════════════╬══════════╬══════════╬═══════╬══════════╬═════════════╣\n");
     for (int i = 0; i < n_phases; i++) {
-        PhaseResult* r = &results[i];
-        const char* verdict = (r->mismatches == 0) ? "PASS" : "FAIL";
+        PhaseResult* rr = &results[i];
+        const char* verdict = (rr->mismatches == 0) ? "PASS" : "FAIL";
         printf("║  %-12s║ %8.0f ║ %8.0f ║ %5.2fx ║ %8.0f ║ %-11s ║\n",
-               r->phase, r->write_mbps, r->read_mbps,
-               r->ratio, (double)r->file_bytes / (1 << 20), verdict);
+               rr->phase, rr->write_mbps, rr->read_mbps,
+               rr->ratio, (double)rr->file_bytes / (1 << 20), verdict);
     }
     printf("╚══════════════╩══════════╩══════════╩═══════╩══════════╩═════════════╝\n");
 
-    // NN SGD/exploration detail
     for (int i = 0; i < n_phases; i++) {
         if (strncmp(results[i].phase, "nn", 2) == 0 && results[i].n_chunks > 0) {
             printf("\n  %-14s SGD fired: %d/%d chunks  Explorations: %d/%d chunks\n",
@@ -751,9 +877,7 @@ begin_diagnostics {
         }
     }
 
-    printf("\n=== VPIC Benchmark %s ===\n", any_fail ? "FAILED" : "PASSED");
-
-    // Write CSV results
+    // Write summary CSV
     {
         const char* csv_dir  = GPU_DIR "/benchmarks/vpic-kokkos/results";
         const char* csv_path = GPU_DIR "/benchmarks/vpic-kokkos/results/benchmark_vpic_deck.csv";
@@ -763,21 +887,26 @@ begin_diagnostics {
             fprintf(csv, "source,phase,write_ms,read_ms,file_mib,orig_mib,ratio,"
                          "write_mibps,read_mibps,mismatches,sgd_fires,explorations,n_chunks\n");
             for (int i = 0; i < n_phases; i++) {
-                PhaseResult* r = &results[i];
+                PhaseResult* rr = &results[i];
                 fprintf(csv, "vpic,%s,%.2f,%.2f,%.2f,%.2f,%.4f,"
                              "%.1f,%.1f,%llu,%d,%d,%d\n",
-                        r->phase, r->write_ms, r->read_ms,
-                        (double)r->file_bytes / (1 << 20),
-                        (double)r->orig_bytes / (1 << 20), r->ratio,
-                        r->write_mbps, r->read_mbps,
-                        r->mismatches, r->sgd_fires, r->explorations, r->n_chunks);
+                        rr->phase, rr->write_ms, rr->read_ms,
+                        (double)rr->file_bytes / (1 << 20),
+                        (double)rr->orig_bytes / (1 << 20), rr->ratio,
+                        rr->write_mbps, rr->read_mbps,
+                        rr->mismatches, rr->sgd_fires, rr->explorations, rr->n_chunks);
             }
             fclose(csv);
-            printf("CSV written to: %s\n", csv_path);
         }
     }
 
-    // Cleanup benchmark buffers
+    if (any_fail) printf("\n=== VPIC Benchmark FAILED ===\n");
+
+    global->benchmark_done = 1;
+    printf("\n=== VPIC Benchmark complete ===\n");
+    printf("Chunks CSV: %s\n", CHUNKS_CSV);
+
+    // Cleanup
     cudaFree(global->d_read);
     free(global->h_orig);
     free(global->h_read);

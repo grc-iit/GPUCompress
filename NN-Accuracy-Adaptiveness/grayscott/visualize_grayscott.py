@@ -28,6 +28,7 @@ import sys
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 import matplotlib.ticker as mticker
 import numpy as np
 
@@ -63,7 +64,8 @@ def g(row, *keys, default=0.0):
 
 # -- Constants -----------------------------------------------------------------
 
-DEFAULT_DIR = "benchmarks/grayscott"
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_DIR = os.path.join(_SCRIPT_DIR, "results")
 
 ALGO_COLORS = {
     "lz4":       "#e74c3c",
@@ -87,19 +89,15 @@ MAPE_COLORS = ["#e74c3c", "#3498db", "#2ecc71", "#e67e22", "#9b59b6",
 
 # -- Helpers -------------------------------------------------------------------
 
-def _decode_nn_action(action):
-    """Decode NN action int -> (algo_name, tag_string)."""
-    action = int(action)
-    algo_id = action % 8
-    quant = (action // 8) % 2
-    shuffle = (action // 16) % 2
-    algo = ALGO_NAMES_BY_ID.get(algo_id, f"unk{algo_id}")
-    tag = algo
-    if shuffle:
-        tag += "+s4"
-    if quant:
-        tag += "+q"
-    return algo, tag
+def _parse_nn_action(action_str):
+    """Parse nn_action string -> (algo_name, tag_string).
+
+    The CSV now stores human-readable strings like 'lz4', 'snappy+shuf',
+    'zstd+shuf+quant'.  Extract the base algo and return the full tag.
+    """
+    s = str(action_str).strip()
+    algo = s.split("+")[0] if "+" in s else s
+    return algo, s
 
 
 def _get_ub_best_per_chunk(ub_rows):
@@ -127,8 +125,7 @@ def _get_chunks_by_phase(chunks_rows, phase_prefix):
         phase = r.get("phase", "")
         if isinstance(phase, str) and phase.startswith(phase_prefix):
             ci = int(g(r, "chunk"))
-            action = int(g(r, "nn_action"))
-            algo, tag = _decode_nn_action(action)
+            algo, tag = _parse_nn_action(r.get("nn_action", ""))
             result[ci] = (g(r, "actual_ratio"), tag, algo)
     return result
 
@@ -140,8 +137,7 @@ def _get_sgd_phase_chunks(chunks_rows, lr, mt):
     for r in chunks_rows:
         if r.get("phase") == phase:
             ci = int(g(r, "chunk"))
-            action = int(g(r, "nn_action"))
-            algo, tag = _decode_nn_action(action)
+            algo, tag = _parse_nn_action(r.get("nn_action", ""))
             result[ci] = (g(r, "actual_ratio"), tag, algo)
     return result
 
@@ -202,7 +198,13 @@ def plot_summary(agg_rows, sgd_rows, output_dir):
                 fontweight="bold")
 
     ax.set_ylabel("Compression Ratio", fontsize=12)
-    ax.set_title("Gray-Scott Adaptiveness: Aggregate Compression Ratio", fontsize=14)
+    fig.suptitle("Gray-Scott NN Adaptiveness: Aggregate Compression Ratio", fontsize=14,
+                 fontweight="bold", y=1.02)
+    fig.text(0.5, 0.99,
+             "Compares oracle (exhaustive per-chunk search), NN baseline (inference-only),\n"
+             "and best SGD config (online learning) on Gray-Scott reaction-diffusion data.",
+             ha="center", fontsize=8.5, color="#555", va="top", style="italic")
+    ax.set_title("")
     ax.grid(True, alpha=0.3, axis="y")
 
     if oracle_ratio > 0 and baseline_ratio > 0:
@@ -259,7 +261,11 @@ def plot_sgd_heatmap(sgd_rows, output_dir):
                     ax.text(j, i, fmt, ha="center", va="center",
                             fontsize=8, color="white" if val > np.nanmean(grid) else "black")
 
-    fig.suptitle("SGD Hyperparameter Study: Gray-Scott Data", fontsize=14)
+    fig.suptitle("SGD Hyperparameter Study: Gray-Scott Data", fontsize=14, fontweight="bold")
+    fig.text(0.5, 0.95,
+             "Grid search over SGD learning rate and MAPE threshold.\n"
+             "Left: compression ratio achieved. Right: final prediction error (MAPE %).",
+             ha="center", fontsize=8.5, color="#555", va="top", style="italic")
     fig.tight_layout()
     path = os.path.join(output_dir, "sgd_heatmap.png")
     fig.savefig(path, dpi=150, bbox_inches="tight")
@@ -303,8 +309,12 @@ def plot_sgd_convergence(chunks_rows, sgd_rows, output_dir):
         fig, axes = plt.subplots(n_mt, 1, figsize=(14, 4 * n_mt), sharex=True)
         if n_mt == 1:
             axes = [axes]
-        fig.suptitle(f"SGD Convergence on Gray-Scott Data - LR = {lr:.3f}",
-                     fontsize=14, y=1.01)
+        fig.suptitle(f"SGD Convergence on Gray-Scott Data — LR = {lr:.3f}",
+                     fontsize=14, fontweight="bold", y=1.03)
+        fig.text(0.5, 1.01,
+                 "Per-chunk MAPE as SGD processes each chunk sequentially.\n"
+                 "Green vertical line marks convergence point; dashed horizontal line is the MAPE threshold.",
+                 ha="center", fontsize=8.5, color="#555", va="top", style="italic")
 
         for mi, mt in enumerate(mapes):
             ax = axes[mi]
@@ -413,7 +423,13 @@ def plot_per_chunk_comparison(chunks_rows, sgd_rows, ub_rows, output_dir):
 
     ax.set_xlabel("Chunk Index")
     ax.set_ylabel("Compression Ratio")
-    ax.set_title("Per-Chunk Compression Ratio: Gray-Scott Data", fontsize=13)
+    fig.suptitle("Per-Chunk Compression Ratio: Gray-Scott Data", fontsize=14,
+                 fontweight="bold", y=1.02)
+    fig.text(0.5, 0.99,
+             "Compression ratio for each data chunk — oracle upper bound vs NN baseline vs best SGD.\n"
+             "Shows how well the NN tracks the optimal per-chunk compression across the dataset.",
+             ha="center", fontsize=8.5, color="#555", va="top", style="italic")
+    ax.set_title("")
 
     # Use log scale if range is large
     all_vals = []
@@ -547,7 +563,12 @@ def plot_per_chunk_config(chunks_rows, sgd_rows, ub_rows, output_dir):
                    title="Config", title_fontsize=8,
                    bbox_to_anchor=(0.99, 0.99))
 
-    fig.suptitle("Per-Chunk Config & Ratio: Gray-Scott Data", fontsize=14, y=1.01)
+    fig.suptitle("Per-Chunk Config & Ratio: Gray-Scott Data", fontsize=14,
+                 fontweight="bold", y=1.03)
+    fig.text(0.5, 1.01,
+             "Per-chunk algorithm selection and compression ratio. Markers colored by chosen config.\n"
+             "Reveals which algorithm each method picks per chunk and how that affects ratio.",
+             ha="center", fontsize=8.5, color="#555", va="top", style="italic")
     fig.tight_layout()
     path = os.path.join(output_dir, "per_chunk_config.png")
     fig.savefig(path, dpi=150, bbox_inches="tight")
@@ -648,7 +669,12 @@ def plot_upper_bound_configs(ub_rows, chunks_rows, sgd_rows, output_dir):
     if has_sgd:
         title += f" vs Best SGD ({sgd_label})"
     title += ": Per Chunk"
-    ax.set_title(title, fontsize=13)
+    fig.suptitle(title, fontsize=13, fontweight="bold", y=1.02)
+    fig.text(0.5, 0.99,
+             "Side-by-side compression ratio per chunk. Annotations show the oracle's best-static\n"
+             "algorithm config. Compares how close baseline and SGD get to the oracle upper bound.",
+             ha="center", fontsize=8.5, color="#555", va="top", style="italic")
+    ax.set_title("")
 
     all_ratios = [ub_best[ci][0] for ci in chunk_indices]
     if max(all_ratios) / max(min(all_ratios), 0.01) > 5:
@@ -739,8 +765,13 @@ def plot_config_crosscheck(ub_rows, chunks_rows, sgd_rows, output_dir):
         ax.set_xticklabels([str(ci) for ci in chunk_indices], fontsize=6)
     ax.set_xlabel("Chunk Index", fontsize=10)
 
-    ax.set_title("Config Cross-Check: Per-Chunk Algorithm Selection\n"
-                 "(x = differs from Oracle)", fontsize=12)
+    fig.suptitle("Config Cross-Check: Per-Chunk Algorithm Selection",
+                 fontsize=13, fontweight="bold", y=1.03)
+    fig.text(0.5, 1.01,
+             "Each row shows the algorithm chosen per chunk. Red 'x' marks chunks where the method\n"
+             "disagrees with the oracle. Fewer mismatches = better NN prediction accuracy.",
+             ha="center", fontsize=8.5, color="#555", va="top", style="italic")
+    ax.set_title("")
 
     # Algorithm color legend
     legend_handles = [plt.Rectangle((0, 0), 1, 1, fc=c, edgecolor="white", label=a)
@@ -767,6 +798,323 @@ def plot_config_crosscheck(ub_rows, chunks_rows, sgd_rows, output_dir):
                            best_sgd.get(ci, (0, "", ""))[1])
         print(f"    Best SGD vs Oracle match: {sgd_match}/{n_total} "
               f"({100 * sgd_match / n_total:.1f}%)")
+
+
+# -- Plot 8: Per-Chunk Prediction Error (Avg MAPE) ----------------------------
+
+def plot_fig1_avg_mape(chunks_rows, sgd_rows, output_dir):
+    """Per-chunk prediction error: Baseline vs Best SGD MAPE per chunk."""
+    # Collect baseline per-chunk MAPE
+    bl_mape = {}
+    for r in chunks_rows:
+        if r.get("phase") == "baseline":
+            ci = int(g(r, "chunk"))
+            pred = g(r, "predicted_ratio")
+            actual = g(r, "actual_ratio")
+            if actual > 0:
+                bl_mape[ci] = abs(pred - actual) / actual * 100.0
+
+    if not bl_mape:
+        return
+
+    # Find best SGD config by max ratio
+    best_lr, best_mt = 0, 0
+    if sgd_rows:
+        best = max(sgd_rows, key=lambda r: g(r, "ratio"))
+        best_lr = g(best, "lr")
+        best_mt = g(best, "mape_threshold")
+
+    # Collect best SGD per-chunk MAPE
+    sgd_mape = {}
+    if best_lr > 0:
+        phase = f"sgd_{best_lr:.2f}_{best_mt:.2f}"
+        for r in chunks_rows:
+            if r.get("phase") == phase:
+                ci = int(g(r, "chunk"))
+                pred = g(r, "predicted_ratio")
+                actual = g(r, "actual_ratio")
+                if actual > 0:
+                    sgd_mape[ci] = abs(pred - actual) / actual * 100.0
+
+    all_indices = sorted(set(list(bl_mape.keys()) + list(sgd_mape.keys())))
+    if not all_indices:
+        return
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    x = np.array(all_indices, dtype=float)
+
+    # Oracle line (perfect prediction = 0 MAPE, show as small constant for log)
+    oracle_val = 0.01
+    ax.axhline(y=oracle_val, color="#e74c3c", linestyle="--", linewidth=1.5,
+               alpha=0.7, label="Oracle (perfect prediction)", zorder=2)
+
+    # Baseline MAPE
+    bl_vals = [bl_mape.get(i, np.nan) for i in all_indices]
+    ax.plot(x, bl_vals, color="#2980b9", linewidth=1.5, alpha=0.9,
+            label="Baseline (NN inference-only)", marker="s", markersize=3, zorder=3)
+    for xi, val in zip(x, bl_vals):
+        if not np.isnan(val):
+            ax.annotate(f"{val:.1f}", (xi, val), fontsize=6,
+                        ha="center", va="bottom", textcoords="offset points",
+                        xytext=(0, 3), color="#2980b9")
+
+    # Best SGD MAPE
+    if sgd_mape:
+        sgd_vals = [sgd_mape.get(i, np.nan) for i in all_indices]
+        ax.plot(x, sgd_vals, color="#27ae60", linewidth=1.5, alpha=0.9,
+                label=f"Best SGD (lr={best_lr:.2f}, mt={best_mt:.2f})",
+                marker="^", markersize=3, zorder=3)
+        for xi, val in zip(x, sgd_vals):
+            if not np.isnan(val):
+                ax.annotate(f"{val:.1f}", (xi, val), fontsize=6,
+                            ha="center", va="bottom", textcoords="offset points",
+                            xytext=(0, 3), color="#27ae60")
+
+        # Running average line for SGD convergence
+        valid_sgd = [(i, sgd_mape[i]) for i in all_indices if i in sgd_mape]
+        if len(valid_sgd) > 1:
+            running_avg = []
+            cumsum = 0.0
+            for idx, (ci, val) in enumerate(valid_sgd):
+                cumsum += val
+                running_avg.append(cumsum / (idx + 1))
+            ra_x = [ci for ci, _ in valid_sgd]
+            ax.plot(ra_x, running_avg, color="#27ae60", linewidth=2.0,
+                    alpha=0.4, linestyle="--", label="SGD Running Avg MAPE",
+                    zorder=2)
+
+    ax.set_xlabel("Chunk Index")
+    ax.set_ylabel("MAPE (%)")
+    ax.set_yscale("log")
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(_log_percent_formatter))
+
+    fig.suptitle("Per-Chunk Prediction Error: Baseline vs Best SGD",
+                 fontsize=14, fontweight="bold", y=1.02)
+    fig.text(0.5, 0.99,
+             "MAPE (|predicted - actual| / actual) per chunk on log scale.\n"
+             "Shows how online SGD reduces prediction error relative to the static baseline.",
+             ha="center", fontsize=8.5, color="#555", va="top", style="italic")
+    ax.set_title("")
+
+    if len(all_indices) > 40:
+        step = max(1, len(all_indices) // 25)
+        ax.set_xticks(all_indices[::step])
+    else:
+        ax.set_xticks(all_indices)
+
+    ax.legend(fontsize=9, loc="best")
+    ax.grid(True, alpha=0.3, axis="y", which="both")
+    fig.tight_layout()
+    path = os.path.join(output_dir, "fig1_avg_mape.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {path}")
+
+
+# -- Plot 9: Chunk MAPE Comparison (Side-by-Side Bars) -------------------------
+
+def plot_chunk_mape_comparison(chunks_rows, sgd_rows, output_dir):
+    """MAPE heatmap: config (y-axis) vs chunk (x-axis), like VPIC style."""
+    # Gather all phases present in chunks data
+    phases = sorted(set(r.get("phase", "") for r in chunks_rows if r.get("phase")))
+    if not phases:
+        return
+
+    all_chunks = sorted(set(int(g(r, "chunk")) for r in chunks_rows))
+    if not all_chunks:
+        return
+
+    # Order: baseline first, then SGD configs sorted naturally
+    baseline_phases = [p for p in phases if p == "baseline"]
+    sgd_phases = sorted([p for p in phases if p.startswith("sgd_")])
+    ordered_phases = baseline_phases + sgd_phases
+    if not ordered_phases:
+        return
+
+    # Build 2D grid: rows = configs, cols = chunks
+    grid = np.full((len(ordered_phases), len(all_chunks)), np.nan)
+    ch_idx = {c: i for i, c in enumerate(all_chunks)}
+
+    for r in chunks_rows:
+        phase = r.get("phase", "")
+        if phase not in ordered_phases:
+            continue
+        ci = int(g(r, "chunk"))
+        pred = g(r, "predicted_ratio")
+        actual = g(r, "actual_ratio")
+        if actual > 0 and pred > 0:
+            mape = abs(pred - actual) / actual * 100.0
+            row_i = ordered_phases.index(phase)
+            grid[row_i, ch_idx[ci]] = mape
+
+    if np.all(np.isnan(grid)):
+        return
+
+    # Pretty labels
+    def _label(p):
+        if p == "baseline":
+            return "Baseline (no SGD)"
+        parts = p.split("_")
+        if len(parts) == 3:
+            return f"SGD lr={parts[1]} mt={parts[2]}"
+        return p
+
+    labels = [_label(p) for p in ordered_phases]
+
+    vmax = min(np.nanpercentile(grid, 95), 5000)
+    vmax = max(vmax, 2)  # avoid degenerate range
+    norm = mcolors.LogNorm(vmin=1, vmax=vmax, clip=True)
+
+    fig, ax = plt.subplots(figsize=(max(12, len(all_chunks) * 0.25),
+                                    max(4, len(ordered_phases) * 0.6 + 2)))
+    im = ax.imshow(grid, aspect="auto", cmap="RdYlGn_r", norm=norm,
+                   interpolation="nearest")
+
+    # X-axis: chunks
+    if len(all_chunks) > 40:
+        step = max(1, len(all_chunks) // 25)
+        ax.set_xticks(range(0, len(all_chunks), step))
+        ax.set_xticklabels([str(all_chunks[i]) for i in range(0, len(all_chunks), step)],
+                           fontsize=7)
+    else:
+        ax.set_xticks(range(len(all_chunks)))
+        ax.set_xticklabels([str(c) for c in all_chunks], fontsize=7)
+    ax.set_xlabel("Chunk Index", fontsize=10)
+
+    # Y-axis: configs
+    ax.set_yticks(range(len(labels)))
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.set_ylabel("Configuration", fontsize=10)
+
+    # Annotate cells if grid is small enough
+    if grid.size <= 600:
+        for i in range(grid.shape[0]):
+            for j in range(grid.shape[1]):
+                val = grid[i, j]
+                if not np.isnan(val):
+                    txt = f"{val:.0f}" if val < 10000 else f"{val/1000:.0f}K"
+                    color = "white" if val > 500 else "black"
+                    ax.text(j, i, txt, ha="center", va="center",
+                            fontsize=5, color=color)
+
+    cbar = fig.colorbar(im, ax=ax, shrink=0.8, pad=0.02)
+    cbar.set_label("MAPE (%)", fontsize=10)
+
+    fig.suptitle("Per-Chunk Prediction Error: All Configurations",
+                 fontsize=14, fontweight="bold")
+    fig.text(0.5, 0.97,
+             "Heatmap of MAPE (%) per chunk (x-axis) vs configuration (y-axis).\n"
+             "Green = low error, Red = high error. Log scale.",
+             ha="center", fontsize=9, color="#555", va="top", style="italic")
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    path = os.path.join(output_dir, "chunk_mape_comparison.png")
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {path}")
+
+
+# -- Plot 10: Compression Ratio Aggregate Comparison ---------------------------
+
+def plot_fig4_compression_ratio(agg_rows, sgd_rows, output_dir):
+    """Bar chart: Oracle vs Baseline vs Best SGD aggregate compression ratio."""
+    oracle_ratio, oracle_file, oracle_orig = 0, 0, 0
+    baseline_ratio, baseline_file = 0, 0
+    best_sgd_ratio, best_sgd_file = 0, 0
+
+    for r in agg_rows:
+        phase = r.get("phase")
+        if phase == "oracle":
+            oracle_ratio = g(r, "ratio")
+            oracle_file = g(r, "file_mib")
+            oracle_orig = g(r, "orig_mib")
+        elif phase == "baseline":
+            baseline_ratio = g(r, "ratio")
+            baseline_file = g(r, "file_mib")
+        elif phase == "best_sgd":
+            best_sgd_ratio = g(r, "ratio")
+            best_sgd_file = g(r, "file_mib")
+
+    # If best_sgd not in agg, derive from sgd_rows
+    if best_sgd_ratio == 0 and sgd_rows:
+        best = max(sgd_rows, key=lambda r: g(r, "ratio"))
+        best_sgd_ratio = g(best, "ratio")
+
+    if oracle_ratio == 0 and baseline_ratio == 0:
+        return
+
+    labels = []
+    values = []
+    colors = []
+    file_sizes = []
+
+    labels.append("Oracle\n(best-static)")
+    values.append(oracle_ratio)
+    colors.append("#e74c3c")
+    file_sizes.append(oracle_file)
+
+    labels.append("Baseline\n(NN only)")
+    values.append(baseline_ratio)
+    colors.append("#2980b9")
+    file_sizes.append(baseline_file)
+
+    if best_sgd_ratio > 0:
+        labels.append("Best SGD")
+        values.append(best_sgd_ratio)
+        colors.append("#27ae60")
+        file_sizes.append(best_sgd_file)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    bars = ax.bar(labels, values, color=colors, edgecolor="white",
+                  linewidth=1.5, alpha=0.85, width=0.5)
+
+    # Annotate with ratio, file size, and % of oracle
+    for bar, val, fsize in zip(bars, values, file_sizes):
+        x_center = bar.get_x() + bar.get_width() / 2
+        y_top = bar.get_height()
+
+        # Ratio value
+        ax.text(x_center, y_top + 0.05, f"{val:.2f}x",
+                ha="center", va="bottom", fontsize=12, fontweight="bold")
+
+        # File size (if available)
+        if fsize > 0:
+            ax.text(x_center, y_top * 0.5, f"{fsize:.1f} MiB",
+                    ha="center", va="center", fontsize=9, color="white",
+                    fontweight="bold")
+
+        # % of oracle
+        if oracle_ratio > 0 and val > 0:
+            pct = val / oracle_ratio * 100
+            ax.text(x_center, y_top + 0.35,
+                    f"({pct:.1f}% of oracle)",
+                    ha="center", va="bottom", fontsize=8,
+                    color="#555", style="italic")
+
+    # Original data size reference line
+    if oracle_orig > 0 and oracle_ratio > 0:
+        # Show as a text annotation since units differ
+        ax.text(0.98, 0.05,
+                f"Original data: {oracle_orig:.1f} MiB",
+                transform=ax.transAxes, ha="right", va="bottom",
+                fontsize=9, color="#555", style="italic",
+                bbox=dict(boxstyle="round,pad=0.3", fc="white",
+                          ec="#ccc", alpha=0.9))
+
+    ax.set_ylabel("Compression Ratio", fontsize=12)
+    fig.suptitle("Compression Ratio: Oracle vs Baseline vs Best SGD",
+                 fontsize=14, fontweight="bold", y=1.02)
+    fig.text(0.5, 0.99,
+             "Aggregate compression ratio comparison across the full Gray-Scott dataset.\n"
+             "Shows how close the NN-based methods get to the exhaustive oracle upper bound.",
+             ha="center", fontsize=8.5, color="#555", va="top", style="italic")
+    ax.set_title("")
+    ax.grid(True, alpha=0.3, axis="y")
+
+    fig.tight_layout()
+    path = os.path.join(output_dir, "fig4_compression_ratio.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {path}")
 
 
 # -- Main ----------------------------------------------------------------------
@@ -850,6 +1198,18 @@ def main():
     # 7. Config cross-check
     if ub_rows and chunks_rows:
         plot_config_crosscheck(ub_rows, chunks_rows, sgd_rows, output_dir)
+
+    # 8. Per-chunk prediction error (avg MAPE)
+    if chunks_rows:
+        plot_fig1_avg_mape(chunks_rows, sgd_rows, output_dir)
+
+    # 9. Chunk MAPE comparison (side-by-side bars)
+    if chunks_rows:
+        plot_chunk_mape_comparison(chunks_rows, sgd_rows, output_dir)
+
+    # 10. Compression ratio aggregate comparison
+    if agg_rows:
+        plot_fig4_compression_ratio(agg_rows, sgd_rows, output_dir)
 
     print("\nDone.")
 

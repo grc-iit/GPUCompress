@@ -5,16 +5,13 @@ NN Adaptiveness Benchmark Visualizer.
 Reads CSV results from the NN adaptiveness benchmark and produces:
   1. SGD heatmap: LR vs MAPE threshold, color = final MAPE
   2. SGD convergence: Cumulative MAPE vs chunk index with pattern-region bands
-  3. Exploration heatmap: K vs threshold, color = ratio vs upper bound
-  4. Exploration time-quality scatter: overhead vs ratio improvement
-  5. Per-chunk ratio comparison: upper bound vs baseline vs best SGD
-  6. Best configs bar chart: upper bound vs baseline vs best SGD vs best SGD+expl
+  3. Per-chunk ratio comparison: upper bound vs baseline vs best SGD
+  4. Best configs bar chart: upper bound vs baseline vs best SGD
 
 Usage:
   python3 benchmarks/nn_adaptiveness/visualize_nn_adaptiveness.py [options]
 
   --sgd-csv PATH     SGD study CSV (default: auto-detect)
-  --expl-csv PATH    Exploration study CSV (default: auto-detect)
   --chunks-csv PATH  Chunks detail CSV (default: auto-detect)
   --output-dir DIR   Directory for output PNGs (default: benchmarks/nn_adaptiveness/)
 """
@@ -26,6 +23,7 @@ import sys
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 import matplotlib.ticker as mticker
 import numpy as np
 
@@ -88,7 +86,8 @@ PATTERN_COLORS = {
 MAPE_COLORS = ["#e74c3c", "#3498db", "#2ecc71", "#e67e22", "#9b59b6",
                "#1abc9c", "#34495e", "#f39c12"]
 
-DEFAULT_DIR = "benchmarks/nn_adaptiveness"
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_DIR = os.path.join(_SCRIPT_DIR, "results")
 
 
 # -- Helpers -----------------------------------------------------------------
@@ -183,7 +182,12 @@ def plot_sgd_heatmap(sgd_rows, output_dir):
         return
 
     fig, ax = plt.subplots(figsize=(6, 5))
-    fig.suptitle("SGD Study: Final MAPE (%) by LR x MAPE Threshold", fontsize=13)
+    fig.suptitle("SGD Study: Final MAPE (%) by LR x MAPE Threshold", fontsize=13,
+                 fontweight="bold")
+    fig.text(0.5, 0.95,
+             "Hyperparameter grid search on 5 synthetic data patterns. Each cell shows the final\n"
+             "prediction error after SGD converges. Lower MAPE = better prediction accuracy.",
+             ha="center", fontsize=8.5, color="#555", va="top", style="italic")
 
     grid = np.full((len(lrs), len(mapes)), np.nan)
     for r in sgd_rows:
@@ -235,7 +239,12 @@ def plot_sgd_convergence(chunks_rows, sgd_rows, output_dir):
         fig, axes = plt.subplots(n_mt, 1, figsize=(14, 4 * n_mt), sharex=True)
         if n_mt == 1:
             axes = [axes]
-        fig.suptitle(f"SGD Convergence — LR = {lr:.3f}", fontsize=14, y=1.01)
+        fig.suptitle(f"SGD Convergence — LR = {lr:.3f}", fontsize=14,
+                     fontweight="bold", y=1.03)
+        fig.text(0.5, 1.01,
+                 "Per-chunk prediction error as SGD processes chunks sequentially across 5 data patterns.\n"
+                 "Colored bands show pattern boundaries. Vertical line marks convergence point.",
+                 ha="center", fontsize=8.5, color="#555", va="top", style="italic")
 
         for mi, mt in enumerate(mapes):
             ax = axes[mi]
@@ -289,114 +298,7 @@ def plot_sgd_convergence(chunks_rows, sgd_rows, output_dir):
         print(f"  Saved: {path}")
 
 
-# -- Plot 3: Exploration Heatmap ---------------------------------------------
-
-def plot_exploration_heatmap(expl_rows, output_dir):
-    """Single heatmap: K vs threshold, color = ratio vs upper bound."""
-    thresholds = sorted(set(g(r, "expl_threshold") for r in expl_rows))
-    ks = sorted(set(int(g(r, "K")) for r in expl_rows))
-    if not thresholds or not ks:
-        return
-
-    # Use ratio_vs_upper_bound if available, else fall back to ratio_vs_baseline
-    has_ub = any("ratio_vs_upper_bound" in r for r in expl_rows)
-    col = "ratio_vs_upper_bound" if has_ub else "ratio_vs_baseline"
-    label = "Ratio vs Upper Bound" if has_ub else "Ratio vs Baseline"
-
-    fig, ax = plt.subplots(figsize=(6, 5))
-    fig.suptitle(f"Exploration Study: {label} by Threshold x K", fontsize=13)
-
-    grid = np.full((len(ks), len(thresholds)), np.nan)
-    for r in expl_rows:
-        ki = ks.index(int(g(r, "K")))
-        ti = thresholds.index(g(r, "expl_threshold"))
-        grid[ki, ti] = g(r, col)
-
-    vmax = max(1.3, np.nanmax(grid)) if not np.all(np.isnan(grid)) else 1.3
-    vmin = min(0.95, np.nanmin(grid)) if not np.all(np.isnan(grid)) else 0.95
-    im = ax.imshow(grid, aspect="auto", cmap="RdYlGn", origin="lower",
-                    vmin=vmin, vmax=vmax)
-    ax.set_xticks(range(len(thresholds)))
-    ax.set_xticklabels([f"{t:.2f}" for t in thresholds], fontsize=9)
-    ax.set_yticks(range(len(ks)))
-    ax.set_yticklabels([str(k) for k in ks], fontsize=9)
-    ax.set_xlabel("Exploration Threshold")
-    ax.set_ylabel("K (alternatives)")
-    fig.colorbar(im, ax=ax, shrink=0.8, label=label)
-
-    for i in range(len(ks)):
-        for j in range(len(thresholds)):
-            if not np.isnan(grid[i, j]):
-                ax.text(j, i, f"{grid[i,j]:.3f}", ha="center", va="center",
-                        fontsize=8)
-
-    fig.tight_layout()
-    path = os.path.join(output_dir, "exploration_heatmap.png")
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {path}")
-
-
-# -- Plot 4: Exploration Time-Quality Scatter --------------------------------
-
-def plot_exploration_scatter(expl_rows, ub_rows, output_dir):
-    """Overhead (ms) vs ratio improvement, Pareto frontier, upper bound ref."""
-    if not expl_rows:
-        return
-
-    fig, ax = plt.subplots(figsize=(8, 6))
-    fig.suptitle("Exploration: Overhead vs Ratio Improvement", fontsize=13)
-
-    x = [g(r, "total_exploration_ms") for r in expl_rows]
-    y = [g(r, "ratio_vs_baseline") for r in expl_rows]
-    labels = [f"t={g(r,'expl_threshold'):.2f} K={int(g(r,'K'))}" for r in expl_rows]
-
-    ax.scatter(x, y, color="#3498db", alpha=0.7, s=50, edgecolors="white", linewidths=0.5)
-
-    for xi, yi, label in zip(x, y, labels):
-        ax.annotate(label, (xi, yi), fontsize=6, alpha=0.7,
-                    textcoords="offset points", xytext=(5, 3))
-
-    # Pareto frontier
-    if x and y:
-        points = sorted(zip(x, y))
-        pareto_x, pareto_y = [], []
-        best_y = -float("inf")
-        for px, py in points:
-            if py > best_y:
-                pareto_x.append(px)
-                pareto_y.append(py)
-                best_y = py
-        if pareto_x:
-            ax.plot(pareto_x, pareto_y, "k--", alpha=0.5, label="Pareto frontier")
-
-    ax.axhline(y=1.0, color="gray", linestyle=":", alpha=0.5, label="Baseline")
-
-    # Upper bound reference line
-    ub_ratio = _get_upper_bound_ratio(ub_rows)
-    if ub_ratio > 0:
-        best_expl = max(expl_rows, key=lambda r: g(r, "ratio"))
-        rvb = g(best_expl, "ratio_vs_baseline")
-        if rvb > 0:
-            baseline_ratio = g(best_expl, "ratio") / rvb
-            if baseline_ratio > 0:
-                ub_vs_baseline = ub_ratio / baseline_ratio
-                ax.axhline(y=ub_vs_baseline, color="#2ecc71", linestyle="--",
-                           alpha=0.7, label=f"Upper Bound ({ub_vs_baseline:.2f}x)")
-
-    ax.set_xlabel("Exploration Overhead (ms)")
-    ax.set_ylabel("Ratio vs Baseline")
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
-
-    fig.tight_layout()
-    path = os.path.join(output_dir, "exploration_scatter.png")
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {path}")
-
-
-# -- Plot 5: Per-Chunk Ratio Comparison --------------------------------------
+# -- Plot 3: Per-Chunk Ratio Comparison --------------------------------------
 
 def plot_per_chunk_comparison(chunks_rows, sgd_rows, ub_rows, output_dir):
     """Per-chunk ratio comparison: one PNG per pattern + one combined.
@@ -464,7 +366,13 @@ def plot_per_chunk_comparison(chunks_rows, sgd_rows, ub_rows, output_dir):
 
     ax.set_xlabel("Chunk Index")
     ax.set_ylabel("Compression Ratio (log)")
-    ax.set_title("Per-Chunk Compression Ratio Comparison (All Patterns)", fontsize=13)
+    fig.suptitle("Per-Chunk Compression Ratio Comparison (All Patterns)", fontsize=14,
+                 fontweight="bold", y=1.02)
+    fig.text(0.5, 0.99,
+             "Compression ratio per chunk across all 5 synthetic patterns. Compares upper bound\n"
+             "(exhaustive search), NN baseline (inference-only), and best SGD (online learning).",
+             ha="center", fontsize=8.5, color="#555", va="top", style="italic")
+    ax.set_title("")
     ax.set_yscale("log")
     ax.yaxis.set_major_formatter(mticker.FuncFormatter(
         lambda v, _: f"{v:.1f}x" if v < 10 else f"{v:.0f}x"))
@@ -486,8 +394,7 @@ def plot_per_chunk_comparison(chunks_rows, sgd_rows, ub_rows, output_dir):
     sgd_configs = {}
     for r in chunks_rows:
         ci = int(g(r, "chunk_idx"))
-        action = int(g(r, "nn_action"))
-        _, tag = _decode_nn_action(action)
+        _, tag = _parse_nn_action(r.get("nn_action", ""))
         if r.get("study") == "baseline":
             bl_configs[ci] = (g(r, "actual_ratio"), tag)
         elif (r.get("study") == "sgd" and sgd_label
@@ -614,7 +521,12 @@ def plot_per_chunk_comparison(chunks_rows, sgd_rows, ub_rows, output_dir):
                        title="Config", title_fontsize=8,
                        bbox_to_anchor=(0.99, 0.99))
 
-        fig.suptitle(f"Per-Chunk Config & Ratio: {pat}", fontsize=14, y=1.01)
+        fig.suptitle(f"Per-Chunk Config & Ratio: {pat}", fontsize=14,
+                     fontweight="bold", y=1.03)
+        fig.text(0.5, 1.01,
+                 "Algorithm selection and ratio per chunk. Markers colored by config.\n"
+                 "Shows which algorithm each method picks and the resulting compression ratio.",
+                 ha="center", fontsize=8.5, color="#555", va="top", style="italic")
         fig.tight_layout()
 
         safe_name = pat.replace(" ", "_").lower()
@@ -644,19 +556,15 @@ ALGO_NAMES_BY_ID = {
 }
 
 
-def _decode_nn_action(action):
-    """Decode NN action int -> (algo_name, shuffle, quant) using modular encoding."""
-    action = int(action)
-    algo_id = action % 8
-    quant = (action // 8) % 2
-    shuffle = (action // 16) % 2
-    algo = ALGO_NAMES_BY_ID.get(algo_id, f"unk{algo_id}")
-    tag = algo
-    if shuffle:
-        tag += "+s4"
-    if quant:
-        tag += "+q"
-    return algo, tag
+def _parse_nn_action(action_str):
+    """Parse nn_action string from CSV -> (algo_name, tag_string).
+
+    CSV now stores human-readable strings like 'lz4', 'snappy+shuf4',
+    'zstd+shuf4+quant'.
+    """
+    s = str(action_str).strip()
+    algo = s.split("+")[0] if "+" in s else s
+    return algo, s
 
 
 def plot_upper_bound_configs(ub_rows, chunks_rows, sgd_rows, output_dir):
@@ -690,8 +598,7 @@ def plot_upper_bound_configs(ub_rows, chunks_rows, sgd_rows, output_dir):
     for r in chunks_rows:
         if r.get("study") == "baseline":
             ci = int(g(r, "chunk_idx"))
-            action = int(g(r, "nn_action"))
-            algo, tag = _decode_nn_action(action)
+            algo, tag = _parse_nn_action(r.get("nn_action", ""))
             nn_per_chunk[ci] = (g(r, "actual_ratio"), tag, algo)
 
     # Get best SGD run's picks per chunk
@@ -707,8 +614,7 @@ def plot_upper_bound_configs(ub_rows, chunks_rows, sgd_rows, output_dir):
                     and abs(g(r, "lr") - best_lr) < 1e-6
                     and abs(g(r, "mape_threshold") - best_mt) < 1e-6):
                 ci = int(g(r, "chunk_idx"))
-                action = int(g(r, "nn_action"))
-                algo, tag = _decode_nn_action(action)
+                algo, tag = _parse_nn_action(r.get("nn_action", ""))
                 sgd_per_chunk[ci] = (g(r, "actual_ratio"), tag, algo)
 
     chunk_indices = sorted(best_per_chunk.keys())
@@ -815,7 +721,12 @@ def plot_upper_bound_configs(ub_rows, chunks_rows, sgd_rows, output_dir):
     if has_sgd:
         title += f" vs Best SGD ({sgd_label})"
     title += ": Per Chunk"
-    ax.set_title(title, fontsize=13)
+    fig.suptitle(title, fontsize=13, fontweight="bold", y=1.02)
+    fig.text(0.5, 0.99,
+             "Side-by-side ratio per chunk with oracle annotations. Pattern bands show data transitions.\n"
+             "Compares how close NN baseline and SGD approach the exhaustive-search upper bound.",
+             ha="center", fontsize=8.5, color="#555", va="top", style="italic")
+    ax.set_title("")
     ax.set_yscale("log")
     ax.yaxis.set_major_formatter(mticker.FuncFormatter(
         lambda v, _: f"{v:.1f}x" if v < 10 else f"{v:.0f}x"))
@@ -839,8 +750,8 @@ def plot_upper_bound_configs(ub_rows, chunks_rows, sgd_rows, output_dir):
 
 # -- Plot 7: Config Cross-Check (NN vs Upper Bound) -------------------------
 
-def plot_config_crosscheck(ub_rows, chunks_rows, sgd_rows, expl_rows, output_dir):
-    """Four-row heatmap: Upper Bound vs Best Exploration vs Best SGD vs NN Baseline
+def plot_config_crosscheck(ub_rows, chunks_rows, sgd_rows, output_dir):
+    """Multi-row heatmap: Upper Bound vs Best SGD vs NN Baseline
     per chunk, colored by algorithm. Mismatched chunks marked."""
     if not ub_rows or not chunks_rows:
         return
@@ -871,8 +782,7 @@ def plot_config_crosscheck(ub_rows, chunks_rows, sgd_rows, expl_rows, output_dir
     for r in chunks_rows:
         if r.get("study") == "baseline":
             ci = int(g(r, "chunk_idx"))
-            action = int(g(r, "nn_action"))
-            algo, tag = _decode_nn_action(action)
+            algo, tag = _parse_nn_action(r.get("nn_action", ""))
             nn_per_chunk[ci] = (g(r, "actual_ratio"), tag, algo)
 
     # Best SGD config per chunk
@@ -888,26 +798,8 @@ def plot_config_crosscheck(ub_rows, chunks_rows, sgd_rows, expl_rows, output_dir
                     and abs(g(r, "lr") - best_lr) < 1e-6
                     and abs(g(r, "mape_threshold") - best_mt) < 1e-6):
                 ci = int(g(r, "chunk_idx"))
-                action = int(g(r, "nn_action"))
-                algo, tag = _decode_nn_action(action)
+                algo, tag = _parse_nn_action(r.get("nn_action", ""))
                 sgd_per_chunk[ci] = (g(r, "actual_ratio"), tag, algo)
-
-    # Best Exploration config per chunk
-    expl_per_chunk = {}
-    expl_label = "Best Exploration"
-    if expl_rows:
-        best_expl = max(expl_rows, key=lambda r: g(r, "ratio"))
-        best_et = g(best_expl, "expl_threshold")
-        best_k = int(g(best_expl, "K"))
-        expl_label = f"Best Expl\n(t={best_et:.2f}, K={best_k})"
-        for r in chunks_rows:
-            if (r.get("study") == "exploration"
-                    and abs(g(r, "expl_threshold") - best_et) < 1e-6
-                    and int(g(r, "K")) == best_k):
-                ci = int(g(r, "chunk_idx"))
-                action = int(g(r, "nn_action"))
-                algo, tag = _decode_nn_action(action)
-                expl_per_chunk[ci] = (g(r, "actual_ratio"), tag, algo)
 
     chunk_indices = sorted(ub_per_chunk.keys())
     if not chunk_indices:
@@ -915,15 +807,12 @@ def plot_config_crosscheck(ub_rows, chunks_rows, sgd_rows, expl_rows, output_dir
     n_chunks = len(chunk_indices)
 
     has_sgd = bool(sgd_per_chunk)
-    has_expl = bool(expl_per_chunk)
 
-    # Build rows bottom-to-top: NN Baseline, Best SGD, Best Expl, Upper Bound
+    # Build rows bottom-to-top: NN Baseline, Best SGD, Upper Bound
     rows = []  # list of (label, per_chunk_dict)
     rows.append(("NN Baseline", nn_per_chunk))
     if has_sgd:
         rows.append((sgd_label, sgd_per_chunk))
-    if has_expl:
-        rows.append((expl_label, expl_per_chunk))
     rows.append(("Upper Bound", ub_per_chunk))
 
     n_rows = len(rows)
@@ -982,8 +871,13 @@ def plot_config_crosscheck(ub_rows, chunks_rows, sgd_rows, expl_rows, output_dir
         ax.set_xticklabels([str(ci) for ci in chunk_indices], fontsize=6)
     ax.set_xlabel("Chunk Index", fontsize=10)
 
-    ax.set_title("Config Cross-Check: Per-Chunk Algorithm Selection\n"
-                 "(x = differs from Upper Bound)", fontsize=12)
+    fig.suptitle("Config Cross-Check: Per-Chunk Algorithm Selection",
+                 fontsize=13, fontweight="bold", y=1.03)
+    fig.text(0.5, 1.01,
+             "Each row shows the algorithm chosen per chunk. Red 'x' marks disagreements with upper bound.\n"
+             "Fewer mismatches = better NN prediction. Pattern regions separated by dashed lines.",
+             ha="center", fontsize=8.5, color="#555", va="top", style="italic")
+    ax.set_title("")
 
     # Algorithm color legend
     all_algos = list(ALGO_COLORS.keys())
@@ -1014,12 +908,485 @@ def plot_config_crosscheck(ub_rows, chunks_rows, sgd_rows, expl_rows, output_dir
                            sgd_per_chunk.get(ci, (0, "", ""))[1])
         print(f"    Best SGD vs UB match:    {sgd_match}/{n_total} "
               f"({100*sgd_match/n_total:.1f}%)")
-    if has_expl:
-        expl_match = sum(1 for ci in chunk_indices
-                         if ub_per_chunk.get(ci, (0, "", ""))[1] ==
-                            expl_per_chunk.get(ci, (0, "", ""))[1])
-        print(f"    Best Expl vs UB match:   {expl_match}/{n_total} "
-              f"({100*expl_match/n_total:.1f}%)")
+
+
+# -- Plot 8: Summary Bar Chart -----------------------------------------------
+
+def plot_summary(sgd_rows, ub_rows, chunks_rows, output_dir):
+    """Aggregate bar chart: Upper Bound vs Baseline vs Best SGD."""
+    ub_ratio = _get_upper_bound_ratio(ub_rows)
+
+    # Baseline: harmonic mean of actual_ratio from baseline chunks
+    bl_ratios = [g(r, "actual_ratio") for r in chunks_rows
+                 if r.get("study") == "baseline" and g(r, "actual_ratio") > 0]
+    if bl_ratios:
+        bl_ratio = len(bl_ratios) / sum(1.0 / v for v in bl_ratios)
+    else:
+        bl_ratio = 0.0
+
+    # Best SGD ratio
+    sgd_ratio = max((g(r, "ratio") for r in sgd_rows), default=0.0) if sgd_rows else 0.0
+
+    labels, values, colors = [], [], []
+    if ub_ratio > 0:
+        labels.append("Upper Bound")
+        values.append(ub_ratio)
+        colors.append("#e74c3c")
+    if bl_ratio > 0:
+        labels.append("Baseline")
+        values.append(bl_ratio)
+        colors.append("#2980b9")
+    if sgd_ratio > 0:
+        labels.append("Best SGD")
+        values.append(sgd_ratio)
+        colors.append("#27ae60")
+
+    if not values:
+        return
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    fig.suptitle("NN Adaptiveness: Aggregate Compression Ratio", fontsize=14,
+                 fontweight="bold", y=1.02)
+    fig.text(0.5, 0.99,
+             "Harmonic mean compression ratio across all chunks and patterns.\n"
+             "Compares upper bound, NN baseline, and best SGD configs.",
+             ha="center", fontsize=8.5, color="#555", va="top", style="italic")
+
+    bars = ax.bar(range(len(labels)), values, color=colors, edgecolor="white",
+                  linewidth=0.5, alpha=0.85, zorder=3)
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, fontsize=10)
+    ax.set_ylabel("Compression Ratio")
+    ax.grid(True, alpha=0.3, axis="y")
+
+    for bar, val in zip(bars, values):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                f"{val:.2f}x", ha="center", va="bottom", fontsize=11,
+                fontweight="bold")
+
+    fig.tight_layout()
+    path = os.path.join(output_dir, "summary.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {path}")
+
+
+# -- Plot 9: Per-Chunk Prediction Error (Baseline vs Best SGD) ---------------
+
+def plot_fig1_avg_mape(chunks_rows, sgd_rows, output_dir):
+    """Per-chunk prediction error: baseline vs best SGD, with pattern bands."""
+    bl_chunks = [r for r in chunks_rows if r.get("study") == "baseline"]
+    if not bl_chunks:
+        return
+
+    max_chunk = max(int(g(r, "chunk_idx")) for r in chunks_rows)
+    n_chunks = max_chunk + 1
+
+    # Baseline MAPE per chunk
+    bl_idx, bl_mape = _compute_per_chunk_mape(bl_chunks)
+
+    # Best SGD MAPE per chunk
+    sgd_idx, sgd_mape = [], []
+    sgd_label = ""
+    if sgd_rows:
+        best_sgd = max(sgd_rows, key=lambda r: g(r, "ratio"))
+        best_lr = g(best_sgd, "lr")
+        best_mt = g(best_sgd, "mape_threshold")
+        sgd_label = f"lr={best_lr:.3f}, mt={best_mt:.2f}"
+        sgd_chunks = [r for r in chunks_rows
+                      if r.get("study") == "sgd"
+                      and abs(g(r, "lr") - best_lr) < 1e-6
+                      and abs(g(r, "mape_threshold") - best_mt) < 1e-6]
+        sgd_chunks.sort(key=lambda r: g(r, "chunk_idx"))
+        sgd_idx, sgd_mape = _compute_per_chunk_mape(sgd_chunks)
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    fig.suptitle("Per-Chunk Prediction Error: Baseline vs Best SGD", fontsize=14,
+                 fontweight="bold", y=1.02)
+    fig.text(0.5, 0.99,
+             "MAPE (%) per chunk on log scale. Lower = better prediction accuracy.\n"
+             "Running average shows SGD convergence trend across pattern transitions.",
+             ha="center", fontsize=8.5, color="#555", va="top", style="italic")
+
+    _draw_pattern_bands(ax, n_chunks)
+
+    # Oracle reference line
+    ax.axhline(y=0.1, color="gray", linestyle="--", alpha=0.5, linewidth=1.0,
+               label="Oracle (~0% error)")
+
+    # Baseline
+    if bl_idx:
+        ax.plot(bl_idx, bl_mape, color="#2980b9", linewidth=1.2, alpha=0.8,
+                label="Baseline", marker=".", markersize=2, zorder=3)
+
+    # Best SGD
+    if sgd_idx:
+        ax.plot(sgd_idx, sgd_mape, color="#27ae60", linewidth=1.2, alpha=0.8,
+                label=f"Best SGD ({sgd_label})", marker=".", markersize=2, zorder=3)
+        # Running average
+        if len(sgd_mape) >= 5:
+            window = max(5, len(sgd_mape) // 20)
+            running_avg = np.convolve(sgd_mape, np.ones(window) / window, mode="valid")
+            offset = window // 2
+            ax.plot(sgd_idx[offset:offset + len(running_avg)], running_avg,
+                    color="#2c3e50", linewidth=2.0, alpha=0.7, linestyle="--",
+                    label=f"SGD Running Avg (w={window})", zorder=4)
+
+    ax.set_xlabel("Chunk Index")
+    ax.set_ylabel("MAPE (%)")
+    ax.set_yscale("log")
+    ax.set_ylim(bottom=0.01)
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(_log_percent_formatter))
+    ax.legend(fontsize=8, loc="upper right")
+    ax.grid(True, alpha=0.3, which="both")
+
+    fig.tight_layout()
+    path = os.path.join(output_dir, "fig1_avg_mape.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {path}")
+
+
+# -- Plot 10: Chunk MAPE Comparison (Side-by-Side Bars) ----------------------
+
+def plot_chunk_mape_comparison(chunks_rows, sgd_rows, output_dir):
+    """MAPE heatmap: config (y-axis) vs chunk (x-axis), like VPIC style."""
+    all_chunks = sorted(set(int(g(r, "chunk_idx")) for r in chunks_rows))
+    if not all_chunks:
+        return
+    n_chunks = max(all_chunks) + 1
+
+    # Gather unique configs: baseline + each SGD (lr, mt) combo
+    configs = []  # list of (label, filter_func)
+    configs.append(("Baseline (no SGD)",
+                    lambda r: r.get("study") == "baseline"))
+
+    # Collect unique SGD configs
+    sgd_configs = set()
+    for r in chunks_rows:
+        if r.get("study") == "sgd":
+            lr = g(r, "lr")
+            mt = g(r, "mape_threshold")
+            if lr > 0:
+                sgd_configs.add((lr, mt))
+
+    for lr, mt in sorted(sgd_configs):
+        label = f"SGD lr={lr:.3f} mt={mt:.2f}"
+        configs.append((label,
+                        lambda r, _lr=lr, _mt=mt: (
+                            r.get("study") == "sgd"
+                            and abs(g(r, "lr") - _lr) < 1e-6
+                            and abs(g(r, "mape_threshold") - _mt) < 1e-6)))
+
+    if not configs:
+        return
+
+    # Build 2D grid: rows = configs, cols = chunks
+    ch_idx = {c: i for i, c in enumerate(all_chunks)}
+    grid = np.full((len(configs), len(all_chunks)), np.nan)
+
+    for r in chunks_rows:
+        pred = g(r, "predicted_ratio")
+        actual = g(r, "actual_ratio")
+        if not (pred > 0 and actual > 0):
+            continue
+        ci = int(g(r, "chunk_idx"))
+        if ci not in ch_idx:
+            continue
+        mape = abs(pred - actual) / actual * 100.0
+        for row_i, (_, filt) in enumerate(configs):
+            if filt(r):
+                grid[row_i, ch_idx[ci]] = mape
+                break
+
+    if np.all(np.isnan(grid)):
+        return
+
+    labels = [lbl for lbl, _ in configs]
+
+    vmax = min(np.nanpercentile(grid, 95), 5000)
+    vmax = max(vmax, 2)
+    norm = mcolors.LogNorm(vmin=1, vmax=vmax, clip=True)
+
+    fig, ax = plt.subplots(figsize=(max(12, len(all_chunks) * 0.25),
+                                    max(4, len(configs) * 0.6 + 2)))
+
+    # Draw pattern bands behind the heatmap
+    _draw_pattern_bands(ax, n_chunks)
+
+    im = ax.imshow(grid, aspect="auto", cmap="RdYlGn_r", norm=norm,
+                   interpolation="nearest", zorder=2)
+
+    # X-axis: chunks
+    if len(all_chunks) > 40:
+        step = max(1, len(all_chunks) // 25)
+        ax.set_xticks(range(0, len(all_chunks), step))
+        ax.set_xticklabels([str(all_chunks[i]) for i in range(0, len(all_chunks), step)],
+                           fontsize=7)
+    else:
+        ax.set_xticks(range(len(all_chunks)))
+        ax.set_xticklabels([str(c) for c in all_chunks], fontsize=7)
+    ax.set_xlabel("Chunk Index", fontsize=10)
+
+    # Y-axis: configs
+    ax.set_yticks(range(len(labels)))
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.set_ylabel("Configuration", fontsize=10)
+
+    # Annotate cells if grid is small enough
+    if grid.size <= 600:
+        for i in range(grid.shape[0]):
+            for j in range(grid.shape[1]):
+                val = grid[i, j]
+                if not np.isnan(val):
+                    txt = f"{val:.0f}" if val < 10000 else f"{val/1000:.0f}K"
+                    color = "white" if val > 500 else "black"
+                    ax.text(j, i, txt, ha="center", va="center",
+                            fontsize=5, color=color)
+
+    cbar = fig.colorbar(im, ax=ax, shrink=0.8, pad=0.02)
+    cbar.set_label("MAPE (%)", fontsize=10)
+
+    fig.suptitle("Per-Chunk Prediction Error: All Configurations",
+                 fontsize=14, fontweight="bold")
+    fig.text(0.5, 0.97,
+             "Heatmap of MAPE (%) per chunk (x-axis) vs configuration (y-axis).\n"
+             "Green = low error, Red = high error. Log scale. Pattern regions shown as background bands.",
+             ha="center", fontsize=9, color="#555", va="top", style="italic")
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    path = os.path.join(output_dir, "chunk_mape_comparison.png")
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {path}")
+
+
+# -- Plot 11: Compression Ratio Comparison Bars ------------------------------
+
+def plot_fig4_compression_ratio(sgd_rows, ub_rows, chunks_rows, output_dir):
+    """Aggregate compression ratio comparison: Upper Bound vs Baseline vs Best SGD."""
+    ub_ratio = _get_upper_bound_ratio(ub_rows)
+
+    # Baseline: harmonic mean
+    bl_ratios = [g(r, "actual_ratio") for r in chunks_rows
+                 if r.get("study") == "baseline" and g(r, "actual_ratio") > 0]
+    if bl_ratios:
+        bl_ratio = len(bl_ratios) / sum(1.0 / v for v in bl_ratios)
+    else:
+        bl_ratio = 0.0
+
+    # Best SGD ratio
+    sgd_ratio = max((g(r, "ratio") for r in sgd_rows), default=0.0) if sgd_rows else 0.0
+
+    labels, values, colors = [], [], []
+    if ub_ratio > 0:
+        labels.append("Upper Bound")
+        values.append(ub_ratio)
+        colors.append("#e74c3c")
+    if bl_ratio > 0:
+        labels.append("Baseline")
+        values.append(bl_ratio)
+        colors.append("#2980b9")
+    if sgd_ratio > 0:
+        labels.append("Best SGD")
+        values.append(sgd_ratio)
+        colors.append("#27ae60")
+
+    if not values:
+        return
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    fig.suptitle("Compression Ratio: Upper Bound vs Baseline vs Best SGD", fontsize=14,
+                 fontweight="bold", y=1.02)
+    fig.text(0.5, 0.99,
+             "Aggregate compression ratio (harmonic mean across chunks).\n"
+             "Shows how close each method gets to the exhaustive-search upper bound.",
+             ha="center", fontsize=8.5, color="#555", va="top", style="italic")
+
+    bars = ax.bar(range(len(labels)), values, color=colors, edgecolor="white",
+                  linewidth=0.5, alpha=0.85, zorder=3)
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, fontsize=10)
+    ax.set_ylabel("Compression Ratio")
+    ax.grid(True, alpha=0.3, axis="y")
+
+    # Annotate with ratio values and % of upper bound
+    for i, (bar, val) in enumerate(zip(bars, values)):
+        text = f"{val:.2f}x"
+        if ub_ratio > 0 and labels[i] != "Upper Bound":
+            pct = val / ub_ratio * 100
+            text += f"\n({pct:.1f}% of UB)"
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                text, ha="center", va="bottom", fontsize=10,
+                fontweight="bold")
+
+    fig.tight_layout()
+    path = os.path.join(output_dir, "fig4_compression_ratio.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {path}")
+
+
+# -- Plot 12: Per-Chunk Config (3-Panel) -------------------------------------
+
+def plot_per_chunk_config(chunks_rows, sgd_rows, ub_rows, output_dir):
+    """3-panel plot showing all chunks with markers colored by algorithm config.
+    Panel 1: Upper Bound, Panel 2: Baseline, Panel 3: Best SGD."""
+    ub_best = _get_upper_bound_per_chunk(ub_rows)
+    bl = _get_baseline_per_chunk(chunks_rows)
+    if not ub_best and not bl:
+        return
+
+    # Build per-chunk config dicts: chunk_idx -> (ratio, tag, algo)
+    ub_configs = {}
+    for r in (ub_rows or []):
+        if r.get("status") != "ok" or g(r, "compression_ratio") <= 0:
+            continue
+        ci = int(g(r, "chunk_idx"))
+        ratio = g(r, "compression_ratio")
+        if ratio > ub_configs.get(ci, (0, "", ""))[0]:
+            algo = r.get("algorithm", "?")
+            shuf = int(g(r, "shuffle_bytes"))
+            quant = int(g(r, "quantization"))
+            tag = algo
+            if shuf:
+                tag += f"+s{shuf}"
+            if quant:
+                tag += "+q"
+            ub_configs[ci] = (ratio, tag, algo)
+
+    bl_configs = {}
+    for r in chunks_rows:
+        if r.get("study") == "baseline":
+            ci = int(g(r, "chunk_idx"))
+            algo, tag = _parse_nn_action(r.get("nn_action", ""))
+            bl_configs[ci] = (g(r, "actual_ratio"), tag, algo)
+
+    sgd_configs = {}
+    sgd_label = ""
+    if sgd_rows:
+        best_sgd = max(sgd_rows, key=lambda r: g(r, "ratio"))
+        best_lr = g(best_sgd, "lr")
+        best_mt = g(best_sgd, "mape_threshold")
+        sgd_label = f"lr={best_lr:.3f}, mt={best_mt:.2f}"
+        for r in chunks_rows:
+            if (r.get("study") == "sgd"
+                    and abs(g(r, "lr") - best_lr) < 1e-6
+                    and abs(g(r, "mape_threshold") - best_mt) < 1e-6):
+                ci = int(g(r, "chunk_idx"))
+                algo, tag = _parse_nn_action(r.get("nn_action", ""))
+                sgd_configs[ci] = (g(r, "actual_ratio"), tag, algo)
+
+    all_indices = sorted(set(list(ub_configs.keys()) + list(bl_configs.keys())
+                             + list(sgd_configs.keys())))
+    if not all_indices:
+        return
+    n_chunks = max(all_indices) + 1
+
+    # Collect all unique config tags for color mapping
+    all_tags = set()
+    for configs in [ub_configs, bl_configs, sgd_configs]:
+        for ci in all_indices:
+            if ci in configs:
+                all_tags.add(configs[ci][1])
+    tag_list = sorted(all_tags)
+    config_cmap = plt.cm.tab10
+    tag_colors = {t: config_cmap(i % 10) for i, t in enumerate(tag_list)}
+
+    series = [
+        ("Upper Bound (best-static)", ub_configs, "#e74c3c", "o"),
+        ("Baseline (NN inference-only)", bl_configs, "#2980b9", "s"),
+        (f"Best SGD ({sgd_label})" if sgd_label else "Best SGD", sgd_configs, "#27ae60", "^"),
+    ]
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 12), sharex=True)
+    fig.suptitle("Per-Chunk Config & Ratio (All Patterns)", fontsize=14,
+                 fontweight="bold", y=1.03)
+    fig.text(0.5, 1.01,
+             "Algorithm selection and compression ratio per chunk. Markers colored by config.\n"
+             "Shows which algorithm each method picks across all pattern regions.",
+             ha="center", fontsize=8.5, color="#555", va="top", style="italic")
+
+    for ax, (label, configs, line_color, marker) in zip(axes, series):
+        _draw_pattern_bands(ax, n_chunks)
+
+        ratios = [configs.get(ci, (0, "", ""))[0] for ci in all_indices]
+        tags = [configs.get(ci, (0, "unknown", ""))[1] for ci in all_indices]
+
+        if not any(r > 0 for r in ratios):
+            ax.text(0.5, 0.5, f"{label}: no data", transform=ax.transAxes,
+                    ha="center", va="center", fontsize=12, color="gray")
+            ax.set_ylabel("Ratio")
+            ax.set_title(label, fontsize=11)
+            continue
+
+        # Plot connecting line
+        ax.plot(all_indices, ratios, color=line_color, linewidth=1.0,
+                alpha=0.4, zorder=2)
+
+        # Plot colored markers by config
+        for ci, ratio, tag in zip(all_indices, ratios, tags):
+            if ratio > 0:
+                c = tag_colors.get(tag, "gray")
+                ax.scatter(ci, ratio, color=c, marker=marker, s=40,
+                           edgecolors="white", linewidths=0.3, zorder=3)
+
+        # Config-change annotations: label runs of same config
+        runs = []
+        for i, tag in enumerate(tags):
+            if runs and runs[-1][2] == tag:
+                runs[-1] = (runs[-1][0], i, tag)
+            else:
+                runs.append((i, i, tag))
+
+        for start, end, tag in runs:
+            if tag == "" or tag == "unknown":
+                continue
+            mid_idx = (start + end) // 2
+            mid_x = all_indices[mid_idx] if mid_idx < len(all_indices) else all_indices[-1]
+            peak = max(ratios[start:end + 1]) if ratios[start:end + 1] else 0
+            if peak > 0:
+                ax.annotate(tag, (mid_x, peak), fontsize=6,
+                            ha="center", va="bottom", rotation=45,
+                            textcoords="offset points", xytext=(0, 5),
+                            color=tag_colors.get(tag, "gray"),
+                            fontweight="bold", zorder=4)
+
+        avg = np.mean([r for r in ratios if r > 0])
+        ax.set_ylabel("Ratio")
+        ax.set_title(f"{label}  (avg={avg:.2f}x)", fontsize=11)
+        ax.grid(True, alpha=0.3, axis="y")
+
+        # Use log scale if range is large
+        valid = [r for r in ratios if r > 0]
+        if valid and max(valid) / max(min(valid), 0.01) > 5:
+            ax.set_yscale("log")
+            ax.yaxis.set_major_formatter(mticker.FuncFormatter(
+                lambda v, _: f"{v:.1f}x" if v < 10 else f"{v:.0f}x"))
+
+    axes[-1].set_xlabel("Chunk Index")
+
+    if len(all_indices) > 40:
+        step = max(1, len(all_indices) // 25)
+        axes[-1].set_xticks(all_indices[::step])
+    else:
+        axes[-1].set_xticks(all_indices)
+
+    # Config color legend
+    legend_handles = [plt.Line2D([0], [0], marker="o", color="w",
+                      markerfacecolor=tag_colors.get(t, "gray"),
+                      markersize=8, label=t)
+                      for t in tag_list if t]
+    if legend_handles:
+        fig.legend(handles=legend_handles, loc="upper right",
+                   fontsize=7, ncol=min(len(legend_handles), 4),
+                   title="Config", title_fontsize=8,
+                   bbox_to_anchor=(0.99, 0.99))
+
+    fig.tight_layout()
+    path = os.path.join(output_dir, "per_chunk_config.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {path}")
 
 
 # -- Main --------------------------------------------------------------------
@@ -1027,33 +1394,25 @@ def plot_config_crosscheck(ub_rows, chunks_rows, sgd_rows, expl_rows, output_dir
 def main():
     parser = argparse.ArgumentParser(description="NN Adaptiveness Benchmark Visualizer")
     parser.add_argument("--sgd-csv", default=None)
-    parser.add_argument("--expl-csv", default=None)
     parser.add_argument("--chunks-csv", default=None)
     parser.add_argument("--ub-csv", default=None)
     parser.add_argument("--output-dir", default=DEFAULT_DIR)
     args = parser.parse_args()
 
     sgd_csv = args.sgd_csv or os.path.join(DEFAULT_DIR, "sgd_study.csv")
-    expl_csv = args.expl_csv or os.path.join(DEFAULT_DIR, "exploration_study.csv")
     chunks_csv = args.chunks_csv or os.path.join(DEFAULT_DIR, "chunks_detail.csv")
     ub_csv = args.ub_csv or os.path.join(DEFAULT_DIR, "upper_bound.csv")
     output_dir = args.output_dir
 
     os.makedirs(output_dir, exist_ok=True)
 
-    sgd_rows, expl_rows, chunks_rows, ub_rows = [], [], [], []
+    sgd_rows, chunks_rows, ub_rows = [], [], []
 
     if os.path.exists(sgd_csv):
         sgd_rows = parse_csv(sgd_csv)
         print(f"Loaded {len(sgd_rows)} SGD rows from {sgd_csv}")
     else:
         print(f"WARNING: SGD CSV not found: {sgd_csv}")
-
-    if os.path.exists(expl_csv):
-        expl_rows = parse_csv(expl_csv)
-        print(f"Loaded {len(expl_rows)} exploration rows from {expl_csv}")
-    else:
-        print(f"WARNING: Exploration CSV not found: {expl_csv}")
 
     if os.path.exists(chunks_csv):
         chunks_rows = parse_csv(chunks_csv)
@@ -1067,7 +1426,7 @@ def main():
     else:
         print(f"WARNING: Upper bound CSV not found: {ub_csv}")
 
-    if not sgd_rows and not expl_rows and not chunks_rows and not ub_rows:
+    if not sgd_rows and not chunks_rows and not ub_rows:
         print("ERROR: No data to visualize. Run the benchmark first.")
         sys.exit(1)
 
@@ -1078,10 +1437,6 @@ def main():
         if chunks_rows:
             plot_sgd_convergence(chunks_rows, sgd_rows, output_dir)
 
-    if expl_rows:
-        plot_exploration_heatmap(expl_rows, output_dir)
-        plot_exploration_scatter(expl_rows, ub_rows, output_dir)
-
     if chunks_rows or ub_rows:
         plot_per_chunk_comparison(chunks_rows, sgd_rows, ub_rows, output_dir)
 
@@ -1089,7 +1444,20 @@ def main():
         plot_upper_bound_configs(ub_rows, chunks_rows, sgd_rows, output_dir)
 
     if ub_rows and chunks_rows:
-        plot_config_crosscheck(ub_rows, chunks_rows, sgd_rows, expl_rows, output_dir)
+        plot_config_crosscheck(ub_rows, chunks_rows, sgd_rows, output_dir)
+
+    if sgd_rows or ub_rows or chunks_rows:
+        plot_summary(sgd_rows, ub_rows, chunks_rows, output_dir)
+
+    if chunks_rows:
+        plot_fig1_avg_mape(chunks_rows, sgd_rows, output_dir)
+        plot_chunk_mape_comparison(chunks_rows, sgd_rows, output_dir)
+
+    if ub_rows or chunks_rows:
+        plot_fig4_compression_ratio(sgd_rows, ub_rows, chunks_rows, output_dir)
+
+    if chunks_rows or ub_rows:
+        plot_per_chunk_config(chunks_rows, sgd_rows, ub_rows, output_dir)
 
     print("\nDone.")
 

@@ -23,7 +23,8 @@ import matplotlib.colors as mcolors
 import numpy as np
 
 
-DEFAULT_DIR = "benchmarks/vpic"
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_DIR = os.path.join(_SCRIPT_DIR, "results")
 
 
 def parse_csv(path):
@@ -93,8 +94,8 @@ def _add_heatmap(ax, grid, timesteps, chunks, title, vmax=None):
 
 def plot_single_heatmap(rows, phase, label, output_dir):
     timesteps, chunks, grid = build_mape_grid(rows, phase)
-    if grid is None:
-        print(f"  Skipping {phase}: no data")
+    if grid is None or np.all(np.isnan(grid)):
+        print(f"  Skipping {phase}: no prediction data")
         return
 
     fig, ax = plt.subplots(figsize=(max(10, len(chunks) * 0.7), 8))
@@ -128,8 +129,9 @@ def plot_side_by_side(rows, output_dir):
     ts_bl, ch_bl, grid_bl = build_mape_grid(rows, "nn_baseline")
     ts_sgd, ch_sgd, grid_sgd = build_mape_grid(rows, "nn_sgd")
 
-    if grid_bl is None or grid_sgd is None:
-        print("  Skipping side-by-side: missing data")
+    if (grid_bl is None or np.all(np.isnan(grid_bl)) or
+            grid_sgd is None or np.all(np.isnan(grid_sgd))):
+        print("  Skipping side-by-side: no prediction data")
         return
 
     vmax = min(max(np.nanpercentile(grid_bl, 95),
@@ -147,7 +149,12 @@ def plot_side_by_side(rows, output_dir):
     fig.colorbar(im2, ax=axes[1], orientation="horizontal",
                  pad=0.08, shrink=0.6, label="MAPE (%)")
 
-    fig.suptitle("Per-Chunk Prediction Error: Baseline vs SGD", fontsize=14)
+    fig.suptitle("Per-Chunk Prediction Error: Baseline vs SGD", fontsize=14,
+                 fontweight="bold")
+    fig.text(0.5, 0.97,
+             "Heatmap of MAPE (%) per chunk (x-axis) vs simulation timestep (y-axis).\n"
+             "Top: static NN baseline. Bottom: NN + online SGD. Green = low error, Red = high error.",
+             ha="center", fontsize=9, color="#555", va="top", style="italic")
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     path = os.path.join(output_dir, "chunk_mape_comparison.png")
     fig.savefig(path, dpi=150, bbox_inches="tight")
@@ -180,10 +187,6 @@ def main():
     print(f"Loaded {len(rows)} rows from {chunk_csv}")
 
     print("\nGenerating plots...")
-    plot_single_heatmap(rows, "nn_baseline", "NN Baseline (no learning)",
-                        args.output_dir)
-    plot_single_heatmap(rows, "nn_sgd", "NN + SGD (online learning)",
-                        args.output_dir)
     plot_side_by_side(rows, args.output_dir)
     print("\nDone.")
 

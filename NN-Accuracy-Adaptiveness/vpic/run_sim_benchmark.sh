@@ -12,9 +12,10 @@
 #   ./benchmarks/vpic/run_sim_benchmark.sh [--build-only] [--run-only]
 #
 # Runtime environment variables (optional):
+#   VPIC_NX                     Grid side length        (default: 128)
 #   GPUCOMPRESS_SGD_LR          SGD learning rate       (default: 0.5)
 #   GPUCOMPRESS_SGD_MAPE        MAPE threshold          (default: 0.25)
-#   GPUCOMPRESS_DIAG_INTERVAL   Diagnostic interval     (default: 34)
+#   GPUCOMPRESS_DIAG_INTERVAL   Oracle + logging every N steps (default: 20)
 #   GPUCOMPRESS_NUM_STEPS       Total simulation steps  (default: 1000)
 #   GPUCOMPRESS_CHUNK_MB        Chunk size in MB        (default: 8)
 # ============================================================
@@ -25,7 +26,7 @@ VPIC_DIR="${VPIC_DIR:-$HOME/vpic-kokkos}"
 HDF5_PREFIX="${HDF5_PREFIX:-/tmp/hdf5-install}"
 NVCOMP_LIB="${NVCOMP_LIB:-/tmp/lib}"
 BUILD_DIR="${VPIC_DIR}/build-sim-benchmark"
-DECK_SRC="${GPUCOMPRESS_DIR}/benchmarks/vpic/benchmark_vpic_sim.cxx"
+DECK_SRC="${GPUCOMPRESS_DIR}/NN-Accuracy-Adaptiveness/vpic/vpicNNaccuracy.cxx"
 WEIGHTS="${GPUCOMPRESS_DIR}/neural_net/weights/model.nnwt"
 
 BUILD_ONLY=0
@@ -59,6 +60,8 @@ if [ "$RUN_ONLY" -eq 0 ]; then
 
     cmake --build "$BUILD_DIR" -j"$(nproc)"
     echo ""
+    # Create symlink so run step finds it
+    ln -sf "$BUILD_DIR/vpicNNaccuracy" "$BUILD_DIR/benchmark_vpic_sim" 2>/dev/null || true
     echo "Build complete: $BUILD_DIR/benchmark_vpic_sim"
 fi
 
@@ -77,7 +80,7 @@ if [ "$BUILD_ONLY" -eq 0 ]; then
     # Print runtime config
     echo "  SGD LR       : ${GPUCOMPRESS_SGD_LR:-0.5 (default)}"
     echo "  SGD MAPE     : ${GPUCOMPRESS_SGD_MAPE:-0.25 (default)}"
-    echo "  Diag interval: ${GPUCOMPRESS_DIAG_INTERVAL:-34 (default)}"
+    echo "  Diag interval: ${GPUCOMPRESS_DIAG_INTERVAL:-20 (default)}"
     echo "  Num steps    : ${GPUCOMPRESS_NUM_STEPS:-1000 (default)}"
     echo "  Chunk MB     : ${GPUCOMPRESS_CHUNK_MB:-8 (default)}"
     echo ""
@@ -87,9 +90,10 @@ if [ "$BUILD_ONLY" -eq 0 ]; then
 
     echo ""
     echo "=== Results ==="
-    echo "  Timestep CSV : benchmarks/vpic/sim_timestep_metrics.csv"
-    echo "  Chunk CSV    : benchmarks/vpic/sim_chunk_metrics.csv"
+    echo "  Timestep CSV : NN-Accuracy-Adaptiveness/vpic/results/sim_timestep_metrics.csv"
+    echo "  Chunk CSV    : NN-Accuracy-Adaptiveness/vpic/results/sim_chunk_metrics.csv"
     echo ""
     echo "To visualize:"
-    echo "  python3 benchmarks/vpic/visualize_vpic_sim.py"
+    echo "  python3 NN-Accuracy-Adaptiveness/vpic/visualize_vpic_sim.py"
+    echo "  python3 NN-Accuracy-Adaptiveness/vpic/visualize_chunk_mape.py"
 fi

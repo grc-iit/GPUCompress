@@ -77,7 +77,7 @@
 #define TMP_BASELINE "/tmp/bm_gs_baseline.h5"
 #define TMP_SGD      "/tmp/bm_gs_sgd.h5"
 
-#define OUT_DIR        "benchmarks/grayscott"
+#define OUT_DIR        "NN-Accuracy-Adaptiveness/grayscott/results"
 #define OUT_CSV        OUT_DIR "/benchmark_grayscott_vol.csv"
 #define OUT_CHUNKS     OUT_DIR "/benchmark_grayscott_vol_chunks.csv"
 #define OUT_SGD_CSV    OUT_DIR "/sgd_study.csv"
@@ -86,6 +86,28 @@
 /* HDF5 filter ID */
 #define H5Z_FILTER_GPUCOMPRESS    305
 #define H5Z_GPUCOMPRESS_CD_NELMTS 5
+
+/* ============================================================
+ * Action → human-readable string
+ * ============================================================ */
+static const char *ACTION_ALGO_NAMES[] = {
+    "lz4", "snappy", "deflate", "gdeflate",
+    "zstd", "ans", "cascaded", "bitcomp"
+};
+
+static void action_to_str(int action, char *buf, size_t bufsz)
+{
+    if (action < 0 || action > 31) {
+        snprintf(buf, bufsz, "act%d", action);
+        return;
+    }
+    int algo    = action % 8;
+    int quant   = (action / 8) % 2;
+    int shuffle = (action / 16) % 2;
+    int n = snprintf(buf, bufsz, "%s", ACTION_ALGO_NAMES[algo]);
+    if (shuffle) n += snprintf(buf + n, bufsz - n, "+shuf");
+    if (quant)   snprintf(buf + n, bufsz - n, "+quant");
+}
 
 /* ============================================================
  * GPU-side byte-exact comparison
@@ -249,14 +271,12 @@ typedef struct {
     double read_mbps;
     unsigned long long mismatches;
     int    sgd_fires;
-    int    explorations;
     int    n_chunks;
 
     /* Per-phase timing breakdown (summed across chunks) */
     double total_nn_inference_ms;
     double total_preprocessing_ms;
     double total_compression_ms;
-    double total_exploration_ms;
     double total_sgd_ms;
 
     /* Per-phase ratio distribution */
@@ -296,7 +316,7 @@ static double run_simulation(gpucompress_grayscott_t sim, int steps,
  * Phase: VOL write/read with compression
  * ============================================================ */
 
-static int run_phase_vol(gpucompress_grayscott_t sim, int steps,
+static int run_phase_vol(float *d_v, float *d_read,
                          unsigned long long *d_count,
                          size_t n_floats, int L, int chunk_z,
                          const char *phase_name, const char *tmp_file,
@@ -306,11 +326,6 @@ static int run_phase_vol(gpucompress_grayscott_t sim, int steps,
     size_t total_bytes = n_floats * sizeof(float);
     int n_chunks = (L + chunk_z - 1) / chunk_z;
     hsize_t dims[3] = { (hsize_t)L, (hsize_t)L, (hsize_t)L };
-
-    printf("[%s] Running simulation (%d steps)...\n", phase_name, steps);
-    float *d_v = NULL, *d_read = NULL;
-    double sim_ms = run_simulation(sim, steps, &d_v, &d_read);
-    printf("[%s] Simulation: %.0f ms\n", phase_name, sim_ms);
 
     /* VOL write */
     printf("[%s] H5Dwrite (GPU ptr, VOL)... ", phase_name); fflush(stdout);
@@ -364,18 +379,16 @@ static int run_phase_vol(gpucompress_grayscott_t sim, int steps,
 
     /* Collect per-chunk diagnostics */
     int sgd_fires  = 0;
-    int explorations = 0;
     int n_hist     = gpucompress_get_chunk_history_count();
     for (int i = 0; i < n_hist; i++) {
         gpucompress_chunk_diag_t d;
         if (gpucompress_get_chunk_diag(i, &d) == 0) {
             sgd_fires    += d.sgd_fired;
-            explorations += d.exploration_triggered;
         }
     }
 
     size_t fbytes = file_size(tmp_file);
-    r->sim_ms      = sim_ms;
+    r->sim_ms      = 0;  /* simulation time tracked by caller */
     r->write_ms    = t1 - t0;
     r->read_ms     = t3 - t2;
     r->file_bytes  = fbytes;
@@ -385,14 +398,13 @@ static int run_phase_vol(gpucompress_grayscott_t sim, int steps,
     r->read_mbps   = (double)total_bytes / (1 << 20) / ((t3 - t2) / 1000.0);
     r->mismatches  = mm;
     r->sgd_fires   = sgd_fires;
-    r->explorations = explorations;
     r->n_chunks    = n_chunks;
     snprintf(r->phase, sizeof(r->phase), "%s", phase_name);
 
     printf("[%s] ratio=%.2fx  write=%.0f MiB/s  read=%.0f MiB/s  "
-           "file=%.0f MiB  sgd=%d expl=%d/%d  mismatches=%llu\n",
+           "file=%.0f MiB  sgd=%d/%d  mismatches=%llu\n",
            phase_name, r->ratio, r->write_mbps, r->read_mbps,
-           (double)fbytes / (1 << 20), sgd_fires, explorations, n_hist, mm);
+           (double)fbytes / (1 << 20), sgd_fires, n_hist, mm);
     return (mm == 0) ? 0 : 1;
 }
 
@@ -409,9 +421,9 @@ static void write_chunk_csv(const char *phase_name, int n_chunks,
     if (!header_written) {
         f = fopen(OUT_CHUNKS, "w");
         if (!f) { perror("fopen " OUT_CHUNKS); return; }
-        fprintf(f, "phase,chunk,nn_action,explored,sgd_fired,"
+        fprintf(f, "phase,chunk,nn_action,sgd_fired,"
                    "nn_inference_ms,preprocessing_ms,compression_ms,"
-                   "exploration_ms,sgd_update_ms,"
+                   "sgd_update_ms,"
                    "actual_ratio,predicted_ratio\n");
         fclose(f);
         header_written = 1;
@@ -421,7 +433,7 @@ static void write_chunk_csv(const char *phase_name, int n_chunks,
     if (!f) { perror("fopen " OUT_CHUNKS); return; }
 
     /* Aggregate accumulators */
-    double sum_nn = 0, sum_pp = 0, sum_comp = 0, sum_expl = 0, sum_sgd = 0;
+    double sum_nn = 0, sum_pp = 0, sum_comp = 0, sum_sgd = 0;
     double r_min = 1e30, r_max = 0, r_sum = 0, r_sum2 = 0;
     double mape_sum = 0;
     int    mape_count = 0;
@@ -431,19 +443,20 @@ static void write_chunk_csv(const char *phase_name, int n_chunks,
     for (int i = 0; i < n_hist && i < n_chunks; i++) {
         gpucompress_chunk_diag_t d;
         if (gpucompress_get_chunk_diag(i, &d) == 0) {
-            fprintf(f, "%s,%d,%d,%d,%d,"
-                       "%.3f,%.3f,%.3f,%.3f,%.3f,"
+            char act_str[64];
+            action_to_str(d.nn_action, act_str, sizeof(act_str));
+            fprintf(f, "%s,%d,%s,%d,"
+                       "%.3f,%.3f,%.3f,%.3f,"
                        "%.4f,%.4f\n",
                     phase_name, i,
-                    d.nn_action, d.exploration_triggered, d.sgd_fired,
+                    act_str, d.sgd_fired,
                     d.nn_inference_ms, d.preprocessing_ms, d.compression_ms,
-                    d.exploration_ms, d.sgd_update_ms,
+                    d.sgd_update_ms,
                     d.actual_ratio, d.predicted_ratio);
 
             sum_nn   += d.nn_inference_ms;
             sum_pp   += d.preprocessing_ms;
             sum_comp += d.compression_ms;
-            sum_expl += d.exploration_ms;
             sum_sgd  += d.sgd_update_ms;
 
             if (d.actual_ratio > 0) {
@@ -459,7 +472,7 @@ static void write_chunk_csv(const char *phase_name, int n_chunks,
                 mape_count++;
             }
         } else {
-            fprintf(f, "%s,%d,-1,0,0,0,0,0,0,0,0,0\n", phase_name, i);
+            fprintf(f, "%s,%d,none,0,0,0,0,0,0,0\n", phase_name, i);
         }
     }
     fclose(f);
@@ -469,7 +482,6 @@ static void write_chunk_csv(const char *phase_name, int n_chunks,
         r->total_nn_inference_ms  = sum_nn;
         r->total_preprocessing_ms = sum_pp;
         r->total_compression_ms   = sum_comp;
-        r->total_exploration_ms   = sum_expl;
         r->total_sgd_ms           = sum_sgd;
         r->ratio_min = (n_valid > 0) ? r_min : 0;
         r->ratio_max = (n_valid > 0) ? r_max : 0;
@@ -728,7 +740,7 @@ int main(int argc, char **argv)
     PhaseResult baseline_res;
     memset(&baseline_res, 0, sizeof(baseline_res));
     hid_t dcpl_nn = make_dcpl_auto(L, chunk_z);
-    int rc = run_phase_vol(sim, steps, d_count,
+    int rc = run_phase_vol(d_v, d_u, d_count,
                            n_floats, L, chunk_z,
                            "baseline", TMP_BASELINE, dcpl_nn,
                            &baseline_res);
@@ -788,7 +800,7 @@ int main(int argc, char **argv)
             snprintf(tmp_file, sizeof(tmp_file), "/tmp/bm_gs_sgd_%.2f_%.2f.h5", lr, mape);
 
             hid_t dcpl_sgd = make_dcpl_auto(L, chunk_z);
-            rc = run_phase_vol(sim, steps, d_count,
+            rc = run_phase_vol(d_v, d_u, d_count,
                                n_floats, L, chunk_z,
                                phase_name, tmp_file, dcpl_sgd,
                                &sgd_res);
@@ -798,14 +810,28 @@ int main(int argc, char **argv)
 
             write_chunk_csv(phase_name, n_chunks, &sgd_res);
 
-            /* Compute convergence and final MAPE from chunk history */
+            /* Compute convergence and final MAPE from chunk history.
+             * Convergence uses a sliding window (last CONV_WINDOW chunks)
+             * rather than a single-chunk test, matching nn_adaptiveness. */
+#define CONV_WINDOW    10
+#define CONV_THRESHOLD 0.15  /* 15% — realistic for NN ratio prediction */
             int convergence_chunks = 0;
             double final_mape_val = 0;
             int n_hist = gpucompress_get_chunk_history_count();
             {
                 double mape_sum = 0;
                 int mape_count = 0;
-                int converged = 0;
+                double conv_ring[CONV_WINDOW];
+                memset(conv_ring, 0, sizeof(conv_ring));
+                int conv_ring_pos = 0;
+                int conv_ring_count = 0;
+
+                /* Final MAPE: over last 10% of chunks */
+                int last_10pct_start = n_hist - (n_hist / 10);
+                if (last_10pct_start < 0) last_10pct_start = 0;
+                double final_mape_sum = 0;
+                int final_mape_count = 0;
+
                 for (int i = 0; i < n_hist; i++) {
                     gpucompress_chunk_diag_t d;
                     if (gpucompress_get_chunk_diag(i, &d) != 0) continue;
@@ -814,13 +840,26 @@ int main(int argc, char **argv)
                                      / d.actual_ratio;
                         mape_sum += err;
                         mape_count++;
-                        if (!converged && err < (double)mape) {
-                            convergence_chunks = i + 1;
-                            converged = 1;
+
+                        conv_ring[conv_ring_pos] = err;
+                        conv_ring_pos = (conv_ring_pos + 1) % CONV_WINDOW;
+                        if (conv_ring_count < CONV_WINDOW) conv_ring_count++;
+                        if (convergence_chunks == 0 && conv_ring_count == CONV_WINDOW) {
+                            double window_sum = 0;
+                            for (int w = 0; w < CONV_WINDOW; w++) window_sum += conv_ring[w];
+                            if (window_sum / CONV_WINDOW < CONV_THRESHOLD) {
+                                convergence_chunks = i + 1;
+                            }
+                        }
+
+                        if (i >= last_10pct_start) {
+                            final_mape_sum += err;
+                            final_mape_count++;
                         }
                     }
                 }
-                final_mape_val = (mape_count > 0) ? (mape_sum / mape_count) * 100.0 : 0;
+                final_mape_val = (final_mape_count > 0)
+                    ? (final_mape_sum / final_mape_count) * 100.0 : 0;
             }
 
             double sgd_fire_rate = (sgd_res.n_chunks > 0)
@@ -889,6 +928,7 @@ int main(int argc, char **argv)
                        "ratio_min,ratio_max,ratio_stddev,mean_prediction_error_pct\n");
             fprintf(f, "oracle,%.4f,%.2f,0,0,0,%.2f,0,0,0,0,%d,0,0,0,0\n",
                     oracle_ratio, sim_ms, dataset_mb, n_chunks);
+            baseline_res.sim_ms = sim_ms;
             fprintf(f, "baseline,%.4f,%.2f,%.2f,%.2f,%.2f,%.2f,"
                        "%.1f,%.1f,%llu,%d,%d,"
                        "%.4f,%.4f,%.4f,%.2f\n",
@@ -903,6 +943,7 @@ int main(int argc, char **argv)
                     baseline_res.ratio_stddev,
                     baseline_res.mean_prediction_error_pct);
             if (n_lrs > 0) {
+                best_sgd_res.sim_ms = sim_ms;
                 fprintf(f, "best_sgd,%.4f,%.2f,%.2f,%.2f,%.2f,%.2f,"
                            "%.1f,%.1f,%llu,%d,%d,"
                            "%.4f,%.4f,%.4f,%.2f\n",

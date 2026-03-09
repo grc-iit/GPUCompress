@@ -1,10 +1,9 @@
 /**
  * @file benchmark_nn_adaptiveness.cu
- * @brief NN Model Adaptiveness Benchmark: SGD & Exploration Hyperparameter Study
+ * @brief NN Model Adaptiveness Benchmark: SGD Hyperparameter Study
  *
  * Generates 5 different GPU-resident data patterns (~3.2GB each at L=928)
- * and runs hyperparameter grid searches over SGD learning rate / MAPE threshold
- * and exploration threshold / K alternatives.
+ * and runs hyperparameter grid searches over SGD learning rate / MAPE threshold.
  *
  * Usage:
  *   ./build/benchmark_nn_adaptiveness model.nnwt \
@@ -14,11 +13,10 @@
  *   model.nnwt       Path to NN weights (required, or GPUCOMPRESS_WEIGHTS env)
  *   --L N            Grid side length (dataset = N^3 floats, default 928)
  *   --chunk-mb N     Chunk size in MB (default 64)
- *   --quick          Reduced hyperparameter grid (~55 runs vs ~255)
+ *   --quick          Reduced hyperparameter grid
  *
  * Output:
  *   benchmarks/nn_adaptiveness/sgd_study.csv
- *   benchmarks/nn_adaptiveness/exploration_study.csv
  *   benchmarks/nn_adaptiveness/chunks_detail.csv
  */
 
@@ -51,9 +49,8 @@
 
 #define TMP_FILE           "/tmp/bm_nn_adapt.h5"
 
-#define OUT_DIR            "benchmarks/nn_adaptiveness"
+#define OUT_DIR            "NN-Accuracy-Adaptiveness/nn_adaptiveness/results"
 #define OUT_SGD_CSV        OUT_DIR "/sgd_study.csv"
-#define OUT_EXPL_CSV       OUT_DIR "/exploration_study.csv"
 #define OUT_CHUNKS_CSV     OUT_DIR "/chunks_detail.csv"
 #define OUT_UB_CSV         OUT_DIR "/upper_bound.csv"
 
@@ -346,12 +343,10 @@ typedef struct {
     int     convergence_chunks;
     int     n_chunks;
     int     sgd_fires;
-    int     explorations;
     double  total_write_ms;
     double  total_sgd_ms;
     double  total_nn_inference_ms;
     double  total_compression_ms;
-    double  total_exploration_ms;
     double  write_mibps;
     double  file_mib;
     unsigned long long mismatches;
@@ -410,11 +405,11 @@ static int do_single_run(float *d_data, float *d_readback, size_t n_floats,
 
     /* Collect diagnostics from chunk history */
     int n_hist = gpucompress_get_chunk_history_count();
-    double sum_nn = 0, sum_comp = 0, sum_expl = 0, sum_sgd = 0;
+    double sum_nn = 0, sum_comp = 0, sum_sgd = 0;
     double r_min = 1e30, r_max = 0, r_sum = 0, r_sum2 = 0;
     double mape_sum = 0;
     int mape_count = 0, n_valid = 0;
-    int sgd_fires = 0, explorations = 0;
+    int sgd_fires = 0;
 
     /* For convergence tracking: sliding window MAPE over last CONV_WINDOW chunks.
      * A cumulative average never recovers from early high-error chunks, so we
@@ -438,10 +433,8 @@ static int do_single_run(float *d_data, float *d_readback, size_t n_floats,
 
         sum_nn   += d.nn_inference_ms;
         sum_comp += d.compression_ms;
-        sum_expl += d.exploration_ms;
         sum_sgd  += d.sgd_update_ms;
         sgd_fires    += d.sgd_fired;
-        explorations += d.exploration_triggered;
 
         if (d.actual_ratio > 0) {
             if (d.actual_ratio < r_min) r_min = d.actual_ratio;
@@ -492,12 +485,10 @@ static int do_single_run(float *d_data, float *d_readback, size_t n_floats,
     result->convergence_chunks  = convergence_chunk;
     result->n_chunks            = n_chunks;
     result->sgd_fires           = sgd_fires;
-    result->explorations        = explorations;
     result->total_write_ms      = write_ms;
     result->total_sgd_ms        = sum_sgd;
     result->total_nn_inference_ms = sum_nn;
     result->total_compression_ms  = sum_comp;
-    result->total_exploration_ms  = sum_expl;
     result->write_mibps         = (double)total_bytes / (1 << 20) / (write_ms / 1000.0);
     result->file_mib            = (double)fbytes / (1 << 20);
     result->mismatches          = mm;
@@ -673,21 +664,22 @@ static const char* chunk_pattern_name(int chunk_idx, int n_chunks)
 }
 
 static void write_chunk_detail(FILE *f, const char *study, int n_chunks,
-                                float lr, float mape_thresh,
-                                float expl_thresh, int K)
+                                float lr, float mape_thresh)
 {
     int n_hist = gpucompress_get_chunk_history_count();
     for (int i = 0; i < n_hist; i++) {
         gpucompress_chunk_diag_t d;
         if (gpucompress_get_chunk_diag(i, &d) != 0) continue;
 
-        fprintf(f, "%s,%s,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%.4f,%.4f,%.3f,%.3f,%.3f,%.3f\n",
+        char act_str[64];
+        action_to_string(d.nn_action, act_str, sizeof(act_str));
+        fprintf(f, "%s,%s,%.3f,%.3f,%d,%s,%d,%.4f,%.4f,%.3f,%.3f,%.3f\n",
                 study, chunk_pattern_name(i, n_chunks),
-                lr, mape_thresh, expl_thresh, K,
-                i, d.nn_action, d.exploration_triggered, d.sgd_fired,
+                lr, mape_thresh,
+                i, act_str, d.sgd_fired,
                 d.actual_ratio, d.predicted_ratio,
                 d.nn_inference_ms, d.compression_ms,
-                d.exploration_ms, d.sgd_update_ms);
+                d.sgd_update_ms);
     }
 }
 
@@ -703,7 +695,6 @@ int main(int argc, char **argv)
     int chunk_mb = DEFAULT_CHUNK_MB;
     int chunk_z  = 0;
     int quick    = 0;
-    int no_explore = 0;
     int no_sgd = 0;
 
     /* Parse args */
@@ -716,8 +707,6 @@ int main(int argc, char **argv)
             g_error_bound = atof(argv[++i]);
         } else if (strcmp(argv[i], "--quick") == 0) {
             quick = 1;
-        } else if (strcmp(argv[i], "--no-explore") == 0) {
-            no_explore = 1;
         } else if (strcmp(argv[i], "--no-sgd") == 0) {
             no_sgd = 1;
         } else if (argv[i][0] != '-') {
@@ -726,7 +715,7 @@ int main(int argc, char **argv)
     }
     if (!weights_path) weights_path = getenv("GPUCOMPRESS_WEIGHTS");
     if (!weights_path) {
-        fprintf(stderr, "Usage: %s <weights.nnwt> [--L N] [--chunk-mb N] [--error-bound E] [--quick] [--no-explore] [--no-sgd]\n",
+        fprintf(stderr, "Usage: %s <weights.nnwt> [--L N] [--chunk-mb N] [--error-bound E] [--quick] [--no-sgd]\n",
                 argv[0]);
         return 1;
     }
@@ -747,7 +736,7 @@ int main(int argc, char **argv)
     double cmb         = (double)L * L * chunk_z * sizeof(float) / (1024.0 * 1024.0);
 
     printf("╔═══════════════════════════════════════════════════════════════════════════╗\n");
-    printf("║  NN Adaptiveness Benchmark: SGD & Exploration Hyperparameter Study       ║\n");
+    printf("║  NN Adaptiveness Benchmark: SGD Hyperparameter Study                     ║\n");
     printf("╚═══════════════════════════════════════════════════════════════════════════╝\n\n");
     printf("  Grid     : %d^3 = %zu floats (%.1f MB)\n", L, n_floats, dataset_mb);
     printf("  Chunks   : %d x %d x %d  (%d chunks, %.1f MB each)\n",
@@ -762,28 +751,16 @@ int main(int argc, char **argv)
     float sgd_lrs_quick[]  = {0.05f, 0.2f, 0.8f};
     float sgd_mapes_quick[] = {0.20f, 0.30f};
 
-    float expl_thresholds_full[]  = {0.10f, 0.20f, 0.30f, 0.50f};
-    int   expl_ks_full[]          = {2, 4, 8, 16, 31};
-    float expl_thresholds_quick[] = {0.10f, 0.30f};
-    int   expl_ks_quick[]         = {4, 16};
-
     float *sgd_lrs   = quick ? sgd_lrs_quick   : sgd_lrs_full;
     float *sgd_mapes = quick ? sgd_mapes_quick  : sgd_mapes_full;
     int n_lrs   = no_sgd ? 0 : (quick ? 3 : 3);
     int n_mapes = no_sgd ? 0 : (quick ? 2 : 3);
 
-    float *expl_thresholds = quick ? expl_thresholds_quick : expl_thresholds_full;
-    int   *expl_ks         = quick ? expl_ks_quick         : expl_ks_full;
-    int n_thresholds = no_explore ? 0 : (quick ? 2 : 4);
-    int n_ks         = no_explore ? 0 : (quick ? 2 : 5);
-
     int total_runs = 1                                      /* baseline */
-                   + n_lrs * n_mapes                       /* SGD study */
-                   + n_thresholds * n_ks;                  /* exploration study */
-    printf("  Total runs: %d (1 baseline + %d SGD + %d exploration)\n",
+                   + n_lrs * n_mapes;                      /* SGD study */
+    printf("  Total runs: %d (1 baseline + %d SGD)\n",
            total_runs,
-           n_lrs * n_mapes,
-           n_thresholds * n_ks);
+           n_lrs * n_mapes);
     printf("  Dataset   : composite (5 patterns along Z, each %d slices)\n\n",
            L / 5);
 
@@ -811,7 +788,7 @@ int main(int argc, char **argv)
     float *d_data = NULL, *d_readback = NULL;
     unsigned long long *d_count = NULL;
     gpucompress_grayscott_t gs_sim = NULL;
-    FILE *f_sgd = NULL, *f_expl = NULL, *f_chunks = NULL, *f_ub = NULL;
+    FILE *f_sgd = NULL, *f_chunks = NULL, *f_ub = NULL;
     int run_num = 0;
     int any_fail = 0;
     double baseline_ratio = 0;
@@ -847,10 +824,9 @@ int main(int argc, char **argv)
 
     /* Open CSV files */
     f_sgd = fopen(OUT_SGD_CSV, "w");
-    f_expl = fopen(OUT_EXPL_CSV, "w");
     f_chunks = fopen(OUT_CHUNKS_CSV, "w");
     f_ub = fopen(OUT_UB_CSV, "w");
-    if (!f_sgd || !f_expl || !f_chunks || !f_ub) {
+    if (!f_sgd || !f_chunks || !f_ub) {
         fprintf(stderr, "FATAL: Cannot open output CSV files in %s\n", OUT_DIR);
         goto cleanup;
     }
@@ -861,15 +837,10 @@ int main(int argc, char **argv)
                    "total_nn_inference_ms,total_compression_ms,"
                    "ratio_min,ratio_max,ratio_stddev,write_mibps,file_mib,mismatches\n");
 
-    fprintf(f_expl, "expl_threshold,K,n_chunks,ratio,ratio_vs_baseline,ratio_vs_upper_bound,"
-                    "exploration_trigger_rate,total_write_ms,total_exploration_ms,"
-                    "total_sgd_ms,total_nn_inference_ms,total_compression_ms,"
-                    "ratio_min,ratio_max,ratio_stddev,write_mibps,file_mib,mismatches\n");
-
-    fprintf(f_chunks, "study,pattern_region,lr,mape_threshold,expl_threshold,K,"
-                      "chunk_idx,nn_action,explored,sgd_fired,"
+    fprintf(f_chunks, "study,pattern_region,lr,mape_threshold,"
+                      "chunk_idx,nn_action,sgd_fired,"
                       "actual_ratio,predicted_ratio,"
-                      "nn_inference_ms,compression_ms,exploration_ms,sgd_update_ms\n");
+                      "nn_inference_ms,compression_ms,sgd_update_ms\n");
 
     fprintf(f_ub, "chunk_idx,pattern_region,algorithm,shuffle_bytes,quantization,"
                   "error_bound,compression_ratio,compressed_bytes,original_bytes,status\n");
@@ -893,7 +864,7 @@ int main(int argc, char **argv)
         }
     }
 
-    printf("\n═══ BASELINE (inference-only, no SGD/exploration) ═══\n\n");
+    printf("\n═══ BASELINE (inference-only, no SGD) ═══\n\n");
 
     {
         run_num++;
@@ -915,7 +886,7 @@ int main(int argc, char **argv)
                res.mismatches == 0 ? "PASS" : "FAIL");
         print_action_summary();
         print_per_chunk_ratios(n_chunks);
-        write_chunk_detail(f_chunks, "baseline", n_chunks, 0, 0, 0, 0);
+        write_chunk_detail(f_chunks, "baseline", n_chunks, 0, 0);
     }
 
     /* ────────────────────────────────────────────────────────────────────
@@ -961,7 +932,7 @@ int main(int argc, char **argv)
                     res.ratio_min, res.ratio_max, res.ratio_stddev,
                     res.write_mibps, res.file_mib, res.mismatches);
 
-            write_chunk_detail(f_chunks, "sgd", n_chunks, lr, mape, 0, 0);
+            write_chunk_detail(f_chunks, "sgd", n_chunks, lr, mape);
 
             printf("ratio=%.2fx  mape=%.1f%%  conv=%d  %s\n",
                    res.ratio, res.final_mape, res.convergence_chunks,
@@ -971,64 +942,6 @@ int main(int argc, char **argv)
         }
     }
     fflush(f_sgd);
-
-    /* ────────────────────────────────────────────────────────────────────
-     * EXPLORATION STUDY
-     * ──────────────────────────────────────────────────────────────────── */
-
-    printf("\n═══ EXPLORATION HYPERPARAMETER STUDY ═══\n\n");
-
-    for (int ti = 0; ti < n_thresholds; ti++) {
-        for (int ki = 0; ki < n_ks; ki++) {
-            float thresh = expl_thresholds[ti];
-            int K = expl_ks[ki];
-
-            run_num++;
-            printf("  [%d/%d] Expl thresh=%.2f K=%d ... ",
-                   run_num, total_runs, thresh, K);
-            fflush(stdout);
-
-            gpucompress_reload_nn(weights_path);
-            gpucompress_enable_online_learning();
-            gpucompress_set_reinforcement(1, 0.1f, 0.20f, 0.20f);
-            gpucompress_set_exploration(1);
-            gpucompress_set_exploration_threshold((double)thresh);
-            gpucompress_set_exploration_k(K);
-
-            RunResult res;
-            int rc = do_single_run(d_data, d_readback, n_floats,
-                                   L, chunk_z, d_count, &res);
-            if (rc) any_fail = 1;
-
-            double ratio_vs_baseline = (baseline_ratio > 0)
-                ? res.ratio / baseline_ratio : 1.0;
-            double expl_ratio_vs_oracle = (oracle_ratio > 0)
-                ? res.ratio / oracle_ratio : 0;
-            double expl_trigger_rate = (res.n_chunks > 0)
-                ? (double)res.explorations / res.n_chunks : 0;
-
-            fprintf(f_expl, "%.3f,%d,%d,%.4f,%.4f,%.4f,"
-                            "%.4f,%.2f,%.2f,"
-                            "%.2f,%.2f,%.2f,"
-                            "%.4f,%.4f,%.4f,%.1f,%.2f,%llu\n",
-                    thresh, K, res.n_chunks,
-                    res.ratio, ratio_vs_baseline, expl_ratio_vs_oracle,
-                    expl_trigger_rate,
-                    res.total_write_ms, res.total_exploration_ms,
-                    res.total_sgd_ms, res.total_nn_inference_ms,
-                    res.total_compression_ms,
-                    res.ratio_min, res.ratio_max, res.ratio_stddev,
-                    res.write_mibps, res.file_mib, res.mismatches);
-
-            write_chunk_detail(f_chunks, "exploration", n_chunks, 0.1f, 0.20f, thresh, K);
-
-            printf("ratio=%.2fx (%.0f%% vs base)  expl=%.0f%%  %s\n",
-                   res.ratio, (ratio_vs_baseline - 1.0) * 100.0,
-                   expl_trigger_rate * 100.0,
-                   res.mismatches == 0 ? "PASS" : "FAIL");
-            print_action_summary();
-        }
-    }
 
     /* ────────────────────────────────────────────────────────────────────
      * Console summary
@@ -1044,7 +957,6 @@ int main(int argc, char **argv)
     printf("╠═══════════════════════════════════════════════════════════════════════════╣\n");
     printf("║  Output files:                                                           ║\n");
     printf("║    %s\n", OUT_SGD_CSV);
-    printf("║    %s\n", OUT_EXPL_CSV);
     printf("║    %s\n", OUT_CHUNKS_CSV);
     printf("║    %s\n", OUT_UB_CSV);
     printf("╚═══════════════════════════════════════════════════════════════════════════╝\n");
@@ -1056,7 +968,6 @@ int main(int argc, char **argv)
 cleanup:
     if (oracle_results) free(oracle_results);
     if (f_sgd)    fclose(f_sgd);
-    if (f_expl)   fclose(f_expl);
     if (f_chunks) fclose(f_chunks);
     if (f_ub)     fclose(f_ub);
     if (gs_sim) gpucompress_grayscott_destroy(gs_sim);
