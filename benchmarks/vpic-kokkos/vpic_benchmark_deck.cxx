@@ -163,6 +163,11 @@ struct PhaseResult {
     int    explorations;
     int    n_chunks;
     double mape_pct;
+    double nn_ms;
+    double preproc_ms;
+    double comp_ms;
+    double explore_ms;
+    double sgd_ms;
 };
 
 // ============================================================
@@ -490,6 +495,11 @@ static int run_phase(const char* phase_name, const char* tmp_file,
     int explorations = 0;
     double ape_sum   = 0.0;
     int    ape_cnt   = 0;
+    double total_nn_ms      = 0.0;
+    double total_preproc_ms = 0.0;
+    double total_comp_ms    = 0.0;
+    double total_explore_ms = 0.0;
+    double total_sgd_ms     = 0.0;
     int n_hist       = gpucompress_get_chunk_history_count();
     FILE *chunk_csv  = NULL;
     if (n_hist > 0) {
@@ -511,6 +521,11 @@ static int run_phase(const char* phase_name, const char* tmp_file,
         if (gpucompress_get_chunk_diag(i, &d) == 0) {
             sgd_fires    += d.sgd_fired;
             explorations += d.exploration_triggered;
+            total_nn_ms      += d.nn_inference_ms;
+            total_preproc_ms += d.preprocessing_ms;
+            total_comp_ms    += d.compression_ms;
+            total_explore_ms += d.exploration_ms;
+            total_sgd_ms     += d.sgd_update_ms;
             if (d.predicted_ratio > 0 && d.actual_ratio > 0) {
                 ape_sum += fabs(d.predicted_ratio - d.actual_ratio)
                            / d.actual_ratio;
@@ -552,12 +567,33 @@ static int run_phase(const char* phase_name, const char* tmp_file,
     r->explorations = explorations;
     r->n_chunks     = n_chunks;
     r->mape_pct     = (ape_cnt > 0) ? 100.0 * ape_sum / ape_cnt : 0.0;
+    r->nn_ms        = total_nn_ms;
+    r->preproc_ms   = total_preproc_ms;
+    r->comp_ms      = total_comp_ms;
+    r->explore_ms   = total_explore_ms;
+    r->sgd_ms       = total_sgd_ms;
     snprintf(r->phase, sizeof(r->phase), "%s", phase_name);
 
     printf("  [%s] ratio=%.2fx  write=%.0f MiB/s  read=%.0f MiB/s  "
            "file=%.0f MiB  sgd=%d expl=%d/%d  mismatches=%llu\n",
            phase_name, r->ratio, r->write_mbps, r->read_mbps,
            (double)fbytes / (1 << 20), sgd_fires, explorations, n_hist, mm);
+
+    double total_tracked = total_nn_ms + total_preproc_ms + total_comp_ms
+                         + total_explore_ms + total_sgd_ms;
+    double write_ms = t1 - t0;
+    printf("  [%s] Overhead breakdown (%d chunks, write=%.1f ms, total GPU-time=%.1f ms):\n",
+           phase_name, n_hist, write_ms, total_tracked);
+    printf("    NN inference : %8.1f ms  (%4.1f%% of GPU-time)\n",
+           total_nn_ms, total_tracked > 0 ? 100.0 * total_nn_ms / total_tracked : 0.0);
+    printf("    Preprocessing: %8.1f ms  (%4.1f%% of GPU-time)\n",
+           total_preproc_ms, total_tracked > 0 ? 100.0 * total_preproc_ms / total_tracked : 0.0);
+    printf("    Compression  : %8.1f ms  (%4.1f%% of GPU-time)\n",
+           total_comp_ms, total_tracked > 0 ? 100.0 * total_comp_ms / total_tracked : 0.0);
+    printf("    Exploration  : %8.1f ms  (%4.1f%% of GPU-time)\n",
+           total_explore_ms, total_tracked > 0 ? 100.0 * total_explore_ms / total_tracked : 0.0);
+    printf("    SGD update   : %8.1f ms  (%4.1f%% of GPU-time)\n",
+           total_sgd_ms, total_tracked > 0 ? 100.0 * total_sgd_ms / total_tracked : 0.0);
 
     remove(tmp_file);
     return (mm == 0) ? 0 : 1;
@@ -884,6 +920,48 @@ begin_diagnostics {
                    results[i].sgd_fires,   results[i].n_chunks,
                    results[i].explorations, results[i].n_chunks,
                    results[i].mape_pct);
+        }
+    }
+
+    // GPU-time overhead breakdown for NN phases
+    {
+        bool has_nn = false;
+        for (int i = 0; i < n_phases; i++)
+            if (strncmp(results[i].phase, "nn", 2) == 0) { has_nn = true; break; }
+
+        if (has_nn) {
+            printf("\n╔══════════════════════════════════════════════════════════════════════════════════════╗\n");
+            printf("║  GPU-Time Overhead Breakdown (cumulative across chunks, 8 concurrent workers)       ║\n");
+            printf("╠══════════════╦══════════╦══════════╦══════════╦══════════╦══════════╦════════════════╣\n");
+            printf("║  Phase       ║ NN Infer ║ Preproc  ║ Compress ║ Explore  ║ SGD      ║ Total GPU-time ║\n");
+            printf("╠══════════════╬══════════╬══════════╬══════════╬══════════╬══════════╬════════════════╣\n");
+            for (int i = 0; i < n_phases; i++) {
+                if (strncmp(results[i].phase, "nn", 2) != 0) continue;
+                PhaseResult* rr = &results[i];
+                double total_gpu = rr->nn_ms + rr->preproc_ms + rr->comp_ms
+                                 + rr->explore_ms + rr->sgd_ms;
+                printf("║  %-12s║ %5.0f ms ║ %5.0f ms ║ %5.0f ms ║ %5.0f ms ║ %5.0f ms ║   %7.0f ms   ║\n",
+                       rr->phase, rr->nn_ms, rr->preproc_ms, rr->comp_ms,
+                       rr->explore_ms, rr->sgd_ms, total_gpu);
+            }
+            printf("╠══════════════╬══════════╬══════════╬══════════╬══════════╬══════════╬════════════════╣\n");
+            printf("║  (%% of GPU)  ║          ║          ║          ║          ║          ║                ║\n");
+            for (int i = 0; i < n_phases; i++) {
+                if (strncmp(results[i].phase, "nn", 2) != 0) continue;
+                PhaseResult* rr = &results[i];
+                double total_gpu = rr->nn_ms + rr->preproc_ms + rr->comp_ms
+                                 + rr->explore_ms + rr->sgd_ms;
+                if (total_gpu <= 0) total_gpu = 1.0;
+                printf("║  %-12s║ %5.1f%%   ║ %5.1f%%   ║ %5.1f%%   ║ %5.1f%%   ║ %5.1f%%   ║   wall: %4.0f ms ║\n",
+                       rr->phase,
+                       100.0 * rr->nn_ms / total_gpu,
+                       100.0 * rr->preproc_ms / total_gpu,
+                       100.0 * rr->comp_ms / total_gpu,
+                       100.0 * rr->explore_ms / total_gpu,
+                       100.0 * rr->sgd_ms / total_gpu,
+                       rr->write_ms);
+            }
+            printf("╚══════════════╩══════════╩══════════╩══════════╩══════════╩══════════╩════════════════╝\n");
         }
     }
 

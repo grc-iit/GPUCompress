@@ -473,6 +473,24 @@ extern "C" gpucompress_error_t gpucompress_compress(
                 d_stats_ptr = gpucompress::runStatsKernelsNoSync(d_input, input_size, stream);
 
                 if (d_stats_ptr) {
+                    // Enqueue stats D→H copies now (before inference kernel) so
+                    // the single cudaStreamSynchronize inside runNNFusedInference
+                    // drains both stats copies and inference D→H in one sync.
+                    if (stats != nullptr) {
+                        GC_LOG("[XFER D→H] stats: entropy (%zu B)\n", sizeof(double));
+                        XFER_TRACK("compress/auto: D->H stats entropy", sizeof(double), cudaMemcpyDeviceToHost);
+                        cudaMemcpyAsync(&entropy, &d_stats_ptr->entropy, sizeof(double),
+                                        cudaMemcpyDeviceToHost, stream);
+                        GC_LOG("[XFER D→H] stats: mad_normalized (%zu B)\n", sizeof(double));
+                        XFER_TRACK("compress/auto: D->H stats mad", sizeof(double), cudaMemcpyDeviceToHost);
+                        cudaMemcpyAsync(&mad, &d_stats_ptr->mad_normalized, sizeof(double),
+                                        cudaMemcpyDeviceToHost, stream);
+                        GC_LOG("[XFER D→H] stats: deriv_normalized (%zu B)\n", sizeof(double));
+                        XFER_TRACK("compress/auto: D->H stats deriv", sizeof(double), cudaMemcpyDeviceToHost);
+                        cudaMemcpyAsync(&second_derivative, &d_stats_ptr->deriv_normalized, sizeof(double),
+                                        cudaMemcpyDeviceToHost, stream);
+                    }
+
                     float* p_ratio = &predicted_ratio;  // always capture — no extra cost
                     float* p_comp_time = &predicted_comp_time;
                     int* p_top = g_online_learning_enabled ? top_actions : nullptr;
@@ -487,24 +505,6 @@ extern "C" gpucompress_error_t gpucompress_compress(
                     if (rc == 0) {
                         is_ood = (fused_ood != 0);
                     }
-                }
-
-                // Conditional stats D→H only when user wants stats output
-                if (d_stats_ptr && stats != nullptr) {
-                    GC_LOG("[XFER D→H] stats: entropy (%zu B)\n", sizeof(double));
-                    XFER_TRACK("compress/auto: D->H stats entropy", sizeof(double), cudaMemcpyDeviceToHost);
-                    cudaMemcpyAsync(&entropy, &d_stats_ptr->entropy, sizeof(double),
-                                    cudaMemcpyDeviceToHost, stream);
-                    // mad_normalized and deriv_normalized are contiguous
-                    GC_LOG("[XFER D→H] stats: mad_normalized (%zu B)\n", sizeof(double));
-                    XFER_TRACK("compress/auto: D->H stats mad", sizeof(double), cudaMemcpyDeviceToHost);
-                    cudaMemcpyAsync(&mad, &d_stats_ptr->mad_normalized, sizeof(double),
-                                    cudaMemcpyDeviceToHost, stream);
-                    GC_LOG("[XFER D→H] stats: deriv_normalized (%zu B)\n", sizeof(double));
-                    XFER_TRACK("compress/auto: D->H stats deriv", sizeof(double), cudaMemcpyDeviceToHost);
-                    cudaMemcpyAsync(&second_derivative, &d_stats_ptr->deriv_normalized, sizeof(double),
-                                    cudaMemcpyDeviceToHost, stream);
-                    cudaStreamSynchronize(stream);
                 }
             } // auto_lk released
 
@@ -1763,6 +1763,21 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
             d_stats_ptr = gpucompress::runStatsKernelsNoSync(d_input, input_size, stream, ctx);
 
             if (d_stats_ptr) {
+                /* Enqueue stats D→H copies now (before inference kernel) so
+                 * the single cudaStreamSynchronize inside runNNFusedInferenceCtx
+                 * drains both stats copies and inference D→H in one sync. */
+                if (stats != nullptr) {
+                    XFER_TRACK("compress_gpu/auto: D->H stats entropy", sizeof(double), cudaMemcpyDeviceToHost);
+                    cudaMemcpyAsync(&entropy, &d_stats_ptr->entropy, sizeof(double),
+                                    cudaMemcpyDeviceToHost, stream);
+                    XFER_TRACK("compress_gpu/auto: D->H stats mad", sizeof(double), cudaMemcpyDeviceToHost);
+                    cudaMemcpyAsync(&mad, &d_stats_ptr->mad_normalized, sizeof(double),
+                                    cudaMemcpyDeviceToHost, stream);
+                    XFER_TRACK("compress_gpu/auto: D->H stats deriv", sizeof(double), cudaMemcpyDeviceToHost);
+                    cudaMemcpyAsync(&second_derivative, &d_stats_ptr->deriv_normalized, sizeof(double),
+                                    cudaMemcpyDeviceToHost, stream);
+                }
+
                 float* p_ratio = &predicted_ratio;  // always capture — no extra cost
                 float* p_comp_time = &predicted_comp_time;
                 int* p_top = g_online_learning_enabled ? top_actions : nullptr;
@@ -1774,20 +1789,6 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
                     g_online_learning_enabled ? &fused_ood : nullptr, p_top);
                 rc = (action >= 0) ? 0 : -1;
                 if (rc == 0) is_ood = (fused_ood != 0);
-            }
-
-            /* Conditional stats D→H only when caller requests stats output */
-            if (d_stats_ptr && stats != nullptr) {
-                XFER_TRACK("compress_gpu/auto: D->H stats entropy", sizeof(double), cudaMemcpyDeviceToHost);
-                cudaMemcpyAsync(&entropy, &d_stats_ptr->entropy, sizeof(double),
-                                cudaMemcpyDeviceToHost, stream);
-                XFER_TRACK("compress_gpu/auto: D->H stats mad", sizeof(double), cudaMemcpyDeviceToHost);
-                cudaMemcpyAsync(&mad, &d_stats_ptr->mad_normalized, sizeof(double),
-                                cudaMemcpyDeviceToHost, stream);
-                XFER_TRACK("compress_gpu/auto: D->H stats deriv", sizeof(double), cudaMemcpyDeviceToHost);
-                cudaMemcpyAsync(&second_derivative, &d_stats_ptr->deriv_normalized, sizeof(double),
-                                cudaMemcpyDeviceToHost, stream);
-                cudaStreamSynchronize(stream);
             }
 
             if (rc == 0) {

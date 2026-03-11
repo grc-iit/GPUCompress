@@ -617,10 +617,18 @@ __global__ void nnSGDKernel(
 
         // Thread 0 computes targets + output errors → s_d3[4]
         if (t == 0) {
+            // Clamp actual values to sane ranges BEFORE log1p encoding.
+            // This prevents extreme out-of-distribution samples from
+            // producing unbounded normalized targets that cause gradient
+            // explosion and weight oscillation (Issue #1).
+            float clamped_ratio     = fmaxf(0.5f,  fminf(sample.actual_ratio,     200.0f));
+            float clamped_comp_time = fmaxf(0.01f, fminf(sample.actual_comp_time, 5000.0f));
+            float clamped_decomp    = fmaxf(0.01f, fminf(sample.actual_decomp_time, 5000.0f));
+
             // Targets in normalized space
             float y_std2 = weights->y_stds[2];
             if (y_std2 < 1e-8f) y_std2 = 1e-8f;
-            float target_ratio = (log1pf(sample.actual_ratio) - weights->y_means[2]) / y_std2;
+            float target_ratio = (log1pf(clamped_ratio) - weights->y_means[2]) / y_std2;
 
             s_d3[2] = s_y[2] - target_ratio;
 
@@ -628,7 +636,7 @@ __global__ void nnSGDKernel(
             if (sample.actual_comp_time > 0.0f) {
                 float y_std0 = weights->y_stds[0];
                 if (y_std0 < 1e-8f) y_std0 = 1e-8f;
-                s_d3[0] = s_y[0] - (log1pf(sample.actual_comp_time) - weights->y_means[0]) / y_std0;
+                s_d3[0] = s_y[0] - (log1pf(clamped_comp_time) - weights->y_means[0]) / y_std0;
             } else {
                 s_d3[0] = 0.0f;
             }
@@ -637,7 +645,7 @@ __global__ void nnSGDKernel(
             if (sample.actual_decomp_time > 0.0f) {
                 float y_std1 = weights->y_stds[1];
                 if (y_std1 < 1e-8f) y_std1 = 1e-8f;
-                s_d3[1] = s_y[1] - (log1pf(sample.actual_decomp_time) - weights->y_means[1]) / y_std1;
+                s_d3[1] = s_y[1] - (log1pf(clamped_decomp) - weights->y_means[1]) / y_std1;
             } else {
                 s_d3[1] = 0.0f;
             }
@@ -645,10 +653,25 @@ __global__ void nnSGDKernel(
             // PSNR (output 3) — treat psnr<=0 as 120 dB (lossless = perfect reconstruction)
             {
                 float psnr_val = (sample.actual_psnr <= 0.0f) ? 120.0f : sample.actual_psnr;
-                float clamped = fminf(psnr_val, 120.0f);
+                float clamped_psnr = fminf(psnr_val, 120.0f);
                 float y_std3 = weights->y_stds[3];
                 if (y_std3 < 1e-8f) y_std3 = 1e-8f;
-                s_d3[3] = s_y[3] - (clamped - weights->y_means[3]) / y_std3;
+                s_d3[3] = s_y[3] - (clamped_psnr - weights->y_means[3]) / y_std3;
+            }
+
+            // Clamp per-output error signals (Huber-style gradient clipping).
+            //
+            // Without clamping, OOD samples produce normalized errors of
+            // magnitude 5-10+, which after backprop amplification cause
+            // catastrophic weight oscillation: SGD overshoots, a different
+            // action wins, the predicted_ratio jumps 100x, repeat.
+            //
+            // We use a tight delta of 0.5 (half a standard deviation) so
+            // each SGD step makes small corrections rather than large jumps.
+            // This matches PPO/DQN practice of constraining update magnitude.
+            constexpr float SGD_ERROR_DELTA = 0.5f;
+            for (int o = 0; o < NN_OUTPUT_DIM; o++) {
+                s_d3[o] = fmaxf(-SGD_ERROR_DELTA, fminf(s_d3[o], SGD_ERROR_DELTA));
             }
         }
         __syncthreads();
@@ -751,7 +774,13 @@ __global__ void nnSGDKernel(
     }
 
     float norm = sqrtf(s_reduce[0]);
-    float clip_scale = (norm > 1.0f) ? (1.0f / norm) : 1.0f;
+    // Gradient norm clipping: threshold lowered from 1.0 to 0.1 (Issue #1).
+    // With the original threshold of 1.0, the total weight update norm is
+    // lr * 1.0 = 0.05, which is enough to flip action rankings in a single
+    // step, causing prediction oscillation. A threshold of 0.1 limits the
+    // effective update to lr * 0.1 = 0.005, enabling gradual convergence.
+    constexpr float GRAD_CLIP_THRESHOLD = 0.1f;
+    float clip_scale = (norm > GRAD_CLIP_THRESHOLD) ? (GRAD_CLIP_THRESHOLD / norm) : 1.0f;
     float lr_scaled = learning_rate * clip_scale;
 
     // SGD step: update weights in-place

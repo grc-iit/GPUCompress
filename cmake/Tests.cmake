@@ -381,6 +381,24 @@ target_include_directories(test_h6_cub_int_overflow PRIVATE
 target_link_libraries(test_h6_cub_int_overflow PRIVATE gpucompress CUDA::cudart m)
 set_target_properties(test_h6_cub_int_overflow PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
+add_executable(test_explore_lossless_skip tests/regression/test_explore_lossless_skip_roundtrip.cu)
+set_source_files_properties(tests/regression/test_explore_lossless_skip_roundtrip.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(test_explore_lossless_skip PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_explore_lossless_skip PRIVATE gpucompress CUDA::cudart m)
+set_target_properties(test_explore_lossless_skip PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+add_executable(test_sgd_target_clamping tests/regression/test_sgd_target_clamping.cu)
+set_source_files_properties(tests/regression/test_sgd_target_clamping.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(test_sgd_target_clamping PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_sgd_target_clamping PRIVATE gpucompress CUDA::cudart m)
+set_target_properties(test_sgd_target_clamping PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
 add_executable(test_h4_sgd_mutex tests/regression/test_h4_sgd_mutex.cu)
 set_source_files_properties(tests/regression/test_h4_sgd_mutex.cu PROPERTIES LANGUAGE CUDA)
 target_include_directories(test_h4_sgd_mutex PRIVATE
@@ -419,4 +437,13 @@ target_include_directories(test_perf14_atomic_double PRIVATE
 )
 target_link_libraries(test_perf14_atomic_double PRIVATE gpucompress CUDA::cudart m)
 set_target_properties(test_perf14_atomic_double PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+add_executable(test_nn_inference_profile tests/perf/test_nn_inference_profile.cu)
+set_source_files_properties(tests/perf/test_nn_inference_profile.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(test_nn_inference_profile PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_nn_inference_profile PRIVATE gpucompress CUDA::cudart m)
+set_target_properties(test_nn_inference_profile PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
