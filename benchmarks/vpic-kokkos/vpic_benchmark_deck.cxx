@@ -53,7 +53,7 @@
 // ============================================================
 // Constants
 // ============================================================
-#define REINFORCE_LR        0.9f
+#define REINFORCE_LR        0.4f
 #define REINFORCE_MAPE      0.20f
 
 #define H5Z_FILTER_GPUCOMPRESS    305
@@ -858,11 +858,23 @@ begin_diagnostics {
     const char* env_eb_diag = getenv("VPIC_ERROR_BOUND");
     double diag_error_bound = env_eb_diag ? atof(env_eb_diag) : 0.0;
 
+    /* Phase selection: VPIC_PHASES="exhaustive,nn-rl" to run only those.
+     * Default (unset or empty): run all 5 phases. */
+    const char* env_phases = getenv("VPIC_PHASES");
+    auto phase_enabled = [&](const char* name) -> bool {
+        if (!env_phases || env_phases[0] == '\0') return true;  /* all */
+        return strstr(env_phases, name) != NULL;
+    };
+
+    if (env_phases && env_phases[0])
+        sim_log("  Phase filter: " << env_phases);
+
     PhaseResult results[N_PHASES];
     int n_phases = 0;
     int any_fail = 0;
 
     // ── Phase 1: no-comp ──────────────────────────────────────────
+    if (phase_enabled("no-comp")) {
     sim_log("── Phase 1/5: no-comp (GPU→Host→HDF5, VOL-2 fallback) ────────");
     gpucompress_disable_online_learning();
     gpucompress_set_exploration(0);
@@ -875,8 +887,10 @@ begin_diagnostics {
         if (rc) any_fail = 1;
         n_phases++;
     }
+    }
 
     // ── Phase 2: oracle (exhaustive search + end-to-end I/O) ──────
+    if (phase_enabled("exhaustive")) {
     sim_log("── Phase 2/5: exhaustive search (8 algos × 2 shuffle per chunk) ──");
     {
         int rc = run_oracle_pass(d_fields, global->d_read,
@@ -886,8 +900,10 @@ begin_diagnostics {
         if (rc) any_fail = 1;
         n_phases++;
     }
+    }
 
     // ── Phase 3: nn (inference-only) ──────────────────────────────
+    if (phase_enabled("nn-only") || (phase_enabled("nn") && !env_phases)) {
     sim_log("── Phase 3/5: nn (VOL, ALGO_AUTO, inference-only) ───────────");
     gpucompress_disable_online_learning();
     gpucompress_set_exploration(0);
@@ -900,8 +916,10 @@ begin_diagnostics {
         if (rc) any_fail = 1;
         n_phases++;
     }
+    }
 
     // ── Phase 4: nn-rl (SGD, no exploration) ──────────────────────
+    if (phase_enabled("nn-rl")) {
     sim_log("── Phase 4/5: nn-rl (ALGO_AUTO + SGD, MAPE>=20%, LR=0.4) ───");
     gpucompress_enable_online_learning();
     gpucompress_set_reinforcement(1, REINFORCE_LR, REINFORCE_MAPE, REINFORCE_MAPE);
@@ -916,8 +934,10 @@ begin_diagnostics {
         if (rc) any_fail = 1;
         n_phases++;
     }
+    }
 
     // ── Phase 5: nn-rl+exp50 (SGD + exploration) ──────────────────
+    if (phase_enabled("nn-rl+exp")) {
     sim_log("── Phase 5/5: nn-rl+exp50 (ALGO_AUTO + SGD + expl@MAPE>=50%) ");
     gpucompress_enable_online_learning();
     gpucompress_set_reinforcement(1, REINFORCE_LR, REINFORCE_MAPE, REINFORCE_MAPE);
@@ -933,6 +953,7 @@ begin_diagnostics {
         gpucompress_disable_online_learning();
         if (rc) any_fail = 1;
         n_phases++;
+    }
     }
 
     // ── Summary table ─────────────────────────────────────────────

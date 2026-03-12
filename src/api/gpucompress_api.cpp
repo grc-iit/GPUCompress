@@ -1049,6 +1049,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
                             // Track if this is better than current best
                             if (alt_ratio > best_ratio) {
                                 best_ratio = alt_ratio;
+                                nn_action = alt_action;  // update so diagnostics & SGD see the real winner
                                 g_last_nn_action.store(alt_action);
                                 diag_compression_ms = alt_ct_ms;
 
@@ -2345,6 +2346,7 @@ skip_nn:
 
                             if (alt_ratio > best_ratio) {
                                 best_ratio = alt_ratio;
+                                nn_action = alt_action;  // update so diagnostics & SGD see the real winner
                                 g_last_nn_action.store(alt_action);
                                 diag_compression_ms = alt_ct_ms;
 

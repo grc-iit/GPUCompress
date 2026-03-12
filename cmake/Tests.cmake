@@ -473,3 +473,12 @@ target_include_directories(test_shuffle_quant_effect PRIVATE
 target_link_libraries(test_shuffle_quant_effect PRIVATE gpucompress CUDA::cudart)
 set_target_properties(test_shuffle_quant_effect PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
+add_executable(explore_algo_patterns tests/explore_algo_patterns.cu)
+set_source_files_properties(tests/explore_algo_patterns.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(explore_algo_patterns PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(explore_algo_patterns PRIVATE gpucompress CUDA::cudart m)
+set_target_properties(explore_algo_patterns PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
