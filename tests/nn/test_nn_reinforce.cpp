@@ -31,6 +31,8 @@ int runNNInference(double entropy, double mad_norm, double deriv_norm,
                    cudaStream_t stream,
                    float* out_predicted_ratio = nullptr,
                    float* out_predicted_comp_time = nullptr,
+                   float* out_predicted_decomp_time = nullptr,
+                   float* out_predicted_psnr = nullptr,
                    int* out_top_actions = nullptr);
 }
 
@@ -219,7 +221,7 @@ static bool test_forward_parity(const NNWeightsGPU& h_weights) {
     int winner = gpucompress::runNNInference(
         TEST_ENTROPY, TEST_MAD, TEST_DERIV,
         TEST_DATA_SIZE, TEST_ERROR_BOUND,
-        nullptr, &gpu_ratio, nullptr, top_actions);
+        nullptr, &gpu_ratio, nullptr, nullptr, nullptr, top_actions);
 
     if (winner < 0) {
         printf("  GPU inference failed\n  FAIL\n");

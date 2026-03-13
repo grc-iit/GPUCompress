@@ -31,6 +31,8 @@ namespace gpucompress {
         size_t data_size, double error_bound, cudaStream_t stream,
         float* out_predicted_ratio = nullptr,
         float* out_predicted_comp_time = nullptr,
+        float* out_predicted_decomp_time = nullptr,
+        float* out_predicted_psnr = nullptr,
         int* out_top_actions = nullptr
     );
 }
@@ -219,7 +221,7 @@ static void test_inference_repeated() {
         int top[32];
         int action = gpucompress::runNNInference(
             4.0 + i * 0.01, 0.3, 0.1, 1024 * 1024, 0.001, 0,
-            &ratio, &comp_time, top);
+            &ratio, &comp_time, nullptr, nullptr, top);
         if (action < 0 || action >= 32) { all_valid = false; break; }
         if (isnan(ratio) || isnan(comp_time)) { all_valid = false; break; }
     }
@@ -259,7 +261,7 @@ static void test_full_pipeline() {
     int top[32];
     int action = gpucompress::runNNInference(
         5.0, 0.25, 0.15, 4 * 1024 * 1024, 0.001, 0,
-        &ratio, &comp_time, top);
+        &ratio, &comp_time, nullptr, nullptr, top);
     ASSERT(action >= 0 && action < 32, "inference should return valid action");
 
     gpucompress::cleanupNN();

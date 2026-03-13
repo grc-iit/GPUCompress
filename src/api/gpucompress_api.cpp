@@ -19,6 +19,8 @@
 #include <vector>
 #include <algorithm>
 #include <chrono>
+#include <unistd.h>
+#include <fcntl.h>
 
 #include "gpucompress.h"
 #include "api/internal.hpp"
@@ -45,7 +47,6 @@ extern "C" {
     int gpucompress_nn_load_impl(const char* filepath);
     int gpucompress_nn_is_loaded_impl(void);
     void gpucompress_nn_cleanup_impl(void);
-    void gpucompress_nn_set_criterion_impl(int criterion);
     void* gpucompress_nn_get_device_ptr_impl(void);
 
     // From stats_kernel.cu
@@ -64,6 +65,12 @@ std::atomic<bool> g_sgd_ever_fired{false};
 
 /** Verbose transfer/SGD logging — off by default, set via gpucompress_set_verbose(). */
 bool g_gc_verbose = false;
+
+/** Cost-based ranking weights and measured bandwidth — extern-referenced from nn_gpu.cu */
+float g_rank_w0 = 1.0f;                   // weight on compression time
+float g_rank_w1 = 1.0f;                   // weight on decompression time
+float g_rank_w2 = 1.0f;                   // weight on I/O cost (data_size / (ratio * bw))
+float g_measured_bw_bytes_per_ms = 1e6f;   // default 1 GB/s = 1e6 bytes/ms
 
 #define GC_LOG(fmt, ...) do { if (g_gc_verbose) fprintf(stderr, fmt, ##__VA_ARGS__); } while(0)
 
@@ -340,6 +347,35 @@ extern "C" gpucompress_error_t gpucompress_init(const char* weights_path) {
 
     // Init CompContext pool
     gpucompress::initCompContextPool();
+
+    // Bandwidth probe: write+read 16MB temp file to measure storage BW
+    {
+        const size_t probe_sz = 16 * 1024 * 1024;
+        char tmp_path[] = "/tmp/gpucompress_bw_XXXXXX";
+        int fd = mkstemp(tmp_path);
+        if (fd >= 0) {
+            std::vector<char> buf(probe_sz, 0x42);
+            auto t_bw0 = std::chrono::steady_clock::now();
+            ssize_t wr = write(fd, buf.data(), probe_sz);
+            fsync(fd);
+            posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+            lseek(fd, 0, SEEK_SET);
+            ssize_t rd = read(fd, buf.data(), probe_sz);
+            auto t_bw1 = std::chrono::steady_clock::now();
+            close(fd);
+            unlink(tmp_path);
+            if (wr == (ssize_t)probe_sz && rd == (ssize_t)probe_sz) {
+                double ms = std::chrono::duration<double, std::milli>(t_bw1 - t_bw0).count();
+                if (ms > 0.0) {
+                    // Use min of write and read BW (conservative)
+                    g_measured_bw_bytes_per_ms = static_cast<float>(
+                        static_cast<double>(probe_sz) / ms);
+                    GC_LOG("[BW PROBE] 16 MB write+read in %.1f ms => %.2f GB/s\n",
+                           ms, g_measured_bw_bytes_per_ms / 1e6);
+                }
+            }
+        }
+    }
 
     // Load NN weights if path provided
     if (weights_path != nullptr && weights_path[0] != '\0') {
@@ -726,6 +762,29 @@ extern "C" gpucompress_error_t gpucompress_compress(
     size_t compressed_size = compressor->get_compressed_output_size(d_compressed);
     size_t total_size = header_size + compressed_size;
 
+    // Measure primary decomp time (RL-gated: only when SGD can learn from it)
+    float primary_decomp_time_ms = 0.0f;
+    if (g_reinforce_lr > 0.0f && nn_was_used && timing_ok) {
+        auto rt_decomp = createDecompressionManager(d_compressed, stream);
+        if (rt_decomp) {
+            DecompressionConfig rt_dc = rt_decomp->configure_decompression(d_compressed);
+            size_t rt_decomp_size = rt_dc.decomp_data_size;
+            uint8_t* d_rt_buf = nullptr;
+            if (cudaMalloc(&d_rt_buf, rt_decomp_size) == cudaSuccess) {
+                cudaEventRecord(tl_t_start, stream);
+                try {
+                    rt_decomp->decompress(d_rt_buf, d_compressed, rt_dc);
+                    cudaEventRecord(tl_t_stop, stream);
+                    cudaEventSynchronize(tl_t_stop);
+                    cudaEventElapsedTime(&primary_decomp_time_ms, tl_t_start, tl_t_stop);
+                } catch (...) {
+                    // Decompress failed — leave at 0
+                }
+                cudaFree(d_rt_buf);
+            }
+        }
+    }
+
     // Check output buffer size
     if (total_size > *output_size) {
         cudaFree(d_output);
@@ -802,11 +861,26 @@ extern "C" gpucompress_error_t gpucompress_compress(
         double actual_ratio = static_cast<double>(input_size) /
                               static_cast<double>(compressed_size);
 
-        // Check prediction error (ratio MAPE only — time prediction is too noisy)
-        double pred_ratio_d = static_cast<double>(predicted_ratio);
-        double ratio_mape = (actual_ratio > 0.0) ?
-            std::abs(pred_ratio_d - actual_ratio) / actual_ratio : 0.0;
-        double error_pct = ratio_mape;
+        // Cost-based prediction error: compare predicted vs actual cost.
+        // Now uses measured decomp time when available (RL-gated decomp-at-write).
+        double ds = static_cast<double>(input_size);
+        double bw = static_cast<double>(g_measured_bw_bytes_per_ms);
+        double w0 = static_cast<double>(g_rank_w0);
+        double w1 = static_cast<double>(g_rank_w1);
+        double w2 = static_cast<double>(g_rank_w2);
+        double pred_dt = static_cast<double>(predicted_decomp_time);
+        double pred_ct = static_cast<double>(predicted_comp_time);
+        double pred_r  = static_cast<double>(predicted_ratio);
+        double act_ct  = static_cast<double>(primary_comp_time_ms);
+        double act_dt  = (primary_decomp_time_ms > 0.0f)
+                       ? static_cast<double>(primary_decomp_time_ms) : pred_dt;
+
+        double actual_cost = w0 * act_ct + w1 * act_dt
+                           + ((actual_ratio > 0.0) ? w2 * ds / (actual_ratio * bw) : 0.0);
+        double predicted_cost = w0 * pred_ct + w1 * pred_dt
+                              + ((pred_r > 0.0) ? w2 * ds / (pred_r * bw) : 0.0);
+        double error_pct = (actual_cost > 0.0)
+            ? std::abs(actual_cost - predicted_cost) / actual_cost : 0.0;
 
         // Collect explored (action, ratio, comp_time) for reinforcement
         struct ExploredResult { int action; double ratio; double comp_time_ms;
@@ -821,7 +895,8 @@ extern "C" gpucompress_error_t gpucompress_compress(
         }
         explored_samples.push_back({nn_action, actual_ratio,
                                     static_cast<double>(primary_comp_time_ms),
-                                    0.0, primary_psnr});
+                                    static_cast<double>(primary_decomp_time_ms),
+                                    primary_psnr});
 
         if (g_exploration_enabled && error_pct > g_exploration_threshold) {
             exploration_triggered = true;
@@ -837,13 +912,13 @@ extern "C" gpucompress_error_t gpucompress_compress(
 
             gpucompress::DecodedAction primary_dec = gpucompress::decodeAction(nn_action);
             GC_LOG("[EXPLORE] Chunk %zuB | primary=action%d (%s%s%s) ratio=%.3f | "
-                    "ratio_mape=%.1f%% %s| K=%d\n",
+                    "cost_err=%.1f%% %s| K=%d\n",
                     input_size, nn_action,
                     ALGORITHM_NAMES[primary_dec.algorithm + 1],
                     primary_dec.shuffle_size > 0 ? "+shuf" : "",
                     primary_dec.use_quantization ? "+quant" : "",
                     actual_ratio,
-                    ratio_mape * 100.0,
+                    error_pct * 100.0,
                     is_ood ? "OOD " : "",
                     K);
 
@@ -1134,7 +1209,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
                 std::chrono::steady_clock::now() - t_explore_start).count();
         }
 
-        // Online reinforcement: fire GPU SGD only when ratio MAPE exceeds threshold.
+        // Online reinforcement: trigger GPU SGD when cost prediction error exceeds threshold.
         auto t_sgd_start = std::chrono::steady_clock::now();
         if (error_pct > static_cast<double>(g_reinforce_mape_threshold) && d_stats_ptr) {
             // Sort explored samples by ratio (descending) and feed top 3 to GPU SGD.
@@ -1233,7 +1308,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
             h->predicted_comp_time   = predicted_comp_time;
             h->predicted_decomp_time = predicted_decomp_time;
             h->predicted_psnr        = predicted_psnr;
-            h->decompression_ms      = 0.0f;  /* filled later during read */
+            h->decompression_ms      = primary_decomp_time_ms;  /* measured at write when RL active, updated during read */
         }
     }
 
@@ -1759,6 +1834,17 @@ extern "C" void gpucompress_set_verbose(int enable) {
     g_gc_verbose = (enable != 0);
 }
 
+extern "C" void gpucompress_set_ranking_weights(float w0, float w1, float w2) {
+    g_rank_w0 = w0;
+    g_rank_w1 = w1;
+    g_rank_w2 = w2;
+}
+
+extern "C" void gpucompress_set_bandwidth(float bw_gbps) {
+    if (bw_gbps > 0.0f)
+        g_measured_bw_bytes_per_ms = bw_gbps * 1e6f;
+}
+
 extern "C" gpucompress_error_t gpucompress_reload_nn(const char* filepath) {
     if (filepath == nullptr) {
         return GPUCOMPRESS_ERROR_INVALID_INPUT;
@@ -2073,6 +2159,29 @@ skip_nn:
     size_t compressed_size = compressor->get_compressed_output_size(d_comp_target);
     size_t total_size      = header_size + compressed_size;
 
+    // Measure primary decomp time (RL-gated: only when SGD can learn from it)
+    float primary_decomp_time_ms = 0.0f;
+    if (g_reinforce_lr > 0.0f && nn_was_used && timing_ok) {
+        auto rt_decomp = createDecompressionManager(d_comp_target, stream);
+        if (rt_decomp) {
+            DecompressionConfig rt_dc = rt_decomp->configure_decompression(d_comp_target);
+            size_t rt_decomp_size = rt_dc.decomp_data_size;
+            uint8_t* d_rt_buf = nullptr;
+            if (cudaMalloc(&d_rt_buf, rt_decomp_size) == cudaSuccess) {
+                cudaEventRecord(ctx->t_start, stream);
+                try {
+                    rt_decomp->decompress(d_rt_buf, d_comp_target, rt_dc);
+                    cudaEventRecord(ctx->t_stop, stream);
+                    cudaEventSynchronize(ctx->t_stop);
+                    cudaEventElapsedTime(&primary_decomp_time_ms, ctx->t_start, ctx->t_stop);
+                } catch (...) {
+                    // Decompress failed — leave at 0
+                }
+                cudaFree(d_rt_buf);
+            }
+        }
+    }
+
     /* Build header and write to d_output[0..63] via H→D */
     CompressionHeader header;
     header.magic               = COMPRESSION_MAGIC;
@@ -2133,10 +2242,25 @@ skip_nn:
         double actual_ratio = static_cast<double>(input_size) /
                               static_cast<double>(compressed_size);
 
-        double pred_ratio_d = static_cast<double>(predicted_ratio);
-        double ratio_mape = (actual_ratio > 0.0) ?
-            std::abs(pred_ratio_d - actual_ratio) / actual_ratio : 0.0;
-        double error_pct = ratio_mape;
+        // Cost-based prediction error (mirrors non-ctx path, uses measured decomp time)
+        double ds = static_cast<double>(input_size);
+        double bw = static_cast<double>(g_measured_bw_bytes_per_ms);
+        double w0 = static_cast<double>(g_rank_w0);
+        double w1 = static_cast<double>(g_rank_w1);
+        double w2 = static_cast<double>(g_rank_w2);
+        double pred_dt = static_cast<double>(predicted_decomp_time);
+        double pred_ct = static_cast<double>(predicted_comp_time);
+        double pred_r  = static_cast<double>(predicted_ratio);
+        double act_ct  = static_cast<double>(primary_comp_time_ms);
+        double act_dt  = (primary_decomp_time_ms > 0.0f)
+                       ? static_cast<double>(primary_decomp_time_ms) : pred_dt;
+
+        double actual_cost = w0 * act_ct + w1 * act_dt
+                           + ((actual_ratio > 0.0) ? w2 * ds / (actual_ratio * bw) : 0.0);
+        double predicted_cost = w0 * pred_ct + w1 * pred_dt
+                              + ((pred_r > 0.0) ? w2 * ds / (pred_r * bw) : 0.0);
+        double error_pct = (actual_cost > 0.0)
+            ? std::abs(actual_cost - predicted_cost) / actual_cost : 0.0;
 
         struct ExploredResult { int action; double ratio; double comp_time_ms;
                                 double decomp_time_ms; double psnr; };
@@ -2150,7 +2274,8 @@ skip_nn:
         }
         explored_samples.push_back({nn_action, actual_ratio,
                                     static_cast<double>(primary_comp_time_ms),
-                                    0.0, primary_psnr});
+                                    static_cast<double>(primary_decomp_time_ms),
+                                    primary_psnr});
 
         if (g_exploration_enabled && error_pct > g_exploration_threshold) {
             exploration_triggered = true;
@@ -2163,13 +2288,13 @@ skip_nn:
 
             gpucompress::DecodedAction primary_dec = gpucompress::decodeAction(nn_action);
             GC_LOG("[EXPLORE-GPU] Chunk %zuB | primary=action%d (%s%s%s) ratio=%.3f | "
-                    "ratio_mape=%.1f%% %s| K=%d\n",
+                    "cost_err=%.1f%% %s| K=%d\n",
                     input_size, nn_action,
                     ALGORITHM_NAMES[primary_dec.algorithm + 1],
                     primary_dec.shuffle_size > 0 ? "+shuf" : "",
                     primary_dec.use_quantization ? "+quant" : "",
                     actual_ratio,
-                    ratio_mape * 100.0,
+                    error_pct * 100.0,
                     is_ood ? "OOD " : "",
                     K);
 
@@ -2430,7 +2555,7 @@ skip_nn:
                 std::chrono::steady_clock::now() - t_explore_start).count();
         }
 
-        /* GPU SGD: fire only when ratio MAPE exceeds threshold */
+        /* GPU SGD: fire when cost prediction error exceeds threshold */
         auto t_sgd_start = std::chrono::steady_clock::now();
         if (error_pct > static_cast<double>(g_reinforce_mape_threshold) && d_stats_ptr) {
             std::sort(explored_samples.begin(), explored_samples.end(),
@@ -2528,7 +2653,7 @@ skip_nn:
             h->predicted_comp_time   = predicted_comp_time;
             h->predicted_decomp_time = predicted_decomp_time;
             h->predicted_psnr        = predicted_psnr;
-            h->decompression_ms      = 0.0f;  /* filled later during read */
+            h->decompression_ms      = primary_decomp_time_ms;  /* measured at write when RL active, updated during read */
         }
     }
 

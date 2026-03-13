@@ -83,6 +83,7 @@ add_vol_test(test_vol_verify_gpu_path        tests/hdf5/test_vol_verify_gpu_path
 add_vol_test(test_nn_algo_convergence        tests/test_nn_algo_convergence.cu)
 add_vol_test(test_nn_bitcomp                 tests/test_nn_bitcomp.cu)
 add_vol_test(test_nn_predict_vs_actual       tests/test_nn_predict_vs_actual.cu)
+add_vol_test(test_vol_nn_predictions         tests/hdf5/test_vol_nn_predictions.cu)
 
 # ============================================================
 # VOL Regression Tests

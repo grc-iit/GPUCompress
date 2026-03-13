@@ -485,6 +485,33 @@ void gpucompress_set_reinforcement(int enable, float learning_rate,
  */
 void gpucompress_set_verbose(int enable);
 
+/* ============================================================
+ * Cost-Based Ranking Configuration
+ *
+ * The NN predicts (comp_time, decomp_time, ratio) for 32 configs.
+ * The ranking formula is:
+ *   cost = w0 * comp_time + w1 * decomp_time + w2 * data_size / (ratio * bw)
+ * The config with the lowest cost is selected.
+ *
+ * Default: w0=1, w1=1, w2=1 with auto-probed bandwidth from gpucompress_init().
+ * ============================================================ */
+
+/**
+ * Set the cost-based ranking weights for NN algorithm selection.
+ *
+ * @param w0  Weight on predicted compression time (ms)
+ * @param w1  Weight on predicted decompression time (ms)
+ * @param w2  Weight on I/O cost: data_size / (ratio * bandwidth)
+ */
+void gpucompress_set_ranking_weights(float w0, float w1, float w2);
+
+/**
+ * Override the auto-probed storage bandwidth used in cost-based ranking.
+ *
+ * @param bw_gbps  Bandwidth in GB/s (e.g. 3.0 for NVMe, 0.2 for HDD)
+ */
+void gpucompress_set_bandwidth(float bw_gbps);
+
 /**
  * Hot-reload neural network weights from a new .nnwt file.
  *

@@ -155,6 +155,15 @@ target_include_directories(test_nn_shuffle PRIVATE
 target_link_libraries(test_nn_shuffle PRIVATE gpucompress CUDA::cudart)
 set_target_properties(test_nn_shuffle PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
+add_executable(test_nn_cost_ranking tests/nn/test_nn_cost_ranking.cu)
+set_source_files_properties(tests/nn/test_nn_cost_ranking.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(test_nn_cost_ranking PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_nn_cost_ranking PRIVATE gpucompress CUDA::cudart)
+set_target_properties(test_nn_cost_ranking PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
 add_executable(test_sgd_weight_update tests/nn/test_sgd_weight_update.cu)
 set_source_files_properties(tests/nn/test_sgd_weight_update.cu PROPERTIES LANGUAGE CUDA)
 target_include_directories(test_sgd_weight_update PRIVATE

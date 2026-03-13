@@ -38,6 +38,12 @@ extern cudaEvent_t  g_sgd_done;
 extern std::atomic<bool> g_sgd_ever_fired;
 #define GC_LOG(fmt, ...) do { if (g_gc_verbose) fprintf(stderr, fmt, ##__VA_ARGS__); } while(0)
 
+/* Cost-based ranking globals — defined in gpucompress_api.cpp */
+extern float g_rank_w0;
+extern float g_rank_w1;
+extern float g_rank_w2;
+extern float g_measured_bw_bytes_per_ms;
+
 namespace gpucompress {
 
 /* ============================================================
@@ -46,21 +52,12 @@ namespace gpucompress {
 
 static constexpr uint32_t NN_MAGIC = 0x4E4E5754;  // "NNWT"
 
-/** Ranking criterion for selecting best config */
-enum NNRankCriterion {
-    NN_RANK_BY_RATIO = 0,       // Highest compression ratio (default)
-    NN_RANK_BY_COMP_TIME = 1,   // Lowest compression time
-    NN_RANK_BY_DECOMP_TIME = 2, // Lowest decompression time
-    NN_RANK_BY_PSNR = 3         // Highest PSNR
-};
-
 /* ============================================================
  * Static state
  * ============================================================ */
 
 static NNWeightsGPU* d_nn_weights = nullptr;
 static std::atomic<bool> g_nn_loaded{false};
-static std::atomic<int> g_rank_criterion{NN_RANK_BY_RATIO};
 
 /** Pre-allocated inference output buffers (avoids per-call cudaMalloc) */
 static NNInferenceOutput* d_infer_output = nullptr;   // batched: action+ratio+comp_time+is_ood (16B)
@@ -109,7 +106,7 @@ __device__ static void nnForwardPass(
     float mad_f,        // (float)mad_norm                 — precomputed by caller
     float deriv_f,      // (float)deriv_norm               — precomputed by caller
     double error_bound, // kept for quant-mask check only
-    int   criterion,
+    float data_size_bytes, float w0, float w1, float w2, float bw,
     float* out_rank_val,
     float* out_ratio,
     float* out_comp_time,
@@ -174,16 +171,11 @@ __device__ static void nnForwardPass(
     decomp_time = fmaxf(1e-6f, fminf(decomp_time, 1e6f));
     ratio       = fmaxf(0.1f,  fminf(ratio,        1e5f));
 
-    float rank_val;
-    bool higher_is_better;
-    switch (criterion) {
-        case NN_RANK_BY_RATIO:       rank_val = ratio;       higher_is_better = true;  break;
-        case NN_RANK_BY_COMP_TIME:   rank_val = comp_time;   higher_is_better = false; break;
-        case NN_RANK_BY_DECOMP_TIME: rank_val = decomp_time; higher_is_better = false; break;
-        case NN_RANK_BY_PSNR:        rank_val = psnr;        higher_is_better = true;  break;
-        default:                     rank_val = ratio;       higher_is_better = true;
-    }
-    if (!higher_is_better) rank_val = -rank_val;
+    /* Cost-based ranking: cost = w0*comp_time + w1*decomp_time + w2*data_size/(ratio*bw)
+       Lower cost is better → rank_val = -cost (reduction finds max). */
+    float io_cost = data_size_bytes / (ratio * bw);
+    float cost = w0 * comp_time + w1 * decomp_time + w2 * io_cost;
+    float rank_val = -cost;
     if (quant == 1 && error_bound <= 0.0) rank_val = -INFINITY;
 
     *out_rank_val   = rank_val;
@@ -216,7 +208,7 @@ __device__ static void nnForwardPass(
  * @param deriv_norm    Normalized 2nd derivative (already divided by range)
  * @param data_size     Data size in bytes
  * @param error_bound   Error bound (0 for lossless)
- * @param criterion         Which output to rank by
+ * @param w0/w1/w2/bw       Cost-based ranking weights and bandwidth
  * @param out_action        Output: best action ID (0-31)
  * @param out_predicted_ratio Output: predicted compression ratio for winner (nullable)
  * @param out_top_actions   Output: all 32 action IDs sorted by rank (nullable)
@@ -228,7 +220,7 @@ __global__ void nnInferenceKernel(
     double deriv_norm,
     size_t data_size,
     double error_bound,
-    int criterion,
+    float w0, float w1, float w2, float bw,
     NNInferenceOutput* __restrict__ out_result,
     int* __restrict__ out_top_actions
 ) {
@@ -253,7 +245,8 @@ __global__ void nnInferenceKernel(
     float rank_val, ratio, comp_time, decomp_time, psnr;
     nnForwardPass(weights, tid,
                   s_enc[0], s_enc[1], s_enc[2], s_enc[3], s_enc[4],
-                  error_bound, criterion,
+                  error_bound,
+                  static_cast<float>(data_size), w0, w1, w2, bw,
                   &rank_val, &ratio, &comp_time, &decomp_time, &psnr);
 
     // ---- Store per-thread predictions for later retrieval ----
@@ -367,7 +360,7 @@ __global__ void nnFusedInferenceKernel(
     const AutoStatsGPU* __restrict__ d_stats,
     size_t data_size,
     double error_bound,
-    int criterion,
+    float w0, float w1, float w2, float bw,
     NNInferenceOutput* __restrict__ out_result,
     int* __restrict__ out_top_actions
 ) {
@@ -393,7 +386,8 @@ __global__ void nnFusedInferenceKernel(
     float rank_val, ratio, comp_time, decomp_time, psnr;
     nnForwardPass(weights, tid,
                   s_enc[0], s_enc[1], s_enc[2], s_enc[3], s_enc[4],
-                  error_bound, criterion,
+                  error_bound,
+                  static_cast<float>(data_size), w0, w1, w2, bw,
                   &rank_val, &ratio, &comp_time, &decomp_time, &psnr);
 
     __shared__ float s_ratios[NN_NUM_CONFIGS];
@@ -1100,13 +1094,6 @@ const NNWeightsGPU* getNNWeightsDevicePtr() {
 }
 
 /**
- * Set the ranking criterion for neural network inference.
- */
-void setNNRankCriterion(NNRankCriterion criterion) {
-    g_rank_criterion.store(static_cast<int>(criterion));
-}
-
-/**
  * Run neural network inference to find best compression config.
  *
  * Launches 32 threads (one per config), each runs a full forward pass
@@ -1153,7 +1140,7 @@ int runNNInference(
         d_nn_weights,
         entropy, mad_norm, deriv_norm,
         data_size, error_bound,
-        g_rank_criterion.load(),
+        g_rank_w0, g_rank_w1, g_rank_w2, g_measured_bw_bytes_per_ms,
         d_infer_output,
         out_top_actions ? d_infer_top_actions : nullptr
     );
@@ -1225,7 +1212,7 @@ int runNNFusedInference(
         d_nn_weights,
         d_stats,
         data_size, error_bound,
-        g_rank_criterion.load(),
+        g_rank_w0, g_rank_w1, g_rank_w2, g_measured_bw_bytes_per_ms,
         d_fused_infer_output,
         out_top_actions ? d_fused_top_actions : nullptr
     );
@@ -1374,7 +1361,7 @@ int runNNFusedInferenceCtx(
         d_nn_weights,
         d_stats,
         data_size, error_bound,
-        g_rank_criterion.load(),
+        g_rank_w0, g_rank_w1, g_rank_w2, g_measured_bw_bytes_per_ms,
         ctx->d_fused_infer_output,
         out_top_actions ? ctx->d_fused_top_actions : nullptr
     );
@@ -1500,11 +1487,6 @@ int gpucompress_nn_is_loaded_impl(void) {
 
 void gpucompress_nn_cleanup_impl(void) {
     gpucompress::cleanupNN();
-}
-
-void gpucompress_nn_set_criterion_impl(int criterion) {
-    gpucompress::setNNRankCriterion(
-        static_cast<gpucompress::NNRankCriterion>(criterion));
 }
 
 void* gpucompress_nn_get_device_ptr_impl(void) {
