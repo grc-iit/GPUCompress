@@ -122,12 +122,18 @@ Allocates `d_histogram` (1 KB) + `d_entropy` (8 bytes) per entropy call. Freed a
 
 ---
 
-### M4: H5VL Worker Buffers Allocated Per-Write [HIGH]
-**File:** `src/hdf5/H5VLgpucompress.cu:1055-1065, 1286-1290`
+### M4: H5VL Worker Buffers Allocated Per-Write [HIGH] -- DONE
+**File:** `src/hdf5/H5VLgpucompress.cu`
 
-Per-write operation: allocates `N_COMP_WORKERS` device buffers + `N_IO_BUFS` pinned buffers. Freed after write completes.
+Per-write operation allocated 8 device buffers + 16 pinned host buffers (24 alloc/free per write).
+`cudaMallocHost` is 1-5ms each (kernel page-table ops), dominating small-write latency.
 
-**Fix:** Move to persistent session-level pool. Allocate once at VOL init.
+**Fix:** Added `VolWriteCtx` struct to `H5VL_gpucompress_t` (VOL dataset object).
+Buffers allocated on first write, reused on subsequent writes, freed at `H5Dclose`.
+If chunk size grows between writes, buffers are re-allocated to the new size.
+
+**Result:** Per-write throughput 90 → 375 MiB/s (4.2x) on 4 MB writes.
+Warmup write: 64ms → 10ms. Avg steady-state: 44ms → 11ms.
 
 ---
 
@@ -371,7 +377,7 @@ K alternatives compressed and decompressed sequentially with sync after each.
 
 | ID | Issue | Impact | Effort | Status |
 |----|-------|--------|--------|--------|
-| **M4** | H5VL worker buffers per-write | 573ms alloc in write | Medium | TODO |
+| **M4** | H5VL worker buffers per-write | 573ms alloc in write | Medium | DONE (session-level VolWriteCtx persists across writes, freed at dataset close) |
 | **N3** | Exploration buffer alloc per-alt | 50-150ms per explore | Low | TODO |
 | **E3** | I/O queue blocking stalls workers | Pipeline stall | Medium | DONE (I/O queue cap raised to N_IO_BUFS, work queue doubled to 2x workers) |
 | **I1** | Only 2 prefetch slots in read | GPU idle on reads | Low | DONE (increased to 4) |
@@ -415,17 +421,30 @@ K alternatives compressed and decompressed sequentially with sync after each.
 - nn phase: write=51 MiB/s, read=286 MiB/s, wall=75ms, GPU-time=66ms
 - nn-rl phase: write=44 MiB/s, read=232 MiB/s, wall=87ms, GPU-time=69ms, SGD=1/4
 
-### After Implemented Optimizations (E1, S1, S2, S3, S4, K1, K2, I1, I2, I6)
-- nn phase: write=48 MiB/s, read varies, GPU-time=91ms (compression-dominated)
+### After All Optimizations (E1, N1, S1-S4, K1, K2, I1, I2, I6, E3, M4)
+
+**Small dataset (4 MB, 4x1MB chunks):**
 - nn-rl phase: write=58-85 MiB/s, wall=45-66ms, GPU-time=12-18ms, SGD=4/4
 - VOL read (16-chunk): 27.58ms -> 23.08ms (16% faster)
 - **nn-rl GPU-time speedup: 3.8-5.75x**
-- **nn-rl write throughput: 1.3-1.9x**
+
+**Large dataset (4 GB, 64x64MB chunks, 1024^3 Gray-Scott):**
+- nn write: 2,494 MiB/s, read: 8,127-9,623 MiB/s
+- nn-rl write: 2,637-2,858 MiB/s, read: 8,573-10,626 MiB/s
+- nn-rl ratio: 172x, MAPE: 50% (down from 158% via online SGD)
+- nn GPU-time: 855-1,929ms, nn-rl GPU-time: 537-948ms
+
+**Multi-write throughput (M4 test, 4 MB per write):**
+- Before M4: 90 MiB/s (44ms/write, 24 alloc/free per write)
+- After M4: 375 MiB/s (11ms/write, buffers persist)
+- **4.2x improvement per-write**
 
 ### Key Wins
 - E1 (mutex removal): nn-rl write 44->85 MiB/s, SGD fires 4/4 instead of 1/4
+- N1 (manager cache): nn GPU-time 2,152->855ms (2.5x) on 4GB dataset
+- M4 (session buffers): per-write throughput 90->375 MiB/s (4.2x)
+- E3 (queue decoupling): unblocked worker→I/O pipeline
 - S2 (double sync removal): VOL read 16% faster
-- S4 (preprocessing sync removal): reduced pipeline latency
 - K2 (spin-wait removal): eliminated GPU warp waste in stats init
 
 ---

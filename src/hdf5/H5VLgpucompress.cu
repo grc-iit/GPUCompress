@@ -50,11 +50,23 @@ typedef struct H5VL_gpucompress_info_t {
     void  *under_vol_info;  /**< Info for the underlying VOL connector     */
 } H5VL_gpucompress_info_t;
 
+/* M4 fix: persistent write state — allocated on first write, reused, freed at close */
+#define M4_N_COMP_WORKERS 8
+#define M4_N_IO_BUFS      (M4_N_COMP_WORKERS * 2)
+
+struct VolWriteCtx {
+    uint8_t* d_comp_w[M4_N_COMP_WORKERS]; /**< Per-worker device output buffers */
+    void*    io_pool_bufs[M4_N_IO_BUFS];  /**< Pinned host staging buffers      */
+    size_t   max_comp;                     /**< Size each buffer was allocated for */
+    bool     initialized;
+};
+
 /** Wrapped HDF5 object.  For datasets, dcpl_id holds a copy of the DCPL. */
 typedef struct H5VL_gpucompress_t {
     hid_t  under_vol_id;    /**< ID of the underlying VOL connector       */
     void  *under_object;    /**< Underlying VOL object pointer             */
     hid_t  dcpl_id;         /**< DCPL copy (datasets only; else INVALID)  */
+    VolWriteCtx* write_ctx; /**< M4: persistent write buffers (NULL until first write) */
 } H5VL_gpucompress_t;
 
 /** Wrap-context object used by HDF5 when wrapping sub-objects */
@@ -998,8 +1010,8 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
         size_t chunk_bytes = chunk_elems * elem_size;
         size_t max_comp    = gpucompress_max_compressed_size(chunk_bytes);
 
-        /* ---- 3-Stage concurrent pipeline: N_COMP_WORKERS + I/O thread ---- */
-#define N_COMP_WORKERS 8
+        /* ---- 3-Stage concurrent pipeline: M4_N_COMP_WORKERS + I/O thread ---- */
+#define N_COMP_WORKERS M4_N_COMP_WORKERS
         struct WorkItem {
             const uint8_t* src;      /* source for compression */
             uint8_t*       d_owned;  /* non-NULL: worker cudaFrees after compression */
@@ -1009,17 +1021,17 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
             bool           valid;
         };
 
-        /* Per-worker device output buffers */
-        uint8_t *d_comp_w[N_COMP_WORKERS] = {};
+        /* M4 fix: use session-level buffers from write_ctx (persistent across writes).
+         * Allocate on first write, reuse on subsequent writes, free at dataset close. */
+#define N_IO_BUFS M4_N_IO_BUFS
 
-        /* Pinned host buffer pool — I2 fix: increased to 2x workers to
-         * decouple worker D→H and IO write. Prevents starvation when IO lags. */
-#define N_IO_BUFS (N_COMP_WORKERS * 2)
-        void    *io_pool_bufs[N_IO_BUFS] = {};
+        /* All pipeline-local variables declared up-front (before any goto,
+         * nvcc requires no init-bypass for non-trivial types). */
+        hsize_t *d_dset_dims = NULL, *d_chunk_dims = NULL, *d_chunk_start = NULL;
+        uint8_t* d_comp_w[N_COMP_WORKERS] = {};
         std::mutex              pool_mtx;
         std::condition_variable pool_cv;
         std::queue<void*>       pool_free;
-
         auto pool_acquire = [&]() -> void* {
             std::unique_lock<std::mutex> lk(pool_mtx);
             pool_cv.wait(lk, [&]{ return !pool_free.empty(); });
@@ -1030,16 +1042,10 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
             { std::lock_guard<std::mutex> lk(pool_mtx); pool_free.push(b); }
             pool_cv.notify_one();
         };
-
-        /* Bounded work queue (capacity = N_COMP_WORKERS) */
         std::mutex              wq_mtx;
         std::condition_variable wq_full_cv, wq_ready_cv;
         std::queue<WorkItem>    wq;
-
-        /* Error propagation from workers */
         std::atomic<herr_t>     worker_err{0};
-
-        /* I/O writer thread (Stage 3) */
         struct IOItem { void *data; size_t sz; hsize_t cs[32]; int nd; };
         std::mutex              io_mtx;
         std::condition_variable io_cv;
@@ -1049,19 +1055,37 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
         bool                    io_started   = false;
         std::thread             io_thr;
 
-        /* Stage-1 dimension arrays for gather kernel (reused across chunks) */
-        hsize_t *d_dset_dims = NULL, *d_chunk_dims = NULL, *d_chunk_start = NULL;
+        if (!o->write_ctx) {
+            o->write_ctx = new VolWriteCtx{};
+            memset(o->write_ctx, 0, sizeof(VolWriteCtx));
+        }
+        VolWriteCtx* wctx = o->write_ctx;
 
-        /* ---- Allocate per-worker device buffers + pinned buffer pool ---- */
-        bool ok = true;
-        for (int w = 0; w < N_COMP_WORKERS && ok; w++) {
-            if (cudaMalloc(&d_comp_w[w], max_comp) != cudaSuccess) ok = false;
+        /* (Re)allocate if first use or chunk size grew */
+        if (!wctx->initialized || wctx->max_comp < max_comp) {
+            if (wctx->initialized) {
+                for (int w = 0; w < N_COMP_WORKERS; w++) {
+                    if (wctx->d_comp_w[w]) { cudaFree(wctx->d_comp_w[w]); wctx->d_comp_w[w] = nullptr; }
+                }
+                for (int i = 0; i < N_IO_BUFS; i++) {
+                    if (wctx->io_pool_bufs[i]) { cudaFreeHost(wctx->io_pool_bufs[i]); wctx->io_pool_bufs[i] = nullptr; }
+                }
+            }
+            bool ok = true;
+            for (int w = 0; w < N_COMP_WORKERS && ok; w++) {
+                if (cudaMalloc(&wctx->d_comp_w[w], max_comp) != cudaSuccess) ok = false;
+            }
+            for (int i = 0; i < N_IO_BUFS && ok; i++) {
+                if (cudaMallocHost(&wctx->io_pool_bufs[i], max_comp) != cudaSuccess) ok = false;
+            }
+            if (!ok) goto done_write;
+            wctx->max_comp = max_comp;
+            wctx->initialized = true;
         }
-        for (int i = 0; i < N_IO_BUFS && ok; i++) {
-            if (cudaMallocHost(&io_pool_bufs[i], max_comp) != cudaSuccess) ok = false;
-            else pool_free.push(io_pool_bufs[i]);
-        }
-        if (!ok) goto done_write;
+
+        /* Alias persistent buffers + populate free pool */
+        for (int w = 0; w < N_COMP_WORKERS; w++) d_comp_w[w] = wctx->d_comp_w[w];
+        for (int i = 0; i < N_IO_BUFS; i++) pool_free.push(wctx->io_pool_bufs[i]);
 
         /* ---- Launch I/O writer thread (Stage 3) ---- */
         io_thr = std::thread([&]() {
@@ -1284,14 +1308,10 @@ done_write:
             if (io_err < 0 && ret == 0) ret = -1;
         }
 
-        /* ---- Cleanup ---- */
+        /* ---- Cleanup (per-write only; buffers persist in write_ctx) ---- */
         if (d_dset_dims) free_dim_arrays(d_dset_dims, d_chunk_dims, d_chunk_start);
-        for (int w = 0; w < N_COMP_WORKERS; w++) {
-            if (d_comp_w[w]) cudaFree(d_comp_w[w]);
-        }
-        for (int i = 0; i < N_IO_BUFS; i++) {
-            if (io_pool_bufs[i]) cudaFreeHost(io_pool_bufs[i]);
-        }
+        /* M4 fix: d_comp_w and io_pool_bufs are NOT freed here — they persist
+         * in wctx for reuse on the next H5Dwrite. Freed in dataset_close. */
 #undef N_IO_BUFS
 #undef N_COMP_WORKERS
     }
@@ -1906,6 +1926,20 @@ H5VL_gpucompress_dataset_close(void *dset, hid_t dxpl_id, void **req)
     herr_t rv = H5VLdataset_close(o->under_object, o->under_vol_id, dxpl_id, req);
     if (req && *req) *req = new_obj(*req, o->under_vol_id);
     if (rv >= 0) {
+        /* M4 fix: free persistent write buffers */
+        if (o->write_ctx) {
+            VolWriteCtx* wctx = o->write_ctx;
+            if (wctx->initialized) {
+                for (int w = 0; w < M4_N_COMP_WORKERS; w++) {
+                    if (wctx->d_comp_w[w]) cudaFree(wctx->d_comp_w[w]);
+                }
+                for (int i = 0; i < M4_N_IO_BUFS; i++) {
+                    if (wctx->io_pool_bufs[i]) cudaFreeHost(wctx->io_pool_bufs[i]);
+                }
+            }
+            delete wctx;
+            o->write_ctx = nullptr;
+        }
         if (o->dcpl_id != H5I_INVALID_HID) { H5Pclose(o->dcpl_id); o->dcpl_id = H5I_INVALID_HID; }
         free_obj(o);
     }
