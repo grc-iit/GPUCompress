@@ -2389,6 +2389,14 @@ skip_nn:
 
             double best_ratio = actual_ratio;
 
+            /* N3 fix: pre-allocate scratch buffers for exploration, reuse across K alts.
+             * Avoids per-alt cudaMalloc/cudaFree for the two largest buffers. */
+            size_t explore_max_comp = gpucompress_max_compressed_size(input_size);
+            uint8_t* d_explore_out = nullptr;
+            uint8_t* d_explore_decomp = nullptr;
+            cudaMalloc(&d_explore_out, explore_max_comp);
+            cudaMalloc(&d_explore_decomp, input_size);
+
             for (int i = 1; i <= K && i < 32; i++) {
                 int alt_action = top_actions[i];
                 if (alt_action == nn_action) continue;
@@ -2448,13 +2456,13 @@ skip_nn:
 
                 size_t alt_comp_size = 0;
 
-                if (alt_comp) {
-                    uint8_t* d_alt_out = nullptr;
+                if (alt_comp && d_explore_out) {
+                    uint8_t* d_alt_out = d_explore_out;  /* N3 fix: reuse scratch */
                     try {
                         CompressionConfig alt_cc =
                             alt_comp->configure_compression(alt_compress_size);
                         size_t alt_max = alt_cc.max_compressed_buffer_size;
-                        if (cudaMalloc(&d_alt_out, alt_max) == cudaSuccess) {
+                        if (alt_max <= explore_max_comp) {
                             float alt_ct_ms = 0.0f;
 
                             /* S6 fix: removed per-alt event-based timing sync.
@@ -2477,12 +2485,13 @@ skip_nn:
                                     if (rt_decomp) {
                                         DecompressionConfig rt_dc = rt_decomp->configure_decompression(d_alt_out);
                                         size_t rt_decomp_size = rt_dc.decomp_data_size;
-                                        uint8_t* d_rt_decompressed = nullptr;
-                                        if (cudaMalloc(&d_rt_decompressed, rt_decomp_size) == cudaSuccess) {
+                                        /* N3 fix: reuse pre-allocated decomp scratch */
+                                        uint8_t* d_rt_decompressed = d_explore_decomp;
+                                        if (d_rt_decompressed && rt_decomp_size <= input_size) {
                                             try {
                                                 rt_decomp->decompress(d_rt_decompressed, d_alt_out, rt_dc);
                                             } catch (...) {
-                                                cudaFree(d_rt_decompressed);
+                                                /* N3: d_rt_decompressed is scratch, don't free */
                                                 goto gpu_skip_roundtrip;
                                             }
 
@@ -2528,7 +2537,7 @@ skip_nn:
 
                                             if (d_rt_dequant) cudaFree(d_rt_dequant);
                                             if (d_rt_unshuf) cudaFree(d_rt_unshuf);
-                                            cudaFree(d_rt_decompressed);
+                                            /* N3: d_rt_decompressed is scratch, freed after loop */
                                         }
                                     }
                                 }
@@ -2603,12 +2612,16 @@ skip_nn:
                     } catch (...) {
                         /* Compression failed for this config, skip it */
                     }
-                    if (d_alt_out) cudaFree(d_alt_out);
+                    /* N3 fix: d_alt_out is scratch — don't free per-alt */
                 }
 
                 if (d_alt_quant) cudaFree(d_alt_quant);
                 if (d_alt_shuf) cudaFree(d_alt_shuf);
             }
+
+            /* N3 fix: free exploration scratch buffers after the loop */
+            if (d_explore_out)    cudaFree(d_explore_out);
+            if (d_explore_decomp) cudaFree(d_explore_decomp);
         }
 
         if (exploration_triggered) {

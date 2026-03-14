@@ -378,7 +378,7 @@ K alternatives compressed and decompressed sequentially with sync after each.
 | ID | Issue | Impact | Effort | Status |
 |----|-------|--------|--------|--------|
 | **M4** | H5VL worker buffers per-write | 573ms alloc in write | Medium | DONE (session-level VolWriteCtx persists across writes, freed at dataset close) |
-| **N3** | Exploration buffer alloc per-alt | 50-150ms per explore | Low | TODO |
+| **N3** | Exploration buffer alloc per-alt | 50-150ms per explore | Low | DONE (pre-allocate d_explore_out + d_explore_decomp, reuse across K alts) |
 | **E3** | I/O queue blocking stalls workers | Pipeline stall | Medium | DONE (I/O queue cap raised to N_IO_BUFS, work queue doubled to 2x workers) |
 | **I1** | Only 2 prefetch slots in read | GPU idle on reads | Low | DONE (increased to 4) |
 | **I2** | Pinned pool buffer contention | Worker starvation | Low | DONE (increased to workers*2) |
