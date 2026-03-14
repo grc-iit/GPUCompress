@@ -79,9 +79,7 @@ begin_globals {
 
     // Buffers for benchmark
     float*             d_read;            // GPU read-back buffer
-    float*             h_orig;            // Host copy of original data
-    float*             h_read;            // Host copy of read-back data
-    size_t             h_buf_size;        // Size of host buffers in bytes
+    unsigned long long* d_count;          // GPU mismatch counter
 };
 
 // ============================================================
@@ -160,6 +158,7 @@ struct PhaseResult {
     int    explorations;
     int    n_chunks;
     double mape_pct;
+    double stats_ms;
     double nn_ms;
     double preproc_ms;
     double comp_ms;
@@ -207,18 +206,30 @@ static hid_t make_dcpl_auto(hsize_t chunk_floats, double eb = 0.0)
 }
 
 // ============================================================
-// CPU-side bitwise comparison (no separate .cu file needed)
+// GPU-side byte-exact comparison
 // ============================================================
-static unsigned long long cpu_compare(const float* a, const float* b, size_t n)
+__global__ void count_mismatches_kernel(const float * __restrict__ a,
+                                        const float * __restrict__ b,
+                                        size_t n,
+                                        unsigned long long *count)
 {
-    unsigned long long mm = 0;
-    for (size_t i = 0; i < n; i++) {
-        unsigned int ua, ub;
-        memcpy(&ua, &a[i], sizeof(unsigned int));
-        memcpy(&ub, &b[i], sizeof(unsigned int));
-        if (ua != ub) mm++;
-    }
-    return mm;
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long local = 0;
+    for (; i < n; i += (size_t)gridDim.x * blockDim.x)
+        if (a[i] != b[i]) local++;
+    atomicAdd(count, local);
+}
+
+static unsigned long long gpu_compare(const float *a, const float *b,
+                                      size_t n_floats,
+                                      unsigned long long *d_count)
+{
+    cudaMemset(d_count, 0, sizeof(unsigned long long));
+    count_mismatches_kernel<<<512, 256>>>(a, b, n_floats, d_count);
+    cudaDeviceSynchronize();
+    unsigned long long h_count = 0;
+    cudaMemcpy(&h_count, d_count, sizeof(h_count), cudaMemcpyDeviceToHost);
+    return h_count;
 }
 
 // ============================================================
@@ -226,7 +237,7 @@ static unsigned long long cpu_compare(const float* a, const float* b, size_t n)
 // ============================================================
 static int run_phase(const char* phase_name, const char* tmp_file,
                      float* d_data, float* d_read,
-                     float* h_orig, float* h_read,
+                     unsigned long long* d_count,
                      size_t n_floats, int n_chunks, hid_t dcpl,
                      PhaseResult* r)
 {
@@ -280,16 +291,15 @@ static int run_phase(const char* phase_name, const char* tmp_file,
 
     if (rret < 0) { fprintf(stderr, "  [%s] H5Dread failed\n", phase_name); return 1; }
 
-    // CPU bitwise verify (copy GPU buffers to host AFTER timing stops)
-    cudaMemcpy(h_orig, d_data, n_floats * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_read, d_read, n_floats * sizeof(float), cudaMemcpyDeviceToHost);
-    unsigned long long mm = cpu_compare(h_orig, h_read, n_floats);
+    // GPU bitwise verify
+    unsigned long long mm = gpu_compare(d_data, d_read, n_floats, d_count);
 
     // Collect per-chunk diagnostics and write to CSV
     int sgd_fires    = 0;
     int explorations = 0;
     double ape_sum   = 0.0;
     int    ape_cnt   = 0;
+    double total_stats_ms   = 0.0;
     double total_nn_ms      = 0.0;
     double total_preproc_ms = 0.0;
     double total_comp_ms    = 0.0;
@@ -319,6 +329,7 @@ static int run_phase(const char* phase_name, const char* tmp_file,
         if (gpucompress_get_chunk_diag(i, &d) == 0) {
             sgd_fires    += d.sgd_fired;
             explorations += d.exploration_triggered;
+            total_stats_ms   += d.stats_ms;
             total_nn_ms      += d.nn_inference_ms;
             total_preproc_ms += d.preprocessing_ms;
             total_comp_ms    += d.compression_ms;
@@ -383,6 +394,7 @@ static int run_phase(const char* phase_name, const char* tmp_file,
     r->explorations = explorations;
     r->n_chunks     = n_chunks;
     r->mape_pct     = (ape_cnt > 0) ? 100.0 * ape_sum / ape_cnt : 0.0;
+    r->stats_ms     = total_stats_ms;
     r->nn_ms        = total_nn_ms;
     r->preproc_ms   = total_preproc_ms;
     r->comp_ms      = total_comp_ms;
@@ -395,11 +407,13 @@ static int run_phase(const char* phase_name, const char* tmp_file,
            phase_name, r->ratio, r->write_mbps, r->read_mbps,
            (double)fbytes / (1 << 20), sgd_fires, explorations, n_hist, mm);
 
-    double total_tracked = total_nn_ms + total_preproc_ms + total_comp_ms
-                         + total_explore_ms + total_sgd_ms;
+    double total_tracked = total_stats_ms + total_nn_ms + total_preproc_ms
+                         + total_comp_ms + total_explore_ms + total_sgd_ms;
     double write_ms = t1 - t0;
     printf("  [%s] Overhead breakdown (%d chunks, write=%.1f ms, total GPU-time=%.1f ms):\n",
            phase_name, n_hist, write_ms, total_tracked);
+    printf("    Stats compute: %8.1f ms  (%4.1f%% of GPU-time)\n",
+           total_stats_ms, total_tracked > 0 ? 100.0 * total_stats_ms / total_tracked : 0.0);
     printf("    NN inference : %8.1f ms  (%4.1f%% of GPU-time)\n",
            total_nn_ms, total_tracked > 0 ? 100.0 * total_nn_ms / total_tracked : 0.0);
     printf("    Preprocessing: %8.1f ms  (%4.1f%% of GPU-time)\n",
@@ -551,9 +565,7 @@ begin_initialization {
     // ---- GPUCompress + HDF5 VOL initialization ----
     global->gpucompress_ready = 0;
     global->d_read    = NULL;
-    global->h_orig    = NULL;
-    global->h_read    = NULL;
-    global->h_buf_size = 0;
+    global->d_count   = NULL;
 
     const char* weights_path = getenv("GPUCOMPRESS_WEIGHTS");
     gpucompress_error_t gerr = gpucompress_init(weights_path);
@@ -598,11 +610,9 @@ begin_initialization {
     sim_log("  Weights  : " << (weights_path ? weights_path : "(none, fallback to LZ4)"));
     sim_log("  NN loaded: " << (gpucompress_nn_is_loaded() ? "yes" : "no"));
 
-    // Allocate GPU read-back buffer and host verification buffers
+    // Allocate GPU read-back buffer and mismatch counter
     cudaMalloc(&global->d_read, field_bytes);
-    global->h_orig    = (float*)malloc(field_bytes);
-    global->h_read    = (float*)malloc(field_bytes);
-    global->h_buf_size = field_bytes;
+    cudaMalloc(&global->d_count, sizeof(unsigned long long));
 };
 
 // ============================================================
@@ -663,7 +673,7 @@ begin_diagnostics {
     {
         hid_t dcpl = make_dcpl_nocomp((hsize_t)chunk_floats);
         int rc = run_phase("no-comp", TMP_NOCOMP,
-                           d_fields, global->d_read, global->h_orig, global->h_read,
+                           d_fields, global->d_read, global->d_count,
                            n_floats, n_chunks, dcpl, &results[n_phases]);
         H5Pclose(dcpl);
         if (rc) any_fail = 1;
@@ -679,7 +689,7 @@ begin_diagnostics {
     {
         hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats, diag_error_bound);
         int rc = run_phase("nn", TMP_NN,
-                           d_fields, global->d_read, global->h_orig, global->h_read,
+                           d_fields, global->d_read, global->d_count,
                            n_floats, n_chunks, dcpl, &results[n_phases]);
         H5Pclose(dcpl);
         if (rc) any_fail = 1;
@@ -696,7 +706,7 @@ begin_diagnostics {
     {
         hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats, diag_error_bound);
         int rc = run_phase("nn-rl", TMP_NN_RL,
-                           d_fields, global->d_read, global->h_orig, global->h_read,
+                           d_fields, global->d_read, global->d_count,
                            n_floats, n_chunks, dcpl, &results[n_phases]);
         H5Pclose(dcpl);
         gpucompress_disable_online_learning();
@@ -707,6 +717,10 @@ begin_diagnostics {
 
     // ── Phase 4: nn-rl+exp50 (SGD + exploration) ──────────────────
     if (phase_enabled("nn-rl+exp")) {
+    // Reset NN weights so phase 4 starts from original trained weights,
+    // not the SGD-modified weights from phase 3.
+    const char* wpath = getenv("GPUCOMPRESS_WEIGHTS");
+    if (wpath) gpucompress_reload_nn(wpath);
     sim_log("── Phase 4/4: nn-rl+exp50 (ALGO_AUTO + SGD + expl@MAPE>=50%) ");
     gpucompress_enable_online_learning();
     gpucompress_set_reinforcement(1, REINFORCE_LR, REINFORCE_MAPE, REINFORCE_MAPE);
@@ -716,7 +730,7 @@ begin_diagnostics {
     {
         hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats, diag_error_bound);
         int rc = run_phase("nn-rl+exp50", TMP_NN_RLEXP,
-                           d_fields, global->d_read, global->h_orig, global->h_read,
+                           d_fields, global->d_read, global->d_count,
                            n_floats, n_chunks, dcpl, &results[n_phases]);
         H5Pclose(dcpl);
         gpucompress_disable_online_learning();
@@ -757,30 +771,31 @@ begin_diagnostics {
             if (strncmp(results[i].phase, "nn", 2) == 0) { has_nn = true; break; }
 
         if (has_nn) {
-            printf("\n╔══════════════════════════════════════════════════════════════════════════════════════╗\n");
-            printf("║  GPU-Time Overhead Breakdown (cumulative across chunks, 8 concurrent workers)       ║\n");
-            printf("╠══════════════╦══════════╦══════════╦══════════╦══════════╦══════════╦════════════════╣\n");
-            printf("║  Phase       ║ NN Infer ║ Preproc  ║ Compress ║ Explore  ║ SGD      ║ Total GPU-time ║\n");
-            printf("╠══════════════╬══════════╬══════════╬══════════╬══════════╬══════════╬════════════════╣\n");
+            printf("\n╔═════════════════════════════════════════════════════════════════════════════════════════════════╗\n");
+            printf("║  GPU-Time Overhead Breakdown (cumulative across chunks, 8 concurrent workers)                  ║\n");
+            printf("╠══════════════╦══════════╦══════════╦══════════╦══════════╦══════════╦══════════╦════════════════╣\n");
+            printf("║  Phase       ║ Stats    ║ NN Infer ║ Preproc  ║ Compress ║ Explore  ║ SGD      ║ Total GPU-time ║\n");
+            printf("╠══════════════╬══════════╬══════════╬══════════╬══════════╬══════════╬══════════╬════════════════╣\n");
             for (int i = 0; i < n_phases; i++) {
                 if (strncmp(results[i].phase, "nn", 2) != 0) continue;
                 PhaseResult* rr = &results[i];
-                double total_gpu = rr->nn_ms + rr->preproc_ms + rr->comp_ms
+                double total_gpu = rr->stats_ms + rr->nn_ms + rr->preproc_ms + rr->comp_ms
                                  + rr->explore_ms + rr->sgd_ms;
-                printf("║  %-12s║ %5.0f ms ║ %5.0f ms ║ %5.0f ms ║ %5.0f ms ║ %5.0f ms ║   %7.0f ms   ║\n",
-                       rr->phase, rr->nn_ms, rr->preproc_ms, rr->comp_ms,
+                printf("║  %-12s║ %5.0f ms ║ %5.0f ms ║ %5.0f ms ║ %5.0f ms ║ %5.0f ms ║ %5.0f ms ║   %7.0f ms   ║\n",
+                       rr->phase, rr->stats_ms, rr->nn_ms, rr->preproc_ms, rr->comp_ms,
                        rr->explore_ms, rr->sgd_ms, total_gpu);
             }
-            printf("╠══════════════╬══════════╬══════════╬══════════╬══════════╬══════════╬════════════════╣\n");
-            printf("║  (%% of GPU)  ║          ║          ║          ║          ║          ║                ║\n");
+            printf("╠══════════════╬══════════╬══════════╬══════════╬══════════╬══════════╬══════════╬════════════════╣\n");
+            printf("║  (%% of GPU)  ║          ║          ║          ║          ║          ║          ║                ║\n");
             for (int i = 0; i < n_phases; i++) {
                 if (strncmp(results[i].phase, "nn", 2) != 0) continue;
                 PhaseResult* rr = &results[i];
-                double total_gpu = rr->nn_ms + rr->preproc_ms + rr->comp_ms
+                double total_gpu = rr->stats_ms + rr->nn_ms + rr->preproc_ms + rr->comp_ms
                                  + rr->explore_ms + rr->sgd_ms;
                 if (total_gpu <= 0) total_gpu = 1.0;
-                printf("║  %-12s║ %5.1f%%   ║ %5.1f%%   ║ %5.1f%%   ║ %5.1f%%   ║ %5.1f%%   ║   wall: %4.0f ms ║\n",
+                printf("║  %-12s║ %5.1f%%   ║ %5.1f%%   ║ %5.1f%%   ║ %5.1f%%   ║ %5.1f%%   ║ %5.1f%%   ║   wall: %4.0f ms ║\n",
                        rr->phase,
+                       100.0 * rr->stats_ms / total_gpu,
                        100.0 * rr->nn_ms / total_gpu,
                        100.0 * rr->preproc_ms / total_gpu,
                        100.0 * rr->comp_ms / total_gpu,
@@ -788,7 +803,7 @@ begin_diagnostics {
                        100.0 * rr->sgd_ms / total_gpu,
                        rr->write_ms);
             }
-            printf("╚══════════════╩══════════╩══════════╩══════════╩══════════╩══════════╩════════════════╝\n");
+            printf("╚══════════════╩══════════╩══════════╩══════════╩══════════╩══════════╩══════════╩════════════════╝\n");
         }
     }
 
@@ -825,11 +840,9 @@ begin_diagnostics {
 
     // Cleanup
     cudaFree(global->d_read);
-    free(global->h_orig);
-    free(global->h_read);
+    cudaFree(global->d_count);
     global->d_read  = NULL;
-    global->h_orig  = NULL;
-    global->h_read  = NULL;
+    global->d_count = NULL;
 
     gpucompress_vpic_destroy(global->vpic_fields_h);
     H5Pclose(global->vol_fapl);

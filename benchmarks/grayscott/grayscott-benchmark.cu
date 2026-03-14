@@ -907,6 +907,9 @@ int main(int argc, char **argv)
 
     /* ── Phase 4: nn-rl+exp50 (ALGO_AUTO + SGD + exploration) ────── */
     if (phase_mask & P_NNRLEXP) {
+        /* Reset NN weights so phase 4 starts from original trained weights,
+         * not the SGD-modified weights from phase 3. */
+        gpucompress_reload_nn(weights_path);
         printf("\n── Phase %d: nn-rl+exp50 (ALGO_AUTO + SGD + expl@MAPE>=50%%) ─\n", n_phases + 1);
         gpucompress_enable_online_learning();
         gpucompress_set_reinforcement(1, REINFORCE_LR, REINFORCE_MAPE, REINFORCE_MAPE);
