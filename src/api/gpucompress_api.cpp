@@ -207,6 +207,30 @@ namespace gpucompress {
 static constexpr size_t kPoolStatsWSZ =
     sizeof(AutoStatsGPU) + 256 * sizeof(unsigned int) + sizeof(int);
 
+/** Destroy a single CompContext slot (null-safe). Caller must hold g_pool_mutex. */
+static void destroyCompContextSlot(CompContext& ctx) {
+    if (ctx.stream)              { cudaStreamDestroy(ctx.stream); ctx.stream = nullptr; }
+    if (ctx.t_start)             { cudaEventDestroy(ctx.t_start);     ctx.t_start     = nullptr; }
+    if (ctx.t_stop)              { cudaEventDestroy(ctx.t_stop);      ctx.t_stop      = nullptr; }
+    if (ctx.nn_start)            { cudaEventDestroy(ctx.nn_start);    ctx.nn_start    = nullptr; }
+    if (ctx.nn_stop)             { cudaEventDestroy(ctx.nn_stop);     ctx.nn_stop     = nullptr; }
+    if (ctx.stats_start)         { cudaEventDestroy(ctx.stats_start); ctx.stats_start = nullptr; }
+    if (ctx.stats_stop)          { cudaEventDestroy(ctx.stats_stop);  ctx.stats_stop  = nullptr; }
+    if (ctx.d_stats_workspace)   { cudaFree(ctx.d_stats_workspace);
+                                   ctx.d_stats_workspace = nullptr;
+                                   ctx.d_stats = nullptr; ctx.d_histogram = nullptr; }
+    if (ctx.d_fused_infer_output){ cudaFree(ctx.d_fused_infer_output);
+                                   ctx.d_fused_infer_output = nullptr; }
+    if (ctx.d_fused_top_actions) { cudaFree(ctx.d_fused_top_actions);
+                                   ctx.d_fused_top_actions = nullptr; }
+    if (ctx.d_sgd_grad_buffer)   { cudaFree(ctx.d_sgd_grad_buffer);
+                                   ctx.d_sgd_grad_buffer = nullptr; }
+    if (ctx.d_sgd_output)        { cudaFree(ctx.d_sgd_output); ctx.d_sgd_output = nullptr; }
+    if (ctx.d_sgd_samples)       { cudaFree(ctx.d_sgd_samples); ctx.d_sgd_samples = nullptr; }
+    if (ctx.d_range_min)         { cudaFree(ctx.d_range_min); ctx.d_range_min = nullptr; }
+    if (ctx.d_range_max)         { cudaFree(ctx.d_range_max); ctx.d_range_max = nullptr; }
+}
+
 int initCompContextPool() {
     std::lock_guard<std::mutex> lk(g_pool_mutex);
     memset(g_comp_pool, 0, sizeof(g_comp_pool));
@@ -214,64 +238,54 @@ int initCompContextPool() {
     for (int i = 0; i < N_COMP_CTX; i++) {
         CompContext& ctx = g_comp_pool[i];
         ctx.slot_id = i;
-        if (cudaStreamCreate(&ctx.stream)   != cudaSuccess) return -1;
-        if (cudaEventCreate (&ctx.t_start)     != cudaSuccess) return -1;
-        if (cudaEventCreate (&ctx.t_stop)      != cudaSuccess) return -1;
-        if (cudaEventCreate (&ctx.nn_start)    != cudaSuccess) return -1;
-        if (cudaEventCreate (&ctx.nn_stop)     != cudaSuccess) return -1;
-        if (cudaEventCreate (&ctx.stats_start) != cudaSuccess) return -1;
-        if (cudaEventCreate (&ctx.stats_stop)  != cudaSuccess) return -1;
+        if (cudaStreamCreate(&ctx.stream)   != cudaSuccess) goto fail;
+        if (cudaEventCreate (&ctx.t_start)     != cudaSuccess) goto fail;
+        if (cudaEventCreate (&ctx.t_stop)      != cudaSuccess) goto fail;
+        if (cudaEventCreate (&ctx.nn_start)    != cudaSuccess) goto fail;
+        if (cudaEventCreate (&ctx.nn_stop)     != cudaSuccess) goto fail;
+        if (cudaEventCreate (&ctx.stats_start) != cudaSuccess) goto fail;
+        if (cudaEventCreate (&ctx.stats_stop)  != cudaSuccess) goto fail;
 
-        if (cudaMalloc(&ctx.d_stats_workspace, kPoolStatsWSZ) != cudaSuccess) return -1;
+        if (cudaMalloc(&ctx.d_stats_workspace, kPoolStatsWSZ) != cudaSuccess) goto fail;
         ctx.d_stats     = static_cast<AutoStatsGPU*>(ctx.d_stats_workspace);
         ctx.d_histogram = reinterpret_cast<unsigned int*>(
             static_cast<uint8_t*>(ctx.d_stats_workspace) + sizeof(AutoStatsGPU));
 
         if (cudaMalloc(&ctx.d_fused_infer_output,
-                       sizeof(NNInferenceOutput)) != cudaSuccess) return -1;
+                       sizeof(NNInferenceOutput)) != cudaSuccess) goto fail;
         if (cudaMalloc(&ctx.d_fused_top_actions,
-                       NN_NUM_CONFIGS * sizeof(int)) != cudaSuccess) return -1;
+                       NN_NUM_CONFIGS * sizeof(int)) != cudaSuccess) goto fail;
 
         if (cudaMalloc(&ctx.d_sgd_grad_buffer,
-                       NN_SGD_GRAD_SIZE * sizeof(float)) != cudaSuccess) return -1;
-        if (cudaMalloc(&ctx.d_sgd_output, sizeof(SGDOutput)) != cudaSuccess) return -1;
+                       NN_SGD_GRAD_SIZE * sizeof(float)) != cudaSuccess) goto fail;
+        if (cudaMalloc(&ctx.d_sgd_output, sizeof(SGDOutput)) != cudaSuccess) goto fail;
         if (cudaMalloc(&ctx.d_sgd_samples,
-                       NN_MAX_SGD_SAMPLES * sizeof(SGDSample)) != cudaSuccess) return -1;
+                       NN_MAX_SGD_SAMPLES * sizeof(SGDSample)) != cudaSuccess) goto fail;
 
         /* Per-slot quantization range buffers — eliminates shared static globals */
-        if (cudaMalloc(&ctx.d_range_min, sizeof(double)) != cudaSuccess) return -1;
-        if (cudaMalloc(&ctx.d_range_max, sizeof(double)) != cudaSuccess) return -1;
+        if (cudaMalloc(&ctx.d_range_min, sizeof(double)) != cudaSuccess) goto fail;
+        if (cudaMalloc(&ctx.d_range_max, sizeof(double)) != cudaSuccess) goto fail;
 
         g_pool_slot_free[i] = true;
         g_pool_free_count++;
     }
     return 0;
+
+fail:
+    /* Clean up all slots (partially-initialized ones have non-null pointers,
+     * untouched ones are zeroed from memset — destroyCompContextSlot is null-safe). */
+    for (int j = 0; j < N_COMP_CTX; j++) {
+        destroyCompContextSlot(g_comp_pool[j]);
+        g_pool_slot_free[j] = false;
+    }
+    g_pool_free_count = 0;
+    return -1;
 }
 
 void destroyCompContextPool() {
     std::lock_guard<std::mutex> lk(g_pool_mutex);
     for (int i = 0; i < N_COMP_CTX; i++) {
-        CompContext& ctx = g_comp_pool[i];
-        if (ctx.stream)              { cudaStreamDestroy(ctx.stream); ctx.stream = nullptr; }
-        if (ctx.t_start)             { cudaEventDestroy(ctx.t_start);     ctx.t_start     = nullptr; }
-        if (ctx.t_stop)              { cudaEventDestroy(ctx.t_stop);      ctx.t_stop      = nullptr; }
-        if (ctx.nn_start)            { cudaEventDestroy(ctx.nn_start);    ctx.nn_start    = nullptr; }
-        if (ctx.nn_stop)             { cudaEventDestroy(ctx.nn_stop);     ctx.nn_stop     = nullptr; }
-        if (ctx.stats_start)         { cudaEventDestroy(ctx.stats_start); ctx.stats_start = nullptr; }
-        if (ctx.stats_stop)          { cudaEventDestroy(ctx.stats_stop);  ctx.stats_stop  = nullptr; }
-        if (ctx.d_stats_workspace)   { cudaFree(ctx.d_stats_workspace);
-                                       ctx.d_stats_workspace = nullptr;
-                                       ctx.d_stats = nullptr; ctx.d_histogram = nullptr; }
-        if (ctx.d_fused_infer_output){ cudaFree(ctx.d_fused_infer_output);
-                                       ctx.d_fused_infer_output = nullptr; }
-        if (ctx.d_fused_top_actions) { cudaFree(ctx.d_fused_top_actions);
-                                       ctx.d_fused_top_actions = nullptr; }
-        if (ctx.d_sgd_grad_buffer)   { cudaFree(ctx.d_sgd_grad_buffer);
-                                       ctx.d_sgd_grad_buffer = nullptr; }
-        if (ctx.d_sgd_output)        { cudaFree(ctx.d_sgd_output); ctx.d_sgd_output = nullptr; }
-        if (ctx.d_sgd_samples)       { cudaFree(ctx.d_sgd_samples); ctx.d_sgd_samples = nullptr; }
-        if (ctx.d_range_min)         { cudaFree(ctx.d_range_min); ctx.d_range_min = nullptr; }
-        if (ctx.d_range_max)         { cudaFree(ctx.d_range_max); ctx.d_range_max = nullptr; }
+        destroyCompContextSlot(g_comp_pool[i]);
         g_pool_slot_free[i] = false;
     }
     g_pool_free_count = 0;

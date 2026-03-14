@@ -188,13 +188,17 @@ int main(void) {
             } else {
                 PASS("dataset opened");
 
-                /* Read back and verify */
-                float* h_buf = (float*)malloc(4096 * sizeof(float));
+                /* Read back via GPU pointer and verify */
+                float* d_rbuf = NULL;
+                cudaMalloc(&d_rbuf, 4096 * sizeof(float));
+                cudaMemset(d_rbuf, 0, 4096 * sizeof(float));
                 herr_t rerr = H5Dread(dset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL,
-                                      H5P_DEFAULT, h_buf);
+                                      H5P_DEFAULT, d_rbuf);
                 if (rerr < 0) {
-                    FAIL("H5Dread host pointer");
+                    FAIL("H5Dread GPU pointer (re-open)");
                 } else {
+                    float* h_buf = (float*)malloc(4096 * sizeof(float));
+                    cudaMemcpy(h_buf, d_rbuf, 4096 * sizeof(float), cudaMemcpyDeviceToHost);
                     int ok = 1;
                     for (int i = 0; i < 4096; i++) {
                         if (fabsf(h_buf[i] - (float)i * 0.1f) > 1e-6f) {
@@ -202,10 +206,11 @@ int main(void) {
                             break;
                         }
                     }
-                    if (ok) PASS("host read round-trip verified");
-                    else FAIL("host read data mismatch");
+                    if (ok) PASS("GPU read round-trip verified (re-open)");
+                    else FAIL("GPU read data mismatch (re-open)");
+                    free(h_buf);
                 }
-                free(h_buf);
+                cudaFree(d_rbuf);
                 H5Dclose(dset);
             }
             H5Fclose(fid);

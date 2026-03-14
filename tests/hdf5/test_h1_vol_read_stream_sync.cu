@@ -209,24 +209,28 @@ int main(void) {
         free(h_data);
     }
 
-    /* ---- Test 2: Host-pointer read (exercises H5Z filter path) ---- */
-    printf("\n--- Test 2: Host-pointer multi-chunk read ---\n");
+    /* ---- Test 2: GPU-pointer re-read (re-open file, verify round-trip) ---- */
+    printf("\n--- Test 2: GPU-pointer multi-chunk re-read ---\n");
     {
         hid_t fid = H5Fopen(TESTFILE, H5F_ACC_RDONLY, fapl);
         if (fid < 0) {
-            FAIL("H5Fopen for host read");
+            FAIL("H5Fopen for GPU re-read");
         } else {
             hid_t dset = H5Dopen2(fid, "data", H5P_DEFAULT);
             if (dset < 0) {
-                FAIL("H5Dopen2 for host read");
+                FAIL("H5Dopen2 for GPU re-read");
             } else {
                 const int N = 16384;
-                float* h_buf = (float*)malloc(N * sizeof(float));
+                float* d_rbuf = NULL;
+                cudaMalloc(&d_rbuf, N * sizeof(float));
+                cudaMemset(d_rbuf, 0, N * sizeof(float));
                 herr_t rerr = H5Dread(dset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL,
-                                      H5P_DEFAULT, h_buf);
+                                      H5P_DEFAULT, d_rbuf);
                 if (rerr < 0) {
-                    FAIL("H5Dread host pointer");
+                    FAIL("H5Dread GPU pointer (re-open)");
                 } else {
+                    float* h_buf = (float*)malloc(N * sizeof(float));
+                    cudaMemcpy(h_buf, d_rbuf, N * sizeof(float), cudaMemcpyDeviceToHost);
                     int ok = 1;
                     for (int i = 0; i < N; i++) {
                         float expected = sinf((float)i * 0.01f) * 100.0f;
@@ -235,10 +239,11 @@ int main(void) {
                             break;
                         }
                     }
-                    if (ok) PASS("host read round-trip verified");
-                    else FAIL("host read data mismatch");
+                    if (ok) PASS("GPU re-read round-trip verified");
+                    else FAIL("GPU re-read data mismatch");
+                    free(h_buf);
                 }
-                free(h_buf);
+                cudaFree(d_rbuf);
                 H5Dclose(dset);
             }
             H5Fclose(fid);

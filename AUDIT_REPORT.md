@@ -47,7 +47,7 @@ cmake --build build --target <test_name> -j$(nproc)    # build specific test
 - VOL test temp files: use `/tmp/test_*.h5` and `unlink()` in cleanup
 - Data sizes: NEVER exceed 1 GB (per project rules)
 
-### Fix Progress: 9/27 resolved, 1 deferred (7 CRITICAL + 2 HIGH fixed, 1 CRITICAL deferred)
+### Fix Progress: 10/27 resolved, 1 deferred (7 CRITICAL + 3 HIGH fixed, 1 CRITICAL deferred)
 
 | Status | Finding | Test |
 |--------|---------|------|
@@ -64,6 +64,7 @@ cmake --build build --target <test_name> -j$(nproc)    # build specific test
 | FIXED | H7: gather/scatter cudaStreamCreate unchecked | `test_vol_c4c8h7_defensive` |
 | FIXED | H1: cudaDeviceSynchronize in VOL read loop | `test_h1_vol_read_stream_sync` |
 | FIXED | H2: Unnecessary cudaStreamSynchronize calls | `test_h2_unnecessary_stream_sync` |
+| FIXED | H8: initCompContextPool leaks on partial failure | `test_h8_pool_partial_leak` |
 
 ---
 
@@ -500,10 +501,11 @@ size_t total_max_size = header_size + max_compressed_size;
 
 ---
 
-#### H8: `initCompContextPool()` Leaks on Partial Failure
+#### H8: `initCompContextPool()` Leaks on Partial Failure — FIXED
 
 - **Category:** Runtime / Memory
 - **Severity:** HIGH
+- **Status:** FIXED — Extracted `destroyCompContextSlot()` helper; `initCompContextPool()` now uses `goto fail` to clean up all partially-initialized slots before returning -1. `destroyCompContextPool()` also refactored to use the same helper. Test: `test_h8_pool_partial_leak`.
 - **Affected files:** `src/api/gpucompress_api.cpp:209-247`
 
 **Execution path:**

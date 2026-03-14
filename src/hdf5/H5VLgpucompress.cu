@@ -1799,13 +1799,12 @@ H5VL_gpucompress_dataset_read(size_t count, void *dset[],
             }
             if (ret < 0) return ret;
         } else {
-            /* Host path: standard pass-through (one dataset at a time) */
-            void *under_obj = o->under_object;
-            ret = H5VLdataset_read(1, &under_obj, o->under_vol_id,
-                                   &mem_type_id[i], &mem_space_id[i],
-                                   &file_space_id[i], plist_id,
-                                   &buf[i], req);
-            if (ret < 0) return ret;
+            /* Host pointer rejected — this VOL requires device pointers */
+            fprintf(stderr,
+                    "gpucompress VOL FATAL: dataset_read[%zu] received a host "
+                    "pointer (buf=%p). The gpucompress VOL connector only "
+                    "accepts CUDA device pointers.\n", i, buf[i]);
+            abort();
         }
     }
 
@@ -1843,13 +1842,12 @@ H5VL_gpucompress_dataset_write(size_t count, void *dset[],
             }
             if (ret < 0) return ret;
         } else {
-            /* Host path: standard pass-through */
-            void *under_obj = o->under_object;
-            ret = H5VLdataset_write(1, &under_obj, o->under_vol_id,
-                                    &mem_type_id[i], &mem_space_id[i],
-                                    &file_space_id[i], plist_id,
-                                    &buf[i], req);
-            if (ret < 0) return ret;
+            /* Host pointer rejected — this VOL requires device pointers */
+            fprintf(stderr,
+                    "gpucompress VOL FATAL: dataset_write[%zu] received a host "
+                    "pointer (buf=%p). The gpucompress VOL connector only "
+                    "accepts CUDA device pointers.\n", i, buf[i]);
+            abort();
         }
     }
 

@@ -305,6 +305,14 @@ target_include_directories(test_m3_pool_init_failure PRIVATE
 target_link_libraries(test_m3_pool_init_failure PRIVATE gpucompress CUDA::cudart)
 set_target_properties(test_m3_pool_init_failure PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
+add_executable(test_h8_pool_partial_leak tests/regression/test_h8_pool_partial_leak.cu)
+set_source_files_properties(tests/regression/test_h8_pool_partial_leak.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(test_h8_pool_partial_leak PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_link_libraries(test_h8_pool_partial_leak PRIVATE gpucompress CUDA::cudart)
+set_target_properties(test_h8_pool_partial_leak PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
 add_executable(test_c6c7_init_error_checking tests/regression/test_c6c7_init_error_checking.cu)
 set_source_files_properties(tests/regression/test_c6c7_init_error_checking.cu PROPERTIES LANGUAGE CUDA)
 target_include_directories(test_c6c7_init_error_checking PRIVATE
