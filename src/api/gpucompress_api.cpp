@@ -99,8 +99,8 @@ int g_cuda_device = 0;
 const char* VERSION_STRING = "1.0.0";
 
 /** Online learning state */
-bool g_online_learning_enabled = false;   // master switch
-bool g_exploration_enabled = false;       // OFF by default
+std::atomic<bool> g_online_learning_enabled{false};   // master switch
+std::atomic<bool> g_exploration_enabled{false};       // OFF by default
 double g_exploration_threshold = 0.20;    // 20% MAPE
 int g_exploration_k_override = -1;        // -1 = use dynamic default
 
@@ -129,6 +129,7 @@ static ForcedAlgo*   g_force_algo_queue    = nullptr;
 static int           g_force_algo_cap      = 0;
 static int           g_force_algo_count    = 0;
 static std::atomic<int> g_force_algo_idx{0};
+static std::mutex    g_force_algo_mutex;
 
 /* ---- CompContext pool ---- */
 static CompContext g_comp_pool[N_COMP_CTX];
@@ -342,11 +343,35 @@ extern "C" gpucompress_error_t gpucompress_init(const char* weights_path) {
     // Timing events are now thread_local — no global creation needed
 
     // SGD stream + event for GPU-level weight-update ordering
-    cudaStreamCreate(&g_sgd_stream);
-    cudaEventCreate(&g_sgd_done);
+    err = cudaStreamCreate(&g_sgd_stream);
+    if (err != cudaSuccess) {
+        cudaStreamDestroy(g_default_stream);
+        g_default_stream = nullptr;
+        g_ref_count--;
+        return GPUCOMPRESS_ERROR_CUDA_FAILED;
+    }
+    err = cudaEventCreate(&g_sgd_done);
+    if (err != cudaSuccess) {
+        cudaStreamDestroy(g_sgd_stream);
+        g_sgd_stream = nullptr;
+        cudaStreamDestroy(g_default_stream);
+        g_default_stream = nullptr;
+        g_ref_count--;
+        return GPUCOMPRESS_ERROR_CUDA_FAILED;
+    }
 
     // Init CompContext pool
-    gpucompress::initCompContextPool();
+    if (gpucompress::initCompContextPool() != 0) {
+        gpucompress::destroyCompContextPool();
+        cudaEventDestroy(g_sgd_done);
+        g_sgd_done = nullptr;
+        cudaStreamDestroy(g_sgd_stream);
+        g_sgd_stream = nullptr;
+        cudaStreamDestroy(g_default_stream);
+        g_default_stream = nullptr;
+        g_ref_count--;
+        return GPUCOMPRESS_ERROR_OUT_OF_MEMORY;
+    }
 
     // Bandwidth probe: write+read 16MB temp file to measure storage BW
     {
@@ -428,12 +453,15 @@ extern "C" void gpucompress_cleanup(void) {
             g_chunk_history_count.store(0);
         }
         /* Free force-algorithm queue */
-        if (g_force_algo_queue) {
-            free(g_force_algo_queue);
-            g_force_algo_queue = nullptr;
-            g_force_algo_cap = 0;
-            g_force_algo_count = 0;
-            g_force_algo_idx.store(0);
+        {
+            std::lock_guard<std::mutex> fq_lock(g_force_algo_mutex);
+            if (g_force_algo_queue) {
+                free(g_force_algo_queue);
+                g_force_algo_queue = nullptr;
+                g_force_algo_cap = 0;
+                g_force_algo_count = 0;
+                g_force_algo_idx.store(0);
+            }
         }
     }
 }
@@ -691,16 +719,14 @@ extern "C" gpucompress_error_t gpucompress_compress(
         }
     }
 
-    cuda_err = cudaStreamSynchronize(stream);
+    /* No cudaStreamSynchronize here — compression runs on the same stream,
+     * so GPU ordering guarantees preprocessing completes first. Any async
+     * errors will surface at the final sync after compression. (H2 fix) */
     if (d_quantized || d_shuffled) {
+        /* Approximate timing — may include compression setup overhead,
+         * but avoids a blocking sync purely for diagnostics. */
         diag_preprocessing_ms = std::chrono::duration<float, std::milli>(
             std::chrono::steady_clock::now() - t_preproc_start).count();
-    }
-    if (cuda_err != cudaSuccess) {
-        if (d_quantized) cudaFree(d_quantized);
-        if (d_shuffled) cudaFree(d_shuffled);
-        cudaFree(d_input);
-        return GPUCOMPRESS_ERROR_CUDA_FAILED;
     }
 
     // Create compression manager
@@ -719,9 +745,26 @@ extern "C" gpucompress_error_t gpucompress_compress(
     CompressionConfig comp_config = compressor->configure_compression(compress_input_size);
     size_t max_compressed_size = comp_config.max_compressed_buffer_size;
 
+    if (max_compressed_size == 0) {
+        fprintf(stderr, "gpucompress ERROR: configure_compression returned "
+                "max_compressed_buffer_size=0 (algo=%d, input_size=%zu)\n",
+                (int)algo_to_use, compress_input_size);
+        if (d_quantized) cudaFree(d_quantized);
+        if (d_shuffled) cudaFree(d_shuffled);
+        cudaFree(d_input);
+        return GPUCOMPRESS_ERROR_COMPRESSION;
+    }
+
     // Allocate output buffer on GPU (with header space)
     size_t header_size = GPUCOMPRESS_HEADER_SIZE;
     size_t total_max_size = header_size + max_compressed_size;
+    if (total_max_size < header_size) {
+        // Overflow in header + compressed size addition
+        if (d_quantized) cudaFree(d_quantized);
+        if (d_shuffled) cudaFree(d_shuffled);
+        cudaFree(d_input);
+        return GPUCOMPRESS_ERROR_INVALID_INPUT;
+    }
 
     uint8_t* d_output = nullptr;
     cuda_err = cudaMalloc(&d_output, total_max_size);
@@ -975,7 +1018,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
                     }
                 }
 
-                cudaStreamSynchronize(stream);
+                /* No sync needed — compression runs on the same stream (H2 fix) */
 
                 // Compress
                 CompressionAlgorithm alt_internal =
@@ -1363,8 +1406,8 @@ extern "C" gpucompress_error_t gpucompress_decompress(
 
     // Validate that input_size can hold header + claimed compressed data
     size_t header_size = GPUCOMPRESS_HEADER_SIZE;
-
-    if (input_size < header_size + compressed_size) {
+    size_t header_plus_compressed = header_size + compressed_size;
+    if (header_plus_compressed < header_size || input_size < header_plus_compressed) {
         return GPUCOMPRESS_ERROR_INVALID_HEADER;
     }
 
@@ -1513,7 +1556,15 @@ extern "C" gpucompress_error_t gpucompress_decompress(
 
 extern "C" size_t gpucompress_max_compressed_size(size_t input_size) {
     // Worst case: no compression + header + some margin
-    return GPUCOMPRESS_HEADER_SIZE + input_size + (input_size / 8) + 1024;
+    // Guard against overflow: each addend must not wrap
+    size_t margin = input_size / 8;
+    size_t sum = input_size + margin;
+    if (sum < input_size) return 0;  // overflow
+    sum += 1024;
+    if (sum < 1024) return 0;       // overflow
+    sum += GPUCOMPRESS_HEADER_SIZE;
+    if (sum < GPUCOMPRESS_HEADER_SIZE) return 0;  // overflow
+    return sum;
 }
 
 extern "C" gpucompress_error_t gpucompress_get_original_size(
@@ -1698,12 +1749,14 @@ extern "C" void gpucompress_reset_chunk_history(void) {
 }
 
 extern "C" void gpucompress_force_algorithm_reset(void) {
+    std::lock_guard<std::mutex> lock(g_force_algo_mutex);
     g_force_algo_count = 0;
     g_force_algo_idx.store(0);
 }
 
 extern "C" void gpucompress_force_algorithm_push(int algorithm, int shuffle,
                                                   int quant, double error_bound) {
+    std::lock_guard<std::mutex> lock(g_force_algo_mutex);
     if (g_force_algo_count >= g_force_algo_cap) {
         int new_cap = (g_force_algo_cap == 0) ? 256 : g_force_algo_cap * 2;
         auto* p = static_cast<ForcedAlgo*>(
@@ -1852,10 +1905,10 @@ extern "C" gpucompress_error_t gpucompress_reload_nn(const char* filepath) {
 
     std::lock_guard<std::mutex> lock(g_init_mutex);
 
-    // Clean up old weights
-    gpucompress_nn_cleanup_impl();
-
-    // Load new weights
+    // Load new weights — loadNNFromBinary handles the atomic pointer swap
+    // and frees the old buffer after draining in-flight kernels.
+    // No cleanupNN() call needed; that would free inference/SGD buffers
+    // and create a window where d_nn_weights is null.
     int result = gpucompress_nn_load_impl(filepath);
     return (result == 0) ? GPUCOMPRESS_SUCCESS : GPUCOMPRESS_ERROR_INVALID_INPUT;
 }
@@ -1927,21 +1980,24 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
     if (algo_to_use == GPUCOMPRESS_ALGO_AUTO) {
         /* Check force-algorithm queue first — oracle/exhaustive uses this
          * to inject per-chunk algorithm choices without NN inference. */
-        int fidx = g_force_algo_idx.fetch_add(1);
-        if (fidx < g_force_algo_count && g_force_algo_queue) {
-            algo_to_use = static_cast<gpucompress_algorithm_t>(
-                g_force_algo_queue[fidx].algorithm);
-            preproc_to_use = 0;
-            if (g_force_algo_queue[fidx].shuffle)
-                preproc_to_use |= GPUCOMPRESS_PREPROC_SHUFFLE_4;
-            if (g_force_algo_queue[fidx].quant) {
-                preproc_to_use |= GPUCOMPRESS_PREPROC_QUANTIZE;
-                cfg.error_bound = g_force_algo_queue[fidx].error_bound;
+        {
+            std::lock_guard<std::mutex> fq_lock(g_force_algo_mutex);
+            int fidx = g_force_algo_idx.fetch_add(1);
+            if (fidx < g_force_algo_count && g_force_algo_queue) {
+                algo_to_use = static_cast<gpucompress_algorithm_t>(
+                    g_force_algo_queue[fidx].algorithm);
+                preproc_to_use = 0;
+                if (g_force_algo_queue[fidx].shuffle)
+                    preproc_to_use |= GPUCOMPRESS_PREPROC_SHUFFLE_4;
+                if (g_force_algo_queue[fidx].quant) {
+                    preproc_to_use |= GPUCOMPRESS_PREPROC_QUANTIZE;
+                    cfg.error_bound = g_force_algo_queue[fidx].error_bound;
+                }
+                goto skip_nn;
             }
-            goto skip_nn;
+            /* No forced entry — revert the index bump and fall through to NN */
+            g_force_algo_idx.fetch_sub(1);
         }
-        /* No forced entry — revert the index bump and fall through to NN */
-        g_force_algo_idx.fetch_sub(1);
 
         size_t num_elements = input_size / sizeof(float);
         int action = 0;
@@ -2068,22 +2124,14 @@ skip_nn:
         }
     }
 
-    /* Only sync when preprocessing actually ran (shuffle/quant allocated GPU buffers).
-     * Subsequent ops (createCompressionManager, configure, compress) are on the same
-     * stream so GPU ordering is already guaranteed by stream semantics. */
-    cudaError_t cuda_err = (d_quantized || d_shuffled)
-        ? cudaStreamSynchronize(stream)
-        : cudaSuccess;
+    /* No sync needed — subsequent compression runs on the same stream,
+     * so GPU ordering guarantees preprocessing completes first.
+     * Any async errors surface at the final stream sync. (H2 fix) */
+    cudaError_t cuda_err = cudaSuccess;
 
     if (d_quantized || d_shuffled) {
         diag_preprocessing_ms = std::chrono::duration<float, std::milli>(
             std::chrono::steady_clock::now() - t_preproc_start).count();
-    }
-
-    if (cuda_err != cudaSuccess) {
-        if (d_quantized) cudaFree(d_quantized);
-        if (d_shuffled)  cudaFree(d_shuffled);
-        return GPUCOMPRESS_ERROR_CUDA_FAILED;
     }
 
     /* Create nvcomp compression manager */
@@ -2101,8 +2149,24 @@ skip_nn:
 
     CompressionConfig comp_config = compressor->configure_compression(compress_input_size);
     size_t max_compressed_size = comp_config.max_compressed_buffer_size;
+
+    if (max_compressed_size == 0) {
+        fprintf(stderr, "gpucompress ERROR: configure_compression returned "
+                "max_compressed_buffer_size=0 (algo=%d, input_size=%zu)\n",
+                (int)algo_to_use, compress_input_size);
+        if (d_quantized) cudaFree(d_quantized);
+        if (d_shuffled)  cudaFree(d_shuffled);
+        return GPUCOMPRESS_ERROR_COMPRESSION;
+    }
+
     size_t header_size = GPUCOMPRESS_HEADER_SIZE;
     size_t total_max_needed = header_size + max_compressed_size;
+    if (total_max_needed < header_size) {
+        // Overflow in header + compressed size addition
+        if (d_quantized) cudaFree(d_quantized);
+        if (d_shuffled)  cudaFree(d_shuffled);
+        return GPUCOMPRESS_ERROR_INVALID_INPUT;
+    }
 
     /* If the NN-chosen algorithm's worst-case buffer exceeds the caller's
      * allocation (configure_compression returns a conservative upper bound
@@ -2696,7 +2760,8 @@ extern "C" gpucompress_error_t gpucompress_decompress_gpu(
     }
 
     size_t compressed_size = header.compressed_size;
-    if (input_size < GPUCOMPRESS_HEADER_SIZE + compressed_size)
+    size_t hdr_plus_comp = GPUCOMPRESS_HEADER_SIZE + compressed_size;
+    if (hdr_plus_comp < GPUCOMPRESS_HEADER_SIZE || input_size < hdr_plus_comp)
         return GPUCOMPRESS_ERROR_INVALID_HEADER;
 
     const uint8_t* d_compressed_data =

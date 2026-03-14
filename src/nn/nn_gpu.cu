@@ -25,6 +25,7 @@
 #include <cstring>
 #include <cmath>
 #include <fstream>
+#include <mutex>
 #include <vector>
 
 #include "stats/auto_stats_gpu.h"
@@ -58,6 +59,11 @@ static constexpr uint32_t NN_MAGIC = 0x4E4E5754;  // "NNWT"
 
 static NNWeightsGPU* d_nn_weights = nullptr;
 static std::atomic<bool> g_nn_loaded{false};
+
+/** Protects d_nn_weights pointer: held during kernel launch (read) and swap (write).
+ *  Prevents use-after-free when gpucompress_reload_nn swaps the pointer
+ *  while concurrent inference is between reading the pointer and launching. */
+static std::mutex g_nn_ptr_mutex;
 
 /** Pre-allocated inference output buffers (avoids per-call cudaMalloc) */
 static NNInferenceOutput* d_infer_output = nullptr;   // batched: action+ratio+comp_time+is_ood (16B)
@@ -987,9 +993,10 @@ bool loadNNFromBinary(const char* filepath) {
         g_has_bounds = false;
     }
 
-    // Allocate GPU memory and copy
-    if (d_nn_weights == nullptr) {
-        cudaError_t err = cudaMalloc(&d_nn_weights, sizeof(NNWeightsGPU));
+    // Allocate new GPU buffer and copy weights into it
+    NNWeightsGPU* d_new = nullptr;
+    {
+        cudaError_t err = cudaMalloc(&d_new, sizeof(NNWeightsGPU));
         if (err != cudaSuccess) {
             fprintf(stderr, "NN: cudaMalloc failed: %s\n", cudaGetErrorString(err));
             return false;
@@ -998,14 +1005,30 @@ bool loadNNFromBinary(const char* filepath) {
 
     GC_LOG("[XFER H→D] NN weights load (%zu B)\n", sizeof(NNWeightsGPU));
     XFER_TRACK("NN: H->D weight load (one-time)", sizeof(NNWeightsGPU), cudaMemcpyHostToDevice);
-    cudaError_t err = cudaMemcpy(d_nn_weights, &h_weights, sizeof(NNWeightsGPU),
-                                  cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "NN: cudaMemcpy failed: %s\n", cudaGetErrorString(err));
-        return false;
+    {
+        cudaError_t err = cudaMemcpy(d_new, &h_weights, sizeof(NNWeightsGPU),
+                                      cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "NN: cudaMemcpy failed: %s\n", cudaGetErrorString(err));
+            cudaFree(d_new);
+            return false;
+        }
     }
 
+    // Atomically swap the weight pointer under lock, then free old after sync
+    NNWeightsGPU* d_old = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_nn_ptr_mutex);
+        d_old = d_nn_weights;
+        d_nn_weights = d_new;
+    }
     g_nn_loaded.store(true);
+
+    if (d_old != nullptr) {
+        // Drain all in-flight kernels that may reference the old pointer
+        cudaDeviceSynchronize();
+        cudaFree(d_old);
+    }
 
     // Pre-allocate inference output buffers
     allocInferenceBuffers();
@@ -1068,14 +1091,20 @@ bool isInputOOD(double entropy, double mad, double deriv,
  * Free neural network GPU memory.
  */
 void cleanupNN() {
-    if (d_nn_weights != nullptr) {
-        cudaFree(d_nn_weights);
+    NNWeightsGPU* d_old = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_nn_ptr_mutex);
+        d_old = d_nn_weights;
         d_nn_weights = nullptr;
+    }
+    g_nn_loaded.store(false);
+    if (d_old != nullptr) {
+        cudaDeviceSynchronize();
+        cudaFree(d_old);
     }
     freeInferenceBuffers();
     freeFusedInferenceBuffers();
     freeSGDBuffers();
-    g_nn_loaded.store(false);
     g_has_bounds = false;
 }
 
@@ -1090,6 +1119,7 @@ bool isNNLoaded() {
  * Get device pointer to NN weights.
  */
 const NNWeightsGPU* getNNWeightsDevicePtr() {
+    std::lock_guard<std::mutex> lock(g_nn_ptr_mutex);
     return d_nn_weights;
 }
 
@@ -1122,30 +1152,35 @@ int runNNInference(
     float* out_predicted_psnr,
     int* out_top_actions
 ) {
-    if (!g_nn_loaded.load() || d_nn_weights == nullptr) {
-        return -1;  // Error: NN not loaded
-    }
-
-    // Ensure pre-allocated buffers exist
+    // Ensure pre-allocated buffers exist (outside pointer lock)
     if (d_infer_output == nullptr) {
         allocInferenceBuffers();
         if (d_infer_output == nullptr) return -1;
     }
 
-    /* GPU-level barrier: wait for last SGD before reading weights */
-    if (g_sgd_ever_fired.load(std::memory_order_acquire))
-        cudaStreamWaitEvent(stream, g_sgd_done, 0);
+    // Lock pointer, launch kernel, then release — prevents use-after-free during reload
+    cudaError_t err;
+    {
+        std::lock_guard<std::mutex> lock(g_nn_ptr_mutex);
+        if (!g_nn_loaded.load() || d_nn_weights == nullptr) {
+            return -1;  // NN not loaded
+        }
 
-    nnInferenceKernel<<<1, NN_NUM_CONFIGS, 0, stream>>>(
-        d_nn_weights,
-        entropy, mad_norm, deriv_norm,
-        data_size, error_bound,
-        g_rank_w0, g_rank_w1, g_rank_w2, g_measured_bw_bytes_per_ms,
-        d_infer_output,
-        out_top_actions ? d_infer_top_actions : nullptr
-    );
+        /* GPU-level barrier: wait for last SGD before reading weights */
+        if (g_sgd_ever_fired.load(std::memory_order_acquire))
+            cudaStreamWaitEvent(stream, g_sgd_done, 0);
 
-    cudaError_t err = cudaGetLastError();
+        nnInferenceKernel<<<1, NN_NUM_CONFIGS, 0, stream>>>(
+            d_nn_weights,
+            entropy, mad_norm, deriv_norm,
+            data_size, error_bound,
+            g_rank_w0, g_rank_w1, g_rank_w2, g_measured_bw_bytes_per_ms,
+            d_infer_output,
+            out_top_actions ? d_infer_top_actions : nullptr
+        );
+
+        err = cudaGetLastError();
+    }
     if (err != cudaSuccess) return -1;
 
     // Single D→H copy of NNInferenceOutput (16B) — replaces 3 separate transfers
@@ -1194,30 +1229,34 @@ int runNNFusedInference(
     int* out_top_actions,
     cudaEvent_t nn_stop_event
 ) {
-    if (!g_nn_loaded.load() || d_nn_weights == nullptr || d_stats == nullptr) {
-        return -1;
-    }
+    if (d_stats == nullptr) return -1;
 
-    // Ensure fused buffers exist
+    // Ensure fused buffers exist (outside pointer lock)
     if (d_fused_infer_output == nullptr) {
         allocFusedInferenceBuffers();
         if (d_fused_infer_output == nullptr) return -1;
     }
 
-    /* GPU-level barrier: wait for last SGD before reading weights */
-    if (g_sgd_ever_fired.load(std::memory_order_acquire))
-        cudaStreamWaitEvent(stream, g_sgd_done, 0);
+    cudaError_t err;
+    {
+        std::lock_guard<std::mutex> lock(g_nn_ptr_mutex);
+        if (!g_nn_loaded.load() || d_nn_weights == nullptr) return -1;
 
-    nnFusedInferenceKernel<<<1, NN_NUM_CONFIGS, 0, stream>>>(
-        d_nn_weights,
-        d_stats,
-        data_size, error_bound,
-        g_rank_w0, g_rank_w1, g_rank_w2, g_measured_bw_bytes_per_ms,
-        d_fused_infer_output,
-        out_top_actions ? d_fused_top_actions : nullptr
-    );
+        /* GPU-level barrier: wait for last SGD before reading weights */
+        if (g_sgd_ever_fired.load(std::memory_order_acquire))
+            cudaStreamWaitEvent(stream, g_sgd_done, 0);
 
-    cudaError_t err = cudaGetLastError();
+        nnFusedInferenceKernel<<<1, NN_NUM_CONFIGS, 0, stream>>>(
+            d_nn_weights,
+            d_stats,
+            data_size, error_bound,
+            g_rank_w0, g_rank_w1, g_rank_w2, g_measured_bw_bytes_per_ms,
+            d_fused_infer_output,
+            out_top_actions ? d_fused_top_actions : nullptr
+        );
+
+        err = cudaGetLastError();
+    }
     if (err != cudaSuccess) return -1;
 
     // Single D→H of NNInferenceOutput (16B)
@@ -1268,11 +1307,11 @@ int runNNSGD(
     int* out_clipped,
     int* out_count
 ) {
-    if (!g_nn_loaded.load() || d_nn_weights == nullptr || d_stats == nullptr) return -1;
+    if (d_stats == nullptr) return -1;
     if (samples == nullptr || num_samples <= 0) return -1;
     if (num_samples > NN_MAX_SGD_SAMPLES) num_samples = NN_MAX_SGD_SAMPLES;
 
-    // Ensure SGD buffers exist
+    // Ensure SGD buffers exist (outside pointer lock)
     if (d_sgd_grad_buffer == nullptr) {
         allocSGDBuffers();
         if (d_sgd_grad_buffer == nullptr) return -1;
@@ -1287,19 +1326,24 @@ int runNNSGD(
                                        cudaMemcpyHostToDevice, stream);
     if (err != cudaSuccess) return -1;
 
-    // Launch SGD kernel
-    nnSGDKernel<<<1, NN_HIDDEN_DIM, 0, stream>>>(
-        d_nn_weights,
-        d_stats,
-        d_sgd_samples,
-        num_samples,
-        data_size, error_bound,
-        learning_rate,
-        d_sgd_grad_buffer,
-        d_sgd_output
-    );
+    // Lock pointer, launch kernel, then release
+    {
+        std::lock_guard<std::mutex> lock(g_nn_ptr_mutex);
+        if (!g_nn_loaded.load() || d_nn_weights == nullptr) return -1;
 
-    err = cudaGetLastError();
+        nnSGDKernel<<<1, NN_HIDDEN_DIM, 0, stream>>>(
+            d_nn_weights,
+            d_stats,
+            d_sgd_samples,
+            num_samples,
+            data_size, error_bound,
+            learning_rate,
+            d_sgd_grad_buffer,
+            d_sgd_output
+        );
+
+        err = cudaGetLastError();
+    }
     if (err != cudaSuccess) return -1;
 
     /* Record completion so future inference waits for this SGD */
@@ -1349,24 +1393,28 @@ int runNNFusedInferenceCtx(
     int* out_top_actions,
     cudaEvent_t nn_stop_event
 ) {
-    if (!g_nn_loaded.load() || d_nn_weights == nullptr || d_stats == nullptr || ctx == nullptr) {
-        return -1;
+    if (d_stats == nullptr || ctx == nullptr) return -1;
+
+    cudaError_t err;
+    {
+        std::lock_guard<std::mutex> lock(g_nn_ptr_mutex);
+        if (!g_nn_loaded.load() || d_nn_weights == nullptr) return -1;
+
+        /* GPU-level barrier: wait for last SGD on g_sgd_stream before reading weights */
+        if (g_sgd_ever_fired.load(std::memory_order_acquire))
+            cudaStreamWaitEvent(stream, g_sgd_done, 0);
+
+        nnFusedInferenceKernel<<<1, NN_NUM_CONFIGS, 0, stream>>>(
+            d_nn_weights,
+            d_stats,
+            data_size, error_bound,
+            g_rank_w0, g_rank_w1, g_rank_w2, g_measured_bw_bytes_per_ms,
+            ctx->d_fused_infer_output,
+            out_top_actions ? ctx->d_fused_top_actions : nullptr
+        );
+
+        err = cudaGetLastError();
     }
-
-    /* GPU-level barrier: wait for last SGD on g_sgd_stream before reading weights */
-    if (g_sgd_ever_fired.load(std::memory_order_acquire))
-        cudaStreamWaitEvent(stream, g_sgd_done, 0);
-
-    nnFusedInferenceKernel<<<1, NN_NUM_CONFIGS, 0, stream>>>(
-        d_nn_weights,
-        d_stats,
-        data_size, error_bound,
-        g_rank_w0, g_rank_w1, g_rank_w2, g_measured_bw_bytes_per_ms,
-        ctx->d_fused_infer_output,
-        out_top_actions ? ctx->d_fused_top_actions : nullptr
-    );
-
-    cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return -1;
 
     NNInferenceOutput h_result;
@@ -1417,7 +1465,7 @@ int runNNSGDCtx(
     int* out_clipped,
     int* out_count
 ) {
-    if (!g_nn_loaded.load() || d_nn_weights == nullptr || d_stats == nullptr || ctx == nullptr) return -1;
+    if (d_stats == nullptr || ctx == nullptr) return -1;
     if (samples == nullptr || num_samples <= 0) return -1;
     if (num_samples > NN_MAX_SGD_SAMPLES) num_samples = NN_MAX_SGD_SAMPLES;
 
@@ -1428,19 +1476,24 @@ int runNNSGDCtx(
                                        cudaMemcpyHostToDevice, g_sgd_stream);
     if (err != cudaSuccess) return -1;
 
-    /* Launch SGD kernel on dedicated g_sgd_stream */
-    nnSGDKernel<<<1, NN_HIDDEN_DIM, 0, g_sgd_stream>>>(
-        d_nn_weights,
-        d_stats,
-        ctx->d_sgd_samples,
-        num_samples,
-        data_size, error_bound,
-        learning_rate,
-        ctx->d_sgd_grad_buffer,
-        ctx->d_sgd_output
-    );
+    /* Lock pointer, launch SGD kernel, then release */
+    {
+        std::lock_guard<std::mutex> lock(g_nn_ptr_mutex);
+        if (!g_nn_loaded.load() || d_nn_weights == nullptr) return -1;
 
-    err = cudaGetLastError();
+        nnSGDKernel<<<1, NN_HIDDEN_DIM, 0, g_sgd_stream>>>(
+            d_nn_weights,
+            d_stats,
+            ctx->d_sgd_samples,
+            num_samples,
+            data_size, error_bound,
+            learning_rate,
+            ctx->d_sgd_grad_buffer,
+            ctx->d_sgd_output
+        );
+
+        err = cudaGetLastError();
+    }
     if (err != cudaSuccess) return -1;
 
     /* Record completion event so future inference calls can wait */
@@ -1490,6 +1543,7 @@ void gpucompress_nn_cleanup_impl(void) {
 }
 
 void* gpucompress_nn_get_device_ptr_impl(void) {
+    std::lock_guard<std::mutex> lock(gpucompress::g_nn_ptr_mutex);
     return static_cast<void*>(gpucompress::d_nn_weights);
 }
 

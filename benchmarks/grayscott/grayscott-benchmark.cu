@@ -85,7 +85,7 @@
 #define DEFAULT_F           0.04f
 #define DEFAULT_K           0.06075f
 
-#define REINFORCE_LR        0.05f
+#define REINFORCE_LR        0.1f
 #define REINFORCE_MAPE      0.20f
 
 #define TMP_NOCOMP   "/tmp/bm_gs_nocomp.h5"

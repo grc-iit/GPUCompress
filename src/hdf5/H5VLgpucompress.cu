@@ -463,6 +463,7 @@ new_obj(void *under_obj, hid_t under_vol_id)
 {
     H5VL_gpucompress_t *o =
         (H5VL_gpucompress_t*)calloc(1, sizeof(H5VL_gpucompress_t));
+    if (!o) return NULL;
     o->under_object = under_obj;
     o->under_vol_id = under_vol_id;
     o->dcpl_id      = H5I_INVALID_HID;
@@ -1140,7 +1141,11 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                 /* Non-default stream for gather kernel: avoids null-stream serialization
                  * against the 8 CompContext worker streams. */
                 cudaStream_t gather_stream = nullptr;
-                cudaStreamCreate(&gather_stream);
+                if (cudaStreamCreate(&gather_stream) != cudaSuccess) {
+                    fprintf(stderr, "gpucompress VOL: cudaStreamCreate failed for gather_stream\n");
+                    ret = -1;
+                    goto done_write;
+                }
                 hsize_t num_chunks[32];
                 for (int d = 0; d < ndims; d++)
                     num_chunks[d] = (dset_dims[d] + chunk_dims[d] - 1) / chunk_dims[d];
@@ -1501,7 +1506,10 @@ gpu_aware_chunked_read(H5VL_gpucompress_t *o,
         uint8_t *d_decompressed      = NULL; /* lazy: only if non-contiguous chunk seen */
         hsize_t *d_dset_dims = NULL, *d_chunk_dims = NULL, *d_chunk_start = NULL;
         cudaStream_t scatter_stream = nullptr;
-        cudaStreamCreate(&scatter_stream);
+        if (cudaStreamCreate(&scatter_stream) != cudaSuccess) {
+            scatter_stream = nullptr;
+            goto done;
+        }
 
         hsize_t num_chunks[32];
         for (int d = 0; d < ndims; d++)
@@ -1632,12 +1640,13 @@ gpu_aware_chunked_read(H5VL_gpucompress_t *o,
 
             /* Decompress on GPU — measure wall-clock time */
             size_t decomp_size = chunk_bytes;
-            cudaDeviceSynchronize();
+            cudaStreamSynchronize(scatter_stream);
             struct timespec _ts0, _ts1;
             clock_gettime(CLOCK_MONOTONIC, &_ts0);
             gpucompress_error_t ce = gpucompress_decompress_gpu(
-                d_compressed, item.comp_sz, dst_ptr, &decomp_size, NULL);
-            cudaDeviceSynchronize();
+                d_compressed, item.comp_sz, dst_ptr, &decomp_size,
+                scatter_stream);
+            cudaStreamSynchronize(scatter_stream);
             clock_gettime(CLOCK_MONOTONIC, &_ts1);
             if (ce != GPUCOMPRESS_SUCCESS) { ret = -1; break; }
             float _decomp_ms = (float)((_ts1.tv_sec - _ts0.tv_sec) * 1000.0
@@ -1984,6 +1993,10 @@ H5VL_gpucompress_file_create(const char *name, unsigned flags,
     if (!info) return NULL;
 
     hid_t under_fapl = H5Pcopy(fapl_id);
+    if (under_fapl < 0) {
+        H5VL_gpucompress_info_free(info);
+        return NULL;
+    }
     H5Pset_vol(under_fapl, info->under_vol_id, info->under_vol_info);
     VOL_TRACE("  → H5VLfile_create(native, \"%s\")", name ? name : "?");
     void *under = H5VLfile_create(name, flags, fcpl_id, under_fapl, dxpl_id, req);
@@ -2004,6 +2017,10 @@ H5VL_gpucompress_file_open(const char *name, unsigned flags,
     if (!info) return NULL;
 
     hid_t under_fapl = H5Pcopy(fapl_id);
+    if (under_fapl < 0) {
+        H5VL_gpucompress_info_free(info);
+        return NULL;
+    }
     H5Pset_vol(under_fapl, info->under_vol_id, info->under_vol_info);
     VOL_TRACE("  → H5VLfile_open(native, \"%s\")", name ? name : "?");
     void *under = H5VLfile_open(name, flags, under_fapl, dxpl_id, req);
@@ -2041,6 +2058,10 @@ H5VL_gpucompress_file_specific(void *file, H5VL_file_specific_args_t *args,
         if (!info) return -1;
         under_vol = info->under_vol_id;
         my_args.args.is_accessible.fapl_id = H5Pcopy(args->args.is_accessible.fapl_id);
+        if (my_args.args.is_accessible.fapl_id < 0) {
+            H5VL_gpucompress_info_free(info);
+            return -1;
+        }
         H5Pset_vol(my_args.args.is_accessible.fapl_id, info->under_vol_id, info->under_vol_info);
         new_args  = &my_args;
         under_obj = NULL;
@@ -2050,6 +2071,10 @@ H5VL_gpucompress_file_specific(void *file, H5VL_file_specific_args_t *args,
         if (!info) return -1;
         under_vol = info->under_vol_id;
         my_args.args.del.fapl_id = H5Pcopy(args->args.del.fapl_id);
+        if (my_args.args.del.fapl_id < 0) {
+            H5VL_gpucompress_info_free(info);
+            return -1;
+        }
         H5Pset_vol(my_args.args.del.fapl_id, info->under_vol_id, info->under_vol_info);
         new_args  = &my_args;
         under_obj = NULL;

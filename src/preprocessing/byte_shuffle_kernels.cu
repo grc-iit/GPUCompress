@@ -221,9 +221,9 @@ DeviceChunkArrays createDeviceChunkArrays(
     if (err != cudaSuccess)
         throw std::runtime_error("Failed to launch populateChunkArraysKernel");
 
-    err = cudaStreamSynchronize(stream);
-    if (err != cudaSuccess)
-        throw std::runtime_error("Kernel execution failed");
+    /* No cudaStreamSynchronize here — the subsequent byte_shuffle kernel
+     * runs on the same stream, so GPU ordering guarantees the chunk arrays
+     * are populated before they are consumed. (H2 fix) */
 
     return result;
 }

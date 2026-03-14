@@ -384,7 +384,7 @@ int main(int argc, char* argv[]) {
             return -1;
         }
 
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        /* No sync needed — compression runs on the same stream (H2 fix) */
         printf("Byte shuffle complete - data reorganized for better compression\n");
         printf("[END] Step 5.5: Apply byte shuffle preprocessing\n");
 
