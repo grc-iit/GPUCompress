@@ -125,6 +125,7 @@ foreach(_demo
     nn_vol_demo:examples/nn_vol_demo.cu:demo
     grayscott_vol_demo:examples/grayscott_vol_demo.cu:demo
     vpic_vol_demo:examples/vpic_vol_demo.cu:demo
+    minimal_nn_vol_profile:examples/minimal_nn_vol_profile.cu:demo
 )
     string(REPLACE ":" ";" _parts ${_demo})
     list(GET _parts 0 _target)

@@ -197,11 +197,7 @@ static constexpr size_t kPoolStatsWSZ =
 
 /** Destroy a single CompContext slot (null-safe). Caller must hold g_pool_mutex. */
 static void destroyCompContextSlot(CompContext& ctx) {
-    /* N1 fix: leak cached managers on shutdown — their GPU workspace
-     * is cleaned up by CUDA context teardown. nvcomp manager dtors
-     * crash if called during late cleanup (CUDA primary ctx gone). */
-    for (int a = 0; a < CompContext::N_COMP_ALGOS; a++)
-        ctx.comp_mgr_cache[a] = nullptr;  /* intentional leak */
+    /* No cached managers to clean up — managers are created fresh per call. */
     if (ctx.stream)              { cudaStreamDestroy(ctx.stream); ctx.stream = nullptr; }
     if (ctx.t_start)             { cudaEventDestroy(ctx.t_start);     ctx.t_start     = nullptr; }
     if (ctx.t_stop)              { cudaEventDestroy(ctx.t_stop);      ctx.t_stop      = nullptr; }
@@ -226,12 +222,7 @@ static void destroyCompContextSlot(CompContext& ctx) {
 
 int initCompContextPool() {
     std::lock_guard<std::mutex> lk(g_pool_mutex);
-    /* N1 fix: delete cached managers before memset (raw ptrs, safe to zero after) */
-    for (int i = 0; i < N_COMP_CTX; i++) {
-        for (int a = 0; a < CompContext::N_COMP_ALGOS; a++) {
-            delete g_comp_pool[i].comp_mgr_cache[a];
-        }
-    }
+    /* No cached managers to clean up. */
     memset(g_comp_pool, 0, sizeof(g_comp_pool));
     g_pool_free_count = 0;
     for (int i = 0; i < N_COMP_CTX; i++) {
@@ -326,15 +317,10 @@ void syncAllCompContextStreams() {
         cudaStreamSynchronize(::g_sgd_stream);
 }
 
-nvcomp::nvcompManagerBase* getCachedCompManager(CompContext* ctx, CompressionAlgorithm algo) {
+std::unique_ptr<nvcomp::nvcompManagerBase> createCompManagerForCtx(CompContext* ctx, CompressionAlgorithm algo) {
     int idx = static_cast<int>(algo);
     if (idx < 0 || idx >= CompContext::N_COMP_ALGOS) return nullptr;
-    if (!ctx->comp_mgr_cache[idx]) {
-        auto mgr = createCompressionManager(
-            algo, gpucompress::DEFAULT_CHUNK_SIZE, ctx->stream, nullptr);
-        ctx->comp_mgr_cache[idx] = mgr.release();  /* transfer ownership to cache */
-    }
-    return ctx->comp_mgr_cache[idx];
+    return createCompressionManager(algo, gpucompress::DEFAULT_CHUNK_SIZE, ctx->stream, nullptr);
 }
 
 } // namespace gpucompress
@@ -758,9 +744,9 @@ extern "C" gpucompress_error_t gpucompress_compress(
             std::chrono::steady_clock::now() - t_preproc_start).count();
     }
 
-    /* N1 fix: use cached compression manager */
     CompressionAlgorithm internal_algo = gpucompress::toInternalAlgorithm(algo_to_use);
-    auto* compressor = gpucompress::getCachedCompManager(ctx, internal_algo);
+    auto compressor_uptr = gpucompress::createCompManagerForCtx(ctx, internal_algo);
+    auto* compressor = compressor_uptr.get();
 
     if (!compressor) {
         if (d_quantized) cudaFree(d_quantized);
@@ -1047,10 +1033,10 @@ extern "C" gpucompress_error_t gpucompress_compress(
 
                 /* No sync needed — compression runs on the same stream (H2 fix) */
 
-                /* N1 fix: use cached manager for exploration alternatives */
                 CompressionAlgorithm alt_internal =
                     gpucompress::toInternalAlgorithm(alt_algo);
-                auto* alt_comp = gpucompress::getCachedCompManager(ctx, alt_internal);
+                auto alt_comp_uptr = gpucompress::createCompManagerForCtx(ctx, alt_internal);
+                auto* alt_comp = alt_comp_uptr.get();
 
                 size_t alt_comp_size = 0;
 
@@ -2159,11 +2145,11 @@ skip_nn:
             std::chrono::steady_clock::now() - t_preproc_start).count();
     }
 
-    /* N1 fix: use cached compression manager (avoids per-call workspace alloc) */
     CompressionAlgorithm internal_algo = gpucompress::toInternalAlgorithm(algo_to_use);
-    auto* compressor = gpucompress::getCachedCompManager(ctx, internal_algo);
+    auto compressor_uptr = gpucompress::createCompManagerForCtx(ctx, internal_algo);
+    auto* compressor = compressor_uptr.get();
     if (!compressor) {
-        fprintf(stderr, "gpucompress ERROR: getCachedCompManager failed for algo=%d "
+        fprintf(stderr, "gpucompress ERROR: createCompManagerForCtx failed for algo=%d "
                 "(GPU OOM or unsupported algo, input_size=%zu)\n",
                 (int)algo_to_use, compress_input_size);
         if (d_quantized) cudaFree(d_quantized);
