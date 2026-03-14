@@ -14,6 +14,9 @@
 // Specialized Shuffle Kernel (compile-time ElementSize)
 // ============================================================================
 
+/* K4 fix: one block per chunk, all threads process elements in parallel.
+ * For ElementSize=4: each thread handles num_elements/blockDim.x elements
+ * across all 4 byte positions. 32x more parallelism than the old 4-lane design. */
 template<unsigned ElementSize>
 __global__ void byte_shuffle_kernel_specialized(
     const uint8_t** input_chunks,
@@ -21,50 +24,42 @@ __global__ void byte_shuffle_kernel_specialized(
     const size_t* chunk_sizes,
     size_t num_chunks
 ) {
-    const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
-    const int lane_id = threadIdx.x % WARP_SIZE;
+    const int chunk_id = blockIdx.x;
+    if (chunk_id >= num_chunks) return;
 
-    if (warp_id >= num_chunks) return;
-
-    const uint8_t* chunk_in = input_chunks[warp_id];
-    uint8_t* chunk_out = output_chunks[warp_id];
-    const size_t chunk_size = chunk_sizes[warp_id];
+    const uint8_t* chunk_in = input_chunks[chunk_id];
+    uint8_t* chunk_out = output_chunks[chunk_id];
+    const size_t chunk_size = chunk_sizes[chunk_id];
     const size_t num_elements = chunk_size / ElementSize;
     const size_t leftover = chunk_size % ElementSize;
 
     if constexpr (ElementSize <= 1) {
-        for (size_t i = lane_id; i < chunk_size; i += WARP_SIZE)
+        for (size_t i = threadIdx.x; i < chunk_size; i += blockDim.x)
             chunk_out[i] = chunk_in[i];
         return;
     }
 
     if (num_elements <= 1) {
-        for (size_t i = lane_id; i < chunk_size; i += WARP_SIZE)
+        for (size_t i = threadIdx.x; i < chunk_size; i += blockDim.x)
             chunk_out[i] = chunk_in[i];
         return;
     }
 
-    #pragma unroll
-    for (int byte_pos = lane_id; byte_pos < ElementSize; byte_pos += WARP_SIZE) {
+    /* All threads in the block cooperate on each byte position.
+     * For ElementSize=4, this loops 4 times with full block parallelism each. */
+    for (unsigned byte_pos = 0; byte_pos < ElementSize; byte_pos++) {
         const uint8_t* src = chunk_in + byte_pos;
         uint8_t* dst = chunk_out + (byte_pos * num_elements);
 
-        constexpr size_t UNROLL = 8;
-        size_t elem = 0;
-
-        for (; elem + UNROLL <= num_elements; elem += UNROLL) {
-            #pragma unroll
-            for (size_t u = 0; u < UNROLL; u++)
-                dst[elem + u] = src[(elem + u) * ElementSize];
-        }
-        for (; elem < num_elements; elem++)
+        for (size_t elem = threadIdx.x; elem < num_elements; elem += blockDim.x) {
             dst[elem] = src[elem * ElementSize];
+        }
     }
 
-    if (lane_id == 0 && leftover > 0) {
+    /* Leftover bytes: single thread copies */
+    if (threadIdx.x == 0 && leftover > 0) {
         const uint8_t* leftover_src = chunk_in + (num_elements * ElementSize);
         uint8_t* leftover_dst = chunk_out + (ElementSize * num_elements);
-        #pragma unroll
         for (size_t i = 0; i < leftover; i++)
             leftover_dst[i] = leftover_src[i];
     }
@@ -74,6 +69,7 @@ __global__ void byte_shuffle_kernel_specialized(
 // Specialized Unshuffle Kernel
 // ============================================================================
 
+/* K4 fix: block-parallel unshuffle (mirrors shuffle above). */
 template<unsigned ElementSize>
 __global__ void byte_unshuffle_kernel_specialized(
     const uint8_t** input_chunks,
@@ -81,50 +77,39 @@ __global__ void byte_unshuffle_kernel_specialized(
     const size_t* chunk_sizes,
     size_t num_chunks
 ) {
-    const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
-    const int lane_id = threadIdx.x % WARP_SIZE;
+    const int chunk_id = blockIdx.x;
+    if (chunk_id >= num_chunks) return;
 
-    if (warp_id >= num_chunks) return;
-
-    const uint8_t* chunk_in = input_chunks[warp_id];
-    uint8_t* chunk_out = output_chunks[warp_id];
-    const size_t chunk_size = chunk_sizes[warp_id];
+    const uint8_t* chunk_in = input_chunks[chunk_id];
+    uint8_t* chunk_out = output_chunks[chunk_id];
+    const size_t chunk_size = chunk_sizes[chunk_id];
     const size_t num_elements = chunk_size / ElementSize;
     const size_t leftover = chunk_size % ElementSize;
 
     if constexpr (ElementSize <= 1) {
-        for (size_t i = lane_id; i < chunk_size; i += WARP_SIZE)
+        for (size_t i = threadIdx.x; i < chunk_size; i += blockDim.x)
             chunk_out[i] = chunk_in[i];
         return;
     }
 
     if (num_elements <= 1) {
-        for (size_t i = lane_id; i < chunk_size; i += WARP_SIZE)
+        for (size_t i = threadIdx.x; i < chunk_size; i += blockDim.x)
             chunk_out[i] = chunk_in[i];
         return;
     }
 
-    #pragma unroll
-    for (int byte_pos = lane_id; byte_pos < ElementSize; byte_pos += WARP_SIZE) {
+    for (unsigned byte_pos = 0; byte_pos < ElementSize; byte_pos++) {
         const uint8_t* src = chunk_in + (byte_pos * num_elements);
         uint8_t* dst = chunk_out + byte_pos;
 
-        constexpr size_t UNROLL = 8;
-        size_t elem = 0;
-
-        for (; elem + UNROLL <= num_elements; elem += UNROLL) {
-            #pragma unroll
-            for (size_t u = 0; u < UNROLL; u++)
-                dst[(elem + u) * ElementSize] = src[elem + u];
-        }
-        for (; elem < num_elements; elem++)
+        for (size_t elem = threadIdx.x; elem < num_elements; elem += blockDim.x) {
             dst[elem * ElementSize] = src[elem];
+        }
     }
 
-    if (lane_id == 0 && leftover > 0) {
+    if (threadIdx.x == 0 && leftover > 0) {
         const uint8_t* leftover_src = chunk_in + (ElementSize * num_elements);
         uint8_t* leftover_dst = chunk_out + (num_elements * ElementSize);
-        #pragma unroll
         for (size_t i = 0; i < leftover; i++)
             leftover_dst[i] = leftover_src[i];
     }
@@ -232,6 +217,8 @@ DeviceChunkArrays createDeviceChunkArrays(
 // Low-Level Launch Functions
 // ============================================================================
 
+/* K4 fix: one block per chunk (was one warp per chunk).
+ * 256 threads/block gives full occupancy for the element-parallel loop. */
 cudaError_t launch_byte_shuffle(
     const uint8_t** input_chunks,
     uint8_t** output_chunks,
@@ -243,9 +230,8 @@ cudaError_t launch_byte_shuffle(
     if (num_chunks == 0)
         return cudaSuccess;
 
-    constexpr int WARPS_PER_BLOCK = 4;
-    constexpr int THREADS_PER_BLOCK = WARP_SIZE * WARPS_PER_BLOCK;
-    const int num_blocks = (num_chunks + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    constexpr int THREADS_PER_BLOCK = 256;
+    const int num_blocks = static_cast<int>(num_chunks);
 
     switch (element_size) {
         case 1: byte_shuffle_kernel_specialized<1><<<num_blocks, THREADS_PER_BLOCK, 0, stream>>>(
@@ -272,9 +258,8 @@ cudaError_t launch_byte_unshuffle(
     if (num_chunks == 0)
         return cudaSuccess;
 
-    constexpr int WARPS_PER_BLOCK = 4;
-    constexpr int THREADS_PER_BLOCK = WARP_SIZE * WARPS_PER_BLOCK;
-    const int num_blocks = (num_chunks + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    constexpr int THREADS_PER_BLOCK = 256;
+    const int num_blocks = static_cast<int>(num_chunks);
 
     switch (element_size) {
         case 1: byte_unshuffle_kernel_specialized<1><<<num_blocks, THREADS_PER_BLOCK, 0, stream>>>(

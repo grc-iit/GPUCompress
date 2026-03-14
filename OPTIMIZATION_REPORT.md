@@ -378,7 +378,7 @@ K alternatives compressed and decompressed sequentially with sync after each.
 | ID | Issue | Impact | Effort | Status |
 |----|-------|--------|--------|--------|
 | **M4** | H5VL worker buffers per-write | 573ms alloc in write | Medium | DONE (session-level VolWriteCtx persists across writes, freed at dataset close) |
-| **N3** | Exploration buffer alloc per-alt | 50-150ms per explore | Low | DONE (pre-allocate d_explore_out + d_explore_decomp, reuse across K alts) |
+| **N3** | Exploration buffer alloc per-alt | 50-150ms per explore | Low | DONE (superseded by S6/E5 parallel rewrite: per-slot buffers allocated in ExploreSlot, freed after barrier) |
 | **E3** | I/O queue blocking stalls workers | Pipeline stall | Medium | DONE (I/O queue cap raised to N_IO_BUFS, work queue doubled to 2x workers) |
 | **I1** | Only 2 prefetch slots in read | GPU idle on reads | Low | DONE (increased to 4) |
 | **I2** | Pinned pool buffer contention | Worker starvation | Low | DONE (increased to workers*2) |
@@ -397,7 +397,7 @@ K alternatives compressed and decompressed sequentially with sync after each.
 | **M2** | Entropy per-call allocs | Per-call overhead | Low | N/A (hot path already uses CompContext buffers) |
 | **M3** | CUB temp storage per-call | Per-call overhead | Low | N/A (hot path already uses CompContext buffers) |
 | **N4** | configure_compression() repeated | 2-10ms per call | Low | TODO (low impact — CPU-side, fast) |
-| **E2** | CPU-side PSNR (no GPU kernel) | D->H overhead | Medium | TODO |
+| **E2** | CPU-side PSNR (no GPU kernel) | D->H overhead | Medium | DONE in GPU path (analytical PSNR from error bound in S6/E5 rewrite; host path still has CPU PSNR) |
 | **E4** | RL decompress blocks main path | 20-50ms per chunk | Medium | TODO |
 | **S6/E5** | Exploration K-loop sequential | All K on one stream | Medium | DONE (parallel streams: K alts each get own stream+manager, single barrier sync. Exploration 5.1s → 170ms on 1GB) |
 
@@ -406,7 +406,7 @@ K alternatives compressed and decompressed sequentially with sync after each.
 | ID | Issue | Impact | Effort | Status |
 |----|-------|--------|--------|--------|
 | **K3** | Gather/scatter uncoalesced | Large chunks only | High | TODO |
-| **K4** | Byte shuffle warp underutil | 12.5% utilization | Medium | TODO |
+| **K4** | Byte shuffle warp underutil | 12.5% utilization | Medium | DONE (block-per-chunk: all 256 threads process elements in parallel. 10.2→26.5 GB/s, 2.6x) |
 | **K5** | SGD kernel bank conflicts | Potential 4-way conflicts | Medium | TODO |
 | **K6** | Gray-Scott no shared mem tiling | Benchmark only | High | TODO |
 | **I3** | H5S_ALL not cached | Minor RPC overhead | Low | TODO |
@@ -421,7 +421,7 @@ K alternatives compressed and decompressed sequentially with sync after each.
 - nn phase: write=51 MiB/s, read=286 MiB/s, wall=75ms, GPU-time=66ms
 - nn-rl phase: write=44 MiB/s, read=232 MiB/s, wall=87ms, GPU-time=69ms, SGD=1/4
 
-### After All Optimizations (E1, N1, S1-S4, K1, K2, I1, I2, I6, E3, M4)
+### After All Optimizations (E1, N1, N3, S1-S6/E5, K1, K2, I1, I2, I6, E2, E3, M4)
 
 **Small dataset (4 MB, 4x1MB chunks):**
 - nn-rl phase: write=58-85 MiB/s, wall=45-66ms, GPU-time=12-18ms, SGD=4/4
@@ -439,9 +439,17 @@ K alternatives compressed and decompressed sequentially with sync after each.
 - After M4: 375 MiB/s (11ms/write, buffers persist)
 - **4.2x improvement per-write**
 
+**Exploration (1 GB, 16x62.5MB, K=3, nn-rl+exp50):**
+- Before S6/E5: exploration=5,123ms (97.4% of GPU-time, serial K-loop)
+- After S6/E5: exploration=170ms (51.4% of GPU-time, parallel streams)
+- **30x exploration speedup**
+- nn-rl+exp50 write: 465 → 654 MiB/s
+- All 4 phases (no-comp, nn, nn-rl, nn-rl+exp50) PASS with bit-exact verification
+
 ### Key Wins
 - E1 (mutex removal): nn-rl write 44->85 MiB/s, SGD fires 4/4 instead of 1/4
 - N1 (manager cache): nn GPU-time 2,152->855ms (2.5x) on 4GB dataset
+- S6/E5 (parallel exploration): exploration 5.1s→170ms (30x) on 1GB
 - M4 (session buffers): per-write throughput 90->375 MiB/s (4.2x)
 - E3 (queue decoupling): unblocked worker→I/O pipeline
 - S2 (double sync removal): VOL read 16% faster
