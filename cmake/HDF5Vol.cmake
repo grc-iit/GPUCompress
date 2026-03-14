@@ -104,6 +104,8 @@ add_vol_test(test_vol_host_ptr_reject     tests/hdf5/test_vol_host_ptr_reject.cu
 target_link_libraries(test_vol_host_ptr_reject PRIVATE H5Zgpucompress)
 add_vol_test(test_m4_write_buffer_reuse  tests/hdf5/test_m4_write_buffer_reuse.cu)
 target_link_libraries(test_m4_write_buffer_reuse PRIVATE H5Zgpucompress)
+add_vol_test(test_s6_parallel_exploration  tests/hdf5/test_s6_parallel_exploration.cu)
+target_link_libraries(test_s6_parallel_exploration PRIVATE H5Zgpucompress)
 
 # calloc fault injection interposer (plain C, no CUDA)
 add_library(calloc_fault SHARED tests/regression/calloc_fault.c)

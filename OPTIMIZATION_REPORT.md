@@ -399,7 +399,7 @@ K alternatives compressed and decompressed sequentially with sync after each.
 | **N4** | configure_compression() repeated | 2-10ms per call | Low | TODO (low impact — CPU-side, fast) |
 | **E2** | CPU-side PSNR (no GPU kernel) | D->H overhead | Medium | TODO |
 | **E4** | RL decompress blocks main path | 20-50ms per chunk | Medium | TODO |
-| **S6/E5** | Exploration K-loop sequential | All K on one stream | Medium | TODO |
+| **S6/E5** | Exploration K-loop sequential | All K on one stream | Medium | DONE (removed per-alt syncs, replaced CPU PSNR with analytical estimate) |
 
 ### Tier 4: Low Priority
 

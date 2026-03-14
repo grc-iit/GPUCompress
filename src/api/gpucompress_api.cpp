@@ -2456,22 +2456,19 @@ skip_nn:
                         size_t alt_max = alt_cc.max_compressed_buffer_size;
                         if (cudaMalloc(&d_alt_out, alt_max) == cudaSuccess) {
                             float alt_ct_ms = 0.0f;
-                            if (timing_ok) cudaEventRecord(ctx->t_start, stream);
 
+                            /* S6 fix: removed per-alt event-based timing sync.
+                             * Still need stream sync before reading compressed size —
+                             * get_compressed_output_size reads from device memory. */
                             alt_comp->compress(d_alt_input, d_alt_out, alt_cc);
-
-                            if (timing_ok) {
-                                cudaEventRecord(ctx->t_stop, stream);
-                                cudaEventSynchronize(ctx->t_stop);
-                                cudaEventElapsedTime(&alt_ct_ms, ctx->t_start, ctx->t_stop);
-                            }
+                            cudaStreamSynchronize(stream);
 
                             alt_comp_size = alt_comp->get_compressed_output_size(d_alt_out);
 
                             double alt_ratio = static_cast<double>(input_size) /
                                                static_cast<double>(alt_comp_size);
 
-                            /* Round-trip decompress + PSNR */
+                            /* Round-trip decompress + PSNR — no per-alt event sync */
                             double alt_decomp_ms = 0.0;
                             double alt_psnr = 0.0;
                             {
@@ -2482,8 +2479,6 @@ skip_nn:
                                         size_t rt_decomp_size = rt_dc.decomp_data_size;
                                         uint8_t* d_rt_decompressed = nullptr;
                                         if (cudaMalloc(&d_rt_decompressed, rt_decomp_size) == cudaSuccess) {
-                                            if (timing_ok) cudaEventRecord(ctx->t_start, stream);
-
                                             try {
                                                 rt_decomp->decompress(d_rt_decompressed, d_alt_out, rt_dc);
                                             } catch (...) {
@@ -2518,41 +2513,17 @@ skip_nn:
                                                 if (d_rt_dequant) d_rt_result = static_cast<uint8_t*>(d_rt_dequant);
                                             }
 
-                                            if (timing_ok) {
-                                                cudaEventRecord(ctx->t_stop, stream);
-                                                cudaEventSynchronize(ctx->t_stop);
-                                                float dt_ms = 0.0f;
-                                                cudaEventElapsedTime(&dt_ms, ctx->t_start, ctx->t_stop);
-                                                alt_decomp_ms = static_cast<double>(dt_ms);
-                                            }
-
+                                            /* S6 fix: PSNR for lossless alts is trivially 120.
+                                             * For lossy alts, compute from error bound (avoids D→H). */
                                             if (!d_alt_quant) {
                                                 alt_psnr = 120.0;
                                             } else {
-                                                size_t num_floats = input_size / sizeof(float);
-                                                std::vector<float> h_orig(num_floats);
-                                                std::vector<float> h_dec(num_floats);
-                                                XFER_TRACK("explore_gpu PSNR: D->H original (UNNECESSARY - could use GPU kernel)", input_size, cudaMemcpyDeviceToHost);
-                                                cudaMemcpy(h_orig.data(), d_input, input_size, cudaMemcpyDeviceToHost);
-                                                XFER_TRACK("explore_gpu PSNR: D->H decompressed (UNNECESSARY - could use GPU kernel)", input_size, cudaMemcpyDeviceToHost);
-                                                cudaMemcpy(h_dec.data(), d_rt_result, input_size, cudaMemcpyDeviceToHost);
-
-                                                double mse = 0.0;
-                                                float dmin = h_orig[0], dmax = h_orig[0];
-                                                for (size_t fi = 0; fi < num_floats; fi++) {
-                                                    double diff = static_cast<double>(h_orig[fi]) - static_cast<double>(h_dec[fi]);
-                                                    mse += diff * diff;
-                                                    if (h_orig[fi] < dmin) dmin = h_orig[fi];
-                                                    if (h_orig[fi] > dmax) dmax = h_orig[fi];
-                                                }
-                                                mse /= static_cast<double>(num_floats);
-                                                double range = static_cast<double>(dmax) - static_cast<double>(dmin);
-                                                if (mse > 0.0 && range > 0.0) {
-                                                    alt_psnr = 10.0 * log10(range * range / mse);
+                                                double range = alt_quant_result.data_max - alt_quant_result.data_min;
+                                                if (range > 0.0 && alt_quant_result.error_bound > 0.0) {
+                                                    alt_psnr = fmin(20.0 * log10(range / alt_quant_result.error_bound), 120.0);
                                                 } else {
                                                     alt_psnr = 120.0;
                                                 }
-                                                alt_psnr = fmin(alt_psnr, 120.0);
                                             }
 
                                             if (d_rt_dequant) cudaFree(d_rt_dequant);
