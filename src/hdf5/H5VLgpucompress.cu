@@ -1012,10 +1012,9 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
         /* Per-worker device output buffers */
         uint8_t *d_comp_w[N_COMP_WORKERS] = {};
 
-        /* Pinned host buffer pool — replaces per-chunk malloc/memcpy/free.
-         * Workers D→H directly into a pool buffer; IO thread returns it after
-         * writing.  N_IO_BUFS = workers(8) + io_q cap(8) ensures no starvation. */
-#define N_IO_BUFS (N_COMP_WORKERS + 8)
+        /* Pinned host buffer pool — I2 fix: increased to 2x workers to
+         * decouple worker D→H and IO write. Prevents starvation when IO lags. */
+#define N_IO_BUFS (N_COMP_WORKERS * 2)
         void    *io_pool_bufs[N_IO_BUFS] = {};
         std::mutex              pool_mtx;
         std::condition_variable pool_cv;
@@ -1128,8 +1127,10 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                         item.nd   = wi.nd;
                         memcpy(item.cs, wi.cs, (size_t)wi.nd * sizeof(hsize_t));
 
+                        /* E3 fix: raise I/O queue cap to match pinned buffer pool.
+                         * Workers no longer block while pool buffers are available. */
                         { std::unique_lock<std::mutex> lk(io_mtx);
-                          io_cv.wait(lk, [&]{ return io_q.size() < 8 || io_done_flag; });
+                          io_cv.wait(lk, [&]{ return io_q.size() < (size_t)N_IO_BUFS || io_done_flag; });
                           io_q.push(item); }
                         io_cv.notify_one();
                     }
@@ -1155,6 +1156,13 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                 ret = 0;
                 s_gpu_writes++;
 
+                /* I6 fix: contiguity depends only on chunk_dims vs dset_dims,
+                 * which are constant across chunks — compute once before loop. */
+                bool contiguous = true;
+                for (int d = 1; d < ndims; d++) {
+                    if (chunk_dims[d] != dset_dims[d]) { contiguous = false; break; }
+                }
+
                 for (size_t ci = 0; ci < total_chunks && ret == 0; ci++) {
                     /* ---- Compute N-D chunk coordinates ---- */
                     hsize_t chunk_idx[32];
@@ -1176,12 +1184,6 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                         actual_elems *= (size_t)actual_chunk[d];
                     }
                     size_t actual_bytes = actual_elems * elem_size;
-
-                    /* ---- Check contiguity ---- */
-                    bool contiguous = true;
-                    for (int d = 1; d < ndims; d++) {
-                        if (chunk_dims[d] != dset_dims[d]) { contiguous = false; break; }
-                    }
 
                     WorkItem wi = {};
                     wi.nd    = ndims;
@@ -1244,8 +1246,10 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                     }
 
                     /* ---- Post WorkItem to bounded work queue ---- */
+                    /* E3 fix: allow 2x workers in work queue so Stage 1 can
+                     * pre-queue chunks while workers are posting to I/O. */
                     { std::unique_lock<std::mutex> lk(wq_mtx);
-                      wq_full_cv.wait(lk, [&]{ return wq.size() < (size_t)N_COMP_WORKERS
+                      wq_full_cv.wait(lk, [&]{ return wq.size() < (size_t)(N_COMP_WORKERS * 2)
                                                       || ret != 0; });
                       if (ret == 0)
                           wq.push(wi);
@@ -1260,7 +1264,7 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                 WorkItem sentinel = {};
                 sentinel.valid = false;
                 { std::unique_lock<std::mutex> lk(wq_mtx);
-                  wq_full_cv.wait(lk, [&]{ return wq.size() < (size_t)N_COMP_WORKERS; });
+                  wq_full_cv.wait(lk, [&]{ return wq.size() < (size_t)(N_COMP_WORKERS * 2); });
                   wq.push(sentinel); }
                 wq_ready_cv.notify_one();
             }
@@ -1500,7 +1504,8 @@ gpu_aware_chunked_read(H5VL_gpucompress_t *o,
         size_t max_comp    = gpucompress_max_compressed_size(chunk_bytes);
 
         /* ---- Prefetch pipeline: disk reader thread + GPU decompress main thread ---- */
-#define N_SLOTS_R 2
+/* I1 fix: increased from 2 to 4 prefetch slots to overlap I/O and decompress */
+#define N_SLOTS_R 4
         void    *h_comp_r[N_SLOTS_R] = {};   /* pinned host staging for compressed data */
         uint8_t *d_compressed        = NULL;
         uint8_t *d_decompressed      = NULL; /* lazy: only if non-contiguous chunk seen */
@@ -1531,6 +1536,12 @@ gpu_aware_chunked_read(H5VL_gpucompress_t *o,
 
         bool        pre_started = false;
         std::thread pre_thr;
+
+        /* I6 fix: hoist contiguity check before resource alloc (avoids goto issue) */
+        bool contiguous_r = true;
+        for (int d = 1; d < ndims; d++) {
+            if (chunk_dims[d] != dset_dims[d]) { contiguous_r = false; break; }
+        }
 
         /* ---- Allocate resources ---- */
         bool ok = true;
@@ -1604,12 +1615,7 @@ gpu_aware_chunked_read(H5VL_gpucompress_t *o,
             }
             size_t actual_bytes = actual_elems * elem_size;
 
-            bool contiguous = true;
-            for (int d = 1; d < ndims; d++) {
-                if (chunk_dims[d] != dset_dims[d]) { contiguous = false; break; }
-            }
-
-            bool    direct_decomp = contiguous && (actual_bytes == chunk_bytes);
+            bool    direct_decomp = contiguous_r && (actual_bytes == chunk_bytes);
             uint8_t *dst_ptr;
 
             if (direct_decomp) {
@@ -1638,9 +1644,11 @@ gpu_aware_chunked_read(H5VL_gpucompress_t *o,
             { std::lock_guard<std::mutex> lk(free_mtx); free_slots_count++; }
             free_cv.notify_one();
 
-            /* Decompress on GPU — measure wall-clock time */
+            /* Decompress on GPU — measure wall-clock time.
+             * Pre-decompress sync removed (S2 fix): H→D copy above is
+             * synchronous (vol_memcpy uses cudaMemcpy), so data is
+             * already on GPU. Post-decompress sync kept only for timing. */
             size_t decomp_size = chunk_bytes;
-            cudaStreamSynchronize(scatter_stream);
             struct timespec _ts0, _ts1;
             clock_gettime(CLOCK_MONOTONIC, &_ts0);
             gpucompress_error_t ce = gpucompress_decompress_gpu(
@@ -1656,7 +1664,7 @@ gpu_aware_chunked_read(H5VL_gpucompress_t *o,
 
             if (direct_decomp) {
                 s_chunks_decomp++;
-            } else if (contiguous) {
+            } else if (contiguous_r) {
                 size_t off = 0, s = elem_size;
                 for (int d = ndims - 1; d >= 0; d--) {
                     off += (size_t)chunk_start[d] * s;

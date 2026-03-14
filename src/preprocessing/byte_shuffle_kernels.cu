@@ -333,7 +333,8 @@ uint8_t* byte_shuffle_simple(
         return nullptr;
     }
 
-    cudaStreamSynchronize(stream);
+    /* S4 fix: sync removed — next operation on same stream (compression)
+     * implicitly waits for shuffle to complete via GPU ordering. */
     return device_output;
 }
 
@@ -376,6 +377,7 @@ uint8_t* byte_unshuffle_simple(
         return nullptr;
     }
 
-    cudaStreamSynchronize(stream);
+    /* S4 fix: sync removed — next operation on same stream
+     * implicitly waits via GPU ordering. */
     return device_output;
 }

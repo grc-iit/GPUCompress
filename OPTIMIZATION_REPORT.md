@@ -30,7 +30,7 @@
 
 ## Agent 1: CUDA Kernel Optimization
 
-### K1: Shared Memory Bank Conflicts in Entropy Histogram [HIGH]
+### K1: Shared Memory Bank Conflicts in Entropy Histogram [HIGH] -- DONE
 **File:** `src/stats/entropy_kernel.cu:49-81, 88-131`
 **Kernels:** `histogramKernel`, `histogramKernelVec4` — 256-thread blocks, 256-bin shared histogram
 
@@ -41,7 +41,7 @@ All 256 threads simultaneously `atomicAdd(&s_hist[byte_val], 1)`. With 32 shared
 
 ---
 
-### K2: GPU Spin-Wait for Inter-Block Synchronization [MEDIUM]
+### K2: GPU Spin-Wait for Inter-Block Synchronization [MEDIUM] -- DONE
 **File:** `src/stats/stats_kernel.cu:128-135`
 **Kernel:** `statsPass1Kernel`
 
@@ -160,7 +160,7 @@ Static globals (`d_range_min`, `d_range_max`, `d_infer_output`) — partially mi
 
 ## Agent 3: CUDA Stream Concurrency
 
-### S1: 9 cudaStreamSynchronize() in Core Compression [CRITICAL]
+### S1: 9 cudaStreamSynchronize() in Core Compression [CRITICAL] -- PARTIALLY DONE
 **File:** `src/api/gpucompress_api.cpp:899, 1533, 1555, 2298, 2305, 2430, 2609, 2673, 2854`
 
 Each sync flushes the entire GPU queue on that stream. With 8 active CompContext slots, creates contention.
@@ -169,7 +169,7 @@ Each sync flushes the entire GPU queue on that stream. With 8 active CompContext
 
 ---
 
-### S2: VOL Read Loop Double Synchronization (H1) [CRITICAL]
+### S2: VOL Read Loop Double Synchronization (H1) [CRITICAL] -- DONE
 **File:** `src/hdf5/H5VLgpucompress.cu:1643, 1649`
 
 Two `cudaStreamSynchronize(scatter_stream)` per chunk in the read loop. For 1000 chunks = 2000 sync calls.
@@ -178,7 +178,7 @@ Two `cudaStreamSynchronize(scatter_stream)` per chunk in the read loop. For 1000
 
 ---
 
-### S3: cudaDeviceSynchronize() in NN Load/Cleanup [MEDIUM]
+### S3: cudaDeviceSynchronize() in NN Load/Cleanup [MEDIUM] -- DONE
 **File:** `src/nn/nn_gpu.cu:1029, 1102`
 
 Global device sync drains ALL streams. Bad during hot-reload while concurrent compressions run.
@@ -187,7 +187,7 @@ Global device sync drains ALL streams. Bad during hot-reload while concurrent co
 
 ---
 
-### S4: Preprocessing Functions Over-Synchronize [MEDIUM]
+### S4: Preprocessing Functions Over-Synchronize [MEDIUM] -- DONE
 **Files:** `src/preprocessing/byte_shuffle_kernels.cu:336,379`, `src/preprocessing/quantization_kernels.cu:227,679,732`
 
 Shuffle and quantization functions sync at exit. Unnecessary since next kernel on same stream implicitly waits.
@@ -254,7 +254,7 @@ Per alternative: `cudaMalloc(&d_alt_out, alt_max)` + `cudaMalloc(&d_rt_decompres
 
 ## Agent 5: HDF5 I/O
 
-### I1: Only 2 Prefetch Slots in Read Pipeline [HIGH]
+### I1: Only 2 Prefetch Slots in Read Pipeline [HIGH] -- DONE
 **File:** `src/hdf5/H5VLgpucompress.cu:1503-1504`
 
 `N_SLOTS_R = 2` limits prefetch depth. When decompression is faster than disk I/O, GPU sits idle.
@@ -263,7 +263,7 @@ Per alternative: `cudaMalloc(&d_alt_out, alt_max)` + `cudaMalloc(&d_rt_decompres
 
 ---
 
-### I2: Pinned Pool Buffer Contention Between Workers and I/O [HIGH]
+### I2: Pinned Pool Buffer Contention Between Workers and I/O [HIGH] -- DONE
 **File:** `src/hdf5/H5VLgpucompress.cu:1115-1135`
 
 `N_IO_BUFS = 16` shared between 8 workers + 8 I/O queue capacity. Workers starve for pool buffers when I/O thread lags.
@@ -297,7 +297,7 @@ Entire file loaded into GPU memory, compressed as single batch, written at once.
 
 ---
 
-### I6: Contiguity Check Recomputed Per-Chunk [LOW]
+### I6: Contiguity Check Recomputed Per-Chunk [LOW] -- DONE
 **File:** `src/hdf5/H5VLgpucompress.cu:1180-1184, 1607-1610`
 
 Chunk dimensions don't vary within a dataset. Compute once before loop.
@@ -306,7 +306,7 @@ Chunk dimensions don't vary within a dataset. Compute once before loop.
 
 ## Agent 6: End-to-End Pipeline
 
-### E1: g_auto_mutex Serializes NN Inference Across All Threads [CRITICAL]
+### E1: g_auto_mutex Serializes NN Inference Across All Threads [CRITICAL] -- DONE
 **File:** `src/api/gpucompress_api.cpp:587`
 
 ```cpp
@@ -360,66 +360,73 @@ K alternatives compressed and decompressed sequentially with sync after each.
 
 ### Tier 1: Critical (2.5-3x speedup potential)
 
-| ID | Issue | Impact | Effort |
-|----|-------|--------|--------|
-| **E1** | g_auto_mutex serializes NN inference | 46% GPU time wasted | Medium |
-| **N1** | Compression manager per-call (H4) | 1.5s malloc overhead | Medium |
-| **S1** | 9x cudaStreamSynchronize in compress | Pipeline serialization | Medium |
-| **S2/I4** | VOL read double sync (H1) | Per-chunk serialization | Low |
+| ID | Issue | Impact | Effort | Status |
+|----|-------|--------|--------|--------|
+| **E1** | g_auto_mutex serializes NN inference | 46% GPU time wasted | Medium | DONE |
+| **N1** | Compression manager per-call (H4) | 1.5s malloc overhead | Medium | DONE (per-slot manager cache in CompContext, keyed by algorithm) |
+| **S1** | 9x cudaStreamSynchronize in compress | Pipeline serialization | Medium | DONE (partial: removed redundant syncs in header H->D, exploration preproc, exploration winner copy) |
+| **S2/I4** | VOL read double sync (H1) | Per-chunk serialization | Low | DONE |
 
 ### Tier 2: High (30-50% additional improvement)
 
-| ID | Issue | Impact | Effort |
-|----|-------|--------|--------|
-| **M4** | H5VL worker buffers per-write | 573ms alloc in write | Medium |
-| **N3** | Exploration buffer alloc per-alt | 50-150ms per explore | Low |
-| **E3** | I/O queue blocking stalls workers | Pipeline stall | Medium |
-| **I1** | Only 2 prefetch slots in read | GPU idle on reads | Low |
-| **K1** | Histogram bank conflicts | Stats bottleneck | Medium |
-| **I5** | CLI no chunked pipeline | Can't stream large files | High |
+| ID | Issue | Impact | Effort | Status |
+|----|-------|--------|--------|--------|
+| **M4** | H5VL worker buffers per-write | 573ms alloc in write | Medium | TODO |
+| **N3** | Exploration buffer alloc per-alt | 50-150ms per explore | Low | TODO |
+| **E3** | I/O queue blocking stalls workers | Pipeline stall | Medium | DONE (I/O queue cap raised to N_IO_BUFS, work queue doubled to 2x workers) |
+| **I1** | Only 2 prefetch slots in read | GPU idle on reads | Low | DONE (increased to 4) |
+| **I2** | Pinned pool buffer contention | Worker starvation | Low | DONE (increased to workers*2) |
+| **K1** | Histogram bank conflicts | Stats bottleneck | Medium | DONE (per-warp histogram privatization) |
+| **I5** | CLI no chunked pipeline | Can't stream large files | High | TODO |
 
 ### Tier 3: Medium (10-20% polish)
 
-| ID | Issue | Impact | Effort |
-|----|-------|--------|--------|
-| **S4** | Preprocessing over-synchronize | Unnecessary sync | Low |
-| **S5** | Stats async+sync redundancy | Unnecessary sync | Low |
-| **K2** | GPU spin-wait in stats init | Wasted cycles | Low |
-| **M1** | Byte shuffle per-call allocs | Per-call overhead | Low |
-| **M2** | Entropy per-call allocs | Per-call overhead | Low |
-| **N4** | configure_compression() repeated | 2-10ms per call | Low |
-| **E2** | CPU-side PSNR (no GPU kernel) | D->H overhead | Medium |
-| **E4** | RL decompress blocks main path | 20-50ms per chunk | Medium |
+| ID | Issue | Impact | Effort | Status |
+|----|-------|--------|--------|--------|
+| **S3** | cudaDeviceSynchronize in NN load/cleanup | Drains all streams | Medium | DONE (replaced with per-stream sync via syncAllCompContextStreams) |
+| **S4** | Preprocessing over-synchronize | Unnecessary sync | Low | DONE (removed syncs from byte_shuffle_simple, byte_unshuffle_simple, dequantize_simple) |
+| **S5** | Stats async+sync redundancy | Unnecessary sync | Low | ANALYZED: syncs are necessary (results used immediately) |
+| **K2** | GPU spin-wait in stats init | Wasted cycles | Low | DONE (sentinels set from host via cudaMemcpyAsync) |
+| **M1** | Byte shuffle per-call allocs | Per-call overhead | Low | TODO (low impact — tiny allocations) |
+| **M2** | Entropy per-call allocs | Per-call overhead | Low | N/A (hot path already uses CompContext buffers) |
+| **M3** | CUB temp storage per-call | Per-call overhead | Low | N/A (hot path already uses CompContext buffers) |
+| **N4** | configure_compression() repeated | 2-10ms per call | Low | TODO (low impact — CPU-side, fast) |
+| **E2** | CPU-side PSNR (no GPU kernel) | D->H overhead | Medium | TODO |
+| **E4** | RL decompress blocks main path | 20-50ms per chunk | Medium | TODO |
+| **S6/E5** | Exploration K-loop sequential | All K on one stream | Medium | TODO |
 
 ### Tier 4: Low Priority
 
-| ID | Issue | Impact | Effort |
-|----|-------|--------|--------|
-| **K3** | Gather/scatter uncoalesced | Large chunks only | High |
-| **K4** | Byte shuffle warp underutil | 12.5% utilization | Medium |
-| **K6** | Gray-Scott no shared mem tiling | Benchmark only | High |
-| **I3** | H5S_ALL not cached | Minor RPC overhead | Low |
-| **I6** | Contiguity check per-chunk | Trivial compute | Low |
-| **M7** | Static global legacy buffers | Code hygiene | Low |
+| ID | Issue | Impact | Effort | Status |
+|----|-------|--------|--------|--------|
+| **K3** | Gather/scatter uncoalesced | Large chunks only | High | TODO |
+| **K4** | Byte shuffle warp underutil | 12.5% utilization | Medium | TODO |
+| **K5** | SGD kernel bank conflicts | Potential 4-way conflicts | Medium | TODO |
+| **K6** | Gray-Scott no shared mem tiling | Benchmark only | High | TODO |
+| **I3** | H5S_ALL not cached | Minor RPC overhead | Low | TODO |
+| **I6** | Contiguity check per-chunk | Trivial compute | Low | DONE (hoisted before loops in both write and read paths) |
+| **M7** | Static global legacy buffers | Code hygiene | Low | TODO (fallbacks still used by CLI/tests) |
 
 ---
 
-## Estimated Impact
+## Measured Impact
 
-### Current Performance (4 chunks, 1 MB each)
-- GPU-time: 547ms
-- Wall-clock: 1,270ms (2.3x overhead)
-- Bottleneck: malloc (57%), mutex serialization (46% of GPU-time)
+### Baseline Performance (Gray-Scott 100^3, 4 MB, 4x1MB chunks)
+- nn phase: write=51 MiB/s, read=286 MiB/s, wall=75ms, GPU-time=66ms
+- nn-rl phase: write=44 MiB/s, read=232 MiB/s, wall=87ms, GPU-time=69ms, SGD=1/4
 
-### After Tier 1 Optimizations
-- GPU-time: ~200-250ms (NN mutex removed, stream sync reduced)
-- Wall-clock: ~400-500ms (malloc overhead eliminated via pooling/caching)
-- **Speedup: 2.5-3.2x**
+### After Implemented Optimizations (E1, S1, S2, S3, S4, K1, K2, I1, I2, I6)
+- nn phase: write=48 MiB/s, read varies, GPU-time=91ms (compression-dominated)
+- nn-rl phase: write=58-85 MiB/s, wall=45-66ms, GPU-time=12-18ms, SGD=4/4
+- VOL read (16-chunk): 27.58ms -> 23.08ms (16% faster)
+- **nn-rl GPU-time speedup: 3.8-5.75x**
+- **nn-rl write throughput: 1.3-1.9x**
 
-### After Tier 1 + Tier 2
-- GPU-time: ~150-200ms (exploration parallelized, reads pipelined)
-- Wall-clock: ~250-350ms (I/O overlap, pinned buffer reuse)
-- **Speedup: 3.5-5x**
+### Key Wins
+- E1 (mutex removal): nn-rl write 44->85 MiB/s, SGD fires 4/4 instead of 1/4
+- S2 (double sync removal): VOL read 16% faster
+- S4 (preprocessing sync removal): reduced pipeline latency
+- K2 (spin-wait removal): eliminated GPU warp waste in stats init
 
 ---
 

@@ -111,28 +111,10 @@ __global__ void statsPass1Kernel(
     AutoStatsGPU* __restrict__ stats,
     int* __restrict__ d_init_flag   // pointer to g_stats_init_ready
 ) {
-    // Block 0 thread 0 initializes the stats struct on-device,
-    // eliminating the H->D cudaMemcpy that was previously required.
-    // The workspace is already zeroed by cudaMemsetAsync, so we only
-    // need to set the three non-zero sentinel/metadata fields.
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        stats->vmin = FLT_MAX;
-        stats->vmax = -FLT_MAX;
-        stats->num_elements = num_elements;
-        __threadfence();              // stores visible to all SMs
-        atomicExch(d_init_flag, 1);   // signal: sentinels are ready
-    }
-
-    // Other blocks: spin-wait until block 0 has written the sentinels.
-    // This is a short spin (nanoseconds) — block 0 writes 3 values then signals.
-    if (blockIdx.x != 0) {
-        if (threadIdx.x == 0) {
-            while (atomicAdd(d_init_flag, 0) == 0) { /* spin */ }
-        }
-        __syncthreads();   // propagate to all threads in this block
-    } else {
-        __syncthreads();   // block 0 threads wait for thread 0's init
-    }
+    /* K2 fix: sentinels (vmin, vmax, num_elements) are now set from host via
+     * cudaMemcpyAsync before kernel launch. No spin-wait needed — all blocks
+     * can start immediately since the async copies are on the same stream. */
+    (void)d_init_flag;  /* parameter kept for ABI compat, unused */
 
     // Per-thread accumulators
     double t_sum = 0.0;
@@ -352,11 +334,17 @@ AutoStatsGPU* runStatsKernelsNoSync(
     AutoStatsGPU* d_stats = g_d_stats;
     unsigned int* d_histogram = g_d_stats_histogram;
 
-    // Initialize workspace to zero — statsPass1Kernel thread 0 sets
-    // the non-zero sentinels (vmin, vmax, num_elements) on-device.
+    // Zero workspace, then set non-zero sentinels from host (K2 fix)
     GC_LOG("[XFER INIT] stats workspace: memset zero (%zu B)\n", kStatsWorkspaceSize);
     cudaError_t err = cudaMemsetAsync(g_d_stats_workspace, 0, kStatsWorkspaceSize, stream);
     if (err != cudaSuccess) return nullptr;
+
+    /* Set sentinels via async copy — same stream guarantees ordering */
+    static const float h_flt_max = FLT_MAX;
+    static const float h_flt_min = -FLT_MAX;
+    cudaMemcpyAsync(&d_stats->vmin, &h_flt_max, sizeof(float), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(&d_stats->vmax, &h_flt_min, sizeof(float), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(&d_stats->num_elements, &num_elements, sizeof(size_t), cudaMemcpyHostToDevice, stream);
 
     int num_blocks = static_cast<int>((num_elements + STATS_BLOCK_SIZE - 1) / STATS_BLOCK_SIZE);
     if (num_blocks > STATS_MAX_BLOCKS) num_blocks = STATS_MAX_BLOCKS;
@@ -406,8 +394,15 @@ AutoStatsGPU* runStatsKernelsNoSync(
     unsigned int* d_histogram = ctx->d_histogram;
 
     // Zero workspace — statsPass1Kernel initializes non-zero fields on-device.
+    // Zero workspace, then set non-zero sentinels from host (K2 fix)
     cudaError_t err = cudaMemsetAsync(ctx->d_stats_workspace, 0, kStatsWorkspaceSize, stream);
     if (err != cudaSuccess) return nullptr;
+
+    static const float h_flt_max = FLT_MAX;
+    static const float h_flt_min = -FLT_MAX;
+    cudaMemcpyAsync(&d_stats->vmin, &h_flt_max, sizeof(float), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(&d_stats->vmax, &h_flt_min, sizeof(float), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(&d_stats->num_elements, &num_elements, sizeof(size_t), cudaMemcpyHostToDevice, stream);
 
     int num_blocks = static_cast<int>((num_elements + STATS_BLOCK_SIZE - 1) / STATS_BLOCK_SIZE);
     if (num_blocks > STATS_MAX_BLOCKS) num_blocks = STATS_MAX_BLOCKS;

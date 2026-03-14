@@ -141,28 +141,16 @@ static std::condition_variable g_pool_cv;
 /* ---- SGD serialization mutex (CPU-side) ---- */
 static std::mutex g_sgd_mutex;
 
-/* ---- Host-path ALGO_AUTO mutex: protects global stats + inference buffers ---- */
-static std::mutex g_auto_mutex;
+/* g_auto_mutex removed (E1 fix): host-path now uses per-slot CompContext
+ * buffers for stats + NN inference, eliminating serialization. */
 
 /** Thread-local CUDA timing events — each thread gets its own pair,
  *  lazy-initialized on first use. Avoids the race on global events
  *  while keeping the zero-contention benefit of per-thread storage.
  *  Cleanup handled by CUDA context teardown (single GPU node). */
-static thread_local cudaEvent_t tl_t_start    = nullptr;
-static thread_local cudaEvent_t tl_t_stop     = nullptr;
-static thread_local cudaEvent_t tl_nn_start   = nullptr;
-static thread_local cudaEvent_t tl_nn_stop    = nullptr;
-static thread_local cudaEvent_t tl_stats_start = nullptr;
-static thread_local cudaEvent_t tl_stats_stop  = nullptr;
-
-static inline void ensure_timing_events() {
-    if (!tl_t_start)     cudaEventCreate(&tl_t_start);
-    if (!tl_t_stop)      cudaEventCreate(&tl_t_stop);
-    if (!tl_nn_start)    cudaEventCreate(&tl_nn_start);
-    if (!tl_nn_stop)     cudaEventCreate(&tl_nn_stop);
-    if (!tl_stats_start) cudaEventCreate(&tl_stats_start);
-    if (!tl_stats_stop)  cudaEventCreate(&tl_stats_stop);
-}
+/* Thread-local timing events removed for host path (E1 fix):
+ * gpucompress_compress now uses per-slot CompContext events.
+ * These remain only for any non-pool callers that need thread-local events. */
 
 /** Online reinforcement (SGD) state */
 float g_reinforce_lr = 0.01f;
@@ -209,6 +197,11 @@ static constexpr size_t kPoolStatsWSZ =
 
 /** Destroy a single CompContext slot (null-safe). Caller must hold g_pool_mutex. */
 static void destroyCompContextSlot(CompContext& ctx) {
+    /* N1 fix: leak cached managers on shutdown — their GPU workspace
+     * is cleaned up by CUDA context teardown. nvcomp manager dtors
+     * crash if called during late cleanup (CUDA primary ctx gone). */
+    for (int a = 0; a < CompContext::N_COMP_ALGOS; a++)
+        ctx.comp_mgr_cache[a] = nullptr;  /* intentional leak */
     if (ctx.stream)              { cudaStreamDestroy(ctx.stream); ctx.stream = nullptr; }
     if (ctx.t_start)             { cudaEventDestroy(ctx.t_start);     ctx.t_start     = nullptr; }
     if (ctx.t_stop)              { cudaEventDestroy(ctx.t_stop);      ctx.t_stop      = nullptr; }
@@ -233,6 +226,12 @@ static void destroyCompContextSlot(CompContext& ctx) {
 
 int initCompContextPool() {
     std::lock_guard<std::mutex> lk(g_pool_mutex);
+    /* N1 fix: delete cached managers before memset (raw ptrs, safe to zero after) */
+    for (int i = 0; i < N_COMP_CTX; i++) {
+        for (int a = 0; a < CompContext::N_COMP_ALGOS; a++) {
+            delete g_comp_pool[i].comp_mgr_cache[a];
+        }
+    }
     memset(g_comp_pool, 0, sizeof(g_comp_pool));
     g_pool_free_count = 0;
     for (int i = 0; i < N_COMP_CTX; i++) {
@@ -310,6 +309,32 @@ void releaseCompContext(CompContext* ctx) {
     g_pool_slot_free[ctx->slot_id] = true;
     g_pool_free_count++;
     g_pool_cv.notify_one();
+}
+
+void syncAllCompContextStreams() {
+    /* S3 fix: synchronize only the N_COMP_CTX pool streams + g_sgd_stream,
+     * rather than draining the entire device with cudaDeviceSynchronize.
+     * Safe to call under g_pool_mutex since streams are never destroyed
+     * while the pool is live. */
+    std::lock_guard<std::mutex> lk(g_pool_mutex);
+    for (int i = 0; i < N_COMP_CTX; i++) {
+        if (g_comp_pool[i].stream)
+            cudaStreamSynchronize(g_comp_pool[i].stream);
+    }
+    /* g_sgd_stream is at file scope (not in gpucompress namespace) */
+    if (::g_sgd_stream)
+        cudaStreamSynchronize(::g_sgd_stream);
+}
+
+nvcomp::nvcompManagerBase* getCachedCompManager(CompContext* ctx, CompressionAlgorithm algo) {
+    int idx = static_cast<int>(algo);
+    if (idx < 0 || idx >= CompContext::N_COMP_ALGOS) return nullptr;
+    if (!ctx->comp_mgr_cache[idx]) {
+        auto mgr = createCompressionManager(
+            algo, gpucompress::DEFAULT_CHUNK_SIZE, ctx->stream, nullptr);
+        ctx->comp_mgr_cache[idx] = mgr.release();  /* transfer ownership to cache */
+    }
+    return ctx->comp_mgr_cache[idx];
 }
 
 } // namespace gpucompress
@@ -521,10 +546,11 @@ extern "C" gpucompress_error_t gpucompress_compress(
     // Use default config if not provided
     gpucompress_config_t cfg = config ? *config : gpucompress_default_config();
 
-    // Get CUDA stream
-    cudaStream_t stream = cfg.cuda_stream ?
-                          static_cast<cudaStream_t>(cfg.cuda_stream) :
-                          g_default_stream;
+    /* Acquire a per-slot context for thread-safe stats+NN (E1 fix) */
+    ContextGuard guard{gpucompress::acquireCompContext()};
+    if (!guard.ctx) return GPUCOMPRESS_ERROR_CUDA_FAILED;
+    CompContext* ctx = guard.ctx;
+    cudaStream_t stream = ctx->stream;
 
     cudaError_t cuda_err;
 
@@ -582,59 +608,48 @@ extern "C" gpucompress_error_t gpucompress_compress(
 
         if (num_elements > 0 && gpucompress_nn_is_loaded_impl()) {
             bool nn_timed = false;
-            {
-                // Lock protects global stats + inference GPU buffers.
-                std::lock_guard<std::mutex> auto_lk(g_auto_mutex);
-                ensure_timing_events();
 
-                // Stats timing
-                cudaEventRecord(tl_stats_start, stream);
+            /* Stats timing — use per-context events (no mutex needed, E1 fix) */
+            cudaEventRecord(ctx->stats_start, stream);
 
-                // Fused stats→NN: run stats kernels (no D→H, no sync)
-                d_stats_ptr = gpucompress::runStatsKernelsNoSync(d_input, input_size, stream);
+            /* Use ctx-aware stats (per-slot buffers, no global contention) */
+            d_stats_ptr = gpucompress::runStatsKernelsNoSync(d_input, input_size, stream, ctx);
 
-                if (d_stats_ptr && stats != nullptr) {
-                    // Enqueue stats D→H copies now (before inference kernel) so
-                    // the single cudaStreamSynchronize inside runNNFusedInference
-                    // drains both stats copies and inference D→H in one sync.
-                    GC_LOG("[XFER D→H] stats: entropy (%zu B)\n", sizeof(double));
-                    XFER_TRACK("compress/auto: D->H stats entropy", sizeof(double), cudaMemcpyDeviceToHost);
-                    cudaMemcpyAsync(&entropy, &d_stats_ptr->entropy, sizeof(double),
-                                    cudaMemcpyDeviceToHost, stream);
-                    GC_LOG("[XFER D→H] stats: mad_normalized (%zu B)\n", sizeof(double));
-                    XFER_TRACK("compress/auto: D->H stats mad", sizeof(double), cudaMemcpyDeviceToHost);
-                    cudaMemcpyAsync(&mad, &d_stats_ptr->mad_normalized, sizeof(double),
-                                    cudaMemcpyDeviceToHost, stream);
-                    GC_LOG("[XFER D→H] stats: deriv_normalized (%zu B)\n", sizeof(double));
-                    XFER_TRACK("compress/auto: D->H stats deriv", sizeof(double), cudaMemcpyDeviceToHost);
-                    cudaMemcpyAsync(&second_derivative, &d_stats_ptr->deriv_normalized, sizeof(double),
-                                    cudaMemcpyDeviceToHost, stream);
+            if (d_stats_ptr && stats != nullptr) {
+                XFER_TRACK("compress/auto: D->H stats entropy", sizeof(double), cudaMemcpyDeviceToHost);
+                cudaMemcpyAsync(&entropy, &d_stats_ptr->entropy, sizeof(double),
+                                cudaMemcpyDeviceToHost, stream);
+                XFER_TRACK("compress/auto: D->H stats mad", sizeof(double), cudaMemcpyDeviceToHost);
+                cudaMemcpyAsync(&mad, &d_stats_ptr->mad_normalized, sizeof(double),
+                                cudaMemcpyDeviceToHost, stream);
+                XFER_TRACK("compress/auto: D->H stats deriv", sizeof(double), cudaMemcpyDeviceToHost);
+                cudaMemcpyAsync(&second_derivative, &d_stats_ptr->deriv_normalized, sizeof(double),
+                                cudaMemcpyDeviceToHost, stream);
+            }
+            cudaEventRecord(ctx->stats_stop, stream);
+
+            if (d_stats_ptr) {
+                float* p_ratio = &predicted_ratio;
+                float* p_comp_time = &predicted_comp_time;
+                float* p_decomp_time = &predicted_decomp_time;
+                float* p_psnr = &predicted_psnr;
+                int* p_top = g_online_learning_enabled ? top_actions : nullptr;
+                int fused_ood = 0;
+
+                /* NN timing — use ctx-aware inference (per-slot buffers, E1 fix) */
+                cudaEventRecord(ctx->nn_start, stream);
+                action = gpucompress::runNNFusedInferenceCtx(
+                    d_stats_ptr, input_size, cfg.error_bound, stream, ctx,
+                    &action, p_ratio, p_comp_time, p_decomp_time, p_psnr,
+                    g_online_learning_enabled ? &fused_ood : nullptr, p_top,
+                    ctx->nn_stop);
+                nn_timed = true;
+                rc = (action >= 0) ? 0 : -1;
+
+                if (rc == 0) {
+                    is_ood = (fused_ood != 0);
                 }
-                cudaEventRecord(tl_stats_stop, stream);
-
-                if (d_stats_ptr) {
-                    float* p_ratio = &predicted_ratio;  // always capture — no extra cost
-                    float* p_comp_time = &predicted_comp_time;
-                    float* p_decomp_time = &predicted_decomp_time;
-                    float* p_psnr = &predicted_psnr;
-                    int* p_top = g_online_learning_enabled ? top_actions : nullptr;
-                    int fused_ood = 0;
-
-                    // NN timing — nn_start recorded here, nn_stop inside runNNFusedInference
-                    cudaEventRecord(tl_nn_start, stream);
-                    action = gpucompress::runNNFusedInference(
-                        d_stats_ptr, input_size, cfg.error_bound, stream,
-                        &action, p_ratio, p_comp_time, p_decomp_time, p_psnr,
-                        g_online_learning_enabled ? &fused_ood : nullptr, p_top,
-                        tl_nn_stop);
-                    nn_timed = true;
-                    rc = (action >= 0) ? 0 : -1;
-
-                    if (rc == 0) {
-                        is_ood = (fused_ood != 0);
-                    }
-                }
-            } // auto_lk released
+            }
 
             if (rc == 0) {
                 nn_was_used = true;
@@ -643,10 +658,10 @@ extern "C" gpucompress_error_t gpucompress_compress(
                 g_last_nn_action.store(action);
             }
 
-            // Events already synchronized by runNNFusedInference's internal sync
+            /* Events already synchronized by runNNFusedInferenceCtx's internal sync */
             if (nn_timed) {
-                cudaEventElapsedTime(&diag_nn_inference_ms, tl_nn_start, tl_nn_stop);
-                cudaEventElapsedTime(&diag_stats_ms, tl_stats_start, tl_stats_stop);
+                cudaEventElapsedTime(&diag_nn_inference_ms, ctx->nn_start, ctx->nn_stop);
+                cudaEventElapsedTime(&diag_stats_ms, ctx->stats_start, ctx->stats_stop);
             }
         }
 
@@ -743,10 +758,9 @@ extern "C" gpucompress_error_t gpucompress_compress(
             std::chrono::steady_clock::now() - t_preproc_start).count();
     }
 
-    // Create compression manager
+    /* N1 fix: use cached compression manager */
     CompressionAlgorithm internal_algo = gpucompress::toInternalAlgorithm(algo_to_use);
-    auto compressor = createCompressionManager(
-        internal_algo, gpucompress::DEFAULT_CHUNK_SIZE, stream, d_compress_input);
+    auto* compressor = gpucompress::getCachedCompManager(ctx, internal_algo);
 
     if (!compressor) {
         if (d_quantized) cudaFree(d_quantized);
@@ -794,9 +808,8 @@ extern "C" gpucompress_error_t gpucompress_compress(
 
     // Compress (with timing for reinforcement)
     float primary_comp_time_ms = 0.0f;
-    ensure_timing_events();
-    bool timing_ok = (tl_t_start != nullptr && tl_t_stop != nullptr);
-    if (timing_ok) cudaEventRecord(tl_t_start, stream);
+    bool timing_ok = (ctx->t_start != nullptr && ctx->t_stop != nullptr);
+    if (timing_ok) cudaEventRecord(ctx->t_start, stream);
 
     try {
         compressor->compress(d_compress_input, d_compressed, comp_config);
@@ -809,9 +822,9 @@ extern "C" gpucompress_error_t gpucompress_compress(
     }
 
     if (timing_ok) {
-        cudaEventRecord(tl_t_stop, stream);
-        cudaEventSynchronize(tl_t_stop);
-        cudaEventElapsedTime(&primary_comp_time_ms, tl_t_start, tl_t_stop);
+        cudaEventRecord(ctx->t_stop, stream);
+        cudaEventSynchronize(ctx->t_stop);
+        cudaEventElapsedTime(&primary_comp_time_ms, ctx->t_start, ctx->t_stop);
     }
     diag_compression_ms = primary_comp_time_ms;
 
@@ -828,12 +841,12 @@ extern "C" gpucompress_error_t gpucompress_compress(
             size_t rt_decomp_size = rt_dc.decomp_data_size;
             uint8_t* d_rt_buf = nullptr;
             if (cudaMalloc(&d_rt_buf, rt_decomp_size) == cudaSuccess) {
-                cudaEventRecord(tl_t_start, stream);
+                cudaEventRecord(ctx->t_start, stream);
                 try {
                     rt_decomp->decompress(d_rt_buf, d_compressed, rt_dc);
-                    cudaEventRecord(tl_t_stop, stream);
-                    cudaEventSynchronize(tl_t_stop);
-                    cudaEventElapsedTime(&primary_decomp_time_ms, tl_t_start, tl_t_stop);
+                    cudaEventRecord(ctx->t_stop, stream);
+                    cudaEventSynchronize(ctx->t_stop);
+                    cudaEventElapsedTime(&primary_decomp_time_ms, ctx->t_start, ctx->t_stop);
                 } catch (...) {
                     // Decompress failed — leave at 0
                 }
@@ -1034,12 +1047,10 @@ extern "C" gpucompress_error_t gpucompress_compress(
 
                 /* No sync needed — compression runs on the same stream (H2 fix) */
 
-                // Compress
+                /* N1 fix: use cached manager for exploration alternatives */
                 CompressionAlgorithm alt_internal =
                     gpucompress::toInternalAlgorithm(alt_algo);
-                auto alt_comp = createCompressionManager(
-                    alt_internal, gpucompress::DEFAULT_CHUNK_SIZE,
-                    stream, d_alt_input);
+                auto* alt_comp = gpucompress::getCachedCompManager(ctx, alt_internal);
 
                 size_t alt_comp_size = 0;
 
@@ -1051,14 +1062,14 @@ extern "C" gpucompress_error_t gpucompress_compress(
                         size_t alt_max = alt_cc.max_compressed_buffer_size;
                         if (cudaMalloc(&d_alt_out, alt_max) == cudaSuccess) {
                             float alt_ct_ms = 0.0f;
-                            if (timing_ok) cudaEventRecord(tl_t_start, stream);
+                            if (timing_ok) cudaEventRecord(ctx->t_start, stream);
 
                             alt_comp->compress(d_alt_input, d_alt_out, alt_cc);
 
                             if (timing_ok) {
-                                cudaEventRecord(tl_t_stop, stream);
-                                cudaEventSynchronize(tl_t_stop);
-                                cudaEventElapsedTime(&alt_ct_ms, tl_t_start, tl_t_stop);
+                                cudaEventRecord(ctx->t_stop, stream);
+                                cudaEventSynchronize(ctx->t_stop);
+                                cudaEventElapsedTime(&alt_ct_ms, ctx->t_start, ctx->t_stop);
                             }
 
                             alt_comp_size = alt_comp->get_compressed_output_size(d_alt_out);
@@ -1078,7 +1089,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
                                         size_t rt_decomp_size = rt_dc.decomp_data_size;
                                         uint8_t* d_rt_decompressed = nullptr;
                                         if (cudaMalloc(&d_rt_decompressed, rt_decomp_size) == cudaSuccess) {
-                                            if (timing_ok) cudaEventRecord(tl_t_start, stream);
+                                            if (timing_ok) cudaEventRecord(ctx->t_start, stream);
 
                                             try {
                                                 rt_decomp->decompress(d_rt_decompressed, d_alt_out, rt_dc);
@@ -1118,10 +1129,10 @@ extern "C" gpucompress_error_t gpucompress_compress(
                                             }
 
                                             if (timing_ok) {
-                                                cudaEventRecord(tl_t_stop, stream);
-                                                cudaEventSynchronize(tl_t_stop);
+                                                cudaEventRecord(ctx->t_stop, stream);
+                                                cudaEventSynchronize(ctx->t_stop);
                                                 float dt_ms = 0.0f;
-                                                cudaEventElapsedTime(&dt_ms, tl_t_start, tl_t_stop);
+                                                cudaEventElapsedTime(&dt_ms, ctx->t_start, ctx->t_stop);
                                                 alt_decomp_ms = static_cast<double>(dt_ms);
                                             }
 
@@ -1289,9 +1300,9 @@ extern "C" gpucompress_error_t gpucompress_compress(
             int sgd_clipped = 0, sgd_count = 0;
             {
                 std::lock_guard<std::mutex> sgd_lk(g_sgd_mutex);
-                if (gpucompress::runNNSGD(d_stats_ptr, sgd_samples,
+                if (gpucompress::runNNSGDCtx(d_stats_ptr, sgd_samples,
                         static_cast<int>(sgd_limit), input_size, cfg.error_bound,
-                        g_reinforce_lr, stream,
+                        g_reinforce_lr, ctx,
                         &sgd_grad_norm, &sgd_clipped, &sgd_count) == 0) {
                     sgd_fired = true;
                 }
@@ -2148,12 +2159,11 @@ skip_nn:
             std::chrono::steady_clock::now() - t_preproc_start).count();
     }
 
-    /* Create nvcomp compression manager */
+    /* N1 fix: use cached compression manager (avoids per-call workspace alloc) */
     CompressionAlgorithm internal_algo = gpucompress::toInternalAlgorithm(algo_to_use);
-    auto compressor = createCompressionManager(
-        internal_algo, gpucompress::DEFAULT_CHUNK_SIZE, stream, d_compress_input);
+    auto* compressor = gpucompress::getCachedCompManager(ctx, internal_algo);
     if (!compressor) {
-        fprintf(stderr, "gpucompress ERROR: createCompressionManager failed for algo=%d "
+        fprintf(stderr, "gpucompress ERROR: getCachedCompManager failed for algo=%d "
                 "(GPU OOM or unsupported algo, input_size=%zu)\n",
                 (int)algo_to_use, compress_input_size);
         if (d_quantized) cudaFree(d_quantized);
@@ -2298,11 +2308,12 @@ skip_nn:
             cuda_err = cudaStreamSynchronize(stream);
         cudaFree(d_temp_out);
     } else {
+        /* S1 fix: header is 64B from non-pinned stack — cudaMemcpyAsync is
+         * internally synchronous for non-pinned host memory, so the extra
+         * cudaStreamSynchronize was redundant. Final sync at scope exit. */
         XFER_TRACK("compress_gpu: H->D header (64B struct from host)", sizeof(CompressionHeader), cudaMemcpyHostToDevice);
         cuda_err = cudaMemcpyAsync(d_out, &header, sizeof(CompressionHeader),
                                    cudaMemcpyHostToDevice, stream);
-        if (cuda_err == cudaSuccess)
-            cuda_err = cudaStreamSynchronize(stream);
     }
 
     if (d_quantized) cudaFree(d_quantized);
@@ -2427,13 +2438,13 @@ skip_nn:
                     }
                 }
 
-                cudaStreamSynchronize(stream);
+                /* S1 fix: sync removed — compression on same stream as
+                 * preprocessing; GPU ordering ensures completion. */
 
+                /* N1 fix: use cached manager for exploration alternatives */
                 CompressionAlgorithm alt_internal =
                     gpucompress::toInternalAlgorithm(alt_algo);
-                auto alt_comp = createCompressionManager(
-                    alt_internal, gpucompress::DEFAULT_CHUNK_SIZE,
-                    stream, d_alt_input);
+                auto* alt_comp = gpucompress::getCachedCompManager(ctx, alt_internal);
 
                 size_t alt_comp_size = 0;
 
@@ -2606,7 +2617,8 @@ skip_nn:
                                     XFER_TRACK("explore_gpu winner: D->D alt payload", alt_comp_size, cudaMemcpyDeviceToDevice);
                                     cudaMemcpyAsync(d_out + hdr_sz, d_alt_out, alt_comp_size,
                                                     cudaMemcpyDeviceToDevice, stream);
-                                    cudaStreamSynchronize(stream);
+                                    /* S1 fix: sync removed — final sync at scope exit
+                                     * ensures all stream ops complete before release. */
                                     *output_size = alt_total;
                                     total_size = alt_total;
                                     compressed_size = alt_comp_size;

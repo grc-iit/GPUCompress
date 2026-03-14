@@ -55,6 +55,15 @@ struct CompContext {
      * streams never alias each other's min/max reduction targets. */
     void* d_range_min;
     void* d_range_max;
+
+    /* N1 fix: cached nvcomp compression managers, one per algorithm.
+     * Avoids 1-100+ MB workspace alloc/free per compression call.
+     * Managers are stream-bound (no set_stream), so they stay on ctx->stream.
+     * Index = CompressionAlgorithm enum (0-7).
+     * Raw pointers used (not unique_ptr) because CompContext is memset-zeroed
+     * in some paths and compiled by nvcc — non-trivial dtors cause issues. */
+    static constexpr int N_COMP_ALGOS = 8;
+    nvcomp::nvcompManagerBase* comp_mgr_cache[N_COMP_ALGOS];
 };
 
 /** Runtime verbose-logging flag — set via gpucompress_set_verbose(). */
@@ -293,6 +302,15 @@ int          initCompContextPool();
 void         destroyCompContextPool();
 CompContext* acquireCompContext();   ///< blocks until a slot is free
 void         releaseCompContext(CompContext*);
+
+/** S3 fix: synchronize all CompContext streams without draining the entire device.
+ *  Used by NN load/cleanup to ensure no in-flight kernels reference old weights. */
+void         syncAllCompContextStreams();
+
+/** N1 fix: get a cached compression manager for this context+algorithm.
+ *  Creates on first use, reuses on subsequent calls. Thread-safe because
+ *  each CompContext is exclusively owned by one thread at a time. */
+nvcomp::nvcompManagerBase* getCachedCompManager(CompContext* ctx, CompressionAlgorithm algo);
 
 /* ============================================================
  * Context-aware inference / SGD overloads (used by pool)

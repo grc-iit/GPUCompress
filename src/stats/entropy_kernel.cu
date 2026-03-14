@@ -51,31 +51,36 @@ __global__ void histogramKernel(
     size_t num_bytes,
     unsigned int* __restrict__ global_histogram
 ) {
-    // Shared memory histogram for this block
-    __shared__ unsigned int s_hist[NUM_BINS];
+    /* Per-warp histogram privatization (K1 fix) */
+    constexpr int WARPS_PER_BLOCK = HIST_BLOCK_SIZE / 32;
+    __shared__ unsigned int s_hist[WARPS_PER_BLOCK][NUM_BINS];
 
-    // Initialize shared histogram
     int tid = threadIdx.x;
-    if (tid < NUM_BINS) {
-        s_hist[tid] = 0;
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+
+    for (int b = lane_id; b < NUM_BINS; b += 32) {
+        s_hist[warp_id][b] = 0;
     }
     __syncthreads();
 
-    // Process data in strided pattern
     size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
 
-    // Each thread processes multiple bytes
     for (size_t i = idx; i < num_bytes; i += stride) {
         uint8_t byte_val = data[i];
-        atomicAdd(&s_hist[byte_val], 1);
+        atomicAdd(&s_hist[warp_id][byte_val], 1);
     }
     __syncthreads();
 
-    // Merge shared histogram to global
+    // Merge per-warp histograms to global
     if (tid < NUM_BINS) {
-        if (s_hist[tid] > 0) {
-            atomicAdd(&global_histogram[tid], s_hist[tid]);
+        unsigned int sum = 0;
+        for (int w = 0; w < WARPS_PER_BLOCK; w++) {
+            sum += s_hist[w][tid];
+        }
+        if (sum > 0) {
+            atomicAdd(&global_histogram[tid], sum);
         }
     }
 }
@@ -85,20 +90,32 @@ __global__ void histogramKernel(
  *
  * Processes 4 bytes at a time using uint32_t reads.
  */
+/**
+ * Vectorized histogram with per-warp privatization (K1 fix).
+ *
+ * Each warp maintains its own 256-bin histogram to avoid shared memory
+ * bank conflicts. With 8 warps/block, uses 8*256 = 2048 shared ints (8 KB).
+ * Warp-private histograms are merged to global at the end.
+ */
 __global__ void histogramKernelVec4(
     const uint8_t* __restrict__ data,
     size_t num_bytes,
     unsigned int* __restrict__ global_histogram
 ) {
-    __shared__ unsigned int s_hist[NUM_BINS];
+    constexpr int WARPS_PER_BLOCK = HIST_BLOCK_SIZE / 32;
+    __shared__ unsigned int s_hist[WARPS_PER_BLOCK][NUM_BINS];
 
     int tid = threadIdx.x;
-    if (tid < NUM_BINS) {
-        s_hist[tid] = 0;
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+
+    // Initialize per-warp histograms (8 passes of 32 threads = 256 bins)
+    for (int b = lane_id; b < NUM_BINS; b += 32) {
+        s_hist[warp_id][b] = 0;
     }
     __syncthreads();
 
-    // Process 4 bytes at a time
+    // Process 4 bytes at a time — each thread writes to its warp's histogram
     size_t num_words = num_bytes / 4;
     const uint32_t* data32 = reinterpret_cast<const uint32_t*>(data);
 
@@ -107,25 +124,29 @@ __global__ void histogramKernelVec4(
 
     for (size_t i = idx; i < num_words; i += stride) {
         uint32_t word = data32[i];
-        atomicAdd(&s_hist[(word >>  0) & 0xFF], 1);
-        atomicAdd(&s_hist[(word >>  8) & 0xFF], 1);
-        atomicAdd(&s_hist[(word >> 16) & 0xFF], 1);
-        atomicAdd(&s_hist[(word >> 24) & 0xFF], 1);
+        atomicAdd(&s_hist[warp_id][(word >>  0) & 0xFF], 1);
+        atomicAdd(&s_hist[warp_id][(word >>  8) & 0xFF], 1);
+        atomicAdd(&s_hist[warp_id][(word >> 16) & 0xFF], 1);
+        atomicAdd(&s_hist[warp_id][(word >> 24) & 0xFF], 1);
     }
 
     // Handle remaining bytes (only one block to avoid double-counting)
     if (blockIdx.x == 0) {
         size_t remaining_start = num_words * 4;
         for (size_t i = remaining_start + tid; i < num_bytes; i += blockDim.x) {
-            atomicAdd(&s_hist[data[i]], 1);
+            atomicAdd(&s_hist[warp_id][data[i]], 1);
         }
     }
     __syncthreads();
 
-    // Merge to global
+    // Merge per-warp histograms to global: each thread handles one bin
     if (tid < NUM_BINS) {
-        if (s_hist[tid] > 0) {
-            atomicAdd(&global_histogram[tid], s_hist[tid]);
+        unsigned int sum = 0;
+        for (int w = 0; w < WARPS_PER_BLOCK; w++) {
+            sum += s_hist[w][tid];
+        }
+        if (sum > 0) {
+            atomicAdd(&global_histogram[tid], sum);
         }
     }
 }

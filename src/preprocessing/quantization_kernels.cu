@@ -676,7 +676,8 @@ void* dequantize_simple(
         return nullptr;
     }
 
-    cudaStreamSynchronize(stream);
+    /* S4 fix: sync removed — callers use result on same stream,
+     * GPU ordering guarantees dequantize completes first. */
     return d_output;
 }
 

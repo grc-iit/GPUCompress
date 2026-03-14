@@ -1025,8 +1025,8 @@ bool loadNNFromBinary(const char* filepath) {
     g_nn_loaded.store(true);
 
     if (d_old != nullptr) {
-        // Drain all in-flight kernels that may reference the old pointer
-        cudaDeviceSynchronize();
+        /* S3 fix: drain only CompContext + SGD streams, not the entire device */
+        gpucompress::syncAllCompContextStreams();
         cudaFree(d_old);
     }
 
@@ -1099,7 +1099,8 @@ void cleanupNN() {
     }
     g_nn_loaded.store(false);
     if (d_old != nullptr) {
-        cudaDeviceSynchronize();
+        /* S3 fix: drain only CompContext + SGD streams */
+        gpucompress::syncAllCompContextStreams();
         cudaFree(d_old);
     }
     freeInferenceBuffers();
