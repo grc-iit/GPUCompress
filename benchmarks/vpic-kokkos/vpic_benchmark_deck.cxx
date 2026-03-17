@@ -51,7 +51,7 @@
 // ============================================================
 // Constants
 // ============================================================
-#define REINFORCE_LR        0.4f
+#define REINFORCE_LR        0.9f
 #define REINFORCE_MAPE      0.20f
 
 #define H5Z_FILTER_GPUCOMPRESS    305
@@ -738,7 +738,7 @@ begin_diagnostics {
     gpucompress_set_reinforcement(1, REINFORCE_LR, REINFORCE_MAPE, REINFORCE_MAPE);
     gpucompress_set_exploration(1);
     gpucompress_set_exploration_threshold(0.50);
-    gpucompress_set_exploration_k(2);
+    gpucompress_set_exploration_k(6);
     {
         hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats, diag_error_bound);
         int rc = run_phase("nn-rl+exp50", TMP_NN_RLEXP,

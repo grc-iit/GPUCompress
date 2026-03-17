@@ -84,6 +84,9 @@ add_vol_test(test_nn_algo_convergence        tests/test_nn_algo_convergence.cu)
 add_vol_test(test_nn_bitcomp                 tests/test_nn_bitcomp.cu)
 add_vol_test(test_nn_predict_vs_actual       tests/test_nn_predict_vs_actual.cu)
 add_vol_test(test_vol_nn_predictions         tests/hdf5/test_vol_nn_predictions.cu)
+add_vol_test(test_nn_vol_correctness         tests/hdf5/test_nn_vol_correctness.cu)
+add_vol_test(test_hdf5_compat                tests/hdf5/test_hdf5_compat.cu)
+target_link_libraries(test_hdf5_compat PRIVATE H5Zgpucompress)
 
 # ============================================================
 # VOL Regression Tests

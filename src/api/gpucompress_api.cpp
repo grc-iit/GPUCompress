@@ -818,28 +818,12 @@ extern "C" gpucompress_error_t gpucompress_compress(
     size_t compressed_size = compressor->get_compressed_output_size(d_compressed);
     size_t total_size = header_size + compressed_size;
 
-    // Measure primary decomp time (RL-gated: only when SGD can learn from it)
+    /* Decomp time deferred to read (Option C): the VOL read path measures
+     * actual decompression time via gpucompress_record_chunk_decomp_ms().
+     * At write time we leave primary_decomp_time_ms = 0; the cost formula
+     * falls back to the NN prediction (pred_dt), and the SGD kernel skips
+     * the decomp-time gradient when actual_decomp_time == 0. */
     float primary_decomp_time_ms = 0.0f;
-    if (g_reinforce_lr > 0.0f && nn_was_used && timing_ok) {
-        auto rt_decomp = createDecompressionManager(d_compressed, stream);
-        if (rt_decomp) {
-            DecompressionConfig rt_dc = rt_decomp->configure_decompression(d_compressed);
-            size_t rt_decomp_size = rt_dc.decomp_data_size;
-            uint8_t* d_rt_buf = nullptr;
-            if (cudaMalloc(&d_rt_buf, rt_decomp_size) == cudaSuccess) {
-                cudaEventRecord(ctx->t_start, stream);
-                try {
-                    rt_decomp->decompress(d_rt_buf, d_compressed, rt_dc);
-                    cudaEventRecord(ctx->t_stop, stream);
-                    cudaEventSynchronize(ctx->t_stop);
-                    cudaEventElapsedTime(&primary_decomp_time_ms, ctx->t_start, ctx->t_stop);
-                } catch (...) {
-                    // Decompress failed — leave at 0
-                }
-                cudaFree(d_rt_buf);
-            }
-        }
-    }
 
     // Check output buffer size
     if (total_size > *output_size) {
@@ -1362,7 +1346,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
             h->predicted_comp_time   = predicted_comp_time;
             h->predicted_decomp_time = predicted_decomp_time;
             h->predicted_psnr        = predicted_psnr;
-            h->decompression_ms      = primary_decomp_time_ms;  /* measured at write when RL active, updated during read */
+            h->decompression_ms      = 0.0f;  /* deferred to read: VOL calls gpucompress_record_chunk_decomp_ms() */
         }
     }
 
@@ -2233,28 +2217,8 @@ skip_nn:
     size_t compressed_size = compressor->get_compressed_output_size(d_comp_target);
     size_t total_size      = header_size + compressed_size;
 
-    // Measure primary decomp time (RL-gated: only when SGD can learn from it)
+    /* Decomp time deferred to read (Option C): see host-path comment above. */
     float primary_decomp_time_ms = 0.0f;
-    if (g_reinforce_lr > 0.0f && nn_was_used && timing_ok) {
-        auto rt_decomp = createDecompressionManager(d_comp_target, stream);
-        if (rt_decomp) {
-            DecompressionConfig rt_dc = rt_decomp->configure_decompression(d_comp_target);
-            size_t rt_decomp_size = rt_dc.decomp_data_size;
-            uint8_t* d_rt_buf = nullptr;
-            if (cudaMalloc(&d_rt_buf, rt_decomp_size) == cudaSuccess) {
-                cudaEventRecord(ctx->t_start, stream);
-                try {
-                    rt_decomp->decompress(d_rt_buf, d_comp_target, rt_dc);
-                    cudaEventRecord(ctx->t_stop, stream);
-                    cudaEventSynchronize(ctx->t_stop);
-                    cudaEventElapsedTime(&primary_decomp_time_ms, ctx->t_start, ctx->t_stop);
-                } catch (...) {
-                    // Decompress failed — leave at 0
-                }
-                cudaFree(d_rt_buf);
-            }
-        }
-    }
 
     /* Build header and write to d_output[0..63] via H→D */
     CompressionHeader header;
@@ -2677,7 +2641,7 @@ skip_nn:
             h->predicted_comp_time   = predicted_comp_time;
             h->predicted_decomp_time = predicted_decomp_time;
             h->predicted_psnr        = predicted_psnr;
-            h->decompression_ms      = primary_decomp_time_ms;  /* measured at write when RL active, updated during read */
+            h->decompression_ms      = 0.0f;  /* deferred to read: VOL calls gpucompress_record_chunk_decomp_ms() */
         }
     }
 

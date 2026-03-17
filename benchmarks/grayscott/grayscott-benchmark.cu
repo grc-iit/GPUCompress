@@ -918,7 +918,7 @@ int main(int argc, char **argv)
         gpucompress_set_reinforcement(1, REINFORCE_LR, REINFORCE_MAPE, REINFORCE_MAPE);
         gpucompress_set_exploration(1);
         gpucompress_set_exploration_threshold(0.50);
-        gpucompress_set_exploration_k(2);  // limit K to avoid GPU OOM with large datasets + 8 workers
+        gpucompress_set_exploration_k(6);  // limit K to avoid GPU OOM with large datasets + 8 workers
         hid_t dcpl_rlexp = make_dcpl_auto(L, chunk_z, error_bound);
         rc = run_phase_vol(d_v, d_read, d_count,
                            n_floats, L, chunk_z,
