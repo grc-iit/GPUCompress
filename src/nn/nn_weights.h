@@ -20,8 +20,8 @@ static constexpr int NN_SGD_GRAD_REGION =
     NN_HIDDEN_DIM * NN_HIDDEN_DIM + NN_HIDDEN_DIM +  // w2 + b2: 16384 + 128
     NN_OUTPUT_DIM * NN_HIDDEN_DIM + NN_OUTPUT_DIM;   // w3 + b3: 512 + 4 = 19076
 
-/** Total SGD buffer size: 2 regions (workspace + accumulator for deferred updates). */
-static constexpr int NN_SGD_GRAD_SIZE = 2 * NN_SGD_GRAD_REGION;
+/** Total SGD buffer size: 3 regions (accumulator + workspace + EMA gradient). */
+static constexpr int NN_SGD_GRAD_SIZE = 3 * NN_SGD_GRAD_REGION;
 
 /** Input sample for GPU SGD kernel. */
 struct SGDSample {
@@ -79,6 +79,13 @@ struct NNWeightsGPU {
     // gradient contribution to shared W1/W2 without hard-cutting them.
     // Regularization term 0.5*log_var prevents log_var → +∞ (silencing all).
     float log_var[NN_OUTPUT_DIM];
+
+    // Previous gradient dot-product signature for anti-flip damping.
+    // Stores the dot(g_current, g_prev) sign from the last SGD call.
+    // When the gradient reverses direction (dot < 0), the update is damped
+    // to prevent oscillation between two weight configurations.
+    float prev_grad_dot;   // last gradient direction signature (for anti-flip)
+    int   sgd_call_count;  // number of SGD calls (for warmup)
 };
 
 #endif /* NN_WEIGHTS_H */

@@ -269,6 +269,7 @@ int initCompContextPool() {
 
         if (cudaMalloc(&ctx.d_sgd_grad_buffer,
                        NN_SGD_GRAD_SIZE * sizeof(float)) != cudaSuccess) goto fail;
+        cudaMemset(ctx.d_sgd_grad_buffer, 0, NN_SGD_GRAD_SIZE * sizeof(float));
         if (cudaMalloc(&ctx.d_sgd_output, sizeof(SGDOutput)) != cudaSuccess) goto fail;
         if (cudaMalloc(&ctx.d_sgd_samples,
                        NN_MAX_SGD_SAMPLES * sizeof(SGDSample)) != cudaSuccess) goto fail;

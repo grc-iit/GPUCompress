@@ -502,8 +502,9 @@ static void freeFusedInferenceBuffers() {
  * ============================================================ */
 
 // Total gradient buffer size in floats (from nn_weights.h)
-static constexpr int SGD_GRAD_SIZE = NN_SGD_GRAD_SIZE; // 2 x 19076 floats = ~152KB
+static constexpr int SGD_GRAD_SIZE = NN_SGD_GRAD_SIZE; // 3 x 19076 floats = ~228KB
 static constexpr int SGD_REGION = NN_SGD_GRAD_REGION;  // 19076 floats per region
+static constexpr int EMA_REGION = 2 * SGD_REGION;      // region 2: EMA gradient
 
 // Offsets into gradient buffer (region 0 = accumulator, region 1 = per-output workspace)
 static constexpr int SGD_OFF_DW1 = 0;
@@ -696,6 +697,13 @@ __global__ void nnSGDKernel(
             // We use a tight delta of 0.5 (half a standard deviation) so
             // each SGD step makes small corrections rather than large jumps.
             // This matches PPO/DQN practice of constraining update magnitude.
+            // Step 8 (GPT guide): Noise gating for comp_time (output 0).
+            // If |error| < threshold, zero it out — it's GPU timing jitter, not
+            // a real prediction error.  Prevents noisy comp_time gradients from
+            // destabilizing shared layers.
+            constexpr float NOISE_GATE_THRESH = 0.10f;  // ~10% of a std-dev
+            if (fabsf(s_d3[0]) < NOISE_GATE_THRESH) s_d3[0] = 0.0f;
+
             // Cache RAW (unclamped) errors for uncertainty weighting (Phase 1.5).
             // UW needs the true error magnitude to distinguish noisy from clean outputs.
             for (int o = 0; o < NN_OUTPUT_DIM; o++) {
@@ -1041,60 +1049,167 @@ __global__ void nnSGDKernel(
         __syncthreads();
     }
 
-    // Final clip: bound the total accumulated delta norm to GRAD_CLIP_THRESHOLD.
-    // Per-output clipping ensures clean gradient directions; this final clip
-    // bounds the total update magnitude so we don't overshoot.
+    // ================================================================
+    // Steps 5-9: Trust-region scaling, EMA smoothing, anti-flip damping.
+    //
+    // Region 0 now holds the combined gradient from all outputs.
+    // Region 2 (EMA_REGION) stores the exponential moving average.
+    // ================================================================
+    constexpr float EMA_DECAY      = 0.85f;   // EMA smoothing factor
+    constexpr float TRUST_K        = 0.08f;   // step = k * avg_error
+    constexpr float MAX_STEP       = 0.02f;   // maximum step size
+    constexpr float MIN_STEP       = 1e-4f;   // minimum step (avoid stall)
+    constexpr float ANTI_FLIP_DAMP = 0.5f;    // halve update on direction reversal
+
     {
-        float final_norm_sq = 0.0f;
+        // Step 5: Compute gradient norm for trust-region scaling
+        float local_norm_sq = 0.0f;
         for (int i = 0; i < NN_INPUT_DIM; i++) {
             float v = d_grad_buffer[SGD_OFF_DW1 + t * NN_INPUT_DIM + i];
-            final_norm_sq += v * v;
+            local_norm_sq += v * v;
         }
-        final_norm_sq += d_grad_buffer[SGD_OFF_DB1 + t] * d_grad_buffer[SGD_OFF_DB1 + t];
+        local_norm_sq += d_grad_buffer[SGD_OFF_DB1 + t] * d_grad_buffer[SGD_OFF_DB1 + t];
         for (int i = 0; i < NN_HIDDEN_DIM; i++) {
             float v = d_grad_buffer[SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i];
-            final_norm_sq += v * v;
+            local_norm_sq += v * v;
         }
-        final_norm_sq += d_grad_buffer[SGD_OFF_DB2 + t] * d_grad_buffer[SGD_OFF_DB2 + t];
+        local_norm_sq += d_grad_buffer[SGD_OFF_DB2 + t] * d_grad_buffer[SGD_OFF_DB2 + t];
         for (int out = 0; out < NN_OUTPUT_DIM; out++) {
             float v = d_grad_buffer[SGD_OFF_DW3 + out * NN_HIDDEN_DIM + t];
-            final_norm_sq += v * v;
+            local_norm_sq += v * v;
         }
         if (t < NN_OUTPUT_DIM) {
-            final_norm_sq += d_grad_buffer[SGD_OFF_DB3 + t] * d_grad_buffer[SGD_OFF_DB3 + t];
+            local_norm_sq += d_grad_buffer[SGD_OFF_DB3 + t] * d_grad_buffer[SGD_OFF_DB3 + t];
         }
 
-        s_reduce[t] = final_norm_sq;
+        s_reduce[t] = local_norm_sq;
         __syncthreads();
         for (int s = NN_HIDDEN_DIM / 2; s > 0; s >>= 1) {
             if (t < s) s_reduce[t] += s_reduce[t + s];
             __syncthreads();
         }
+        float g_norm = sqrtf(s_reduce[0]) + 1e-8f;
 
-        float final_norm = sqrtf(s_reduce[0]);
-        float final_clip = (final_norm > GRAD_CLIP_THRESHOLD)
-            ? (GRAD_CLIP_THRESHOLD / final_norm) : 1.0f;
+        // Normalize gradient to unit vector (trust-region: decouple direction from magnitude)
+        float inv_norm = 1.0f / g_norm;
+        for (int i = 0; i < NN_INPUT_DIM; i++)
+            d_grad_buffer[SGD_OFF_DW1 + t * NN_INPUT_DIM + i] *= inv_norm;
+        d_grad_buffer[SGD_OFF_DB1 + t] *= inv_norm;
+        for (int i = 0; i < NN_HIDDEN_DIM; i++)
+            d_grad_buffer[SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i] *= inv_norm;
+        d_grad_buffer[SGD_OFF_DB2 + t] *= inv_norm;
+        for (int out = 0; out < NN_OUTPUT_DIM; out++)
+            d_grad_buffer[SGD_OFF_DW3 + out * NN_HIDDEN_DIM + t] *= inv_norm;
+        if (t < NN_OUTPUT_DIM)
+            d_grad_buffer[SGD_OFF_DB3 + t] *= inv_norm;
+        __syncthreads();
 
-        // Apply clipped weight deltas
+        // Step 5 continued: Trust-region step size = k * avg_error, clamped
+        // Compute avg |error| across active outputs and samples
+        __shared__ float s_avg_err;
+        if (t == 0) {
+            float sum_err = 0.0f;
+            int count = 0;
+            for (int si = 0; si < num_samples; si++) {
+                for (int o = 0; o < NN_OUTPUT_DIM; o++) {
+                    float e = fabsf(s_d3_raw[si][o]);
+                    if (e > 0.0f) { sum_err += e; count++; }
+                }
+            }
+            s_avg_err = (count > 0) ? sum_err / static_cast<float>(count) : 0.0f;
+        }
+        __syncthreads();
+
+        // Step 7: Minimum step to avoid stall
+        float step = fmaxf(MIN_STEP, fminf(MAX_STEP, TRUST_K * s_avg_err));
+
+        // Step 9: Anti-flip damping — dot current gradient with EMA (previous direction)
+        // If they point in opposite directions, damp the step.
+        // Use region 2 (EMA) as the "previous direction" reference.
+        float local_dot_ema = 0.0f;
+        for (int i = 0; i < NN_INPUT_DIM; i++)
+            local_dot_ema += d_grad_buffer[SGD_OFF_DW1 + t * NN_INPUT_DIM + i]
+                           * d_grad_buffer[EMA_REGION + SGD_OFF_DW1 + t * NN_INPUT_DIM + i];
+        local_dot_ema += d_grad_buffer[SGD_OFF_DB1 + t]
+                       * d_grad_buffer[EMA_REGION + SGD_OFF_DB1 + t];
+        for (int i = 0; i < NN_HIDDEN_DIM; i++)
+            local_dot_ema += d_grad_buffer[SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i]
+                           * d_grad_buffer[EMA_REGION + SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i];
+        local_dot_ema += d_grad_buffer[SGD_OFF_DB2 + t]
+                       * d_grad_buffer[EMA_REGION + SGD_OFF_DB2 + t];
+
+        s_reduce[t] = local_dot_ema;
+        __syncthreads();
+        for (int s = NN_HIDDEN_DIM / 2; s > 0; s >>= 1) {
+            if (t < s) s_reduce[t] += s_reduce[t + s];
+            __syncthreads();
+        }
+        float dot_ema = s_reduce[0];
+
+        // Only apply anti-flip after warmup (first few SGD calls have no meaningful EMA)
+        bool warmed_up = (weights->sgd_call_count > 3);
+        if (warmed_up && dot_ema < 0.0f) {
+            step *= ANTI_FLIP_DAMP;  // halve step when reversing direction
+        }
+
+        // Step 6: EMA smoothing — blend current gradient into EMA buffer
+        // g_ema = decay * g_ema + (1-decay) * g_current
+        float ema_new = 1.0f - EMA_DECAY;
         for (int i = 0; i < NN_INPUT_DIM; i++) {
-            weights->w1[t * NN_INPUT_DIM + i] -=
-                final_clip * d_grad_buffer[SGD_OFF_DW1 + t * NN_INPUT_DIM + i];
+            int idx = SGD_OFF_DW1 + t * NN_INPUT_DIM + i;
+            d_grad_buffer[EMA_REGION + idx] = EMA_DECAY * d_grad_buffer[EMA_REGION + idx]
+                                            + ema_new * d_grad_buffer[idx];
         }
-        weights->b1[t] -= final_clip * d_grad_buffer[SGD_OFF_DB1 + t];
+        {
+            int idx = SGD_OFF_DB1 + t;
+            d_grad_buffer[EMA_REGION + idx] = EMA_DECAY * d_grad_buffer[EMA_REGION + idx]
+                                            + ema_new * d_grad_buffer[idx];
+        }
         for (int i = 0; i < NN_HIDDEN_DIM; i++) {
-            weights->w2[t * NN_HIDDEN_DIM + i] -=
-                final_clip * d_grad_buffer[SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i];
+            int idx = SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i;
+            d_grad_buffer[EMA_REGION + idx] = EMA_DECAY * d_grad_buffer[EMA_REGION + idx]
+                                            + ema_new * d_grad_buffer[idx];
         }
-        weights->b2[t] -= final_clip * d_grad_buffer[SGD_OFF_DB2 + t];
+        {
+            int idx = SGD_OFF_DB2 + t;
+            d_grad_buffer[EMA_REGION + idx] = EMA_DECAY * d_grad_buffer[EMA_REGION + idx]
+                                            + ema_new * d_grad_buffer[idx];
+        }
         for (int out = 0; out < NN_OUTPUT_DIM; out++) {
-            weights->w3[out * NN_HIDDEN_DIM + t] -=
-                final_clip * d_grad_buffer[SGD_OFF_DW3 + out * NN_HIDDEN_DIM + t];
+            int idx = SGD_OFF_DW3 + out * NN_HIDDEN_DIM + t;
+            d_grad_buffer[EMA_REGION + idx] = EMA_DECAY * d_grad_buffer[EMA_REGION + idx]
+                                            + ema_new * d_grad_buffer[idx];
         }
         if (t < NN_OUTPUT_DIM) {
-            weights->b3[t] -= final_clip * d_grad_buffer[SGD_OFF_DB3 + t];
+            int idx = SGD_OFF_DB3 + t;
+            d_grad_buffer[EMA_REGION + idx] = EMA_DECAY * d_grad_buffer[EMA_REGION + idx]
+                                            + ema_new * d_grad_buffer[idx];
+        }
+        __syncthreads();
+
+        // Apply EMA-smoothed gradient with trust-region step size
+        for (int i = 0; i < NN_INPUT_DIM; i++) {
+            weights->w1[t * NN_INPUT_DIM + i] -=
+                step * d_grad_buffer[EMA_REGION + SGD_OFF_DW1 + t * NN_INPUT_DIM + i];
+        }
+        weights->b1[t] -= step * d_grad_buffer[EMA_REGION + SGD_OFF_DB1 + t];
+        for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+            weights->w2[t * NN_HIDDEN_DIM + i] -=
+                step * d_grad_buffer[EMA_REGION + SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i];
+        }
+        weights->b2[t] -= step * d_grad_buffer[EMA_REGION + SGD_OFF_DB2 + t];
+        for (int out = 0; out < NN_OUTPUT_DIM; out++) {
+            weights->w3[out * NN_HIDDEN_DIM + t] -=
+                step * d_grad_buffer[EMA_REGION + SGD_OFF_DW3 + out * NN_HIDDEN_DIM + t];
+        }
+        if (t < NN_OUTPUT_DIM) {
+            weights->b3[t] -= step * d_grad_buffer[EMA_REGION + SGD_OFF_DB3 + t];
         }
 
-        total_norm = final_norm;
+        // Update call counter for warmup
+        if (t == 0) weights->sgd_call_count++;
+
+        total_norm = g_norm;
     }
 
     // Thread 0 writes output
@@ -1119,6 +1234,10 @@ static bool allocSGDBuffers() {
             fprintf(stderr, "NN: cudaMalloc failed for SGD gradient buffer\n");
             d_sgd_grad_buffer = nullptr;
             return false;
+        }
+        // Zero the entire buffer (includes EMA region 2)
+        if (cudaMemset(d_sgd_grad_buffer, 0, SGD_GRAD_SIZE * sizeof(float)) != cudaSuccess) {
+            fprintf(stderr, "NN: cudaMemset failed for SGD gradient buffer\n");
         }
     }
     if (d_sgd_output == nullptr) {
@@ -1268,6 +1387,10 @@ bool loadNNFromBinary(const char* filepath) {
     // gradient contribution to shared layers.
     for (int o = 0; o < NN_OUTPUT_DIM; o++)
         h_weights.log_var[o] = 0.0f;
+
+    // Initialize anti-flip damping and call counter
+    h_weights.prev_grad_dot = 0.0f;
+    h_weights.sgd_call_count = 0;
 
     // Allocate new GPU buffer and copy weights into it
     NNWeightsGPU* d_new = nullptr;
