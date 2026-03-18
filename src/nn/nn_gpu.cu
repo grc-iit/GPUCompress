@@ -548,6 +548,10 @@ __global__ void nnSGDKernel(
     __shared__ float s_dz2[NN_HIDDEN_DIM];
     __shared__ float s_reduce[NN_HIDDEN_DIM];
     __shared__ float s_d3_all[NN_MAX_SGD_SAMPLES][NN_OUTPUT_DIM];
+    __shared__ float s_d3_raw[NN_MAX_SGD_SAMPLES][NN_OUTPUT_DIM];  // unclamped errors for UW
+    __shared__ float s_uw[NN_OUTPUT_DIM];  // uncertainty weight: exp(-0.5 * log_var[o])
+    __shared__ float s_dz2_all[NN_OUTPUT_DIM][NN_HIDDEN_DIM];  // per-output L2 grad for PCGrad
+    __shared__ float s_pcgrad_dot[NN_OUTPUT_DIM];  // reduction workspace for dot products
 
     // Read stats once
     float stat_entropy = static_cast<float>(d_stats->entropy);
@@ -692,14 +696,18 @@ __global__ void nnSGDKernel(
             // We use a tight delta of 0.5 (half a standard deviation) so
             // each SGD step makes small corrections rather than large jumps.
             // This matches PPO/DQN practice of constraining update magnitude.
+            // Cache RAW (unclamped) errors for uncertainty weighting (Phase 1.5).
+            // UW needs the true error magnitude to distinguish noisy from clean outputs.
+            for (int o = 0; o < NN_OUTPUT_DIM; o++) {
+                s_d3_raw[si][o] = s_d3[o];
+            }
+
             constexpr float SGD_ERROR_DELTA = 0.5f;
             for (int o = 0; o < NN_OUTPUT_DIM; o++) {
                 s_d3[o] = fmaxf(-SGD_ERROR_DELTA, fminf(s_d3[o], SGD_ERROR_DELTA));
             }
 
-            // Cache per-output errors for Phase 2 per-output backward passes.
-            // Max-abs normalization removed: per-output backprop prevents
-            // cross-output interference at W2/W1 layers.
+            // Cache clamped errors for Phase 2 backward pass.
             for (int o = 0; o < NN_OUTPUT_DIM; o++) {
                 s_d3_all[si][o] = s_d3[o];
             }
@@ -708,10 +716,67 @@ __global__ void nnSGDKernel(
     }
 
     // ================================================================
+    // Phase 1.5: Uncertainty weighting (Kendall et al., 2018).
+    //
+    // Each output has a learned log_var[o] = log(σ²_o).  The precision
+    // weight is w_o = exp(-0.5 * log_var[o]) = 1/σ_o.
+    //
+    // Scaling error signals by w_o before backprop means:
+    //   - Noisy outputs (large σ) contribute less to shared W1/W2 gradients
+    //   - Clean outputs (small σ) contribute more
+    //
+    // The log_var update rule is derived from the Gaussian negative
+    // log-likelihood: L_o = 0.5 * exp(-log_var[o]) * error² + 0.5 * log_var[o]
+    //   ∂L/∂log_var = 0.5 * (1 - exp(-log_var[o]) * error²)
+    //
+    // This balances: pushing log_var up (reducing gradient influence) vs
+    // the regularizer pulling it down (preventing total silencing).
+    // ================================================================
+    constexpr float UW_LR        = 0.01f;   // slow LR for log_var (stability)
+    constexpr float UW_LOG_VAR_MIN = -2.0f;  // exp(-2) ≈ 0.14: floor prevents over-weighting
+    constexpr float UW_LOG_VAR_MAX =  4.0f;  // exp(4) ≈ 55: ceiling prevents total silencing
+
+    if (t == 0) {
+        for (int o = 0; o < NN_OUTPUT_DIM; o++) {
+            float lv = weights->log_var[o];
+            float precision = expf(-lv);  // exp(-log_var) = 1/σ²
+
+            // Use RAW (unclamped) errors for log_var gradient.
+            // Clamped errors are all ≤0.5², so UW can't distinguish outputs.
+            // Raw errors preserve the true magnitude: a 2.0 raw error vs 0.05
+            // raw error will drive very different log_var updates.
+            float raw_mse = 0.0f;
+            for (int si = 0; si < num_samples; si++) {
+                float e = s_d3_raw[si][o];
+                raw_mse += e * e;
+            }
+            raw_mse /= static_cast<float>(num_samples);
+
+            // Gradient of NLL w.r.t. log_var: 0.5 * (1 - precision * raw_mse)
+            // When raw_mse >> σ²: grad is negative → lv increases → downweight
+            // When raw_mse << σ²: grad is positive → lv decreases → upweight
+            float grad_lv = 0.5f * (1.0f - precision * raw_mse);
+            lv -= UW_LR * grad_lv;  // gradient descent on log_var
+            lv = fmaxf(UW_LOG_VAR_MIN, fminf(lv, UW_LOG_VAR_MAX));
+            weights->log_var[o] = lv;
+
+            // Precision weight for scaling CLAMPED error signals: 1/σ = exp(-0.5 * log_var)
+            s_uw[o] = expf(-0.5f * lv);
+
+            // Scale clamped errors by the uncertainty weight for backprop
+            for (int si = 0; si < num_samples; si++)
+                s_d3_all[si][o] *= s_uw[o];
+        }
+    }
+    __syncthreads();
+
+    // ================================================================
     // Phase 2: Per-output backward passes through W2/W1
     //
     // Each output's error is backpropagated independently through the
     // shared hidden layers, with per-output gradient clipping.
+    // Error signals are already scaled by uncertainty weights (Phase 1.5),
+    // so noisy outputs naturally contribute less to W1/W2 updates.
     //
     // Region 0 (d_grad_buffer[0..SGD_REGION-1]) = accumulator for
     //   clipped weight deltas across all 4 outputs.
@@ -792,28 +857,98 @@ __global__ void nnSGDKernel(
             }
             __syncthreads();
 
-            // Backward L3→L2: SINGLE output only
-            float error_signal = s_d3_all[si][target_out];
+            // ────────────────────────────────────────────────────────
+            // PCGrad-Lite: compute L3→L2 backward for ALL outputs,
+            // project conflicting gradients, then continue backward.
+            // ────────────────────────────────────────────────────────
+
+            // Step 1: Compute s_dz2 for ALL outputs and normalize.
+            //
+            // Normalization makes projection scale-invariant: a large-magnitude
+            // output can't dominate the projection just because its gradient is
+            // bigger.  After projection, we rescale back to the original magnitude.
             {
-                float dh2_t = weights->w3[target_out * NN_HIDDEN_DIM + t] * error_signal;
-                s_dz2[t] = (s_z2[t] > 0.0f) ? dh2_t : 0.0f;
+                for (int o = 0; o < NN_OUTPUT_DIM; o++) {
+                    float es = s_d3_all[si][o];
+                    float dh2_t = weights->w3[o * NN_HIDDEN_DIM + t] * es;
+                    s_dz2_all[o][t] = (s_z2[t] > 0.0f) ? dh2_t : 0.0f;
+                }
             }
             __syncthreads();
 
-            // Accumulate W3 gradient for this output into workspace
-            d_grad_buffer[WS + SGD_OFF_DW3 + target_out * NN_HIDDEN_DIM + t] +=
-                error_signal * s_h2[t];
-            if (t == 0) {
-                d_grad_buffer[WS + SGD_OFF_DB3 + target_out] += error_signal;
+            // Normalize per-output gradients to unit vectors for PCGrad.
+            // After projection, rescale by |error| (not gradient norm) so the
+            // update magnitude reflects how wrong each output is, not how
+            // large W3 happens to make the gradient.
+            for (int o = 0; o < NN_OUTPUT_DIM; o++) {
+                float local_nsq = s_dz2_all[o][t] * s_dz2_all[o][t];
+                s_reduce[t] = local_nsq;
+                __syncthreads();
+                for (int s = NN_HIDDEN_DIM / 2; s > 0; s >>= 1) {
+                    if (t < s) s_reduce[t] += s_reduce[t + s];
+                    __syncthreads();
+                }
+                float norm_o = sqrtf(s_reduce[0]) + 1e-8f;
+                if (t < NN_OUTPUT_DIM && t == o)
+                    s_pcgrad_dot[o] = fabsf(s_d3_all[si][o]);  // error magnitude for rescaling
+                s_dz2_all[o][t] /= norm_o;    // normalize to unit vector
+                __syncthreads();
             }
 
-            // Accumulate L2 gradients into workspace
+            // Step 2: PCGrad projection with SOFT conflict threshold.
+            //
+            // Only project when cosine similarity < -ε (true conflict).
+            // With normalized vectors, dot(g_i, g_j) IS the cosine similarity.
+            // ε = 0.1 means we ignore conflicts within ±0.1 cosine — avoids
+            // reacting to noise in single-sample SGD.
+            constexpr float PCGRAD_COS_THRESH = -0.1f;  // only project if cos < -0.1
+            {
+                float my_dz2 = s_dz2_all[target_out][t];
+
+                for (int j = 0; j < NN_OUTPUT_DIM; j++) {
+                    if (j == target_out) continue;
+
+                    // Cosine similarity (vectors are unit-normalized)
+                    float local_dot = my_dz2 * s_dz2_all[j][t];
+                    s_reduce[t] = local_dot;
+                    __syncthreads();
+                    for (int s = NN_HIDDEN_DIM / 2; s > 0; s >>= 1) {
+                        if (t < s) s_reduce[t] += s_reduce[t + s];
+                        __syncthreads();
+                    }
+                    float cos_ij = s_reduce[0];
+
+                    // Soft threshold: only project for strong conflicts
+                    if (cos_ij < PCGRAD_COS_THRESH) {
+                        // Vectors are unit-normalized → ||g_j||² = 1.0
+                        // So projection simplifies to: g_i -= dot * g_j
+                        my_dz2 -= cos_ij * s_dz2_all[j][t];
+                    }
+                    __syncthreads();
+                }
+
+                // Rescale projected gradient back to original magnitude
+                s_dz2[t] = my_dz2 * s_pcgrad_dot[target_out];
+            }
+            __syncthreads();
+
+            // Step 3: Accumulate W3 gradient (uses ORIGINAL error_signal, not projected)
+            {
+                float error_signal = s_d3_all[si][target_out];
+                d_grad_buffer[WS + SGD_OFF_DW3 + target_out * NN_HIDDEN_DIM + t] +=
+                    error_signal * s_h2[t];
+                if (t == 0) {
+                    d_grad_buffer[WS + SGD_OFF_DB3 + target_out] += error_signal;
+                }
+            }
+
+            // Step 4: Accumulate L2 gradients using PROJECTED s_dz2
             for (int i = 0; i < NN_HIDDEN_DIM; i++) {
                 d_grad_buffer[WS + SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i] += s_dz2[t] * s_h1[i];
             }
             d_grad_buffer[WS + SGD_OFF_DB2 + t] += s_dz2[t];
 
-            // Backward L2→L1
+            // Step 5: Backward L2→L1 using PROJECTED s_dz2
             float dz1_t;
             {
                 float dh1_t = 0.0f;
@@ -822,7 +957,7 @@ __global__ void nnSGDKernel(
                 dz1_t = (s_z1[t] > 0.0f) ? dh1_t : 0.0f;
             }
 
-            // Accumulate L1 gradients into workspace
+            // Step 6: Accumulate L1 gradients
             for (int i = 0; i < NN_INPUT_DIM; i++) {
                 d_grad_buffer[WS + SGD_OFF_DW1 + t * NN_INPUT_DIM + i] += dz1_t * s_x[i];
             }
@@ -1127,6 +1262,12 @@ bool loadNNFromBinary(const char* filepath) {
         }
         g_has_bounds = false;
     }
+
+    // Initialize per-output log-variance to 0.0 (σ²=1, neutral weighting).
+    // SGD will learn to increase log_var for noisy outputs, reducing their
+    // gradient contribution to shared layers.
+    for (int o = 0; o < NN_OUTPUT_DIM; o++)
+        h_weights.log_var[o] = 0.0f;
 
     // Allocate new GPU buffer and copy weights into it
     NNWeightsGPU* d_new = nullptr;

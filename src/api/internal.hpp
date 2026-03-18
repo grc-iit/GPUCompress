@@ -21,8 +21,9 @@
  * CompContext pool — per-compression-slot GPU state
  * ============================================================ */
 
-/** Number of concurrent compression slots. */
-static constexpr int N_COMP_CTX = 8;
+/** Number of concurrent compression slots.
+ *  9 = 8 worker slots + 1 dedicated inference slot (used by VOL Stage 1). */
+static constexpr int N_COMP_CTX = 9;
 
 /**
  * Per-slot GPU state for concurrent compression.
@@ -397,5 +398,68 @@ int runAutoStatsNNPipeline(
 );
 
 } // namespace gpucompress
+
+/* ============================================================
+ * Split-phase API for sequential-inference pipeline (VOL)
+ * ============================================================ */
+
+/**
+ * Phase A: stats + NN inference only.
+ * Runs on the provided CompContext's stream.  Returns the NN action and
+ * predictions so they can be forwarded to gpucompress_compress_with_action_gpu().
+ *
+ * @param d_input           GPU-resident input data
+ * @param input_size        Size in bytes
+ * @param cfg               Compression config (only error_bound used)
+ * @param stats             Optional stats struct (entropy/mad/deriv filled)
+ * @param ctx               CompContext to run stats+inference on
+ * @param out_action        [out] NN action (0-31), or -1 on error
+ * @param out_predicted_ratio       [out] predicted ratio
+ * @param out_predicted_comp_time   [out] predicted compression time
+ * @param out_predicted_decomp_time [out] predicted decompression time
+ * @param out_predicted_psnr        [out] predicted PSNR
+ * @return GPUCOMPRESS_SUCCESS or error code
+ */
+gpucompress_error_t gpucompress_infer_gpu(
+    const void* d_input, size_t input_size,
+    const gpucompress_config_t* cfg,
+    gpucompress_stats_t* stats,
+    CompContext* ctx,
+    int* out_action,
+    float* out_predicted_ratio,
+    float* out_predicted_comp_time,
+    float* out_predicted_decomp_time,
+    float* out_predicted_psnr);
+
+/**
+ * Phase B: preprocess + compress + exploration + SGD.
+ * Uses the pre-computed action from gpucompress_infer_gpu() instead of
+ * running its own stats+inference.  Acquires its own CompContext from the pool.
+ *
+ * @param d_input           GPU-resident input data
+ * @param input_size        Size in bytes
+ * @param d_output          GPU output buffer
+ * @param output_size       [in] max size, [out] actual compressed size
+ * @param config            Compression config
+ * @param stats             Optional stats struct
+ * @param stream_arg        Optional caller CUDA stream
+ * @param action            Pre-computed NN action from Phase A
+ * @param predicted_ratio   Predicted ratio from Phase A
+ * @param predicted_comp_time   Predicted compression time from Phase A
+ * @param predicted_decomp_time Predicted decompression time from Phase A
+ * @param predicted_psnr    Predicted PSNR from Phase A
+ * @return GPUCOMPRESS_SUCCESS or error code
+ */
+gpucompress_error_t gpucompress_compress_with_action_gpu(
+    const void* d_input, size_t input_size,
+    void* d_output, size_t* output_size,
+    const gpucompress_config_t* config,
+    gpucompress_stats_t* stats,
+    void* stream_arg,
+    int action,
+    float predicted_ratio,
+    float predicted_comp_time,
+    float predicted_decomp_time,
+    float predicted_psnr);
 
 #endif /* INTERNAL_HPP */

@@ -2786,6 +2786,461 @@ skip_nn:
     return GPUCOMPRESS_SUCCESS;
 }
 
+/* ============================================================
+ * Split-phase API: Phase A — stats + inference only
+ * ============================================================ */
+gpucompress_error_t gpucompress_infer_gpu(
+    const void* d_input, size_t input_size,
+    const gpucompress_config_t* config,
+    gpucompress_stats_t* stats,
+    CompContext* ctx,
+    int* out_action,
+    float* out_predicted_ratio,
+    float* out_predicted_comp_time,
+    float* out_predicted_decomp_time,
+    float* out_predicted_psnr)
+{
+    if (!g_initialized.load()) return GPUCOMPRESS_ERROR_NOT_INITIALIZED;
+    if (!d_input || !out_action) return GPUCOMPRESS_ERROR_INVALID_INPUT;
+    if (input_size == 0) return GPUCOMPRESS_ERROR_INVALID_INPUT;
+
+    gpucompress_config_t cfg = config ? *config : gpucompress_default_config();
+    cudaStream_t stream = ctx->stream;
+
+    *out_action = -1;
+    if (out_predicted_ratio)       *out_predicted_ratio = 0.0f;
+    if (out_predicted_comp_time)   *out_predicted_comp_time = 0.0f;
+    if (out_predicted_decomp_time) *out_predicted_decomp_time = 0.0f;
+    if (out_predicted_psnr)        *out_predicted_psnr = 0.0f;
+
+    size_t num_elements = input_size / sizeof(float);
+    if (num_elements == 0 || !gpucompress_nn_is_loaded_impl())
+        return GPUCOMPRESS_ERROR_NN_NOT_LOADED;
+
+    /* Stats timing */
+    cudaEventRecord(ctx->stats_start, stream);
+
+    AutoStatsGPU* d_stats_ptr = gpucompress::runStatsKernelsNoSync(d_input, input_size, stream, ctx);
+
+    double entropy = 0.0, mad = 0.0, second_derivative = 0.0;
+    if (d_stats_ptr && stats != nullptr) {
+        XFER_TRACK("infer_gpu: D->H stats entropy", sizeof(double), cudaMemcpyDeviceToHost);
+        cudaMemcpyAsync(&entropy, &d_stats_ptr->entropy, sizeof(double),
+                        cudaMemcpyDeviceToHost, stream);
+        XFER_TRACK("infer_gpu: D->H stats mad", sizeof(double), cudaMemcpyDeviceToHost);
+        cudaMemcpyAsync(&mad, &d_stats_ptr->mad_normalized, sizeof(double),
+                        cudaMemcpyDeviceToHost, stream);
+        XFER_TRACK("infer_gpu: D->H stats deriv", sizeof(double), cudaMemcpyDeviceToHost);
+        cudaMemcpyAsync(&second_derivative, &d_stats_ptr->deriv_normalized, sizeof(double),
+                        cudaMemcpyDeviceToHost, stream);
+    }
+    cudaEventRecord(ctx->stats_stop, stream);
+
+    if (!d_stats_ptr)
+        return GPUCOMPRESS_ERROR_NN_NOT_LOADED;
+
+    float pred_ratio = 0.0f, pred_ct = 0.0f, pred_dt = 0.0f, pred_psnr = 0.0f;
+    int fused_ood = 0;
+
+    cudaEventRecord(ctx->nn_start, stream);
+    int action = gpucompress::runNNFusedInferenceCtx(
+        d_stats_ptr, input_size, cfg.error_bound, stream, ctx,
+        &action, &pred_ratio, &pred_ct, &pred_dt, &pred_psnr,
+        g_online_learning_enabled ? &fused_ood : nullptr,
+        nullptr,  /* no top_actions needed for inference-only phase */
+        ctx->nn_stop);
+
+    /* runNNFusedInferenceCtx does internal cudaStreamSynchronize */
+
+    if (action < 0)
+        return GPUCOMPRESS_ERROR_NN_NOT_LOADED;
+
+    *out_action = action;
+    if (out_predicted_ratio)       *out_predicted_ratio = pred_ratio;
+    if (out_predicted_comp_time)   *out_predicted_comp_time = pred_ct;
+    if (out_predicted_decomp_time) *out_predicted_decomp_time = pred_dt;
+    if (out_predicted_psnr)        *out_predicted_psnr = pred_psnr;
+
+    if (stats != nullptr) {
+        stats->entropy_bits = entropy;
+        stats->mad = mad;
+        stats->second_derivative = second_derivative;
+        stats->predicted_ratio = static_cast<double>(pred_ratio);
+        stats->predicted_comp_time_ms = static_cast<double>(pred_ct);
+        stats->predicted_decomp_time_ms = static_cast<double>(pred_dt);
+        stats->predicted_psnr_db = static_cast<double>(pred_psnr);
+    }
+
+    return GPUCOMPRESS_SUCCESS;
+}
+
+/* ============================================================
+ * Split-phase API: Phase B — preprocess + compress + SGD
+ * Uses pre-computed action from gpucompress_infer_gpu().
+ * ============================================================ */
+gpucompress_error_t gpucompress_compress_with_action_gpu(
+    const void* d_input, size_t input_size,
+    void* d_output, size_t* output_size,
+    const gpucompress_config_t* config,
+    gpucompress_stats_t* stats,
+    void* stream_arg,
+    int action,
+    float predicted_ratio,
+    float predicted_comp_time,
+    float predicted_decomp_time,
+    float predicted_psnr)
+{
+    if (!g_initialized.load()) return GPUCOMPRESS_ERROR_NOT_INITIALIZED;
+    if (!d_input || !d_output || !output_size) return GPUCOMPRESS_ERROR_INVALID_INPUT;
+    if (input_size == 0) return GPUCOMPRESS_ERROR_INVALID_INPUT;
+
+    gpucompress_config_t cfg = config ? *config : gpucompress_default_config();
+
+    /* Acquire a per-slot context (blocks until one is free) */
+    ContextGuard guard{gpucompress::acquireCompContext()};
+    if (!guard.ctx) return GPUCOMPRESS_ERROR_CUDA_FAILED;
+    CompContext* ctx = guard.ctx;
+    cudaStream_t stream = ctx->stream;
+    cudaStream_t caller_stream = stream_arg ? static_cast<cudaStream_t>(stream_arg) : nullptr;
+    if (caller_stream) {
+        cudaEventRecord(ctx->t_start, caller_stream);
+        cudaStreamWaitEvent(stream, ctx->t_start, 0);
+    }
+
+    /* NN action → algo + preprocessing */
+    int nn_action = action;
+    int nn_original_action = action;
+    bool nn_was_used = true;
+    bool sgd_fired = false, exploration_triggered = false;
+    int top_actions[32] = {0};
+    bool is_ood = false;
+    AutoStatsGPU* d_stats_ptr = nullptr;
+
+    /* Per-chunk timing breakdown */
+    bool timing_ok = (ctx->t_start != nullptr && ctx->t_stop != nullptr);
+    float diag_nn_inference_ms  = 0.0f;
+    float diag_stats_ms         = 0.0f;
+    float diag_preprocessing_ms = 0.0f;
+    float diag_compression_ms   = 0.0f;
+    float diag_exploration_ms   = 0.0f;
+    float diag_sgd_ms           = 0.0f;
+
+    gpucompress_algorithm_t algo_to_use;
+    unsigned int preproc_to_use = 0;
+
+    /* Decode action to algorithm + preprocessing */
+    gpucompress::DecodedAction decoded = gpucompress::decodeAction(action);
+    algo_to_use = static_cast<gpucompress_algorithm_t>(decoded.algorithm + 1);
+    if (decoded.shuffle_size > 0)
+        preproc_to_use |= GPUCOMPRESS_PREPROC_SHUFFLE_4;
+    if (decoded.use_quantization)
+        preproc_to_use |= GPUCOMPRESS_PREPROC_QUANTIZE;
+
+    g_last_nn_action.store(action);
+
+    /* ---- Preprocessing (same as gpucompress_compress_gpu) ---- */
+    const uint8_t* d_compress_input = static_cast<const uint8_t*>(d_input);
+    size_t compress_input_size = input_size;
+    uint8_t* d_quantized = nullptr;
+    uint8_t* d_shuffled  = nullptr;
+    QuantizationResult quant_result;
+
+    auto t_preproc_start = std::chrono::steady_clock::now();
+
+    if ((preproc_to_use & GPUCOMPRESS_PREPROC_QUANTIZE) && cfg.error_bound > 0.0) {
+        size_t num_elements = input_size / sizeof(float);
+        if (num_elements > 0) {
+            QuantizationConfig quant_cfg(
+                QuantizationType::LINEAR, cfg.error_bound,
+                num_elements, sizeof(float));
+            quant_result = quantize_simple(
+                const_cast<uint8_t*>(d_compress_input), num_elements, sizeof(float), quant_cfg,
+                ctx->d_range_min, ctx->d_range_max, stream);
+            if (quant_result.isValid()) {
+                d_quantized = static_cast<uint8_t*>(quant_result.d_quantized);
+                d_compress_input = d_quantized;
+                compress_input_size = quant_result.quantized_bytes;
+            } else {
+                return GPUCOMPRESS_ERROR_COMPRESSION;
+            }
+        }
+    }
+
+    unsigned int shuffle_size = GPUCOMPRESS_GET_SHUFFLE_SIZE(preproc_to_use);
+    if (shuffle_size > 0) {
+        d_shuffled = byte_shuffle_simple(
+            const_cast<uint8_t*>(d_compress_input), compress_input_size,
+            shuffle_size, gpucompress::SHUFFLE_CHUNK_SIZE, stream);
+        if (d_shuffled) {
+            d_compress_input = d_shuffled;
+        } else {
+            if (d_quantized) cudaFree(d_quantized);
+            return GPUCOMPRESS_ERROR_COMPRESSION;
+        }
+    }
+
+    cudaError_t cuda_err = cudaSuccess;
+
+    if (d_quantized || d_shuffled) {
+        diag_preprocessing_ms = std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - t_preproc_start).count();
+    }
+
+    /* ---- Compression ---- */
+    CompressionAlgorithm internal_algo = gpucompress::toInternalAlgorithm(algo_to_use);
+    auto* compressor = gpucompress::getOrCreateCompManager(ctx, internal_algo);
+    if (!compressor) {
+        if (d_quantized) cudaFree(d_quantized);
+        if (d_shuffled)  cudaFree(d_shuffled);
+        return GPUCOMPRESS_ERROR_COMPRESSION;
+    }
+
+    CompressionConfig comp_config = compressor->configure_compression(compress_input_size);
+    size_t max_compressed_size = comp_config.max_compressed_buffer_size;
+
+    if (max_compressed_size == 0) {
+        if (d_quantized) cudaFree(d_quantized);
+        if (d_shuffled)  cudaFree(d_shuffled);
+        return GPUCOMPRESS_ERROR_COMPRESSION;
+    }
+
+    size_t header_size = GPUCOMPRESS_HEADER_SIZE;
+    size_t total_max_needed = header_size + max_compressed_size;
+    if (total_max_needed < header_size) {
+        if (d_quantized) cudaFree(d_quantized);
+        if (d_shuffled)  cudaFree(d_shuffled);
+        return GPUCOMPRESS_ERROR_INVALID_INPUT;
+    }
+
+    uint8_t* d_out      = static_cast<uint8_t*>(d_output);
+    uint8_t* d_temp_out = nullptr;
+    uint8_t* d_comp_target;
+
+    if (total_max_needed > *output_size) {
+        if (cudaMalloc(&d_temp_out, total_max_needed) != cudaSuccess) {
+            if (d_quantized) cudaFree(d_quantized);
+            if (d_shuffled)  cudaFree(d_shuffled);
+            return GPUCOMPRESS_ERROR_OUT_OF_MEMORY;
+        }
+        d_comp_target = d_temp_out + header_size;
+    } else {
+        d_comp_target = d_out + header_size;
+    }
+
+    float primary_comp_time_ms = 0.0f;
+    bool need_timing = timing_ok && (stats != nullptr || g_online_learning_enabled);
+    if (need_timing) cudaEventRecord(ctx->t_start, stream);
+
+    try {
+        compressor->compress(d_compress_input, d_comp_target, comp_config);
+    } catch (const std::exception& e) {
+        if (d_temp_out)  cudaFree(d_temp_out);
+        if (d_quantized) cudaFree(d_quantized);
+        if (d_shuffled)  cudaFree(d_shuffled);
+        return GPUCOMPRESS_ERROR_COMPRESSION;
+    } catch (...) {
+        if (d_temp_out)  cudaFree(d_temp_out);
+        if (d_quantized) cudaFree(d_quantized);
+        if (d_shuffled)  cudaFree(d_shuffled);
+        return GPUCOMPRESS_ERROR_COMPRESSION;
+    }
+
+    if (need_timing) {
+        cudaEventRecord(ctx->t_stop, stream);
+        cudaEventSynchronize(ctx->t_stop);
+        cudaEventElapsedTime(&primary_comp_time_ms, ctx->t_start, ctx->t_stop);
+    }
+    diag_compression_ms = primary_comp_time_ms;
+
+    size_t compressed_size = compressor->get_compressed_output_size(d_comp_target);
+    size_t total_size      = header_size + compressed_size;
+
+    float primary_decomp_time_ms = 0.0f;
+
+    /* Build header */
+    CompressionHeader header;
+    header.magic               = COMPRESSION_MAGIC;
+    header.version             = COMPRESSION_HEADER_VERSION;
+    header.shuffle_element_size = shuffle_size;
+    header.original_size       = input_size;
+    header.compressed_size     = compressed_size;
+    if (d_quantized && quant_result.isValid()) {
+        header.setQuantizationFlags(
+            static_cast<uint32_t>(quant_result.type),
+            quant_result.actual_precision, true);
+        header.quant_error_bound = quant_result.error_bound;
+        header.quant_scale       = quant_result.scale_factor;
+        header.data_min          = quant_result.data_min;
+        header.data_max          = quant_result.data_max;
+    } else {
+        header.quant_flags       = 0;
+        header.quant_error_bound = 0.0;
+        header.quant_scale       = 0.0;
+        header.data_min          = 0.0;
+        header.data_max          = 0.0;
+    }
+    header.setAlgorithmId((uint8_t)algo_to_use);
+
+    if (d_temp_out) {
+        XFER_TRACK("compress_with_action: H->D header to temp", sizeof(CompressionHeader), cudaMemcpyHostToDevice);
+        cuda_err = cudaMemcpyAsync(d_temp_out, &header, sizeof(CompressionHeader),
+                                   cudaMemcpyHostToDevice, stream);
+        if (cuda_err == cudaSuccess) {
+            XFER_TRACK("compress_with_action: D->D temp->output", total_size, cudaMemcpyDeviceToDevice);
+            cuda_err = cudaMemcpyAsync(d_out, d_temp_out, total_size,
+                                       cudaMemcpyDeviceToDevice, stream);
+        }
+        if (cuda_err == cudaSuccess)
+            cuda_err = cudaStreamSynchronize(stream);
+        cudaFree(d_temp_out);
+    } else {
+        XFER_TRACK("compress_with_action: H->D header", sizeof(CompressionHeader), cudaMemcpyHostToDevice);
+        cuda_err = cudaMemcpyAsync(d_out, &header, sizeof(CompressionHeader),
+                                   cudaMemcpyHostToDevice, stream);
+    }
+
+    if (d_quantized) cudaFree(d_quantized);
+    if (d_shuffled)  cudaFree(d_shuffled);
+
+    if (cuda_err != cudaSuccess) return GPUCOMPRESS_ERROR_CUDA_FAILED;
+
+    *output_size = total_size;
+
+    /* ---- Exploration + SGD (same as gpucompress_compress_gpu) ---- */
+    /* We need stats for SGD — run stats on this ctx for the SGD/exploration phase */
+    auto t_explore_start = std::chrono::steady_clock::now();
+
+    if (cfg.algorithm == GPUCOMPRESS_ALGO_AUTO && g_online_learning_enabled) {
+        /* Compute stats on this worker's ctx for SGD */
+        d_stats_ptr = gpucompress::runStatsKernelsNoSync(d_input, input_size, stream, ctx);
+        if (d_stats_ptr) {
+            cudaStreamSynchronize(stream);  /* ensure stats are ready */
+        }
+
+        double actual_ratio = static_cast<double>(input_size) /
+                              static_cast<double>(compressed_size);
+
+        double ds = static_cast<double>(input_size);
+        double bw = static_cast<double>(g_measured_bw_bytes_per_ms);
+        double w0 = static_cast<double>(g_rank_w0);
+        double w1 = static_cast<double>(g_rank_w1);
+        double w2 = static_cast<double>(g_rank_w2);
+        double pred_dt = static_cast<double>(predicted_decomp_time);
+        double pred_ct = static_cast<double>(predicted_comp_time);
+        double pred_r  = static_cast<double>(predicted_ratio);
+        double act_ct  = static_cast<double>(primary_comp_time_ms);
+        double act_dt  = (primary_decomp_time_ms > 0.0f)
+                       ? static_cast<double>(primary_decomp_time_ms) : pred_dt;
+
+        double actual_cost = w0 * act_ct + w1 * act_dt
+                           + ((actual_ratio > 0.0) ? w2 * ds / (actual_ratio * bw) : 0.0);
+        double predicted_cost = w0 * pred_ct + w1 * pred_dt
+                              + ((pred_r > 0.0) ? w2 * ds / (pred_r * bw) : 0.0);
+        double error_pct = (actual_cost > 0.0)
+            ? std::abs(actual_cost - predicted_cost) / actual_cost : 0.0;
+
+        /* ── SGD: learn from primary result ── */
+        auto t_sgd_start = std::chrono::steady_clock::now();
+        if (error_pct > static_cast<double>(g_reinforce_mape_threshold) && d_stats_ptr) {
+            SGDSample primary_sgd[1];
+            primary_sgd[0].action            = nn_action;
+            primary_sgd[0].actual_ratio      = static_cast<float>(actual_ratio);
+            primary_sgd[0].actual_comp_time  = static_cast<float>(primary_comp_time_ms);
+            primary_sgd[0].actual_decomp_time= static_cast<float>(primary_decomp_time_ms);
+            primary_sgd[0].actual_psnr       = 120.0f;
+            if (d_quantized && quant_result.isValid()) {
+                double range = quant_result.data_max - quant_result.data_min;
+                if (range > 0.0 && quant_result.error_bound > 0.0)
+                    primary_sgd[0].actual_psnr = static_cast<float>(
+                        fmin(20.0 * log10(range / quant_result.error_bound), 120.0));
+            }
+            {
+                std::lock_guard<std::mutex> sgd_lk(g_sgd_mutex);
+                float gn = 0; int gc = 0, gs = 0;
+                if (gpucompress::runNNSGDCtx(d_stats_ptr, primary_sgd, 1,
+                        input_size, cfg.error_bound, g_reinforce_lr, ctx,
+                        &gn, &gc, &gs) == 0) {
+                    sgd_fired = true;
+                }
+            }
+        }
+        if (sgd_fired) {
+            diag_sgd_ms = std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - t_sgd_start).count();
+        }
+    }
+
+    /* Synchronize ctx->stream before releasing context */
+    cudaStreamSynchronize(stream);
+
+    /* Fill stats */
+    if (stats != nullptr) {
+        stats->original_size = input_size;
+        stats->compressed_size = total_size;
+        stats->compression_ratio = static_cast<double>(input_size) /
+            static_cast<double>(total_size > 0 ? total_size : 1);
+        stats->algorithm_used = algo_to_use;
+        stats->preprocessing_used = preproc_to_use;
+        stats->throughput_mbps = (primary_comp_time_ms > 0.0f) ?
+            (input_size / (1024.0 * 1024.0)) / (primary_comp_time_ms / 1000.0) : 0.0;
+        stats->predicted_ratio = static_cast<double>(predicted_ratio);
+        stats->predicted_comp_time_ms = static_cast<double>(predicted_comp_time);
+        stats->predicted_decomp_time_ms = static_cast<double>(predicted_decomp_time);
+        stats->predicted_psnr_db = static_cast<double>(predicted_psnr);
+        stats->actual_comp_time_ms = static_cast<double>(primary_comp_time_ms);
+        stats->sgd_fired = sgd_fired ? 1 : 0;
+        stats->exploration_triggered = exploration_triggered ? 1 : 0;
+        stats->nn_original_action = nn_original_action;
+        stats->nn_final_action = nn_action;
+    }
+
+    /* Update globals */
+    g_last_nn_action.store(nn_action);
+    g_last_nn_original_action.store(nn_original_action);
+    g_last_exploration_triggered.store(exploration_triggered ? 1 : 0);
+    g_last_sgd_fired.store(sgd_fired ? 1 : 0);
+
+    /* Append to per-chunk history */
+    {
+        std::lock_guard<std::mutex> lk(g_chunk_history_mutex);
+        int idx = g_chunk_history_count.fetch_add(1);
+        if (idx >= g_chunk_history_cap) {
+            int new_cap = (g_chunk_history_cap == 0) ? 4096 : g_chunk_history_cap * 2;
+            auto* p = static_cast<gpucompress_chunk_diag_t*>(
+                realloc(g_chunk_history, (size_t)new_cap * sizeof(gpucompress_chunk_diag_t)));
+            if (p) { g_chunk_history = p; g_chunk_history_cap = new_cap; }
+        }
+        if (idx < g_chunk_history_cap) {
+            gpucompress_chunk_diag_t *h = &g_chunk_history[idx];
+            h->nn_action             = nn_action;
+            h->nn_original_action    = nn_original_action;
+            h->exploration_triggered = exploration_triggered ? 1 : 0;
+            h->sgd_fired             = sgd_fired ? 1 : 0;
+            h->nn_inference_ms       = diag_nn_inference_ms;
+            h->stats_ms             = diag_stats_ms;
+            h->preprocessing_ms      = diag_preprocessing_ms;
+            h->compression_ms        = diag_compression_ms;
+            h->exploration_ms        = diag_exploration_ms;
+            h->sgd_update_ms         = diag_sgd_ms;
+            h->actual_ratio          = (compressed_size > 0)
+                ? static_cast<float>(input_size) / static_cast<float>(compressed_size)
+                : 0.0f;
+            h->predicted_ratio       = predicted_ratio;
+            h->predicted_comp_time   = predicted_comp_time;
+            h->predicted_decomp_time = predicted_decomp_time;
+            h->predicted_psnr        = predicted_psnr;
+            h->decompression_ms      = 0.0f;
+        }
+    }
+
+    if (caller_stream) {
+        cudaEventRecord(ctx->t_stop, stream);
+        cudaStreamWaitEvent(caller_stream, ctx->t_stop, 0);
+    }
+
+    return GPUCOMPRESS_SUCCESS;
+}
+
 extern "C" gpucompress_error_t gpucompress_decompress_gpu(
     const void* d_input,
     size_t input_size,

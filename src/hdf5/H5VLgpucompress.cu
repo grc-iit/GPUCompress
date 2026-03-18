@@ -37,6 +37,9 @@
 #include "gpucompress.h"
 #include "gpucompress_hdf5_vol.h"
 
+/* Internal API: split-phase inference + CompContext pool */
+#include "api/internal.hpp"
+
 /* gpucompress HDF5 filter ID (must match H5Zgpucompress.h) */
 #define H5Z_FILTER_GPUCOMPRESS 305
 
@@ -1019,6 +1022,13 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
             hsize_t        cs[32];
             int            nd;
             bool           valid;
+            /* Pre-computed inference results (sequential-inference pipeline) */
+            bool           has_inference;
+            int            action;
+            float          predicted_ratio;
+            float          predicted_comp_time;
+            float          predicted_decomp_time;
+            float          predicted_psnr;
         };
 
         /* M4 fix: use session-level buffers from write_ctx (persistent across writes).
@@ -1120,8 +1130,16 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
 
                         size_t comp_sz = max_comp;
                         gpucompress_stats_t wstats = {};
-                        gpucompress_error_t ce = gpucompress_compress_gpu(
-                            wi.src, wi.sz, d_comp_w[w], &comp_sz, &cfg, &wstats, NULL);
+                        gpucompress_error_t ce;
+                        if (wi.has_inference) {
+                            ce = gpucompress_compress_with_action_gpu(
+                                wi.src, wi.sz, d_comp_w[w], &comp_sz, &cfg, &wstats, NULL,
+                                wi.action, wi.predicted_ratio, wi.predicted_comp_time,
+                                wi.predicted_decomp_time, wi.predicted_psnr);
+                        } else {
+                            ce = gpucompress_compress_gpu(
+                                wi.src, wi.sz, d_comp_w[w], &comp_sz, &cfg, &wstats, NULL);
+                        }
 
                         /* Free per-chunk owned buffer after compression completes */
                         if (wi.d_owned) { cudaFree(wi.d_owned); wi.d_owned = NULL; }
@@ -1161,7 +1179,7 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                 });
             }
 
-            /* ---- Stage 1: iterate chunks, post WorkItems ---- */
+            /* ---- Stage 1: iterate chunks, sequential inference + post WorkItems ---- */
             {
                 /* Non-default stream for gather kernel: avoids null-stream serialization
                  * against the 8 CompContext worker streams. */
@@ -1185,6 +1203,19 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                 bool contiguous = true;
                 for (int d = 1; d < ndims; d++) {
                     if (chunk_dims[d] != dset_dims[d]) { contiguous = false; break; }
+                }
+
+                /* Acquire dedicated CompContext for sequential inference (slot 8).
+                 * This lets the main thread run stats+inference without racing
+                 * with workers, and each chunk sees the latest SGD update. */
+                bool use_seq_inference = (cfg.algorithm == GPUCOMPRESS_ALGO_AUTO);
+                CompContext* infer_ctx = nullptr;
+                if (use_seq_inference) {
+                    infer_ctx = gpucompress::acquireCompContext();
+                    if (!infer_ctx) {
+                        fprintf(stderr, "gpucompress VOL: failed to acquire inference CompContext\n");
+                        use_seq_inference = false;
+                    }
                 }
 
                 for (size_t ci = 0; ci < total_chunks && ret == 0; ci++) {
@@ -1212,6 +1243,7 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                     WorkItem wi = {};
                     wi.nd    = ndims;
                     wi.valid = true;
+                    wi.has_inference = false;
                     memcpy(wi.cs, chunk_start, (size_t)ndims * sizeof(hsize_t));
 
                     VOL_TRACE("  chunk[%zu] off=%llu actual=%zuB  path=%s",
@@ -1269,6 +1301,27 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                         wi.d_owned = d_owned;
                     }
 
+                    /* ---- Sequential inference: run stats+NN on main thread ----
+                     * Each chunk sees the latest SGD-updated weights because
+                     * runNNFusedInferenceCtx waits on g_sgd_done before reading. */
+                    if (use_seq_inference && wi.src && wi.sz > 0) {
+                        int infer_action = -1;
+                        float infer_ratio = 0, infer_ct = 0, infer_dt = 0, infer_psnr = 0;
+                        gpucompress_error_t ie = gpucompress_infer_gpu(
+                            wi.src, wi.sz, &cfg, nullptr, infer_ctx,
+                            &infer_action, &infer_ratio, &infer_ct, &infer_dt, &infer_psnr);
+                        if (ie == GPUCOMPRESS_SUCCESS && infer_action >= 0) {
+                            wi.has_inference      = true;
+                            wi.action             = infer_action;
+                            wi.predicted_ratio    = infer_ratio;
+                            wi.predicted_comp_time = infer_ct;
+                            wi.predicted_decomp_time = infer_dt;
+                            wi.predicted_psnr     = infer_psnr;
+                        }
+                        /* On failure, has_inference stays false → worker falls back
+                         * to full gpucompress_compress_gpu() with its own inference */
+                    }
+
                     /* ---- Post WorkItem to bounded work queue ---- */
                     /* E3 fix: allow 2x workers in work queue so Stage 1 can
                      * pre-queue chunks while workers are posting to I/O. */
@@ -1280,6 +1333,10 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                       else if (wi.d_owned) { cudaFree(wi.d_owned); wi.d_owned = NULL; } }
                     wq_ready_cv.notify_one();
                 } /* chunk loop */
+                if (infer_ctx) {
+                    gpucompress::releaseCompContext(infer_ctx);
+                    infer_ctx = nullptr;
+                }
                 cudaStreamDestroy(gather_stream);
             } /* Stage 1 scope */
 

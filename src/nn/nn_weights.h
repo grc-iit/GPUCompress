@@ -72,6 +72,13 @@ struct NNWeightsGPU {
     // Feature bounds for OOD detection (v2+)
     float x_mins[NN_INPUT_DIM];
     float x_maxs[NN_INPUT_DIM];
+
+    // Per-output learned log-variance for uncertainty weighting (Kendall 2018).
+    // Each output's error is scaled by exp(-0.5 * log_var[o]) before backprop.
+    // Noisy/hard outputs automatically learn a larger log_var, reducing their
+    // gradient contribution to shared W1/W2 without hard-cutting them.
+    // Regularization term 0.5*log_var prevents log_var → +∞ (silencing all).
+    float log_var[NN_OUTPUT_DIM];
 };
 
 #endif /* NN_WEIGHTS_H */
