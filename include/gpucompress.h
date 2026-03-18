@@ -588,6 +588,14 @@ typedef struct {
 
     /* Filled during read (decompression) — 0 until VOL read completes   */
     float  decompression_ms;     /* actual decompression time (nvCOMP)    */
+
+    /* Deferred decomp SGD — input features saved at write time */
+    int    feat_action;          /* action ID (0-31) for input reconstruction */
+    float  feat_entropy;         /* Shannon entropy */
+    float  feat_mad;             /* normalized MAD */
+    float  feat_deriv;           /* normalized 2nd derivative */
+    float  feat_eb_enc;          /* log10(clip(error_bound, 1e-7)) */
+    float  feat_ds_enc;          /* log2(max(data_size, 1)) */
 } gpucompress_chunk_diag_t;
 
 /**
@@ -610,6 +618,13 @@ int  gpucompress_get_chunk_diag(int idx, gpucompress_chunk_diag_t *out);
  * Record actual decompression time for chunk @p idx (called from VOL read).
  */
 void gpucompress_record_chunk_decomp_ms(int idx, float ms);
+
+/**
+ * Batched deferred decomp SGD: update W3[1]+b3[1] from all chunks' decomp times.
+ * Call ONCE after all chunks in a read are decompressed and timed.
+ * Averages gradients across all valid chunks, applies ONE bounded update.
+ */
+void gpucompress_batched_decomp_sgd(void);
 
 /* ============================================================
  * Force-Algorithm Queue

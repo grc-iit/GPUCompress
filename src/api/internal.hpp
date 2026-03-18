@@ -368,6 +368,14 @@ int runNNSGD(const AutoStatsGPU* d_stats, const SGDSample* samples, int num_samp
     float* out_grad_norm = nullptr, int* out_clipped = nullptr, int* out_count = nullptr);
 
 /**
+ * Batched deferred decomp head-only SGD.
+ * Takes N samples with actual decomp times, computes mean gradient,
+ * applies ONE update to W3[1] + b3[1]. No shared layer changes.
+ */
+int runBatchedDecompSGD(const DeferredDecompSample* samples, int num_samples,
+    float learning_rate, float* out_grad_norm = nullptr);
+
+/**
  * Run the complete ALGO_AUTO statistics + NN inference pipeline on GPU.
  *
  * Same stats computation as runAutoStatsPipeline but uses neural network

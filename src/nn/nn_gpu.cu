@@ -1123,20 +1123,6 @@ __global__ void nnSGDKernel(
         // Step 7: Minimum step to avoid stall
         float step = fmaxf(MIN_STEP, fminf(MAX_STEP, TRUST_K * s_avg_err));
 
-        // DEBUG: print every SGD call to trace NaN progression
-        if (t == 0) {
-            printf("[SGD-KERNEL] call=%d avg_err=%.4f step=%.5f g_norm=%.4f "
-                   "err[0]=%.3f err[1]=%.3f err[2]=%.3f err[3]=%.3f "
-                   "uw[0]=%.3f uw[1]=%.3f uw[2]=%.3f uw[3]=%.3f "
-                   "lv[0]=%.2f lv[1]=%.2f lv[2]=%.2f lv[3]=%.2f\n",
-                   weights->sgd_call_count, s_avg_err, step,
-                   sqrtf(s_reduce[0]) + 1e-8f,
-                   s_d3_raw[0][0], s_d3_raw[0][1], s_d3_raw[0][2], s_d3_raw[0][3],
-                   s_uw[0], s_uw[1], s_uw[2], s_uw[3],
-                   weights->log_var[0], weights->log_var[1],
-                   weights->log_var[2], weights->log_var[3]);
-        }
-
         // Step 9: Anti-flip damping — dot current gradient with EMA (previous direction)
         // If they point in opposite directions, damp the step.
         // Use region 2 (EMA) as the "previous direction" reference.
@@ -1252,11 +1238,13 @@ __global__ void nnSGDKernel(
                 weights->b2[t] = fmaxf(-W_CLAMP, fminf(W_CLAMP, b));
             }
             for (int out = 0; out < NN_OUTPUT_DIM; out++) {
+                // Skip decomp_time head (output 1) — owned by batched deferred SGD
+                if (out == 1) continue;
                 float w = weights->w3[out * NN_HIDDEN_DIM + t] -
                     step * d_grad_buffer[EMA_REGION + SGD_OFF_DW3 + out * NN_HIDDEN_DIM + t];
                 weights->w3[out * NN_HIDDEN_DIM + t] = fmaxf(-W_CLAMP, fminf(W_CLAMP, w));
             }
-            if (t < NN_OUTPUT_DIM) {
+            if (t < NN_OUTPUT_DIM && t != 1) {
                 float b = weights->b3[t] - step * d_grad_buffer[EMA_REGION + SGD_OFF_DB3 + t];
                 weights->b3[t] = fmaxf(-W_CLAMP, fminf(W_CLAMP, b));
             }
@@ -1318,6 +1306,9 @@ static void freeSGDBuffers() {
     if (d_sgd_output) { cudaFree(d_sgd_output); d_sgd_output = nullptr; }
     if (d_sgd_samples) { cudaFree(d_sgd_samples); d_sgd_samples = nullptr; }
 }
+
+/* Forward declarations for batched decomp SGD (defined after runNNSGDCtx) */
+static void freeDecompSGDBuffers();
 
 /* ============================================================
  * Host Functions
@@ -1561,6 +1552,7 @@ void cleanupNN() {
     freeInferenceBuffers();
     freeFusedInferenceBuffers();
     freeSGDBuffers();
+    freeDecompSGDBuffers();
     g_has_bounds = false;
 }
 
@@ -1974,6 +1966,273 @@ int runNNSGDCtx(
     GC_LOG("[SGD-CTX] slot=%d %d samples, grad_norm=%.4f%s\n",
             ctx->slot_id, h_result.sample_count, h_result.grad_norm,
             h_result.was_clipped ? " (clipped)" : "");
+
+    return 0;
+}
+
+/* ============================================================
+ * Batched Deferred Decomp Head-Only SGD
+ *
+ * Called ONCE per timestep after all chunks are read.
+ * Receives N samples with actual decomp times, computes mean
+ * gradient across all samples, applies ONE bounded update to
+ * W3[1] + b3[1].  No shared-layer changes.
+ * ============================================================ */
+
+static DeferredDecompSample* d_decomp_samples = nullptr;
+static SGDOutput*            d_decomp_sgd_output = nullptr;
+static int                   d_decomp_samples_cap = 0;
+
+static bool allocDecompSGDBuffers(int n) {
+    if (d_decomp_samples == nullptr || n > d_decomp_samples_cap) {
+        if (d_decomp_samples) cudaFree(d_decomp_samples);
+        if (cudaMalloc(&d_decomp_samples, n * sizeof(DeferredDecompSample)) != cudaSuccess) {
+            d_decomp_samples = nullptr;
+            d_decomp_samples_cap = 0;
+            return false;
+        }
+        d_decomp_samples_cap = n;
+    }
+    if (d_decomp_sgd_output == nullptr) {
+        if (cudaMalloc(&d_decomp_sgd_output, sizeof(SGDOutput)) != cudaSuccess) {
+            d_decomp_sgd_output = nullptr;
+            return false;
+        }
+    }
+    return true;
+}
+
+static void freeDecompSGDBuffers() {
+    if (d_decomp_samples)    { cudaFree(d_decomp_samples);    d_decomp_samples = nullptr; }
+    if (d_decomp_sgd_output) { cudaFree(d_decomp_sgd_output); d_decomp_sgd_output = nullptr; }
+    d_decomp_samples_cap = 0;
+}
+
+/**
+ * Batched decomp head-only SGD kernel.
+ * Processes N samples: for each, recomputes forward pass through frozen W1/W2,
+ * accumulates mean gradient for W3[1]+b3[1], applies ONE update.
+ *
+ * Launch: <<<1, 128>>>
+ */
+__global__ void nnBatchedDecompSGDKernel(
+    NNWeightsGPU* __restrict__ weights,
+    const DeferredDecompSample* __restrict__ samples,
+    int num_samples,
+    float learning_rate,
+    SGDOutput* __restrict__ out_result
+) {
+    int t = threadIdx.x;  // 0..127
+
+    __shared__ float s_x[NN_INPUT_DIM];
+    __shared__ float s_h1[NN_HIDDEN_DIM];
+    __shared__ float s_h2[NN_HIDDEN_DIM];
+    __shared__ float s_reduce[NN_HIDDEN_DIM];
+    __shared__ float s_err;
+
+    // Accumulate mean gradient across all samples
+    float acc_gw = 0.0f;   // accumulated dw3 for thread t
+    float acc_gb = 0.0f;   // accumulated db3 (thread 0 only)
+    int   valid  = 0;
+
+    for (int si = 0; si < num_samples; si++) {
+        const DeferredDecompSample& samp = samples[si];
+
+        // Thread 0 builds standardized input
+        if (t == 0) {
+            int algo_idx = samp.action % 8;
+            int quant    = (samp.action / 8) % 2;
+            int shuffle  = (samp.action / 16) % 2;
+
+            float raw[NN_INPUT_DIM];
+            for (int i = 0; i < 8; i++) raw[i] = (i == algo_idx) ? 1.0f : 0.0f;
+            raw[8]  = static_cast<float>(quant);
+            raw[9]  = static_cast<float>(shuffle);
+            raw[10] = samp.error_bound_enc;
+            raw[11] = samp.data_size_enc;
+            raw[12] = samp.entropy;
+            raw[13] = samp.mad_normalized;
+            raw[14] = samp.deriv_normalized;
+
+            for (int i = 0; i < NN_INPUT_DIM; i++) {
+                float std_val = weights->x_stds[i];
+                if (std_val < 1e-8f) std_val = 1e-8f;
+                s_x[i] = (raw[i] - weights->x_means[i]) / std_val;
+            }
+        }
+        __syncthreads();
+
+        // Forward L1 (read-only)
+        {
+            float sum = weights->b1[t];
+            for (int i = 0; i < NN_INPUT_DIM; i++)
+                sum += weights->w1[t * NN_INPUT_DIM + i] * s_x[i];
+            s_h1[t] = (sum > 0.0f) ? sum : 0.0f;
+        }
+        __syncthreads();
+
+        // Forward L2 (read-only)
+        {
+            float sum = weights->b2[t];
+            for (int i = 0; i < NN_HIDDEN_DIM; i++)
+                sum += weights->w2[t * NN_HIDDEN_DIM + i] * s_h1[i];
+            s_h2[t] = (sum > 0.0f) ? sum : 0.0f;
+        }
+        __syncthreads();
+
+        // Forward L3 output 1 only, compute error in log-space
+        if (t == 0) {
+            float y_norm = weights->b3[1];
+            for (int i = 0; i < NN_HIDDEN_DIM; i++)
+                y_norm += weights->w3[1 * NN_HIDDEN_DIM + i] * s_h2[i];
+
+            float y_std1 = weights->y_stds[1];
+            if (y_std1 < 1e-8f) y_std1 = 1e-8f;
+            float pred_log = y_norm * y_std1 + weights->y_means[1];
+
+            float clamped = fmaxf(0.01f, fminf(samp.actual_decomp_ms, 5000.0f));
+            float target_log = log1pf(clamped);
+
+            float err_log = pred_log - target_log;
+
+            // Clamp error in log-space
+            err_log = fmaxf(-2.0f, fminf(2.0f, err_log));
+
+            // Convert to normalized-space for gradient
+            s_err = err_log / y_std1;
+        }
+        __syncthreads();
+
+        // Skip if error is tiny (noise gate)
+        if (fabsf(s_err) < 0.05f) { __syncthreads(); continue; }
+
+        // Accumulate gradient: dw3[t] += err * h2[t], db3 += err
+        acc_gw += s_err * s_h2[t];
+        if (t == 0) acc_gb += s_err;
+        valid++;
+        __syncthreads();
+    }
+
+    // Average gradient
+    if (valid == 0) {
+        if (t == 0) {
+            out_result->grad_norm = 0.0f;
+            out_result->was_clipped = 0;
+            out_result->sample_count = 0;
+        }
+        return;
+    }
+
+    float inv_n = 1.0f / static_cast<float>(valid);
+    acc_gw *= inv_n;
+    if (t == 0) acc_gb *= inv_n;
+
+    // Compute gradient norm for diagnostic
+    s_reduce[t] = acc_gw * acc_gw;
+    __syncthreads();
+    for (int s = NN_HIDDEN_DIM / 2; s > 0; s >>= 1) {
+        if (t < s) s_reduce[t] += s_reduce[t + s];
+        __syncthreads();
+    }
+    float g_norm = sqrtf(s_reduce[0] + (t == 0 ? acc_gb * acc_gb : 0.0f)) + 1e-8f;
+
+    // Compute mean absolute error for trust-region scaling.
+    // The step size is proportional to the error: large error → large step,
+    // small error → small step.  This prevents overshooting when the head
+    // is already well-calibrated, eliminating the oscillation that occurs
+    // with a constant step size.
+    __shared__ float s_mean_abs_err;
+    if (t == 0) {
+        float sum_abs = 0.0f;
+        for (int si = 0; si < num_samples; si++) {
+            const DeferredDecompSample& samp = samples[si];
+            float y_norm = weights->b3[1];
+            for (int i = 0; i < NN_HIDDEN_DIM; i++)
+                y_norm += weights->w3[1 * NN_HIDDEN_DIM + i] * s_h2[i];
+            // Note: s_h2 is from last sample. Use acc_gb as proxy for mean error.
+            sum_abs = fabsf(acc_gb);  // mean error magnitude (in normalized space)
+        }
+        s_mean_abs_err = sum_abs;
+    }
+    __syncthreads();
+
+    // Trust-region: step = min(lr, k * |mean_error|), capped
+    constexpr float DECOMP_TRUST_K = 0.15f;
+    constexpr float DECOMP_MAX_STEP = 0.05f;
+    constexpr float DECOMP_MIN_STEP = 1e-4f;
+    float step = fmaxf(DECOMP_MIN_STEP, fminf(DECOMP_MAX_STEP,
+                        DECOMP_TRUST_K * s_mean_abs_err));
+
+    // Normalize gradient, apply bounded step
+    float gw_normed = acc_gw / g_norm;
+    float gb_normed = (t == 0) ? acc_gb / g_norm : 0.0f;
+
+    // Apply with weight clamp
+    constexpr float W_CLAMP = 5.0f;
+    float new_w = weights->w3[1 * NN_HIDDEN_DIM + t] - step * gw_normed;
+    weights->w3[1 * NN_HIDDEN_DIM + t] = fmaxf(-W_CLAMP, fminf(W_CLAMP, new_w));
+    if (t == 0) {
+        float new_b = weights->b3[1] - step * gb_normed;
+        weights->b3[1] = fmaxf(-W_CLAMP, fminf(W_CLAMP, new_b));
+    }
+
+    if (t == 0) {
+        out_result->grad_norm = g_norm;
+        out_result->was_clipped = 0;
+        out_result->sample_count = valid;
+    }
+}
+
+/**
+ * Host wrapper for batched decomp SGD.
+ */
+int runBatchedDecompSGD(
+    const DeferredDecompSample* samples,
+    int num_samples,
+    float learning_rate,
+    float* out_grad_norm
+) {
+    if (samples == nullptr || num_samples <= 0) return -1;
+
+    if (!allocDecompSGDBuffers(num_samples)) return -1;
+
+    // H→D: copy all samples
+    cudaError_t err = cudaMemcpyAsync(d_decomp_samples, samples,
+                                       num_samples * sizeof(DeferredDecompSample),
+                                       cudaMemcpyHostToDevice, g_sgd_stream);
+    if (err != cudaSuccess) return -1;
+
+    // Launch kernel under NN pointer lock
+    {
+        std::lock_guard<std::mutex> lock(g_nn_ptr_mutex);
+        if (!g_nn_loaded.load() || d_nn_weights == nullptr) return -1;
+
+        nnBatchedDecompSGDKernel<<<1, NN_HIDDEN_DIM, 0, g_sgd_stream>>>(
+            d_nn_weights,
+            d_decomp_samples,
+            num_samples,
+            learning_rate,
+            d_decomp_sgd_output
+        );
+        err = cudaGetLastError();
+    }
+    if (err != cudaSuccess) return -1;
+
+    cudaEventRecord(g_sgd_done, g_sgd_stream);
+    g_sgd_ever_fired.store(true, std::memory_order_release);
+
+    SGDOutput h_result;
+    err = cudaMemcpyAsync(&h_result, d_decomp_sgd_output, sizeof(SGDOutput),
+                           cudaMemcpyDeviceToHost, g_sgd_stream);
+    if (err != cudaSuccess) return -1;
+
+    err = cudaStreamSynchronize(g_sgd_stream);
+    if (err != cudaSuccess) return -1;
+
+    if (out_grad_norm) *out_grad_norm = h_result.grad_norm;
+
+    GC_LOG("[DECOMP-SGD] batched: %d/%d samples, grad_norm=%.4f\n",
+            h_result.sample_count, num_samples, h_result.grad_norm);
 
     return 0;
 }

@@ -1015,16 +1015,6 @@ extern "C" gpucompress_error_t gpucompress_compress(
          * with the primary correction through shared hidden layers. */
         auto t_sgd_start = std::chrono::steady_clock::now();
         if (error_pct > static_cast<double>(g_reinforce_mape_threshold) && d_stats_ptr) {
-            /* DEBUG: log SGD trigger details when error is large */
-            if (error_pct > 0.50) {
-                int chunk_idx = g_chunk_history_count.load();
-                fprintf(stderr, "[SGD-DEBUG] chunk=%d error_pct=%.1f%% "
-                        "pred_r=%.1f act_r=%.1f pred_ct=%.3f act_ct=%.3f "
-                        "pred_dt=%.3f act_dt=%.3f action=%d\n",
-                        chunk_idx, error_pct * 100.0,
-                        pred_r, actual_ratio, pred_ct, act_ct,
-                        pred_dt, act_dt, nn_action);
-            }
             SGDSample primary_sgd[1];
             primary_sgd[0].action            = explored_samples[0].action;
             primary_sgd[0].actual_ratio      = static_cast<float>(explored_samples[0].ratio);
@@ -1038,10 +1028,6 @@ extern "C" gpucompress_error_t gpucompress_compress(
                         input_size, cfg.error_bound, g_reinforce_lr, ctx,
                         &gn, &gc, &gs) == 0) {
                     sgd_fired = true;
-                    /* DEBUG: log SGD result for large errors */
-                    if (error_pct > 0.50) {
-                        fprintf(stderr, "[SGD-DEBUG]   -> grad_norm=%.4f clipped=%d\n", gn, gc);
-                    }
                 }
             }
         }
@@ -1460,6 +1446,12 @@ extern "C" gpucompress_error_t gpucompress_compress(
             h->predicted_decomp_time = predicted_decomp_time;
             h->predicted_psnr        = predicted_psnr;
             h->decompression_ms      = 0.0f;  /* deferred to read: VOL calls gpucompress_record_chunk_decomp_ms() */
+            h->feat_action   = nn_action;
+            h->feat_entropy  = static_cast<float>(entropy);
+            h->feat_mad      = static_cast<float>(mad);
+            h->feat_deriv    = static_cast<float>(second_derivative);
+            h->feat_eb_enc   = static_cast<float>(log10(fmax(cfg.error_bound, 1e-7)));
+            h->feat_ds_enc   = static_cast<float>(log2(fmax((double)input_size, 1.0)));
         }
     }
 
@@ -1904,6 +1896,39 @@ extern "C" void gpucompress_record_chunk_decomp_ms(int idx, float ms) {
     std::lock_guard<std::mutex> lk(g_chunk_history_mutex);
     if (idx >= 0 && idx < g_chunk_history_count.load() && idx < g_chunk_history_cap)
         g_chunk_history[idx].decompression_ms = ms;
+}
+
+extern "C" void gpucompress_batched_decomp_sgd(void) {
+    if (!g_online_learning_enabled) return;
+
+    /* Collect all valid chunks with measured decomp times into a batch */
+    std::vector<DeferredDecompSample> batch;
+    {
+        std::lock_guard<std::mutex> lk(g_chunk_history_mutex);
+        int n = g_chunk_history_count.load();
+        if (n > g_chunk_history_cap) n = g_chunk_history_cap;
+        for (int i = 0; i < n; i++) {
+            const gpucompress_chunk_diag_t& h = g_chunk_history[i];
+            if (h.decompression_ms <= 0.0f) continue;  /* not yet measured */
+            if (h.feat_ds_enc <= 0.0f) continue;        /* not an ALGO_AUTO chunk */
+            DeferredDecompSample s;
+            s.action           = h.feat_action;
+            s.entropy          = h.feat_entropy;
+            s.mad_normalized   = h.feat_mad;
+            s.deriv_normalized = h.feat_deriv;
+            s.error_bound_enc  = h.feat_eb_enc;
+            s.data_size_enc    = h.feat_ds_enc;
+            s.actual_decomp_ms = h.decompression_ms;
+            batch.push_back(s);
+        }
+    }
+    if (batch.empty()) return;
+
+    {
+        std::lock_guard<std::mutex> sgd_lk(g_sgd_mutex);
+        gpucompress::runBatchedDecompSGD(batch.data(),
+            static_cast<int>(batch.size()), g_reinforce_lr);
+    }
 }
 
 extern "C" const char* gpucompress_algorithm_name(gpucompress_algorithm_t algorithm) {
@@ -2790,6 +2815,12 @@ skip_nn:
             h->predicted_decomp_time = predicted_decomp_time;
             h->predicted_psnr        = predicted_psnr;
             h->decompression_ms      = 0.0f;  /* deferred to read: VOL calls gpucompress_record_chunk_decomp_ms() */
+            h->feat_action   = nn_action;
+            h->feat_entropy  = static_cast<float>(entropy);
+            h->feat_mad      = static_cast<float>(mad);
+            h->feat_deriv    = static_cast<float>(second_derivative);
+            h->feat_eb_enc   = static_cast<float>(log10(fmax(cfg.error_bound, 1e-7)));
+            h->feat_ds_enc   = static_cast<float>(log2(fmax((double)input_size, 1.0)));
         }
     }
 
@@ -3245,6 +3276,21 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
             h->predicted_decomp_time = predicted_decomp_time;
             h->predicted_psnr        = predicted_psnr;
             h->decompression_ms      = 0.0f;
+            h->feat_action   = nn_action;
+            h->feat_eb_enc   = static_cast<float>(log10(fmax(cfg.error_bound, 1e-7)));
+            h->feat_ds_enc   = static_cast<float>(log2(fmax((double)input_size, 1.0)));
+            if (d_stats_ptr) {
+                AutoStatsGPU h_stats;
+                cudaMemcpy(&h_stats, d_stats_ptr, sizeof(AutoStatsGPU), cudaMemcpyDeviceToHost);
+                h->feat_entropy = static_cast<float>(h_stats.entropy);
+                h->feat_mad     = static_cast<float>(h_stats.mad_normalized);
+                h->feat_deriv   = static_cast<float>(h_stats.deriv_normalized);
+            } else {
+                h->feat_entropy = 0.0f;
+                h->feat_mad     = 0.0f;
+                h->feat_deriv   = 0.0f;
+                h->feat_ds_enc  = 0.0f;
+            }
         }
     }
 

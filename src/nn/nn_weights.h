@@ -32,6 +32,14 @@ struct SGDSample {
     float actual_psnr;
 };
 
+/** Input sample for batched deferred decomp head-only SGD. */
+struct DeferredDecompSample {
+    int   action;
+    float entropy, mad_normalized, deriv_normalized;
+    float error_bound_enc, data_size_enc;
+    float actual_decomp_ms;
+};
+
 /** Output from GPU SGD kernel. */
 struct SGDOutput {
     float grad_norm;

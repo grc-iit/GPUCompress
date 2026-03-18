@@ -1779,6 +1779,9 @@ gpu_aware_chunked_read(H5VL_gpucompress_t *o,
             }
         } /* chunk loop */
 
+        /* Batched deferred decomp SGD: one update from all chunks' decomp times */
+        if (ret == 0) gpucompress_batched_decomp_sgd();
+
 done_read:
         /* Unblock prefetch thread (in case main exited early with ret==-1) */
         if (pre_started) {
