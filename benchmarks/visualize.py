@@ -71,6 +71,13 @@ DEFAULT_GS_TIMESTEPS = [
 DEFAULT_GS_TSTEP_CHUNKS = [
     os.path.join(PROJECT_ROOT, "benchmarks/grayscott/results/benchmark_grayscott_timestep_chunks.csv"),
 ]
+DEFAULT_VPIC_TIMESTEPS = [
+    os.path.join(PROJECT_ROOT, "benchmarks/vpic-kokkos/results/benchmark_vpic_timesteps.csv"),
+    os.path.join(PROJECT_ROOT, "benchmarks/vpic-kokkos/benchmark_vpic_timesteps.csv"),
+]
+DEFAULT_VPIC_TSTEP_CHUNKS = [
+    os.path.join(PROJECT_ROOT, "benchmarks/vpic-kokkos/results/benchmark_vpic_timestep_chunks.csv"),
+]
 
 
 def find_csv(candidates):
@@ -326,9 +333,7 @@ def make_timestep_figure(ts_csv_path, output_path):
                     marker=sty["marker"], markersize=4, linewidth=sty["lw"],
                     label=ph, alpha=0.9, zorder=3)
 
-        # 20% target
         ax.axhline(20, color="#e67e22", linewidth=1, linestyle="--", alpha=0.6)
-
         ax.set_ylabel(f"{label}\nMAPE (%)", fontsize=11, fontweight="bold")
         ax.set_ylim(0, 200)
         ax.grid(axis="y", alpha=0.3, linestyle="--")
@@ -545,6 +550,23 @@ def main():
             out_dir = args.output_dir or os.path.join(SCRIPT_DIR, "vpic-kokkos", "results")
             make_summary_figure("VPIC Harris Sheet Reconnection", rows,
                                 os.path.join(out_dir, "benchmark_vpic.png"), meta)
+
+    vpic_tsteps = find_csv(DEFAULT_VPIC_TIMESTEPS)
+    if vpic_tsteps and os.path.exists(vpic_tsteps) and "timesteps" in views:
+        found_any = True
+        print(f"Loading VPIC timestep adaptation: {vpic_tsteps}")
+        out_dir = args.output_dir or os.path.dirname(os.path.abspath(vpic_tsteps))
+        make_timestep_figure(vpic_tsteps, os.path.join(out_dir, "vpic_sgd_accuracy_over_time.png"))
+
+    vpic_tc = find_csv(DEFAULT_VPIC_TSTEP_CHUNKS)
+    if vpic_tc and os.path.exists(vpic_tc) and "timesteps" in views:
+        found_any = True
+        print(f"Loading VPIC per-chunk milestones: {vpic_tc}")
+        out_dir = args.output_dir or os.path.dirname(os.path.abspath(vpic_tc))
+        try:
+            make_timestep_chunks_figure(vpic_tc, os.path.join(out_dir, "vpic_predicted_vs_actual_per_chunk.png"))
+        except Exception as e:
+            print(f"  Warning: VPIC per-chunk milestone plot failed: {e}")
 
     if not found_any:
         print("ERROR: No benchmark CSV files found.")

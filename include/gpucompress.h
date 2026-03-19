@@ -523,6 +523,23 @@ void gpucompress_set_bandwidth(float bw_gbps);
  */
 gpucompress_error_t gpucompress_reload_nn(const char* filepath);
 
+/**
+ * Save current NN weights from GPU to a caller-provided host buffer.
+ * Buffer must be at least gpucompress_nn_weights_size() bytes.
+ */
+gpucompress_error_t gpucompress_nn_save_weights(void* host_buffer, size_t buffer_size);
+
+/**
+ * Restore NN weights from a caller-provided host buffer to GPU.
+ * Buffer must have been previously filled by gpucompress_nn_save_weights().
+ */
+gpucompress_error_t gpucompress_nn_restore_weights(const void* host_buffer, size_t buffer_size);
+
+/**
+ * Returns the size in bytes needed for gpucompress_nn_save/restore_weights().
+ */
+size_t gpucompress_nn_weights_size(void);
+
 /* ============================================================
  * Utility Functions
  * ============================================================ */

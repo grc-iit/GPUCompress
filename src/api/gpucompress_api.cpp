@@ -2056,6 +2056,32 @@ extern "C" gpucompress_error_t gpucompress_reload_nn(const char* filepath) {
     return (result == 0) ? GPUCOMPRESS_SUCCESS : GPUCOMPRESS_ERROR_INVALID_INPUT;
 }
 
+extern "C" size_t gpucompress_nn_weights_size(void) {
+    return sizeof(NNWeightsGPU);
+}
+
+extern "C" gpucompress_error_t gpucompress_nn_save_weights(void* host_buffer, size_t buffer_size) {
+    if (!host_buffer || buffer_size < sizeof(NNWeightsGPU))
+        return GPUCOMPRESS_ERROR_INVALID_INPUT;
+    const NNWeightsGPU* d_ptr = gpucompress::getNNWeightsDevicePtr();
+    if (!d_ptr) return GPUCOMPRESS_ERROR_NN_NOT_LOADED;
+    cudaError_t err = cudaMemcpy(host_buffer, d_ptr, sizeof(NNWeightsGPU),
+                                  cudaMemcpyDeviceToHost);
+    return (err == cudaSuccess) ? GPUCOMPRESS_SUCCESS : GPUCOMPRESS_ERROR_CUDA_FAILED;
+}
+
+extern "C" gpucompress_error_t gpucompress_nn_restore_weights(const void* host_buffer, size_t buffer_size) {
+    if (!host_buffer || buffer_size < sizeof(NNWeightsGPU))
+        return GPUCOMPRESS_ERROR_INVALID_INPUT;
+    const NNWeightsGPU* d_ptr = gpucompress::getNNWeightsDevicePtr();
+    if (!d_ptr) return GPUCOMPRESS_ERROR_NN_NOT_LOADED;
+    /* d_ptr is const in the getter, but we need to write — cast is safe because
+       we own the buffer and no kernel is in flight (caller must ensure). */
+    cudaError_t err = cudaMemcpy(const_cast<NNWeightsGPU*>(d_ptr), host_buffer,
+                                  sizeof(NNWeightsGPU), cudaMemcpyHostToDevice);
+    return (err == cudaSuccess) ? GPUCOMPRESS_SUCCESS : GPUCOMPRESS_ERROR_CUDA_FAILED;
+}
+
 /* ============================================================
  * GPU Memory API (stubs for now)
  * ============================================================ */
@@ -2104,6 +2130,7 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
     /* Variables for NN/exploration/SGD (mirrors gpucompress_compress) */
     double entropy = 0.0, mad = 0.0, second_derivative = 0.0;
     bool nn_was_used = false, sgd_fired = false, exploration_triggered = false;
+    size_t primary_compressed_size = 0;  /* saved before exploration may overwrite */
     int nn_action = 0, nn_original_action = -1;
     float predicted_ratio = 0.0f, predicted_comp_time = 0.0f,
           predicted_decomp_time = 0.0f, predicted_psnr = 0.0f;
@@ -2427,6 +2454,9 @@ skip_nn:
         g_online_learning_enabled) {
         double actual_ratio = static_cast<double>(input_size) /
                               static_cast<double>(compressed_size);
+
+        /* Save primary metrics before exploration may overwrite them */
+        primary_compressed_size = compressed_size;  /* save before exploration overwrites */
 
         // Cost-based prediction error (mirrors non-ctx path, uses measured decomp time)
         double ds = static_cast<double>(input_size);
@@ -2806,16 +2836,20 @@ skip_nn:
             h->compression_ms        = diag_compression_ms;
             h->exploration_ms        = diag_exploration_ms;
             h->sgd_update_ms         = diag_sgd_ms;
-            h->actual_ratio          = (compressed_size > 0)
-                ? static_cast<float>(input_size) / static_cast<float>(compressed_size)
+            /* Use primary compressed size for ratio if available (before exploration),
+             * otherwise fall back to final compressed_size. */
+            size_t diag_comp_sz = (primary_compressed_size > 0) ? primary_compressed_size : compressed_size;
+            h->actual_ratio          = (diag_comp_sz > 0)
+                ? static_cast<float>(input_size) / static_cast<float>(diag_comp_sz)
                 : 0.0f;
+            h->compression_ms        = diag_compression_ms;
             /* Always report NN's prediction for its ORIGINAL action. */
             h->predicted_ratio       = predicted_ratio;
             h->predicted_comp_time   = predicted_comp_time;
             h->predicted_decomp_time = predicted_decomp_time;
             h->predicted_psnr        = predicted_psnr;
             h->decompression_ms      = 0.0f;  /* deferred to read: VOL calls gpucompress_record_chunk_decomp_ms() */
-            h->feat_action   = nn_action;
+            h->feat_action   = nn_original_action;
             h->feat_entropy  = static_cast<float>(entropy);
             h->feat_mad      = static_cast<float>(mad);
             h->feat_deriv    = static_cast<float>(second_derivative);
@@ -2939,7 +2973,9 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     float predicted_comp_time,
     float predicted_decomp_time,
     float predicted_psnr,
-    const int* top_actions)
+    const int* top_actions,
+    float stage1_nn_ms,
+    float stage1_stats_ms)
 {
     if (!g_initialized.load()) return GPUCOMPRESS_ERROR_NOT_INITIALIZED;
     if (!d_input || !d_output || !output_size) return GPUCOMPRESS_ERROR_INVALID_INPUT;
@@ -2965,11 +3001,16 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     bool sgd_fired = false, exploration_triggered = false;
     bool is_ood = false;
     AutoStatsGPU* d_stats_ptr = nullptr;
+    /* Primary algorithm's actual metrics — saved before exploration may overwrite.
+     * Used in chunk diagnostics for fair MAPE reporting. */
+    size_t primary_compressed_size = 0;
 
-    /* Per-chunk timing breakdown */
+    /* Per-chunk timing breakdown.
+     * stage1_nn_ms / stage1_stats_ms are passed from the VOL Stage 1
+     * sequential-inference loop where stats+NN ran on a dedicated context. */
     bool timing_ok = (ctx->t_start != nullptr && ctx->t_stop != nullptr);
-    float diag_nn_inference_ms  = 0.0f;
-    float diag_stats_ms         = 0.0f;
+    float diag_nn_inference_ms  = stage1_nn_ms;
+    float diag_stats_ms         = stage1_stats_ms;
     float diag_preprocessing_ms = 0.0f;
     float diag_compression_ms   = 0.0f;
     float diag_exploration_ms   = 0.0f;
@@ -3169,6 +3210,11 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
 
         double actual_ratio = static_cast<double>(input_size) /
                               static_cast<double>(compressed_size);
+
+        /* Save primary algorithm's actual metrics BEFORE exploration may overwrite them.
+         * These are used for MAPE reporting in chunk diagnostics so that prediction
+         * accuracy reflects the NN's chosen algorithm, not the exploration winner. */
+        primary_compressed_size = compressed_size;  /* save before exploration overwrites */
 
         double ds = static_cast<double>(input_size);
         double bw = static_cast<double>(g_measured_bw_bytes_per_ms);
@@ -3544,15 +3590,23 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
             h->compression_ms        = diag_compression_ms;
             h->exploration_ms        = diag_exploration_ms;
             h->sgd_update_ms         = diag_sgd_ms;
-            h->actual_ratio          = (compressed_size > 0)
-                ? static_cast<float>(input_size) / static_cast<float>(compressed_size)
+            /* Use primary algorithm's actual metrics for MAPE (not exploration winner).
+             * actual_ratio/compression_ms reflect the NN's chosen algo so prediction
+             * accuracy is measured fairly. The final output still uses the exploration
+             * winner — only diagnostics use the primary values. */
+            /* Use primary compressed size for ratio if available (before exploration),
+             * otherwise fall back to final compressed_size. */
+            size_t diag_comp_sz = (primary_compressed_size > 0) ? primary_compressed_size : compressed_size;
+            h->actual_ratio          = (diag_comp_sz > 0)
+                ? static_cast<float>(input_size) / static_cast<float>(diag_comp_sz)
                 : 0.0f;
+            h->compression_ms        = diag_compression_ms;
             h->predicted_ratio       = predicted_ratio;
             h->predicted_comp_time   = predicted_comp_time;
             h->predicted_decomp_time = predicted_decomp_time;
             h->predicted_psnr        = predicted_psnr;
             h->decompression_ms      = 0.0f;
-            h->feat_action   = nn_action;
+            h->feat_action   = nn_original_action;
             h->feat_eb_enc   = static_cast<float>(log10(fmax(cfg.error_bound, 1e-7)));
             h->feat_ds_enc   = static_cast<float>(log2(fmax((double)input_size, 1.0)));
             if (d_stats_ptr) {

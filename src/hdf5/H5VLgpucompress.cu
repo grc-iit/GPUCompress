@@ -1030,6 +1030,9 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
             float          predicted_decomp_time;
             float          predicted_psnr;
             int            top_actions[32];
+            /* Timing from Stage 1 inference (ms) */
+            float          infer_nn_ms;
+            float          infer_stats_ms;
         };
 
         /* M4 fix: use session-level buffers from write_ctx (persistent across writes).
@@ -1137,7 +1140,8 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                                 wi.src, wi.sz, d_comp_w[w], &comp_sz, &cfg, &wstats, NULL,
                                 wi.action, wi.predicted_ratio, wi.predicted_comp_time,
                                 wi.predicted_decomp_time, wi.predicted_psnr,
-                                wi.top_actions);
+                                wi.top_actions,
+                                wi.infer_nn_ms, wi.infer_stats_ms);
                         } else {
                             ce = gpucompress_compress_gpu(
                                 wi.src, wi.sz, d_comp_w[w], &comp_sz, &cfg, &wstats, NULL);
@@ -1322,6 +1326,9 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                             wi.predicted_decomp_time = infer_dt;
                             wi.predicted_psnr     = infer_psnr;
                             memcpy(wi.top_actions, infer_top, sizeof(infer_top));
+                            /* Capture Stage 1 timing from infer_ctx CUDA events */
+                            cudaEventElapsedTime(&wi.infer_nn_ms, infer_ctx->nn_start, infer_ctx->nn_stop);
+                            cudaEventElapsedTime(&wi.infer_stats_ms, infer_ctx->stats_start, infer_ctx->stats_stop);
                         }
                         /* On failure, has_inference stays false → worker falls back
                          * to full gpucompress_compress_gpu() with its own inference */

@@ -259,6 +259,9 @@ typedef struct {
     double comp_ms;
     double explore_ms;
     double sgd_ms;
+    /* Multi-timestep averaged I/O (set after multi-timestep loop; 0 if single-shot only) */
+    double write_ms_avg;
+    double read_ms_avg;
 } PhaseResult;
 
 /* ============================================================
@@ -517,28 +520,6 @@ static int run_phase_vol(float *d_v, float *d_read,
            phase_name, r->ratio, r->write_mbps, r->read_mbps,
            (double)fbytes / (1 << 20), sgd_fires, explorations, n_hist, mm);
 
-    /* Per-component overhead breakdown.
-     * Per-chunk timings are cumulative (sum across all chunks).  With 8
-     * concurrent VOL workers, the wall-clock time is less than the sum.
-     * Report both the cumulative GPU-time and the share of total GPU-time,
-     * so users can see which component dominates the pipeline. */
-    double total_tracked = total_nn_ms + total_stats_ms + total_preproc_ms
-                         + total_comp_ms + total_explore_ms + total_sgd_ms;
-    printf("[%s] Overhead breakdown (%d chunks, write=%.1f ms, total GPU-time=%.1f ms):\n",
-           phase_name, n_hist, write_ms, total_tracked);
-    printf("  Stats compute: %8.1f ms  (%4.1f%% of GPU-time)\n",
-           total_stats_ms, total_tracked > 0 ? 100.0 * total_stats_ms / total_tracked : 0.0);
-    printf("  NN inference : %8.1f ms  (%4.1f%% of GPU-time)\n",
-           total_nn_ms, total_tracked > 0 ? 100.0 * total_nn_ms / total_tracked : 0.0);
-    printf("  Preprocessing: %8.1f ms  (%4.1f%% of GPU-time)\n",
-           total_preproc_ms, total_tracked > 0 ? 100.0 * total_preproc_ms / total_tracked : 0.0);
-    printf("  Compression  : %8.1f ms  (%4.1f%% of GPU-time)\n",
-           total_comp_ms, total_tracked > 0 ? 100.0 * total_comp_ms / total_tracked : 0.0);
-    printf("  Exploration  : %8.1f ms  (%4.1f%% of GPU-time)\n",
-           total_explore_ms, total_tracked > 0 ? 100.0 * total_explore_ms / total_tracked : 0.0);
-    printf("  SGD update   : %8.1f ms  (%4.1f%% of GPU-time)\n",
-           total_sgd_ms, total_tracked > 0 ? 100.0 * total_sgd_ms / total_tracked : 0.0);
-
     return (mm == 0) ? 0 : 1;
 }
 
@@ -666,46 +647,6 @@ static void print_summary(PhaseResult *res, int n_phases,
         }
     }
 
-    /* GPU-time overhead breakdown for NN phases */
-    bool has_nn = false;
-    for (int i = 0; i < n_phases; i++)
-        if (strncmp(res[i].phase, "nn", 2) == 0) { has_nn = true; break; }
-
-    if (has_nn) {
-        printf("\n╔═════════════════════════════════════════════════════════════════════════════════════════════════╗\n");
-        printf("║  GPU-Time Overhead Breakdown (cumulative across chunks, 8 concurrent workers)                  ║\n");
-        printf("╠══════════════╦══════════╦══════════╦══════════╦══════════╦══════════╦══════════╦════════════════╣\n");
-        printf("║  Phase       ║ Stats    ║ NN Infer ║ Preproc  ║ Compress ║ Explore  ║ SGD      ║ Total GPU-time ║\n");
-        printf("╠══════════════╬══════════╬══════════╬══════════╬══════════╬══════════╬══════════╬════════════════╣\n");
-        for (int i = 0; i < n_phases; i++) {
-            if (strncmp(res[i].phase, "nn", 2) != 0) continue;
-            PhaseResult *r = &res[i];
-            double total_gpu = r->stats_ms + r->nn_ms + r->preproc_ms + r->comp_ms
-                             + r->explore_ms + r->sgd_ms;
-            printf("║  %-12s║ %5.0f ms ║ %5.0f ms ║ %5.0f ms ║ %5.0f ms ║ %5.0f ms ║ %5.0f ms ║   %7.0f ms   ║\n",
-                   r->phase, r->stats_ms, r->nn_ms, r->preproc_ms, r->comp_ms,
-                   r->explore_ms, r->sgd_ms, total_gpu);
-        }
-        printf("╠══════════════╬══════════╬══════════╬══════════╬══════════╬══════════╬══════════╬════════════════╣\n");
-        printf("║  (%% of GPU)  ║          ║          ║          ║          ║          ║          ║                ║\n");
-        for (int i = 0; i < n_phases; i++) {
-            if (strncmp(res[i].phase, "nn", 2) != 0) continue;
-            PhaseResult *r = &res[i];
-            double total_gpu = r->stats_ms + r->nn_ms + r->preproc_ms + r->comp_ms
-                             + r->explore_ms + r->sgd_ms;
-            if (total_gpu <= 0) total_gpu = 1.0;
-            printf("║  %-12s║ %5.1f%%   ║ %5.1f%%   ║ %5.1f%%   ║ %5.1f%%   ║ %5.1f%%   ║ %5.1f%%   ║   wall: %4.0f ms ║\n",
-                   r->phase,
-                   100.0 * r->stats_ms / total_gpu,
-                   100.0 * r->nn_ms / total_gpu,
-                   100.0 * r->preproc_ms / total_gpu,
-                   100.0 * r->comp_ms / total_gpu,
-                   100.0 * r->explore_ms / total_gpu,
-                   100.0 * r->sgd_ms / total_gpu,
-                   r->write_ms);
-        }
-        printf("╚══════════════╩══════════╩══════════╩══════════╩══════════╩══════════╩══════════╩════════════════╝\n");
-    }
 }
 
 /* ============================================================
@@ -726,6 +667,7 @@ int main(int argc, char **argv)
     float  sgd_lr    = REINFORCE_LR;  /* overridable via --lr */
     double error_bound = 0.0;  /* 0 = lossless, >0 = lossy quantization */
     const char *out_dir_override = NULL;  /* overridable via --out-dir */
+    int verbose_chunks = 0;  /* --verbose-chunks: print per-chunk detail at milestones */
 
     /* Phase selection: bit flags */
     enum { P_NOCOMP = 1, P_NN = 4, P_NNRL = 8, P_NNRLEXP = 16 };
@@ -765,6 +707,8 @@ int main(int argc, char **argv)
             else { fprintf(stderr, "Unknown phase: %s\n"
                            "  Valid: no-comp, nn, nn-rl, nn-rl+exp50\n", p);
                    return 1; }
+        } else if (strcmp(argv[i], "--verbose-chunks") == 0) {
+            verbose_chunks = 1;
         } else if (argv[i][0] != '-') {
             weights_path = argv[i];
         }
@@ -915,12 +859,12 @@ int main(int argc, char **argv)
         /* Reset NN weights so phase 4 starts from original trained weights,
          * not the SGD-modified weights from phase 3. */
         gpucompress_reload_nn(weights_path);
-        printf("\n── Phase %d: nn-rl+exp50 (ALGO_AUTO + SGD + expl@MAPE>=20%%, K=8) ─\n", n_phases + 1);
+        printf("\n── Phase %d: nn-rl+exp50 (ALGO_AUTO + SGD + expl@MAPE>=20%%, K=4) ─\n", n_phases + 1);
         gpucompress_enable_online_learning();
         gpucompress_set_reinforcement(1, sgd_lr, REINFORCE_MAPE, REINFORCE_MAPE);
         gpucompress_set_exploration(1);
         gpucompress_set_exploration_threshold(0.20);
-        gpucompress_set_exploration_k(8);
+        gpucompress_set_exploration_k(4);
         hid_t dcpl_rlexp = make_dcpl_auto(L, chunk_z, error_bound);
         rc = run_phase_vol(d_v, d_read, d_count,
                            n_floats, L, chunk_z,
@@ -944,11 +888,10 @@ int main(int argc, char **argv)
             int explore;
         };
         TsPhase ts_phases[] = {
-            { "nn",          0, 0 },
             { "nn-rl",       1, 0 },
             { "nn-rl+exp50", 1, 1 },
         };
-        int n_ts_phases = 3;
+        int n_ts_phases = 2;
 
         hid_t dcpl_ts = make_dcpl_auto(L, chunk_z, error_bound);
         hsize_t dims3[3] = { (hsize_t)L, (hsize_t)L, (hsize_t)L };
@@ -959,7 +902,7 @@ int main(int argc, char **argv)
             fprintf(ts_csv, "phase,timestep,sim_step,write_ms,read_ms,ratio,"
                     "smape_ratio,smape_comp,smape_decomp,"
                     "mape_ratio,mape_comp,mape_decomp,"
-                    "sgd_fires,n_chunks,mismatches,"
+                    "sgd_fires,explorations,n_chunks,mismatches,"
                     "write_mbps,read_mbps,cache_hits,cache_misses\n");
         }
 
@@ -1001,16 +944,26 @@ int main(int argc, char **argv)
             gpucompress_set_exploration(do_expl);
             if (do_expl) {
                 gpucompress_set_exploration_threshold(0.20);
-                gpucompress_set_exploration_k(8);
+                gpucompress_set_exploration_k(4);
             }
 
-            printf("  %-4s  %-8s  %-7s  %-7s  %-7s  %-8s  %-8s  %-8s  %-8s  %-8s  %-8s  %-4s\n",
+            printf("  %-4s  %-8s  %-7s  %-7s  %-7s  %-8s  %-8s  %-8s  %-8s  %-8s  %-8s  %-4s  %-4s\n",
                    "T", "SimStep", "WrMs", "RdMs", "Ratio",
                    "sMAPE_R", "sMAPE_C", "sMAPE_D",
-                   "MAPE_R", "MAPE_C", "MAPE_D", "SGD");
+                   "MAPE_R", "MAPE_C", "MAPE_D", "SGD", "EXP");
             printf("  ----  --------  -------  -------  -------  "
                    "--------  --------  --------  "
-                   "--------  --------  --------  ----\n");
+                   "--------  --------  --------  ----  ----\n");
+
+            /* Accumulators for averaged throughput (skip first WARMUP_SKIP timesteps) */
+            const int WARMUP_SKIP = 5;
+            double sum_write_ms = 0, sum_read_ms = 0;
+            int    n_steady = 0;
+            /* Final timestep MAPE (overwritten each iteration, last value is final) */
+            double final_mape_r = 0, final_mape_c = 0, final_mape_d = 0;
+            int    final_sgd = 0, final_expl = 0;
+            /* Cumulative SGD/exploration counts across all timesteps */
+            int    cum_sgd = 0, cum_expl = 0;
 
             for (int t = 0; t < timesteps; t++) {
                 int cum_sim_step = (t + 1) * steps;
@@ -1059,6 +1012,13 @@ int main(int argc, char **argv)
                 double tr1  = now_ms();
                 double read_ms_t = tr1 - tr0;
 
+                /* Accumulate for averaged throughput (skip warmup) */
+                if (t >= WARMUP_SKIP) {
+                    sum_write_ms += write_ms_t;
+                    sum_read_ms  += read_ms_t;
+                    n_steady++;
+                }
+
                 unsigned long long mm = gpu_compare(d_v, d_read, n_floats, d_count);
 
                 /* File size for ratio */
@@ -1071,11 +1031,12 @@ int main(int argc, char **argv)
                 double mape_r_sum = 0, mape_c_sum = 0, mape_d_sum = 0;
                 int    cnt_r = 0, cnt_c = 0, cnt_d = 0;
                 int    mcnt_r = 0, mcnt_c = 0, mcnt_d = 0;
-                int    sgd_t = 0;
+                int    sgd_t = 0, expl_t = 0;
                 for (int ci = 0; ci < n_hist; ci++) {
                     gpucompress_chunk_diag_t diag;
                     if (gpucompress_get_chunk_diag(ci, &diag) != 0) continue;
                     if (diag.sgd_fired) sgd_t++;
+                    if (diag.exploration_triggered) expl_t++;
                     if (diag.actual_ratio > 0 && diag.predicted_ratio > 0) {
                         double denom = (fabs(diag.actual_ratio) + fabs(diag.predicted_ratio)) / 2.0;
                         if (denom > 0) { ape_r += fabs(diag.actual_ratio - diag.predicted_ratio) / denom; cnt_r++; }
@@ -1108,6 +1069,15 @@ int main(int argc, char **argv)
                 double real_mape_c = mcnt_c ? (mape_c_sum / mcnt_c) * 100.0 : 0.0;
                 double real_mape_d = mcnt_d ? (mape_d_sum / mcnt_d) * 100.0 : 0.0;
 
+                /* Track final timestep values for summary table */
+                final_mape_r = mape_r;
+                final_mape_c = mape_c;
+                final_mape_d = mape_d;
+                final_sgd    = sgd_t;
+                final_expl   = expl_t;
+                cum_sgd     += sgd_t;
+                cum_expl    += expl_t;
+
                 double wr_mbps = (write_ms_t > 0) ? dataset_mb / (write_ms_t / 1000.0) : 0;
                 double rd_mbps = (read_ms_t > 0)  ? dataset_mb / (read_ms_t  / 1000.0) : 0;
 
@@ -1117,19 +1087,21 @@ int main(int argc, char **argv)
                 /* Print summary row every 5 timesteps, first and last */
                 bool print_row = (t % 5 == 0 || t == timesteps - 1);
                 if (print_row) {
-                    printf("  %-4d  %-8d  %6.0f  %6.0f   %5.2fx  %7.1f%%  %7.1f%%  %7.1f%%  %7.1f%%  %7.1f%%  %7.1f%%  %3d\n",
+                    printf("  %-4d  %-8d  %6.0f  %6.0f   %5.2fx  %7.1f%%  %7.1f%%  %7.1f%%  %7.1f%%  %7.1f%%  %7.1f%%  %3d  %3d\n",
                            t, cum_sim_step, write_ms_t, read_ms_t,
                            ratio_t, mape_r, mape_c, mape_d,
-                           real_mape_r, real_mape_c, real_mape_d, sgd_t);
+                           real_mape_r, real_mape_c, real_mape_d, sgd_t, expl_t);
                 }
 
-                /* Per-chunk detail at milestone timesteps */
+                /* Per-chunk detail at milestone timesteps.
+                 * Console output requires --verbose-chunks; CSV always written. */
                 {
                     bool is_milestone = (t == 0 || t == timesteps / 4 ||
                                          t == timesteps / 2 || t == (timesteps * 3) / 4 ||
                                          t == timesteps - 1);
                     if (is_milestone) {
-                        printf("    ── Per-chunk detail for T=%d ──\n", t);
+                        if (verbose_chunks)
+                            printf("    ── Per-chunk detail for T=%d ──\n", t);
                         int n_detail = n_hist;
                         int stride = (n_detail > 20) ? n_detail / 10 : 1;
                         for (int ci = 0; ci < n_detail; ci++) {
@@ -1151,17 +1123,19 @@ int main(int argc, char **argv)
                             if (dd.decompression_ms > 0)
                                 md = fabs(dd.predicted_decomp_time - dd.decompression_ms) / fabs(dd.decompression_ms) * 100.0;
 
-                            bool print_it = (ci < 3 || ci >= n_detail - 3 || ci % stride == 0);
-                            if (print_it) {
-                                printf("      C%3d  pred_d=%6.3fms  act_d=%5.3fms  MAPE_D=%6.1f%%"
-                                       "  pred_r=%6.1fx  act_r=%6.1fx  MAPE_R=%5.1f%%%s%s\n",
-                                       ci + 1,
-                                       (double)dd.predicted_decomp_time,
-                                       (double)dd.decompression_ms, md,
-                                       (double)dd.predicted_ratio,
-                                       (double)dd.actual_ratio, mr,
-                                       dd.sgd_fired ? " [SGD]" : "",
-                                       dd.exploration_triggered ? " [EXP]" : "");
+                            if (verbose_chunks) {
+                                bool print_it = (ci < 3 || ci >= n_detail - 3 || ci % stride == 0);
+                                if (print_it) {
+                                    printf("      C%3d  pred_d=%6.3fms  act_d=%5.3fms  MAPE_D=%6.1f%%"
+                                           "  pred_r=%6.1fx  act_r=%6.1fx  MAPE_R=%5.1f%%%s%s\n",
+                                           ci + 1,
+                                           (double)dd.predicted_decomp_time,
+                                           (double)dd.decompression_ms, md,
+                                           (double)dd.predicted_ratio,
+                                           (double)dd.actual_ratio, mr,
+                                           dd.sgd_fired ? " [SGD]" : "",
+                                           dd.exploration_triggered ? " [EXP]" : "");
+                                }
                             }
 
                             if (tc_csv) {
@@ -1177,22 +1151,47 @@ int main(int argc, char **argv)
                                         dd.sgd_fired, dd.exploration_triggered);
                             }
                         }
-                        printf("    ── end T=%d ──\n", t);
+                        if (verbose_chunks)
+                            printf("    ── end T=%d ──\n", t);
                     }
                 }
 
                 if (ts_csv) {
-                    fprintf(ts_csv, "%s,%d,%d,%.2f,%.2f,%.4f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%llu,%.1f,%.1f,%d,%d\n",
+                    fprintf(ts_csv, "%s,%d,%d,%.2f,%.2f,%.4f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%llu,%.1f,%.1f,%d,%d\n",
                             phase_name, t, cum_sim_step, write_ms_t, read_ms_t, ratio_t,
                             mape_r, mape_c, mape_d,
                             real_mape_r, real_mape_c, real_mape_d,
-                            sgd_t, n_hist,
+                            sgd_t, expl_t, n_hist,
                             (unsigned long long)mm, wr_mbps, rd_mbps,
                             c_hits, c_misses);
                 }
 
                 remove(TMP_NN_RL);
             } /* end timestep loop */
+
+            /* Store averaged throughput and final-timestep MAPE in the matching
+             * single-shot PhaseResult so the summary table reflects multi-timestep state. */
+            for (int ri = 0; ri < n_phases; ri++) {
+                if (strcmp(results[ri].phase, phase_name) == 0) {
+                    if (n_steady > 0) {
+                        double avg_wr = sum_write_ms / n_steady;
+                        double avg_rd = sum_read_ms  / n_steady;
+                        results[ri].write_ms_avg = avg_wr;
+                        results[ri].read_ms_avg  = avg_rd;
+                        results[ri].write_mbps = dataset_mb / (avg_wr / 1000.0);
+                        results[ri].read_mbps  = dataset_mb / (avg_rd / 1000.0);
+                    }
+                    /* Overwrite MAPE with final timestep values (not single-shot) */
+                    results[ri].mape_ratio_pct  = final_mape_r;
+                    results[ri].mape_comp_pct   = final_mape_c;
+                    results[ri].mape_decomp_pct = final_mape_d;
+                    /* Cumulative SGD/exploration across all timesteps */
+                    results[ri].sgd_fires   = cum_sgd;
+                    results[ri].explorations = cum_expl;
+                    results[ri].n_chunks    = n_chunks * timesteps;
+                    break;
+                }
+            }
         } /* end phase loop */
 
         if (ts_csv) {

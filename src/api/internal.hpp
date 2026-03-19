@@ -405,6 +405,9 @@ int runAutoStatsNNPipeline(
     int* out_top_actions = nullptr
 );
 
+/** Get device pointer to current NN weights (read-only). */
+const NNWeightsGPU* getNNWeightsDevicePtr();
+
 } // namespace gpucompress
 
 /* ============================================================
@@ -470,6 +473,8 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     float predicted_comp_time,
     float predicted_decomp_time,
     float predicted_psnr,
-    const int* top_actions = nullptr);
+    const int* top_actions = nullptr,
+    float stage1_nn_ms = 0.0f,
+    float stage1_stats_ms = 0.0f);
 
 #endif /* INTERNAL_HPP */
