@@ -49,7 +49,7 @@ macro(add_vol_demo TARGET_NAME SOURCE_FILE)
 endmacro()
 
 # ---- VOL Library ----
-add_library(H5VLgpucompress SHARED src/hdf5/H5VLgpucompress.cu src/xfer_tracker.cpp)
+add_library(H5VLgpucompress SHARED src/hdf5/H5VLgpucompress.cu)
 set_source_files_properties(src/hdf5/H5VLgpucompress.cu PROPERTIES LANGUAGE CUDA)
 target_include_directories(H5VLgpucompress PRIVATE
     ${HDF5_VOL_INCLUDE}
@@ -71,6 +71,7 @@ set_target_properties(H5VLgpucompress PROPERTIES
 # ============================================================
 # VOL Tests
 # ============================================================
+add_vol_test(test_execution_flow      tests/unit/test_execution_flow.cu)
 add_vol_test(test_vol_gpu_write       tests/hdf5/test_vol_gpu_write.cu)
 add_vol_test(test_vol2_gpu_fallback   tests/hdf5/test_vol2_gpu_fallback.cu)
 add_vol_test(test_vol_comprehensive   tests/hdf5/test_vol_comprehensive.cu)

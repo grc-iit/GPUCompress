@@ -19,7 +19,6 @@ set(LIB_SOURCES
     src/gray-scott/gray_scott_gpu.cu
     src/gray-scott/gray_scott_sim.cu
     src/vpic/vpic_adapter.cu
-    src/xfer_tracker.cpp
 )
 
 # Set language property for .cpp files that use CUDA
@@ -72,7 +71,6 @@ if(CUFILE_LIBRARY)
 
     add_executable(gpu_compress
         src/cli/compress.cpp
-        src/xfer_tracker.cpp
         ${PREPROCESSING_SOURCES}
         ${FACTORY_SOURCES}
     )
@@ -81,7 +79,6 @@ if(CUFILE_LIBRARY)
 
     add_executable(gpu_decompress
         src/cli/decompress.cpp
-        src/xfer_tracker.cpp
         ${PREPROCESSING_SOURCES}
         ${FACTORY_SOURCES}
     )

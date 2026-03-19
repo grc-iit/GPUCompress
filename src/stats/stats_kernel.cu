@@ -19,8 +19,6 @@
 
 #include "stats/auto_stats_gpu.h"
 #include "api/internal.hpp"
-#include "xfer_tracker.h"
-#define GC_LOG(fmt, ...) do { if (g_gc_verbose) fprintf(stderr, fmt, ##__VA_ARGS__); } while(0)
 
 namespace gpucompress {
 
@@ -335,7 +333,6 @@ AutoStatsGPU* runStatsKernelsNoSync(
     unsigned int* d_histogram = g_d_stats_histogram;
 
     // Zero workspace, then set non-zero sentinels from host (K2 fix)
-    GC_LOG("[XFER INIT] stats workspace: memset zero (%zu B)\n", kStatsWorkspaceSize);
     cudaError_t err = cudaMemsetAsync(g_d_stats_workspace, 0, kStatsWorkspaceSize, stream);
     if (err != cudaSuccess) return nullptr;
 
@@ -466,8 +463,6 @@ static int runStatsKernels(
     };
     StatsResultBlock h_result;
 
-    GC_LOG("[XFER D→H] stats: entropy+mad+deriv (24 B)\n");
-    XFER_TRACK("stats pipeline: D->H entropy+mad+deriv (24B)", sizeof(StatsResultBlock), cudaMemcpyDeviceToHost);
     cudaError_t err = cudaMemcpyAsync(&h_result, &d_stats->entropy,
                                       sizeof(StatsResultBlock),
                                       cudaMemcpyDeviceToHost, stream);

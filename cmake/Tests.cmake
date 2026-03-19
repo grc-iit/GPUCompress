@@ -70,6 +70,15 @@ target_include_directories(test_xfer_stats_init PRIVATE
 target_link_libraries(test_xfer_stats_init PRIVATE gpucompress CUDA::cudart)
 set_target_properties(test_xfer_stats_init PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
+add_executable(test_compress_gpu_delegation tests/unit/test_compress_gpu_delegation.cu)
+set_source_files_properties(tests/unit/test_compress_gpu_delegation.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(test_compress_gpu_delegation PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_compress_gpu_delegation PRIVATE gpucompress CUDA::cudart)
+set_target_properties(test_compress_gpu_delegation PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
 # CLI test
 add_executable(test_cli tests/unit/test_cli.cu)
 target_include_directories(test_cli PRIVATE
@@ -336,14 +345,6 @@ target_include_directories(test_h5_configure_compression_check PRIVATE
 )
 target_link_libraries(test_h5_configure_compression_check PRIVATE gpucompress CUDA::cudart)
 set_target_properties(test_h5_configure_compression_check PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-
-add_executable(test_c3_force_algo_realloc_race tests/regression/test_c3_force_algo_realloc_race.cu)
-set_source_files_properties(tests/regression/test_c3_force_algo_realloc_race.cu PROPERTIES LANGUAGE CUDA)
-target_include_directories(test_c3_force_algo_realloc_race PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-)
-target_link_libraries(test_c3_force_algo_realloc_race PRIVATE gpucompress CUDA::cudart pthread)
-set_target_properties(test_c3_force_algo_realloc_race PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
 add_executable(test_c2_learning_flag_race tests/regression/test_c2_learning_flag_race.cu)
 set_source_files_properties(tests/regression/test_c2_learning_flag_race.cu PROPERTIES LANGUAGE CUDA)

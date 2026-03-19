@@ -477,14 +477,6 @@ void gpucompress_set_exploration_k(int k);
 void gpucompress_set_reinforcement(int enable, float learning_rate,
                                    float mape_threshold, float ct_mape_threshold);
 
-/**
- * Enable/disable verbose transfer and SGD logging to stderr.
- * Off by default. Enable when debugging data-transfer timing or SGD behavior.
- *
- * @param enable 1 to enable verbose logging, 0 to disable
- */
-void gpucompress_set_verbose(int enable);
-
 /* ============================================================
  * Cost-Based Ranking Configuration
  *
@@ -642,31 +634,6 @@ void gpucompress_record_chunk_decomp_ms(int idx, float ms);
  * Averages gradients across all valid chunks, applies ONE bounded update.
  */
 void gpucompress_batched_decomp_sgd(void);
-
-/* ============================================================
- * Force-Algorithm Queue
- *
- * Allows callers to override ALGO_AUTO's NN-based algorithm selection
- * on a per-chunk basis.  Push one entry per chunk before calling
- * H5Dwrite; each call to gpucompress_compress_gpu() with ALGO_AUTO
- * will dequeue the next entry instead of running NN inference.
- * ============================================================ */
-
-/**
- * Reset (clear) the force-algorithm queue.
- */
-void gpucompress_force_algorithm_reset(void);
-
-/**
- * Push one per-chunk algorithm override onto the queue.
- *
- * @param algorithm    Algorithm enum (1-8, e.g. GPUCOMPRESS_ALGO_ZSTD)
- * @param shuffle      1 to enable byte-shuffle, 0 to disable
- * @param quant        1 to enable lossy quantization, 0 to disable
- * @param error_bound  Error bound for quantization (ignored when quant=0)
- */
-void gpucompress_force_algorithm_push(int algorithm, int shuffle,
-                                      int quant, double error_bound);
 
 /**
  * Parse algorithm from string.

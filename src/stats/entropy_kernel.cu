@@ -15,7 +15,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include "xfer_tracker.h"
 
 namespace gpucompress {
 
@@ -267,7 +266,6 @@ double calculateEntropyGPU(const void* d_data, size_t num_bytes, cudaStream_t st
 
     // Copy result back to host
     double entropy;
-    XFER_TRACK("entropy standalone: D->H entropy result", sizeof(double), cudaMemcpyDeviceToHost);
     err = cudaMemcpyAsync(&entropy, d_entropy, sizeof(double), cudaMemcpyDeviceToHost, stream);
     if (err != cudaSuccess) {
         cudaFree(d_histogram);
@@ -339,7 +337,6 @@ double calculateEntropyGPUWithBuffers(
 
     // Copy result back to host
     double entropy;
-    XFER_TRACK("entropy buffered: D->H entropy result", sizeof(double), cudaMemcpyDeviceToHost);
     err = cudaMemcpyAsync(&entropy, d_entropy, sizeof(double), cudaMemcpyDeviceToHost, stream);
     if (err != cudaSuccess) {
         return -1.0;

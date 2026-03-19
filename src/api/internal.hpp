@@ -75,9 +75,6 @@ struct CompContext {
     int                        comp_mgr_clock;
 };
 
-/** Runtime verbose-logging flag — set via gpucompress_set_verbose(). */
-extern bool g_gc_verbose;
-
 namespace gpucompress {
 
 /* ============================================================
@@ -475,6 +472,7 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     float predicted_psnr,
     const int* top_actions = nullptr,
     float stage1_nn_ms = 0.0f,
-    float stage1_stats_ms = 0.0f);
+    float stage1_stats_ms = 0.0f,
+    AutoStatsGPU* d_precomputed_stats = nullptr);
 
 #endif /* INTERNAL_HPP */

@@ -58,8 +58,6 @@ int main()
     }
     gpucompress_disable_online_learning();
     gpucompress_set_exploration(0);
-    /* gpucompress_set_verbose(1); — enable for decompress header debug */
-
     /* 4 chunks × 8 MB = 32 MB total */
     const size_t CHUNK_FLOATS = 2 * 1024 * 1024;  /* 8 MB */
     const int N_CHUNKS = 4;

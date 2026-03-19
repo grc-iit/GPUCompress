@@ -26,7 +26,6 @@
 #include <vector>
 
 #include "gpucompress.h"
-#include "xfer_tracker.h"
 #include "stats/auto_stats_gpu.h"
 
 // Internal declarations
@@ -279,51 +278,14 @@ static void test_repeated_calls() {
  * The only transfers should be the D->H at the end of
  * runStatsOnlyPipeline (24B stats result).
  * ============================================================ */
-static void test_no_h2d_for_stats_init() {
-    TEST("Transfer tracker: zero H->D copies during stats pipeline");
-
-    const size_t N = 256 * 1024;
-    std::vector<float> h(N, 1.0f);
-    void* d = upload(h.data(), N);
-
-    // Reset tracker *after* the upload (which itself is H->D)
-    xfer_tracker_reset();
-
-    double entropy, mad, deriv;
-    gpucompress::runStatsOnlyPipeline(d, N * sizeof(float), 0,
-                                       &entropy, &mad, &deriv);
-    cudaFree(d);
-
-    int h2d = g_xfer_h2d_count;
-    int d2h = g_xfer_d2h_count;
-
-    if (h2d != 0) {
-        char buf[128];
-        snprintf(buf, sizeof(buf),
-                 "expected 0 H->D transfers during stats pipeline, got %d", h2d);
-        FAIL(buf);
-        return;
-    }
-    // Should have exactly 1 D->H: the 24B stats result block
-    if (d2h != 1) {
-        char buf[128];
-        snprintf(buf, sizeof(buf),
-                 "expected 1 D->H transfer (stats result), got %d", d2h);
-        FAIL(buf);
-        return;
-    }
-    PASS();
-}
-
 /* ============================================================
- * Test 9: GPU compress round-trip with ALGO_AUTO
+ * Test 8: GPU compress round-trip (non-AUTO, exercises delegation)
  *
- * Data originates on GPU. Compress with NN auto, decompress,
- * verify data integrity. Also checks the transfer tracker
- * shows zero large H->D copies for the input data.
+ * Verifies that compress_gpu correctly delegates to
+ * compress_with_action_gpu for explicit algorithm selection.
  * ============================================================ */
-static void test_gpu_roundtrip_auto() {
-    TEST("GPU compress round-trip (ALGO_AUTO, 256K floats)");
+static void test_gpu_roundtrip_explicit() {
+    TEST("GPU compress round-trip (LZ4 explicit, delegation path)");
 
     gpucompress_error_t err = gpucompress_init(nullptr);
     if (err != GPUCOMPRESS_SUCCESS) {
@@ -334,7 +296,6 @@ static void test_gpu_roundtrip_auto() {
     const size_t N = 256 * 1024;
     const size_t data_bytes = N * sizeof(float);
 
-    // Generate data directly on host then upload (simulates GPU-origin)
     std::vector<float> h_orig(N);
     for (size_t i = 0; i < N; i++) h_orig[i] = sinf((float)i * 0.01f);
 
@@ -342,46 +303,33 @@ static void test_gpu_roundtrip_auto() {
     cudaMalloc(&d_input, data_bytes);
     cudaMemcpy(d_input, h_orig.data(), data_bytes, cudaMemcpyHostToDevice);
 
-    // Allocate output on GPU (generous: 2x input)
     size_t out_buf_sz = data_bytes * 2;
     void* d_compressed = nullptr;
     cudaMalloc(&d_compressed, out_buf_sz);
 
-    // Reset tracker after setup copies
-    xfer_tracker_reset();
-
-    // Compress on GPU with LZ4 (ALGO_AUTO may need NN weights)
     gpucompress_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
-    cfg.algorithm = GPUCOMPRESS_ALGO_LZ4;  // deterministic, no NN needed
+    cfg.algorithm = GPUCOMPRESS_ALGO_LZ4;
     cfg.preprocessing = 0;
 
     size_t comp_size = out_buf_sz;
+    gpucompress_stats_t stats = {};
     err = gpucompress_compress_gpu(d_input, data_bytes, d_compressed,
-                                   &comp_size, &cfg, nullptr, nullptr);
+                                   &comp_size, &cfg, &stats, nullptr);
     if (err != GPUCOMPRESS_SUCCESS) {
-        cudaFree(d_input);
-        cudaFree(d_compressed);
+        cudaFree(d_input); cudaFree(d_compressed);
         gpucompress_cleanup();
         FAIL("gpucompress_compress_gpu failed");
         return;
     }
 
-    // Check: no large H->D transfers for the input data
-    // (only small ones: header 64B, etc.)
-    if (g_xfer_h2d_bytes > 512) {
-        char buf[256];
-        snprintf(buf, sizeof(buf),
-                 "GPU compress sent %ld H->D bytes (expected < 512 for metadata only)",
-                 (long)g_xfer_h2d_bytes);
-        cudaFree(d_input);
-        cudaFree(d_compressed);
+    if (stats.algorithm_used != GPUCOMPRESS_ALGO_LZ4) {
+        cudaFree(d_input); cudaFree(d_compressed);
         gpucompress_cleanup();
-        FAIL(buf);
+        FAIL("algorithm_used != LZ4 after explicit delegation");
         return;
     }
 
-    // Decompress on GPU
     void* d_decompressed = nullptr;
     cudaMalloc(&d_decompressed, data_bytes);
     size_t decomp_size = data_bytes;
@@ -389,15 +337,12 @@ static void test_gpu_roundtrip_auto() {
     err = gpucompress_decompress_gpu(d_compressed, comp_size, d_decompressed,
                                       &decomp_size, nullptr);
     if (err != GPUCOMPRESS_SUCCESS) {
-        cudaFree(d_input);
-        cudaFree(d_compressed);
-        cudaFree(d_decompressed);
+        cudaFree(d_input); cudaFree(d_compressed); cudaFree(d_decompressed);
         gpucompress_cleanup();
         FAIL("gpucompress_decompress_gpu failed");
         return;
     }
 
-    // Verify: copy both back and compare
     std::vector<float> h_decomp(N);
     cudaMemcpy(h_decomp.data(), d_decompressed, data_bytes, cudaMemcpyDeviceToHost);
 
@@ -406,9 +351,7 @@ static void test_gpu_roundtrip_auto() {
         if (h_orig[i] != h_decomp[i]) { match = false; break; }
     }
 
-    cudaFree(d_input);
-    cudaFree(d_compressed);
-    cudaFree(d_decompressed);
+    cudaFree(d_input); cudaFree(d_compressed); cudaFree(d_decompressed);
     gpucompress_cleanup();
 
     ASSERT(match, "decompressed data does not match original");
@@ -438,12 +381,8 @@ int main() {
     test_large_multiblock();
     test_repeated_calls();
 
-    // Transfer tracker tests (must enable tracker before counting)
-    xfer_tracker_enable(1);
-    test_no_h2d_for_stats_init();
-
-    // GPU round-trip test
-    test_gpu_roundtrip_auto();
+    // GPU round-trip test (exercises compress_gpu → _with_action_gpu delegation)
+    test_gpu_roundtrip_explicit();
 
     printf("\nResults: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail > 0 ? 1 : 0;

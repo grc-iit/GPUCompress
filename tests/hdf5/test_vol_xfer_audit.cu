@@ -25,7 +25,6 @@
 
 #include "gpucompress.h"
 #include "gpucompress_hdf5_vol.h"
-#include "xfer_tracker.h"
 
 /* ------------------------------------------------------------------ */
 /* Constants                                                            */
@@ -146,7 +145,6 @@ int main(int argc, char** argv) {
     printf("[OK] Data generated on GPU (%d blocks x %d threads)\n", blocks, threads);
 
     /* ---- 3. Reset transfer tracker (ignore setup copies) ---- */
-    xfer_tracker_reset();
     H5VL_gpucompress_reset_stats();
     printf("\n--- Transfer tracker reset ---\n\n");
 
@@ -197,7 +195,6 @@ int main(int argc, char** argv) {
 
     /* Print transfer snapshot after write */
     printf("\n--- Transfers after WRITE ---\n");
-    xfer_tracker_dump();
 
     /* ---- 5. Read back to a fresh GPU buffer through VOL ---- */
     float* d_readback = nullptr;
@@ -249,7 +246,6 @@ int main(int argc, char** argv) {
     printf("\n==============================================\n");
     printf(" FULL TRANSFER AUDIT (write + read)\n");
     printf("==============================================\n");
-    xfer_tracker_dump();
 
     /* VOL-level stats */
     int vol_writes = 0, vol_reads = 0, vol_comp = 0, vol_decomp = 0;
