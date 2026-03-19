@@ -281,97 +281,63 @@ def make_summary_figure(source_name, rows, output_path, meta_text=""):
 # ═══════════════════════════════════════════════════════════════════════
 
 def make_timestep_figure(ts_csv_path, output_path):
-    """Plot MAPE for ratio/comp_time/decomp_time over all timesteps."""
+    """Plot MAPE for ratio/comp_time/decomp_time over timesteps, one line per phase."""
     rows = parse_csv(ts_csv_path)
     if not rows:
         print(f"  No timestep data in {ts_csv_path}, skipping.")
         return
 
-    timesteps = np.array([g(r, "timestep") for r in rows])
-    mape_r = np.array([g(r, "mape_ratio", default=-1) for r in rows])
-    mape_c = np.array([g(r, "mape_comp", default=-1) for r in rows])
-    mape_d = np.array([g(r, "mape_decomp", default=-1) for r in rows])
-    has_mape = mape_r[0] >= 0
-    if not has_mape:
-        mape_r = np.array([g(r, "smape_ratio") for r in rows])
-        mape_c = np.array([g(r, "smape_comp") for r in rows])
-        mape_d = np.array([g(r, "smape_decomp") for r in rows])
-    sgd_fires = np.array([g(r, "sgd_fires") for r in rows])
+    # Group by phase (new CSV has 'phase' column; old CSV doesn't)
+    has_phase = "phase" in rows[0] if rows else False
+    by_phase = {}
+    for r in rows:
+        ph = r.get("phase", "nn-rl") if has_phase else "nn-rl"
+        by_phase.setdefault(ph, []).append(r)
 
-    metrics = [
-        ("Compression Ratio",  mape_r, "#27ae60", "#2ecc71"),
-        ("Compression Time",   mape_c, "#2471a3", "#3498db"),
-        ("Decompression Time", mape_d, "#c0392b", "#e74c3c"),
+    phase_order = ["nn", "nn-rl", "nn-rl+exp50"]
+    phase_styles = {
+        "nn":          {"color": "#999999", "ls": ":",  "marker": "s", "lw": 1.5},
+        "nn-rl":       {"color": "#6a9f58", "ls": "-",  "marker": "o", "lw": 2.0},
+        "nn-rl+exp50": {"color": "#c85a5a", "ls": "--", "marker": "D", "lw": 1.8},
+    }
+    phases_present = [p for p in phase_order if p in by_phase]
+
+    metric_keys = [
+        ("Compression Ratio",  "mape_ratio",  "smape_ratio"),
+        ("Compression Time",   "mape_comp",   "smape_comp"),
+        ("Decompression Time", "mape_decomp", "smape_decomp"),
     ]
 
     fig, axes = plt.subplots(3, 1, figsize=(14, 12))
     fig.suptitle("Online SGD Prediction Accuracy Over Timesteps",
-                 fontsize=15, fontweight="bold", y=0.98)
+                 fontsize=14, fontweight="bold", y=0.98)
 
-    n_ts = len(timesteps)
-    bar_w = max(0.6, (timesteps[-1] - timesteps[0]) / n_ts * 0.75) if n_ts > 1 else 0.8
+    for ax, (label, mape_key, smape_key) in zip(axes, metric_keys):
+        for ph in phases_present:
+            ph_rows = by_phase[ph]
+            timesteps = np.array([g(r, "timestep") for r in ph_rows])
+            mape = np.array([g(r, mape_key, default=-1) for r in ph_rows])
+            if mape[0] < 0:
+                mape = np.array([g(r, smape_key) for r in ph_rows])
+            clipped = np.clip(mape, 0, 200)
 
-    for ax, (label, mape, dark, light) in zip(axes, metrics):
-        clipped = np.clip(mape, 0, 200)
-
-        # Gradient-colored bars: green < 20%, orange 20-50%, red > 50%
-        colors = [("#27ae60" if v <= 20 else "#f39c12" if v <= 50 else "#e74c3c")
-                  for v in mape]
-        bars = ax.bar(timesteps, clipped, color=colors, edgecolor="white",
-                       linewidth=0.4, alpha=0.85, width=bar_w)
-
-        # Value labels on bars
-        for bar, val in zip(bars, mape):
-            if val > 0 and val <= 180:
-                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 2,
-                        f"{val:.0f}%", ha="center", va="bottom",
-                        fontsize=7, color="#444444")
-            elif val > 200:
-                ax.text(bar.get_x() + bar.get_width() / 2, 192,
-                        f"{val:.0f}%", ha="center", va="top",
-                        fontsize=6, color="white", fontweight="bold")
-
-        # Trend line
-        if n_ts >= 5:
-            w = min(5, n_ts)
-            kernel = np.ones(w) / w
-            rolling = np.clip(np.convolve(mape, kernel, mode="valid"), 0, 200)
-            x_roll = timesteps[w - 1:]
-            ax.plot(x_roll, rolling, color="#2c3e50", linewidth=2.5, alpha=0.9,
-                    label=f"Trend (w={w})", zorder=5)
+            sty = phase_styles.get(ph, {"color": "black", "ls": "-", "marker": ".", "lw": 1.5})
+            ax.plot(timesteps, clipped, color=sty["color"], linestyle=sty["ls"],
+                    marker=sty["marker"], markersize=4, linewidth=sty["lw"],
+                    label=ph, alpha=0.9, zorder=3)
 
         # 20% target
-        ax.axhline(20, color="#e67e22", linewidth=1.2, linestyle="--", alpha=0.7)
-        ax.text(timesteps[-1] + bar_w, 20, " 20% target", fontsize=8,
-                color="#e67e22", va="center", fontweight="bold")
+        ax.axhline(20, color="#e67e22", linewidth=1, linestyle="--", alpha=0.6)
 
         ax.set_ylabel(f"{label}\nMAPE (%)", fontsize=11, fontweight="bold")
         ax.set_ylim(0, 200)
-        ax.set_xlim(timesteps[0] - bar_w, timesteps[-1] + bar_w * 3)
-        ax.grid(axis="y", alpha=0.2, linestyle="-")
+        ax.grid(axis="y", alpha=0.3, linestyle="--")
         ax.tick_params(axis="both", labelsize=9)
-        ax.legend(fontsize=9, loc="upper right", framealpha=0.9)
-
-        # Stats annotation
-        best = np.min(mape)
-        avg_all = np.mean(mape)
-        ax.text(0.01, 0.95,
-                f"Start: {mape[0]:.0f}%    Best: {best:.0f}%    Avg: {avg_all:.0f}%",
-                transform=ax.transAxes, fontsize=9, ha="left", va="top",
-                fontfamily="monospace",
-                bbox=dict(facecolor="white", alpha=0.9, edgecolor="#bbb",
-                          boxstyle="round,pad=0.4"))
+        ax.legend(fontsize=9, loc="upper right")
+        for spine in ["top", "right"]:
+            ax.spines[spine].set_visible(False)
 
     axes[-1].set_xlabel("Timestep", fontsize=11, fontweight="bold")
-
-    # SGD fires as subtle secondary axis on bottom panel
-    ax2 = axes[-1].twinx()
-    ax2.bar(timesteps, sgd_fires, width=bar_w * 0.3, color="#95a5a6",
-            alpha=0.4, zorder=1, label="SGD fires")
-    ax2.set_ylabel("SGD Fires", fontsize=9, color="#7f8c8d")
-    ax2.tick_params(axis="y", labelcolor="#7f8c8d", labelsize=8)
-    ax2.set_ylim(0, max(sgd_fires) * 3 if max(sgd_fires) > 0 else 10)
-    ax2.legend(fontsize=8, loc="lower right", framealpha=0.8)
 
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -380,12 +346,27 @@ def make_timestep_figure(ts_csv_path, output_path):
     print(f"  Saved: {output_path}")
 
 
-def make_timestep_chunks_figure(tc_csv_path, output_path):
-    """Plot per-chunk MAPE at milestone timesteps from timestep_chunks CSV."""
-    rows = parse_csv(tc_csv_path)
-    if not rows:
+def make_timestep_chunks_figure(tc_csv_path, output_path, phase_filter="nn-rl"):
+    """Plot per-chunk predicted vs actual at milestone timesteps for one phase."""
+    all_rows = parse_csv(tc_csv_path)
+    if not all_rows:
         print(f"  No timestep chunk data in {tc_csv_path}, skipping.")
         return
+
+    # Filter by phase if column exists
+    has_phase = "phase" in all_rows[0]
+    if has_phase:
+        rows = [r for r in all_rows if r.get("phase", "") == phase_filter]
+        if not rows:
+            # Fallback: try first available phase
+            phases_avail = list(set(r.get("phase", "") for r in all_rows))
+            if phases_avail:
+                phase_filter = phases_avail[0]
+                rows = [r for r in all_rows if r.get("phase", "") == phase_filter]
+            else:
+                rows = all_rows
+    else:
+        rows = all_rows
 
     # Group by timestep
     by_ts = {}
@@ -409,7 +390,8 @@ def make_timestep_chunks_figure(tc_csv_path, output_path):
 
     fig, axes = plt.subplots(n_ts, 3, figsize=(20, 3.2 * n_ts + 2),
                               squeeze=False)
-    fig.suptitle("NN Predicted vs Actual Per Chunk at Milestone Timesteps",
+    phase_label = phase_filter if has_phase else "nn-rl"
+    fig.suptitle(f"Predicted vs Actual Per Chunk [{phase_label}]",
                  fontsize=14, fontweight="bold", y=0.99)
 
     for row_idx, ts in enumerate(timestep_list):

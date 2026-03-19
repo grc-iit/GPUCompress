@@ -1029,6 +1029,7 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
             float          predicted_comp_time;
             float          predicted_decomp_time;
             float          predicted_psnr;
+            int            top_actions[32];
         };
 
         /* M4 fix: use session-level buffers from write_ctx (persistent across writes).
@@ -1135,7 +1136,8 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                             ce = gpucompress_compress_with_action_gpu(
                                 wi.src, wi.sz, d_comp_w[w], &comp_sz, &cfg, &wstats, NULL,
                                 wi.action, wi.predicted_ratio, wi.predicted_comp_time,
-                                wi.predicted_decomp_time, wi.predicted_psnr);
+                                wi.predicted_decomp_time, wi.predicted_psnr,
+                                wi.top_actions);
                         } else {
                             ce = gpucompress_compress_gpu(
                                 wi.src, wi.sz, d_comp_w[w], &comp_sz, &cfg, &wstats, NULL);
@@ -1307,9 +1309,11 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                     if (use_seq_inference && wi.src && wi.sz > 0) {
                         int infer_action = -1;
                         float infer_ratio = 0, infer_ct = 0, infer_dt = 0, infer_psnr = 0;
+                        int infer_top[32] = {0};
                         gpucompress_error_t ie = gpucompress_infer_gpu(
                             wi.src, wi.sz, &cfg, nullptr, infer_ctx,
-                            &infer_action, &infer_ratio, &infer_ct, &infer_dt, &infer_psnr);
+                            &infer_action, &infer_ratio, &infer_ct, &infer_dt, &infer_psnr,
+                            infer_top);
                         if (ie == GPUCOMPRESS_SUCCESS && infer_action >= 0) {
                             wi.has_inference      = true;
                             wi.action             = infer_action;
@@ -1317,6 +1321,7 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                             wi.predicted_comp_time = infer_ct;
                             wi.predicted_decomp_time = infer_dt;
                             wi.predicted_psnr     = infer_psnr;
+                            memcpy(wi.top_actions, infer_top, sizeof(infer_top));
                         }
                         /* On failure, has_inference stays false → worker falls back
                          * to full gpucompress_compress_gpu() with its own inference */

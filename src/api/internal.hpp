@@ -437,7 +437,8 @@ gpucompress_error_t gpucompress_infer_gpu(
     float* out_predicted_ratio,
     float* out_predicted_comp_time,
     float* out_predicted_decomp_time,
-    float* out_predicted_psnr);
+    float* out_predicted_psnr,
+    int* out_top_actions = nullptr);
 
 /**
  * Phase B: preprocess + compress + exploration + SGD.
@@ -468,6 +469,7 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     float predicted_ratio,
     float predicted_comp_time,
     float predicted_decomp_time,
-    float predicted_psnr);
+    float predicted_psnr,
+    const int* top_actions = nullptr);
 
 #endif /* INTERNAL_HPP */

@@ -2010,7 +2010,7 @@ extern "C" int gpucompress_active_learning_enabled(void) {
 }
 
 extern "C" void gpucompress_set_exploration_threshold(double threshold) {
-    if (threshold > 0.0 && threshold < 1.0) {
+    if (threshold >= 0.0 && threshold < 1.0) {
         g_exploration_threshold = threshold;
     }
 }
@@ -2844,7 +2844,8 @@ gpucompress_error_t gpucompress_infer_gpu(
     float* out_predicted_ratio,
     float* out_predicted_comp_time,
     float* out_predicted_decomp_time,
-    float* out_predicted_psnr)
+    float* out_predicted_psnr,
+    int* out_top_actions)
 {
     if (!g_initialized.load()) return GPUCOMPRESS_ERROR_NOT_INITIALIZED;
     if (!d_input || !out_action) return GPUCOMPRESS_ERROR_INVALID_INPUT;
@@ -2888,12 +2889,14 @@ gpucompress_error_t gpucompress_infer_gpu(
     float pred_ratio = 0.0f, pred_ct = 0.0f, pred_dt = 0.0f, pred_psnr = 0.0f;
     int fused_ood = 0;
 
+    int local_top[32] = {0};
+
     cudaEventRecord(ctx->nn_start, stream);
     int action = gpucompress::runNNFusedInferenceCtx(
         d_stats_ptr, input_size, cfg.error_bound, stream, ctx,
         &action, &pred_ratio, &pred_ct, &pred_dt, &pred_psnr,
         g_online_learning_enabled ? &fused_ood : nullptr,
-        nullptr,  /* no top_actions needed for inference-only phase */
+        local_top,
         ctx->nn_stop);
 
     /* runNNFusedInferenceCtx does internal cudaStreamSynchronize */
@@ -2906,6 +2909,7 @@ gpucompress_error_t gpucompress_infer_gpu(
     if (out_predicted_comp_time)   *out_predicted_comp_time = pred_ct;
     if (out_predicted_decomp_time) *out_predicted_decomp_time = pred_dt;
     if (out_predicted_psnr)        *out_predicted_psnr = pred_psnr;
+    if (out_top_actions)           memcpy(out_top_actions, local_top, sizeof(local_top));
 
     if (stats != nullptr) {
         stats->entropy_bits = entropy;
@@ -2934,7 +2938,8 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     float predicted_ratio,
     float predicted_comp_time,
     float predicted_decomp_time,
-    float predicted_psnr)
+    float predicted_psnr,
+    const int* top_actions)
 {
     if (!g_initialized.load()) return GPUCOMPRESS_ERROR_NOT_INITIALIZED;
     if (!d_input || !d_output || !output_size) return GPUCOMPRESS_ERROR_INVALID_INPUT;
@@ -2958,7 +2963,6 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     int nn_original_action = action;
     bool nn_was_used = true;
     bool sgd_fired = false, exploration_triggered = false;
-    int top_actions[32] = {0};
     bool is_ood = false;
     AutoStatsGPU* d_stats_ptr = nullptr;
 
@@ -3145,8 +3149,8 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
                                    cudaMemcpyHostToDevice, stream);
     }
 
-    if (d_quantized) cudaFree(d_quantized);
-    if (d_shuffled)  cudaFree(d_shuffled);
+    if (d_quantized) { cudaFree(d_quantized); d_quantized = nullptr; }
+    if (d_shuffled)  { cudaFree(d_shuffled);  d_shuffled  = nullptr; }
 
     if (cuda_err != cudaSuccess) return GPUCOMPRESS_ERROR_CUDA_FAILED;
 
@@ -3185,15 +3189,31 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
         double error_pct = (actual_cost > 0.0)
             ? std::abs(actual_cost - predicted_cost) / actual_cost : 0.0;
 
-        /* ── SGD: learn from primary result ── */
+        // cost = w0*ct + w1*dt + w2*ds/(ratio*bw)  — same formula as NN ranking
+        auto compute_explore_cost = [&](double ct, double dt, double r) -> double {
+            return w0 * ct + w1 * dt + ((r > 0.0) ? w2 * ds / (r * bw) : 1e30);
+        };
+        struct ExploredResult { int action; double ratio; double comp_time_ms;
+                                double decomp_time_ms; double psnr; double cost; };
+        std::vector<ExploredResult> explored_samples;
+        double primary_cost = compute_explore_cost(
+            static_cast<double>(primary_comp_time_ms),
+            (primary_decomp_time_ms > 0.0f) ? static_cast<double>(primary_decomp_time_ms) : pred_dt,
+            actual_ratio);
+        explored_samples.push_back({nn_action, actual_ratio,
+            static_cast<double>(primary_comp_time_ms),
+            (primary_decomp_time_ms > 0.0f) ? static_cast<double>(primary_decomp_time_ms) : 0.0,
+            120.0, primary_cost});
+
+        /* ── SGD Phase 1: learn from PRIMARY result immediately ── */
         auto t_sgd_start = std::chrono::steady_clock::now();
         if (error_pct > static_cast<double>(g_reinforce_mape_threshold) && d_stats_ptr) {
             SGDSample primary_sgd[1];
-            primary_sgd[0].action            = nn_action;
-            primary_sgd[0].actual_ratio      = static_cast<float>(actual_ratio);
-            primary_sgd[0].actual_comp_time  = static_cast<float>(primary_comp_time_ms);
-            primary_sgd[0].actual_decomp_time= static_cast<float>(primary_decomp_time_ms);
-            primary_sgd[0].actual_psnr       = 120.0f;
+            primary_sgd[0].action            = explored_samples[0].action;
+            primary_sgd[0].actual_ratio      = static_cast<float>(explored_samples[0].ratio);
+            primary_sgd[0].actual_comp_time  = static_cast<float>(explored_samples[0].comp_time_ms);
+            primary_sgd[0].actual_decomp_time= static_cast<float>(explored_samples[0].decomp_time_ms);
+            primary_sgd[0].actual_psnr       = static_cast<float>(explored_samples[0].psnr);
             if (d_quantized && quant_result.isValid()) {
                 double range = quant_result.data_max - quant_result.data_min;
                 if (range > 0.0 && quant_result.error_bound > 0.0)
@@ -3208,6 +3228,262 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
                         &gn, &gc, &gs) == 0) {
                     sgd_fired = true;
                 }
+            }
+        }
+
+        if (g_exploration_enabled && error_pct > g_exploration_threshold && top_actions) {
+            exploration_triggered = true;
+            int K;
+            if (g_exploration_k_override > 0) {
+                K = g_exploration_k_override;
+            } else {
+                K = 3;  // Top-3 alternatives (limits GPU memory pressure)
+            }
+
+            gpucompress::DecodedAction primary_dec = gpucompress::decodeAction(nn_action);
+            GC_LOG("[EXPLORE-GPU] Chunk %zuB | primary=action%d (%s%s%s) ratio=%.3f | "
+                    "cost_err=%.1f%% %s| K=%d\n",
+                    input_size, nn_action,
+                    ALGORITHM_NAMES[primary_dec.algorithm + 1],
+                    primary_dec.shuffle_size > 0 ? "+shuf" : "",
+                    primary_dec.use_quantization ? "+quant" : "",
+                    actual_ratio,
+                    error_pct * 100.0,
+                    is_ood ? "OOD " : "",
+                    K);
+
+            double best_cost = primary_cost;
+
+            /* ---- Parallel exploration: K alternatives on K separate streams ----
+             * Phase 1: launch all K compressions in parallel.
+             * Phase 2: sync all, read sizes, pick winner by cost.
+             * Phase 3: cleanup per-slot resources. */
+
+            constexpr int MAX_EXPLORE_K = 8;
+            int actual_K = std::min(K, MAX_EXPLORE_K);
+
+            struct ExploreSlot {
+                int       action;
+                int       algo;             /* gpucompress_algorithm_t */
+                unsigned  preproc;
+                unsigned  shuf_size;
+                bool      has_quant;
+                QuantizationResult quant_result;
+                cudaStream_t       stream;
+                uint8_t*  d_out;            /* compressed output */
+                uint8_t*  d_quant;          /* quantized buffer (owned) */
+                uint8_t*  d_shuf;           /* shuffled buffer (owned) */
+                void*     d_range_min;      /* per-slot quantization range */
+                void*     d_range_max;
+                std::unique_ptr<nvcomp::nvcompManagerBase> comp_mgr;
+                size_t    comp_size;        /* filled after sync */
+                double    ratio;
+                bool      valid;            /* compression succeeded */
+            };
+
+            ExploreSlot slots[MAX_EXPLORE_K];
+            int n_slots = 0;
+            size_t explore_max_comp = gpucompress_max_compressed_size(input_size);
+
+            /* ---- Phase 1: prepare and launch K compressions in parallel ---- */
+            for (int i = 1; i <= actual_K && i < 32; i++) {
+                int alt_action = top_actions[i];
+                if (alt_action == nn_action) continue;
+
+                gpucompress::DecodedAction alt = gpucompress::decodeAction(alt_action);
+                if (alt.use_quantization && cfg.error_bound <= 0.0) continue;
+
+                ExploreSlot& s = slots[n_slots];
+                memset(&s, 0, sizeof(s));
+                s.action    = alt_action;
+                s.algo      = alt.algorithm + 1;
+                s.shuf_size = (alt.shuffle_size > 0) ? 4 : 0;
+                s.has_quant = alt.use_quantization;
+                s.preproc   = 0;
+                if (s.shuf_size > 0) s.preproc |= GPUCOMPRESS_PREPROC_SHUFFLE_4;
+                if (s.has_quant)     s.preproc |= GPUCOMPRESS_PREPROC_QUANTIZE;
+                s.valid = false;
+
+                /* Create per-slot stream and output buffer */
+                if (cudaStreamCreate(&s.stream) != cudaSuccess) continue;
+                if (cudaMalloc(&s.d_out, explore_max_comp) != cudaSuccess) {
+                    cudaStreamDestroy(s.stream); s.stream = nullptr; continue;
+                }
+
+                /* Per-slot quantization range buffers (8B each) */
+                if (s.has_quant) {
+                    if (cudaMalloc(&s.d_range_min, sizeof(double)) != cudaSuccess ||
+                        cudaMalloc(&s.d_range_max, sizeof(double)) != cudaSuccess) {
+                        cudaFree(s.d_out); cudaStreamDestroy(s.stream);
+                        if (s.d_range_min) cudaFree(s.d_range_min);
+                        continue;
+                    }
+                }
+
+                /* Preprocessing on per-slot stream */
+                uint8_t* d_alt_input = const_cast<uint8_t*>(
+                    static_cast<const uint8_t*>(d_input));
+                size_t alt_compress_size = input_size;
+
+                if (s.has_quant && cfg.error_bound > 0.0) {
+                    size_t num_el = input_size / sizeof(float);
+                    if (num_el > 0) {
+                        QuantizationConfig qcfg(QuantizationType::LINEAR,
+                            cfg.error_bound, num_el, sizeof(float));
+                        s.quant_result = quantize_simple(d_alt_input, num_el,
+                            sizeof(float), qcfg, s.d_range_min, s.d_range_max,
+                            s.stream);
+                        if (s.quant_result.isValid()) {
+                            s.d_quant = static_cast<uint8_t*>(s.quant_result.d_quantized);
+                            d_alt_input = s.d_quant;
+                            alt_compress_size = s.quant_result.quantized_bytes;
+                        }
+                    }
+                }
+
+                if (s.shuf_size > 0) {
+                    uint8_t* shuf = byte_shuffle_simple(d_alt_input,
+                        alt_compress_size, s.shuf_size,
+                        gpucompress::SHUFFLE_CHUNK_SIZE, s.stream);
+                    if (shuf) { s.d_shuf = shuf; d_alt_input = shuf; }
+                }
+
+                /* Create fresh compression manager on per-slot stream */
+                CompressionAlgorithm alt_internal = gpucompress::toInternalAlgorithm(
+                    static_cast<gpucompress_algorithm_t>(s.algo));
+                s.comp_mgr = createCompressionManager(alt_internal,
+                    gpucompress::DEFAULT_CHUNK_SIZE, s.stream, nullptr);
+
+                if (s.comp_mgr) {
+                    try {
+                        CompressionConfig alt_cc =
+                            s.comp_mgr->configure_compression(alt_compress_size);
+                        if (alt_cc.max_compressed_buffer_size <= explore_max_comp) {
+                            s.comp_mgr->compress(d_alt_input, s.d_out, alt_cc);
+                            s.valid = true;
+                        }
+                    } catch (...) { /* compression failed, s.valid stays false */ }
+                }
+
+                n_slots++;
+            }
+
+            /* ---- Phase 2: sync all streams, read sizes, pick winner ---- */
+            for (int k = 0; k < n_slots; k++) {
+                ExploreSlot& s = slots[k];
+                if (!s.valid) continue;
+
+                cudaStreamSynchronize(s.stream);
+                s.comp_size = s.comp_mgr->get_compressed_output_size(s.d_out);
+                s.ratio = static_cast<double>(input_size) /
+                          static_cast<double>(s.comp_size);
+
+                /* PSNR: analytical from error bound (no D->H needed) */
+                double alt_psnr = 120.0;
+                if (s.has_quant && s.quant_result.isValid()) {
+                    double range = s.quant_result.data_max - s.quant_result.data_min;
+                    if (range > 0.0 && s.quant_result.error_bound > 0.0)
+                        alt_psnr = fmin(20.0 * log10(range / s.quant_result.error_bound), 120.0);
+                }
+
+                /* GPU path: no per-alt timing, use I/O cost term only */
+                double alt_cost = compute_explore_cost(0.0, 0.0, s.ratio);
+                explored_samples.push_back({s.action, s.ratio, 0.0, 0.0, alt_psnr, alt_cost});
+
+                GC_LOG("[EXPLORE-GPU]   slot %d: action%d ratio=%.3f cost=%.3f%s\n",
+                        k, s.action, s.ratio, alt_cost,
+                        (alt_cost < best_cost) ? " << NEW BEST" : "");
+
+                if (alt_cost < best_cost) {
+                    best_cost = alt_cost;
+                    nn_action = s.action;
+                    g_last_nn_action.store(s.action);
+
+                    /* Write winner to output */
+                    size_t hdr_sz = GPUCOMPRESS_HEADER_SIZE;
+                    size_t alt_total = hdr_sz + s.comp_size;
+                    if (alt_total <= *output_size) {
+                        CompressionHeader alt_hdr;
+                        alt_hdr.magic = COMPRESSION_MAGIC;
+                        alt_hdr.version = COMPRESSION_HEADER_VERSION;
+                        alt_hdr.shuffle_element_size = s.shuf_size;
+                        alt_hdr.original_size = input_size;
+                        alt_hdr.compressed_size = s.comp_size;
+
+                        if (s.d_quant && s.quant_result.isValid()) {
+                            alt_hdr.setQuantizationFlags(
+                                static_cast<uint32_t>(s.quant_result.type),
+                                s.quant_result.actual_precision, true);
+                            alt_hdr.quant_error_bound = s.quant_result.error_bound;
+                            alt_hdr.quant_scale = s.quant_result.scale_factor;
+                            alt_hdr.data_min = s.quant_result.data_min;
+                            alt_hdr.data_max = s.quant_result.data_max;
+                        } else {
+                            alt_hdr.quant_flags = 0;
+                            alt_hdr.quant_error_bound = 0.0;
+                            alt_hdr.quant_scale = 0.0;
+                            alt_hdr.data_min = 0.0;
+                            alt_hdr.data_max = 0.0;
+                        }
+                        alt_hdr.setAlgorithmId((uint8_t)s.algo);
+
+                        /* Copy winner to output on ctx->stream (sync with caller) */
+                        cudaMemcpyAsync(d_out, &alt_hdr, sizeof(CompressionHeader),
+                                        cudaMemcpyHostToDevice, stream);
+                        cudaMemcpyAsync(d_out + hdr_sz, s.d_out, s.comp_size,
+                                        cudaMemcpyDeviceToDevice, stream);
+                        *output_size = alt_total;
+                        total_size = alt_total;
+                        compressed_size = s.comp_size;
+                        actual_ratio = s.ratio;
+                        algo_to_use = static_cast<gpucompress_algorithm_t>(s.algo);
+                        preproc_to_use = s.preproc;
+                    }
+                }
+            }
+
+            /* ---- Phase 3: cleanup per-slot resources ---- */
+            for (int k = 0; k < n_slots; k++) {
+                ExploreSlot& s = slots[k];
+                s.comp_mgr.reset();  /* release manager before destroying stream */
+                if (s.d_quant)     cudaFree(s.d_quant);
+                if (s.d_shuf)      cudaFree(s.d_shuf);
+                if (s.d_out)       cudaFree(s.d_out);
+                if (s.d_range_min) cudaFree(s.d_range_min);
+                if (s.d_range_max) cudaFree(s.d_range_max);
+                if (s.stream)      cudaStreamDestroy(s.stream);
+            }
+        }
+
+        if (exploration_triggered) {
+            diag_exploration_ms = std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - t_explore_start).count();
+        }
+
+        /* ── SGD Phase 2: learn from EXPLORATION results separately ── */
+        if (exploration_triggered && explored_samples.size() > 1 && d_stats_ptr) {
+            std::sort(explored_samples.begin() + 1, explored_samples.end(),
+                      [](const ExploredResult& a, const ExploredResult& b) {
+                          return a.cost < b.cost;
+                      });
+            SGDSample explore_sgd[NN_MAX_SGD_SAMPLES];
+            int efill = 0;
+            size_t emax = std::min(explored_samples.size(),
+                                    static_cast<size_t>(NN_MAX_SGD_SAMPLES));
+            for (size_t ei = 1; ei < emax; ei++) {
+                explore_sgd[efill].action            = explored_samples[ei].action;
+                explore_sgd[efill].actual_ratio      = static_cast<float>(explored_samples[ei].ratio);
+                explore_sgd[efill].actual_comp_time  = static_cast<float>(explored_samples[ei].comp_time_ms);
+                explore_sgd[efill].actual_decomp_time= static_cast<float>(explored_samples[ei].decomp_time_ms);
+                explore_sgd[efill].actual_psnr       = static_cast<float>(explored_samples[ei].psnr);
+                efill++;
+            }
+            if (efill > 0) {
+                std::lock_guard<std::mutex> sgd_lk(g_sgd_mutex);
+                float gn = 0; int gc = 0, gs = 0;
+                gpucompress::runNNSGDCtx(d_stats_ptr, explore_sgd,
+                    efill, input_size, cfg.error_bound, g_reinforce_lr, ctx,
+                    &gn, &gc, &gs);
             }
         }
         if (sgd_fired) {

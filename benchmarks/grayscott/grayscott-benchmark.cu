@@ -480,29 +480,7 @@ static int run_phase_vol(float *d_v, float *d_read,
                 ape_decomp_sum += mape_decomp; ape_decomp_cnt++;
             }
 
-            char final_str[40], orig_str[40];
-            action_to_str(d.nn_action, final_str, sizeof(final_str));
-            action_to_str(d.nn_original_action, orig_str, sizeof(orig_str));
-
-            printf("\n  Chunk %3d/%d  [%s]%s%s\n",
-                   i + 1, n_chunks, final_str,
-                   d.exploration_triggered ? " [EXPLORE]" : "",
-                   d.sgd_fired ? " [SGD]" : "");
-            printf("  %-14s  %12s  %12s  %9s\n",
-                   "Metric", "Predicted", "Actual", "MAPE");
-            printf("  ─────────────────────────────────────────────────\n");
-            printf("  %-14s  %10.3fx  %10.3fx  %6.1f%%\n",
-                   "ratio", (double)d.predicted_ratio, (double)d.actual_ratio, mape_ratio);
-            printf("  %-14s  %9.3f ms  %9.3f ms  %6.1f%%\n",
-                   "comp_time", (double)d.predicted_comp_time, (double)d.compression_ms, mape_comp);
-            if (d.decompression_ms > 0) {
-                printf("  %-14s  %9.3f ms  %9.3f ms  %6.1f%%\n",
-                       "decomp_time", (double)d.predicted_decomp_time,
-                       (double)d.decompression_ms, mape_decomp);
-            } else {
-                printf("  %-14s  %9.3f ms  %12s\n",
-                       "decomp_time", (double)d.predicted_decomp_time, "n/a");
-            }
+            /* Per-chunk detail omitted for single-write phases (high MAPE expected) */
         }
     }
 
@@ -937,11 +915,11 @@ int main(int argc, char **argv)
         /* Reset NN weights so phase 4 starts from original trained weights,
          * not the SGD-modified weights from phase 3. */
         gpucompress_reload_nn(weights_path);
-        printf("\n── Phase %d: nn-rl+exp50 (ALGO_AUTO + SGD + expl@MAPE>=50%%) ─\n", n_phases + 1);
+        printf("\n── Phase %d: nn-rl+exp50 (ALGO_AUTO + SGD + expl@MAPE>=20%%, K=8) ─\n", n_phases + 1);
         gpucompress_enable_online_learning();
         gpucompress_set_reinforcement(1, sgd_lr, REINFORCE_MAPE, REINFORCE_MAPE);
         gpucompress_set_exploration(1);
-        gpucompress_set_exploration_threshold(0.10);
+        gpucompress_set_exploration_threshold(0.20);
         gpucompress_set_exploration_k(8);
         hid_t dcpl_rlexp = make_dcpl_auto(L, chunk_z, error_bound);
         rc = run_phase_vol(d_v, d_read, d_count,
@@ -958,34 +936,37 @@ int main(int argc, char **argv)
 
     /* ── Multi-timestep mode ─────────────────────────────────────── */
     if (timesteps > 1) {
-        printf("\n══════════════════════════════════════════════════════════════\n");
-        printf("  Multi-timestep mode: %d writes with nn-rl (SGD active)\n", timesteps);
-        printf("  Each timestep: %d sim steps → H5Dwrite → collect MAPE\n", steps);
-        printf("══════════════════════════════════════════════════════════════\n\n");
 
-        /* Reload NN to start fresh */
-        gpucompress_reload_nn(weights_path);
-        gpucompress_enable_online_learning();
-        gpucompress_set_reinforcement(1, sgd_lr, REINFORCE_MAPE, REINFORCE_MAPE);
-        gpucompress_set_exploration(0);
+        /* Phase configs: name, sgd_enabled, exploration_enabled */
+        struct TsPhase {
+            const char *name;
+            int sgd;
+            int explore;
+        };
+        TsPhase ts_phases[] = {
+            { "nn",          0, 0 },
+            { "nn-rl",       1, 0 },
+            { "nn-rl+exp50", 1, 1 },
+        };
+        int n_ts_phases = 3;
 
         hid_t dcpl_ts = make_dcpl_auto(L, chunk_z, error_bound);
         hsize_t dims3[3] = { (hsize_t)L, (hsize_t)L, (hsize_t)L };
 
-        /* Open timestep CSV */
+        /* Open timestep CSV (shared across phases) */
         FILE *ts_csv = fopen(OUT_TSTEP, "w");
         if (ts_csv) {
-            fprintf(ts_csv, "timestep,sim_step,write_ms,read_ms,ratio,"
+            fprintf(ts_csv, "phase,timestep,sim_step,write_ms,read_ms,ratio,"
                     "smape_ratio,smape_comp,smape_decomp,"
                     "mape_ratio,mape_comp,mape_decomp,"
                     "sgd_fires,n_chunks,mismatches,"
                     "write_mbps,read_mbps,cache_hits,cache_misses\n");
         }
 
-        /* Open per-chunk milestone CSV */
+        /* Open per-chunk milestone CSV (shared across phases) */
         FILE *tc_csv = fopen(OUT_TSTEP_CHUNKS, "w");
         if (tc_csv) {
-            fprintf(tc_csv, "timestep,chunk,action,predicted_ratio,actual_ratio,"
+            fprintf(tc_csv, "phase,timestep,chunk,action,predicted_ratio,actual_ratio,"
                     "predicted_comp_ms,actual_comp_ms,"
                     "predicted_decomp_ms,actual_decomp_ms,"
                     "smape_ratio,smape_comp,smape_decomp,"
@@ -993,198 +974,226 @@ int main(int argc, char **argv)
                     "sgd_fired,exploration_triggered\n");
         }
 
-        printf("  %-4s  %-8s  %-7s  %-7s  %-7s  %-8s  %-8s  %-8s  %-8s  %-8s  %-8s  %-4s\n",
-               "T", "SimStep", "WrMs", "RdMs", "Ratio",
-               "sMAPE_R", "sMAPE_C", "sMAPE_D",
-               "MAPE_R", "MAPE_C", "MAPE_D", "SGD");
-        printf("  ----  --------  -------  -------  -------  "
-               "--------  --------  --------  "
-               "--------  --------  --------  ----\n");
+        for (int pi = 0; pi < n_ts_phases; pi++) {
+            const char *phase_name = ts_phases[pi].name;
+            int do_sgd   = ts_phases[pi].sgd;
+            int do_expl  = ts_phases[pi].explore;
 
-        for (int t = 0; t < timesteps; t++) {
-            int cum_sim_step = (t + 1) * steps;
+            printf("\n══════════════════════════════════════════════════════════════\n");
+            printf("  Multi-timestep [%s]: %d writes (SGD=%s, Explore=%s)\n",
+                   phase_name, timesteps,
+                   do_sgd ? "on" : "off", do_expl ? "on" : "off");
+            printf("  Each timestep: %d sim steps → H5Dwrite → collect MAPE\n", steps);
+            printf("══════════════════════════════════════════════════════════════\n\n");
 
-            /* Advance simulation by `steps` */
-            gpucompress_grayscott_run(sim, steps);
-            cudaDeviceSynchronize();
-            gpucompress_grayscott_get_device_ptrs(sim, &d_read, &d_v);
+            /* Reload NN and re-init simulation to start fresh */
+            gpucompress_grayscott_destroy(sim);
+            sim = NULL;
+            gpucompress_grayscott_create(&sim, &s);
 
-            /* Write via VOL */
-            gpucompress_reset_chunk_history();
-            gpucompress_reset_cache_stats();
-            remove(TMP_NN_RL);
-
-            hid_t fapl = make_vol_fapl();
-            hid_t file = H5Fcreate(TMP_NN_RL, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
-            H5Pclose(fapl);
-
-            hid_t fsp  = H5Screate_simple(3, dims3, NULL);
-            hid_t dset = H5Dcreate2(file, "V", H5T_NATIVE_FLOAT,
-                                     fsp, H5P_DEFAULT, dcpl_ts, H5P_DEFAULT);
-            H5Sclose(fsp);
-
-            double tw0  = now_ms();
-            herr_t wret = H5Dwrite(dset, H5T_NATIVE_FLOAT,
-                                    H5S_ALL, H5S_ALL, H5P_DEFAULT, d_v);
-            H5Dclose(dset); H5Fclose(file);
-            double tw1  = now_ms();
-            double write_ms_t = tw1 - tw0;
-
-            if (wret < 0) {
-                printf("  %-4d  H5Dwrite failed\n", t);
-                continue;
+            gpucompress_reload_nn(weights_path);
+            if (do_sgd) {
+                gpucompress_enable_online_learning();
+                gpucompress_set_reinforcement(1, sgd_lr, REINFORCE_MAPE, REINFORCE_MAPE);
+            } else {
+                gpucompress_disable_online_learning();
+            }
+            gpucompress_set_exploration(do_expl);
+            if (do_expl) {
+                gpucompress_set_exploration_threshold(0.20);
+                gpucompress_set_exploration_k(8);
             }
 
-            /* Read back + verify */
-            fapl = make_vol_fapl();
-            file = H5Fopen(TMP_NN_RL, H5F_ACC_RDONLY, fapl);
-            H5Pclose(fapl);
-            dset = H5Dopen2(file, "V", H5P_DEFAULT);
+            printf("  %-4s  %-8s  %-7s  %-7s  %-7s  %-8s  %-8s  %-8s  %-8s  %-8s  %-8s  %-4s\n",
+                   "T", "SimStep", "WrMs", "RdMs", "Ratio",
+                   "sMAPE_R", "sMAPE_C", "sMAPE_D",
+                   "MAPE_R", "MAPE_C", "MAPE_D", "SGD");
+            printf("  ----  --------  -------  -------  -------  "
+                   "--------  --------  --------  "
+                   "--------  --------  --------  ----\n");
 
-            double tr0  = now_ms();
-            H5Dread(dset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, d_read);
-            cudaDeviceSynchronize();
-            H5Dclose(dset); H5Fclose(file);
-            double tr1  = now_ms();
-            double read_ms_t = tr1 - tr0;
+            for (int t = 0; t < timesteps; t++) {
+                int cum_sim_step = (t + 1) * steps;
 
-            unsigned long long mm = gpu_compare(d_v, d_read, n_floats, d_count);
+                /* Advance simulation by `steps` */
+                gpucompress_grayscott_run(sim, steps);
+                cudaDeviceSynchronize();
+                gpucompress_grayscott_get_device_ptrs(sim, &d_read, &d_v);
 
-            /* File size for ratio */
-            size_t file_sz = file_size(TMP_NN_RL);
-            double ratio_t = (file_sz > 0) ? (double)total_bytes / (double)file_sz : 1.0;
+                /* Write via VOL */
+                gpucompress_reset_chunk_history();
+                gpucompress_reset_cache_stats();
+                remove(TMP_NN_RL);
 
-            /* Collect per-chunk sMAPE (symmetric, bounded 0–200%) AND real MAPE */
-            int n_hist = gpucompress_get_chunk_history_count();
-            double ape_r = 0, ape_c = 0, ape_d = 0;       /* sMAPE accumulators */
-            double mape_r_sum = 0, mape_c_sum = 0, mape_d_sum = 0;  /* MAPE accumulators */
-            int    cnt_r = 0, cnt_c = 0, cnt_d = 0;
-            int    mcnt_r = 0, mcnt_c = 0, mcnt_d = 0;     /* MAPE counts */
-            int    sgd_t = 0;
-            for (int ci = 0; ci < n_hist; ci++) {
-                gpucompress_chunk_diag_t diag;
-                if (gpucompress_get_chunk_diag(ci, &diag) != 0) continue;
-                if (diag.sgd_fired) sgd_t++;
-                /* sMAPE */
-                if (diag.actual_ratio > 0 && diag.predicted_ratio > 0) {
-                    double denom = (fabs(diag.actual_ratio) + fabs(diag.predicted_ratio)) / 2.0;
-                    if (denom > 0) { ape_r += fabs(diag.actual_ratio - diag.predicted_ratio) / denom; cnt_r++; }
+                hid_t fapl = make_vol_fapl();
+                hid_t file = H5Fcreate(TMP_NN_RL, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+                H5Pclose(fapl);
+
+                hid_t fsp  = H5Screate_simple(3, dims3, NULL);
+                hid_t dset = H5Dcreate2(file, "V", H5T_NATIVE_FLOAT,
+                                         fsp, H5P_DEFAULT, dcpl_ts, H5P_DEFAULT);
+                H5Sclose(fsp);
+
+                double tw0  = now_ms();
+                herr_t wret = H5Dwrite(dset, H5T_NATIVE_FLOAT,
+                                        H5S_ALL, H5S_ALL, H5P_DEFAULT, d_v);
+                H5Dclose(dset); H5Fclose(file);
+                double tw1  = now_ms();
+                double write_ms_t = tw1 - tw0;
+
+                if (wret < 0) {
+                    printf("  %-4d  H5Dwrite failed\n", t);
+                    continue;
                 }
-                if (diag.compression_ms > 0 && diag.predicted_comp_time > 0) {
-                    double denom = (fabs(diag.compression_ms) + fabs(diag.predicted_comp_time)) / 2.0;
-                    if (denom > 0) { ape_c += fabs(diag.compression_ms - diag.predicted_comp_time) / denom; cnt_c++; }
-                }
-                if (diag.decompression_ms > 0 && diag.predicted_decomp_time > 0) {
-                    double denom = (fabs(diag.decompression_ms) + fabs(diag.predicted_decomp_time)) / 2.0;
-                    if (denom > 0) { ape_d += fabs(diag.decompression_ms - diag.predicted_decomp_time) / denom; cnt_d++; }
-                }
-                /* Real MAPE = |pred - actual| / actual */
-                if (diag.actual_ratio > 0) {
-                    mape_r_sum += fabs(diag.predicted_ratio - diag.actual_ratio) / fabs(diag.actual_ratio);
-                    mcnt_r++;
-                }
-                if (diag.compression_ms > 0) {
-                    mape_c_sum += fabs(diag.predicted_comp_time - diag.compression_ms) / fabs(diag.compression_ms);
-                    mcnt_c++;
-                }
-                if (diag.decompression_ms > 0) {
-                    mape_d_sum += fabs(diag.predicted_decomp_time - diag.decompression_ms) / fabs(diag.decompression_ms);
-                    mcnt_d++;
-                }
-            }
-            double mape_r = cnt_r ? (ape_r / cnt_r) * 100.0 : 0.0;
-            double mape_c = cnt_c ? (ape_c / cnt_c) * 100.0 : 0.0;
-            double mape_d = cnt_d ? (ape_d / cnt_d) * 100.0 : 0.0;
-            double real_mape_r = mcnt_r ? (mape_r_sum / mcnt_r) * 100.0 : 0.0;
-            double real_mape_c = mcnt_c ? (mape_c_sum / mcnt_c) * 100.0 : 0.0;
-            double real_mape_d = mcnt_d ? (mape_d_sum / mcnt_d) * 100.0 : 0.0;
 
-            double wr_mbps = (write_ms_t > 0) ? dataset_mb / (write_ms_t / 1000.0) : 0;
-            double rd_mbps = (read_ms_t > 0)  ? dataset_mb / (read_ms_t  / 1000.0) : 0;
+                /* Read back + verify */
+                fapl = make_vol_fapl();
+                file = H5Fopen(TMP_NN_RL, H5F_ACC_RDONLY, fapl);
+                H5Pclose(fapl);
+                dset = H5Dopen2(file, "V", H5P_DEFAULT);
 
-            int c_hits = 0, c_misses = 0;
-            gpucompress_get_cache_stats(&c_hits, &c_misses);
+                double tr0  = now_ms();
+                H5Dread(dset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, d_read);
+                cudaDeviceSynchronize();
+                H5Dclose(dset); H5Fclose(file);
+                double tr1  = now_ms();
+                double read_ms_t = tr1 - tr0;
 
-            printf("  %-4d  %-8d  %6.0f  %6.0f   %5.2fx  %7.1f%%  %7.1f%%  %7.1f%%  %7.1f%%  %7.1f%%  %7.1f%%  %3d\n",
-                   t, cum_sim_step, write_ms_t, read_ms_t,
-                   ratio_t, mape_r, mape_c, mape_d,
-                   real_mape_r, real_mape_c, real_mape_d, sgd_t);
+                unsigned long long mm = gpu_compare(d_v, d_read, n_floats, d_count);
 
-            /* Per-chunk detail at milestone timesteps:
-             * T=0, T=timesteps/4, T=timesteps/2, T=3*timesteps/4, T=last
-             * Printed to stdout (sampled) and written to CSV (all chunks). */
-            {
-                bool is_milestone = (t == 0 || t == timesteps / 4 ||
-                                     t == timesteps / 2 || t == (timesteps * 3) / 4 ||
-                                     t == timesteps - 1);
-                if (is_milestone) {
-                    printf("    ── Per-chunk detail for T=%d ──\n", t);
-                    int n_detail = n_hist;
-                    int stride = (n_detail > 20) ? n_detail / 10 : 1;
-                    for (int ci = 0; ci < n_detail; ci++) {
-                        gpucompress_chunk_diag_t dd;
-                        if (gpucompress_get_chunk_diag(ci, &dd) != 0) continue;
+                /* File size for ratio */
+                size_t file_sz = file_size(TMP_NN_RL);
+                double ratio_t = (file_sz > 0) ? (double)total_bytes / (double)file_sz : 1.0;
 
-                        /* Compute both sMAPE and real MAPE for this chunk */
-                        double sr = 0, sc = 0, sd = 0;  /* sMAPE */
-                        double mr = 0, mc = 0, md = 0;  /* MAPE */
-                        double den_r = (fabs(dd.actual_ratio) + fabs(dd.predicted_ratio)) / 2.0;
-                        double den_c = (fabs(dd.compression_ms) + fabs(dd.predicted_comp_time)) / 2.0;
-                        double den_d = (fabs(dd.decompression_ms) + fabs(dd.predicted_decomp_time)) / 2.0;
-                        if (den_r > 0) sr = fabs(dd.predicted_ratio - dd.actual_ratio) / den_r * 100.0;
-                        if (den_c > 0) sc = fabs(dd.predicted_comp_time - dd.compression_ms) / den_c * 100.0;
-                        if (den_d > 0) sd = fabs(dd.predicted_decomp_time - dd.decompression_ms) / den_d * 100.0;
-                        if (dd.actual_ratio > 0)
-                            mr = fabs(dd.predicted_ratio - dd.actual_ratio) / fabs(dd.actual_ratio) * 100.0;
-                        if (dd.compression_ms > 0)
-                            mc = fabs(dd.predicted_comp_time - dd.compression_ms) / fabs(dd.compression_ms) * 100.0;
-                        if (dd.decompression_ms > 0)
-                            md = fabs(dd.predicted_decomp_time - dd.decompression_ms) / fabs(dd.decompression_ms) * 100.0;
-
-                        /* Print sampled chunks to stdout */
-                        bool print_it = (ci < 3 || ci >= n_detail - 3 || ci % stride == 0);
-                        if (print_it) {
-                            printf("      C%3d  pred_d=%6.3fms  act_d=%5.3fms  MAPE_D=%6.1f%%"
-                                   "  pred_r=%6.1fx  act_r=%6.1fx  MAPE_R=%5.1f%%%s%s\n",
-                                   ci + 1,
-                                   (double)dd.predicted_decomp_time,
-                                   (double)dd.decompression_ms, md,
-                                   (double)dd.predicted_ratio,
-                                   (double)dd.actual_ratio, mr,
-                                   dd.sgd_fired ? " [SGD]" : "",
-                                   dd.exploration_triggered ? " [EXP]" : "");
-                        }
-
-                        /* Write ALL chunks to CSV */
-                        if (tc_csv) {
-                            char action_str[40];
-                            action_to_str(dd.nn_action, action_str, sizeof(action_str));
-                            fprintf(tc_csv, "%d,%d,%s,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
-                                    "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d\n",
-                                    t, ci, action_str,
-                                    (double)dd.predicted_ratio, (double)dd.actual_ratio,
-                                    (double)dd.predicted_comp_time, (double)dd.compression_ms,
-                                    (double)dd.predicted_decomp_time, (double)dd.decompression_ms,
-                                    sr, sc, sd, mr, mc, md,
-                                    dd.sgd_fired, dd.exploration_triggered);
-                        }
+                /* Collect per-chunk sMAPE (symmetric, bounded 0–200%) AND real MAPE */
+                int n_hist = gpucompress_get_chunk_history_count();
+                double ape_r = 0, ape_c = 0, ape_d = 0;
+                double mape_r_sum = 0, mape_c_sum = 0, mape_d_sum = 0;
+                int    cnt_r = 0, cnt_c = 0, cnt_d = 0;
+                int    mcnt_r = 0, mcnt_c = 0, mcnt_d = 0;
+                int    sgd_t = 0;
+                for (int ci = 0; ci < n_hist; ci++) {
+                    gpucompress_chunk_diag_t diag;
+                    if (gpucompress_get_chunk_diag(ci, &diag) != 0) continue;
+                    if (diag.sgd_fired) sgd_t++;
+                    if (diag.actual_ratio > 0 && diag.predicted_ratio > 0) {
+                        double denom = (fabs(diag.actual_ratio) + fabs(diag.predicted_ratio)) / 2.0;
+                        if (denom > 0) { ape_r += fabs(diag.actual_ratio - diag.predicted_ratio) / denom; cnt_r++; }
                     }
-                    printf("    ── end T=%d ──\n", t);
+                    if (diag.compression_ms > 0 && diag.predicted_comp_time > 0) {
+                        double denom = (fabs(diag.compression_ms) + fabs(diag.predicted_comp_time)) / 2.0;
+                        if (denom > 0) { ape_c += fabs(diag.compression_ms - diag.predicted_comp_time) / denom; cnt_c++; }
+                    }
+                    if (diag.decompression_ms > 0 && diag.predicted_decomp_time > 0) {
+                        double denom = (fabs(diag.decompression_ms) + fabs(diag.predicted_decomp_time)) / 2.0;
+                        if (denom > 0) { ape_d += fabs(diag.decompression_ms - diag.predicted_decomp_time) / denom; cnt_d++; }
+                    }
+                    if (diag.actual_ratio > 0) {
+                        mape_r_sum += fabs(diag.predicted_ratio - diag.actual_ratio) / fabs(diag.actual_ratio);
+                        mcnt_r++;
+                    }
+                    if (diag.compression_ms > 0) {
+                        mape_c_sum += fabs(diag.predicted_comp_time - diag.compression_ms) / fabs(diag.compression_ms);
+                        mcnt_c++;
+                    }
+                    if (diag.decompression_ms > 0) {
+                        mape_d_sum += fabs(diag.predicted_decomp_time - diag.decompression_ms) / fabs(diag.decompression_ms);
+                        mcnt_d++;
+                    }
                 }
-            }
+                double mape_r = cnt_r ? (ape_r / cnt_r) * 100.0 : 0.0;
+                double mape_c = cnt_c ? (ape_c / cnt_c) * 100.0 : 0.0;
+                double mape_d = cnt_d ? (ape_d / cnt_d) * 100.0 : 0.0;
+                double real_mape_r = mcnt_r ? (mape_r_sum / mcnt_r) * 100.0 : 0.0;
+                double real_mape_c = mcnt_c ? (mape_c_sum / mcnt_c) * 100.0 : 0.0;
+                double real_mape_d = mcnt_d ? (mape_d_sum / mcnt_d) * 100.0 : 0.0;
 
-            if (ts_csv) {
-                fprintf(ts_csv, "%d,%d,%.2f,%.2f,%.4f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%llu,%.1f,%.1f,%d,%d\n",
-                        t, cum_sim_step, write_ms_t, read_ms_t, ratio_t,
-                        mape_r, mape_c, mape_d,
-                        real_mape_r, real_mape_c, real_mape_d,
-                        sgd_t, n_hist,
-                        (unsigned long long)mm, wr_mbps, rd_mbps,
-                        c_hits, c_misses);
-            }
+                double wr_mbps = (write_ms_t > 0) ? dataset_mb / (write_ms_t / 1000.0) : 0;
+                double rd_mbps = (read_ms_t > 0)  ? dataset_mb / (read_ms_t  / 1000.0) : 0;
 
-            remove(TMP_NN_RL);
-        }
+                int c_hits = 0, c_misses = 0;
+                gpucompress_get_cache_stats(&c_hits, &c_misses);
+
+                /* Print summary row every 5 timesteps, first and last */
+                bool print_row = (t % 5 == 0 || t == timesteps - 1);
+                if (print_row) {
+                    printf("  %-4d  %-8d  %6.0f  %6.0f   %5.2fx  %7.1f%%  %7.1f%%  %7.1f%%  %7.1f%%  %7.1f%%  %7.1f%%  %3d\n",
+                           t, cum_sim_step, write_ms_t, read_ms_t,
+                           ratio_t, mape_r, mape_c, mape_d,
+                           real_mape_r, real_mape_c, real_mape_d, sgd_t);
+                }
+
+                /* Per-chunk detail at milestone timesteps */
+                {
+                    bool is_milestone = (t == 0 || t == timesteps / 4 ||
+                                         t == timesteps / 2 || t == (timesteps * 3) / 4 ||
+                                         t == timesteps - 1);
+                    if (is_milestone) {
+                        printf("    ── Per-chunk detail for T=%d ──\n", t);
+                        int n_detail = n_hist;
+                        int stride = (n_detail > 20) ? n_detail / 10 : 1;
+                        for (int ci = 0; ci < n_detail; ci++) {
+                            gpucompress_chunk_diag_t dd;
+                            if (gpucompress_get_chunk_diag(ci, &dd) != 0) continue;
+
+                            double sr = 0, sc = 0, sd = 0;
+                            double mr = 0, mc = 0, md = 0;
+                            double den_r = (fabs(dd.actual_ratio) + fabs(dd.predicted_ratio)) / 2.0;
+                            double den_c = (fabs(dd.compression_ms) + fabs(dd.predicted_comp_time)) / 2.0;
+                            double den_d = (fabs(dd.decompression_ms) + fabs(dd.predicted_decomp_time)) / 2.0;
+                            if (den_r > 0) sr = fabs(dd.predicted_ratio - dd.actual_ratio) / den_r * 100.0;
+                            if (den_c > 0) sc = fabs(dd.predicted_comp_time - dd.compression_ms) / den_c * 100.0;
+                            if (den_d > 0) sd = fabs(dd.predicted_decomp_time - dd.decompression_ms) / den_d * 100.0;
+                            if (dd.actual_ratio > 0)
+                                mr = fabs(dd.predicted_ratio - dd.actual_ratio) / fabs(dd.actual_ratio) * 100.0;
+                            if (dd.compression_ms > 0)
+                                mc = fabs(dd.predicted_comp_time - dd.compression_ms) / fabs(dd.compression_ms) * 100.0;
+                            if (dd.decompression_ms > 0)
+                                md = fabs(dd.predicted_decomp_time - dd.decompression_ms) / fabs(dd.decompression_ms) * 100.0;
+
+                            bool print_it = (ci < 3 || ci >= n_detail - 3 || ci % stride == 0);
+                            if (print_it) {
+                                printf("      C%3d  pred_d=%6.3fms  act_d=%5.3fms  MAPE_D=%6.1f%%"
+                                       "  pred_r=%6.1fx  act_r=%6.1fx  MAPE_R=%5.1f%%%s%s\n",
+                                       ci + 1,
+                                       (double)dd.predicted_decomp_time,
+                                       (double)dd.decompression_ms, md,
+                                       (double)dd.predicted_ratio,
+                                       (double)dd.actual_ratio, mr,
+                                       dd.sgd_fired ? " [SGD]" : "",
+                                       dd.exploration_triggered ? " [EXP]" : "");
+                            }
+
+                            if (tc_csv) {
+                                char action_str[40];
+                                action_to_str(dd.nn_action, action_str, sizeof(action_str));
+                                fprintf(tc_csv, "%s,%d,%d,%s,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
+                                        "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d\n",
+                                        phase_name, t, ci, action_str,
+                                        (double)dd.predicted_ratio, (double)dd.actual_ratio,
+                                        (double)dd.predicted_comp_time, (double)dd.compression_ms,
+                                        (double)dd.predicted_decomp_time, (double)dd.decompression_ms,
+                                        sr, sc, sd, mr, mc, md,
+                                        dd.sgd_fired, dd.exploration_triggered);
+                            }
+                        }
+                        printf("    ── end T=%d ──\n", t);
+                    }
+                }
+
+                if (ts_csv) {
+                    fprintf(ts_csv, "%s,%d,%d,%.2f,%.2f,%.4f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%llu,%.1f,%.1f,%d,%d\n",
+                            phase_name, t, cum_sim_step, write_ms_t, read_ms_t, ratio_t,
+                            mape_r, mape_c, mape_d,
+                            real_mape_r, real_mape_c, real_mape_d,
+                            sgd_t, n_hist,
+                            (unsigned long long)mm, wr_mbps, rd_mbps,
+                            c_hits, c_misses);
+                }
+
+                remove(TMP_NN_RL);
+            } /* end timestep loop */
+        } /* end phase loop */
 
         if (ts_csv) {
             fclose(ts_csv);

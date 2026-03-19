@@ -1,0 +1,451 @@
+╔═══════════════════════════════════════════════════════════════════════════╗
+║  Gray-Scott VOL Benchmark: No-Comp vs NN+SGD                            ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+
+  Grid     : 640^3 = 262144000 floats (1000.0 MB)
+  Chunks   : 640 x 640 x 2  (320 chunks, 3.1 MB each)
+  Steps    : 5 per timestep
+  Timesteps: 100 (multi-timestep mode: nn-rl across 100 writes)
+  Pattern  : F=0.0400  k=0.06075
+  SGD LR   : 0.1000
+  Weights  : neural_net/weights/model.nnwt
+
+NN: Loaded 19076 parameters from neural_net/weights/model.nnwt (74.8 KB on GPU)
+
+── Running Gray-Scott simulation once (5 steps)... 43 ms
+
+── Phase 1: no-comp (GPU→Host→HDF5) ────────────────────────
+[no-comp] H5Dwrite (GPU ptr, VOL-2 fallback D->H)... 2229 ms
+[no-comp] H5Dread (GPU ptr, VOL-2 fallback H->D)... 2281 ms
+[no-comp] ratio=1.00x  write=449 MiB/s  read=438 MiB/s  file=1000 MiB  mismatches=0
+
+── Phase 2: nn (VOL, ALGO_AUTO, inference-only) ────────────
+[nn] H5Dwrite (GPU ptr, VOL)... 368 ms
+[nn] H5Dread (GPU ptr, VOL)... 188 ms
+
+  MAPE avg:  ratio=6.8%  comp_time=176.5%  decomp_time=180.6%
+[nn] ratio=70.77x  write=2719 MiB/s  read=5326 MiB/s  file=14 MiB  sgd=0 expl=0/320  mismatches=0
+[nn] Overhead breakdown (320 chunks, write=367.8 ms, total GPU-time=259.0 ms):
+  Stats compute:      0.0 ms  ( 0.0% of GPU-time)
+  NN inference :      0.0 ms  ( 0.0% of GPU-time)
+  Preprocessing:      0.0 ms  ( 0.0% of GPU-time)
+  Compression  :    259.0 ms  (100.0% of GPU-time)
+  Exploration  :      0.0 ms  ( 0.0% of GPU-time)
+  SGD update   :      0.0 ms  ( 0.0% of GPU-time)
+
+── Phase 3: nn-rl (ALGO_AUTO + SGD, MAPE>=10%, LR=0.1000) ────
+[nn-rl] H5Dwrite (GPU ptr, VOL)... 402 ms
+[nn-rl] H5Dread (GPU ptr, VOL)... 191 ms
+
+  MAPE avg:  ratio=17.7%  comp_time=27.6%  decomp_time=149.7%
+[nn-rl] ratio=70.77x  write=2485 MiB/s  read=5236 MiB/s  file=14 MiB  sgd=29 expl=0/320  mismatches=0
+[nn-rl] Overhead breakdown (320 chunks, write=402.4 ms, total GPU-time=168.3 ms):
+  Stats compute:      0.0 ms  ( 0.0% of GPU-time)
+  NN inference :      0.0 ms  ( 0.0% of GPU-time)
+  Preprocessing:      0.0 ms  ( 0.0% of GPU-time)
+  Compression  :    130.3 ms  (77.4% of GPU-time)
+  Exploration  :      0.0 ms  ( 0.0% of GPU-time)
+  SGD update   :     38.0 ms  (22.6% of GPU-time)
+NN: Loaded 19076 parameters from neural_net/weights/model.nnwt (74.8 KB on GPU)
+
+── Phase 4: nn-rl+exp50 (ALGO_AUTO + SGD + expl@MAPE>=20%, K=8) ─
+[nn-rl+exp50] H5Dwrite (GPU ptr, VOL)... 383 ms
+[nn-rl+exp50] H5Dread (GPU ptr, VOL)... 191 ms
+
+  MAPE avg:  ratio=4.2%  comp_time=36.9%  decomp_time=150.9%
+[nn-rl+exp50] ratio=70.77x  write=2608 MiB/s  read=5240 MiB/s  file=14 MiB  sgd=19 expl=0/320  mismatches=0
+[nn-rl+exp50] Overhead breakdown (320 chunks, write=383.4 ms, total GPU-time=160.4 ms):
+  Stats compute:      0.0 ms  ( 0.0% of GPU-time)
+  NN inference :      0.0 ms  ( 0.0% of GPU-time)
+  Preprocessing:      0.0 ms  ( 0.0% of GPU-time)
+  Compression  :    135.2 ms  (84.3% of GPU-time)
+  Exploration  :      0.0 ms  ( 0.0% of GPU-time)
+  SGD update   :     25.1 ms  (15.7% of GPU-time)
+
+══════════════════════════════════════════════════════════════
+  Multi-timestep [nn]: 100 writes (SGD=off, Explore=off)
+  Each timestep: 5 sim steps → H5Dwrite → collect MAPE
+══════════════════════════════════════════════════════════════
+
+NN: Loaded 19076 parameters from neural_net/weights/model.nnwt (74.8 KB on GPU)
+  T     SimStep   WrMs     RdMs     Ratio    sMAPE_R   sMAPE_C   sMAPE_D   MAPE_R    MAPE_C    MAPE_D    SGD 
+  ----  --------  -------  -------  -------  --------  --------  --------  --------  --------  --------  ----
+  0     5            337     184   70.89x      6.8%    180.7%    181.0%      7.1%   1891.1%   1901.6%    0
+    ── Per-chunk detail for T=0 ──
+      C  1  pred_d= 8.273ms  act_d=0.512ms  MAPE_D=1516.7%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C  2  pred_d= 8.273ms  act_d=0.419ms  MAPE_D=1874.4%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C  3  pred_d= 8.273ms  act_d=0.420ms  MAPE_D=1872.1%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C 33  pred_d= 8.273ms  act_d=0.413ms  MAPE_D=1902.6%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C 65  pred_d= 8.273ms  act_d=0.405ms  MAPE_D=1942.7%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C 97  pred_d= 8.273ms  act_d=0.411ms  MAPE_D=1912.3%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C129  pred_d= 8.273ms  act_d=0.406ms  MAPE_D=1935.3%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C161  pred_d= 8.273ms  act_d=0.405ms  MAPE_D=1944.7%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C193  pred_d= 8.273ms  act_d=0.420ms  MAPE_D=1868.7%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C225  pred_d= 8.273ms  act_d=0.419ms  MAPE_D=1876.4%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C257  pred_d= 8.273ms  act_d=0.424ms  MAPE_D=1849.6%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C289  pred_d= 8.273ms  act_d=0.418ms  MAPE_D=1877.9%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C318  pred_d= 8.273ms  act_d=0.426ms  MAPE_D=1841.0%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C319  pred_d= 8.273ms  act_d=0.418ms  MAPE_D=1877.5%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C320  pred_d= 8.273ms  act_d=0.419ms  MAPE_D=1874.7%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+    ── end T=0 ──
+  5     30           331     184   70.89x      6.8%    180.7%    181.0%      7.1%   1898.2%   1907.1%    0
+  10    55           334     184   70.89x      6.8%    180.7%    181.0%      7.1%   1905.1%   1908.0%    0
+  15    80           340     186   70.89x      6.8%    180.4%    180.7%      7.1%   1854.9%   1873.2%    0
+  20    105          342     185   70.89x      6.8%    180.1%    180.8%      7.1%   1846.1%   1885.2%    0
+  25    130          337     186   70.89x      6.8%    180.5%    180.8%      7.1%   1870.4%   1880.6%    0
+    ── Per-chunk detail for T=25 ──
+      C  1  pred_d= 8.273ms  act_d=0.464ms  MAPE_D=1684.5%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C  2  pred_d= 8.273ms  act_d=0.439ms  MAPE_D=1783.1%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C  3  pred_d= 8.273ms  act_d=0.424ms  MAPE_D=1851.8%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C 33  pred_d= 8.273ms  act_d=0.418ms  MAPE_D=1881.5%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C 65  pred_d= 8.273ms  act_d=0.419ms  MAPE_D=1875.2%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C 97  pred_d= 8.273ms  act_d=0.412ms  MAPE_D=1906.3%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C129  pred_d= 8.273ms  act_d=0.418ms  MAPE_D=1880.4%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C161  pred_d= 8.273ms  act_d=0.426ms  MAPE_D=1841.6%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C193  pred_d= 8.273ms  act_d=0.412ms  MAPE_D=1907.8%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C225  pred_d= 8.273ms  act_d=0.419ms  MAPE_D=1876.8%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C257  pred_d= 8.273ms  act_d=0.420ms  MAPE_D=1872.0%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C289  pred_d= 8.273ms  act_d=0.420ms  MAPE_D=1868.9%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C318  pred_d= 8.273ms  act_d=0.418ms  MAPE_D=1879.2%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C319  pred_d= 8.273ms  act_d=0.409ms  MAPE_D=1922.1%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C320  pred_d= 8.273ms  act_d=0.415ms  MAPE_D=1895.3%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+    ── end T=25 ──
+  30    155          337     184   70.89x      6.8%    180.5%    181.1%      7.1%   1866.9%   1911.7%    0
+  35    180          337     185   70.89x      6.8%    180.5%    180.9%      7.1%   1874.2%   1891.6%    0
+  40    205          340     186   70.89x      6.8%    180.6%    180.8%      7.1%   1883.8%   1880.2%    0
+  45    230          339     187   70.89x      6.8%    180.9%    180.6%      7.1%   1919.1%   1887.9%    0
+  50    255          334     186   70.89x      6.8%    180.7%    180.8%      7.1%   1892.1%   1878.9%    0
+    ── Per-chunk detail for T=50 ──
+      C  1  pred_d= 8.273ms  act_d=0.460ms  MAPE_D=1697.0%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C  2  pred_d= 8.273ms  act_d=0.432ms  MAPE_D=1815.9%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C  3  pred_d= 8.273ms  act_d=0.437ms  MAPE_D=1794.8%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C 33  pred_d= 8.273ms  act_d=0.418ms  MAPE_D=1877.3%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C 65  pred_d= 8.273ms  act_d=0.423ms  MAPE_D=1854.1%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C 97  pred_d= 8.273ms  act_d=0.417ms  MAPE_D=1882.8%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C129  pred_d= 8.273ms  act_d=0.417ms  MAPE_D=1883.6%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C161  pred_d= 8.273ms  act_d=0.416ms  MAPE_D=1890.6%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C193  pred_d= 8.273ms  act_d=0.417ms  MAPE_D=1881.9%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C225  pred_d= 8.273ms  act_d=0.411ms  MAPE_D=1913.2%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C257  pred_d= 8.273ms  act_d=0.417ms  MAPE_D=1885.2%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C289  pred_d= 8.273ms  act_d=0.416ms  MAPE_D=1887.3%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C318  pred_d= 8.273ms  act_d=0.419ms  MAPE_D=1873.9%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C319  pred_d= 8.273ms  act_d=0.418ms  MAPE_D=1880.9%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C320  pred_d= 8.273ms  act_d=0.418ms  MAPE_D=1880.3%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+    ── end T=50 ──
+  55    280          338     185   70.89x      6.8%    180.8%    180.9%      7.1%   1903.1%   1890.2%    0
+  60    305          342     184   70.89x      6.8%    180.7%    181.0%      7.1%   1894.3%   1908.3%    0
+  65    330          336     184   70.89x      6.8%    180.5%    181.0%      7.1%   1872.0%   1905.8%    0
+  70    355          335     187   70.89x      6.8%    180.5%    180.6%      7.1%   1869.1%   1889.6%    0
+  75    380          350     183   70.89x      6.8%    180.8%    181.1%      7.1%   1911.2%   1917.4%    0
+    ── Per-chunk detail for T=75 ──
+      C  1  pred_d= 8.273ms  act_d=0.452ms  MAPE_D=1730.5%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C  2  pred_d= 8.273ms  act_d=0.489ms  MAPE_D=1592.3%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C  3  pred_d= 8.273ms  act_d=0.419ms  MAPE_D=1872.8%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C 33  pred_d= 8.273ms  act_d=0.405ms  MAPE_D=1944.4%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C 65  pred_d= 8.273ms  act_d=0.405ms  MAPE_D=1943.2%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C 97  pred_d= 8.273ms  act_d=0.404ms  MAPE_D=1947.8%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C129  pred_d= 8.273ms  act_d=0.428ms  MAPE_D=1834.9%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C161  pred_d= 8.273ms  act_d=0.412ms  MAPE_D=1906.7%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C193  pred_d= 8.273ms  act_d=0.419ms  MAPE_D=1874.5%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C225  pred_d= 8.273ms  act_d=0.423ms  MAPE_D=1858.2%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C257  pred_d= 8.273ms  act_d=0.415ms  MAPE_D=1895.2%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C289  pred_d= 8.273ms  act_d=0.434ms  MAPE_D=1807.5%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C318  pred_d= 8.273ms  act_d=0.411ms  MAPE_D=1911.8%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C319  pred_d= 8.273ms  act_d=0.412ms  MAPE_D=1907.1%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C320  pred_d= 8.273ms  act_d=0.405ms  MAPE_D=1942.0%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+    ── end T=75 ──
+  80    405          332     183   70.89x      6.8%    180.6%    181.1%      7.1%   1877.9%   1915.0%    0
+  85    430          338     184   70.89x      6.8%    180.4%    181.0%      7.1%   1862.9%   1906.4%    0
+  90    455          336     187   70.89x      6.8%    180.5%    180.7%      7.1%   1865.8%   1896.5%    0
+  95    480          339     186   70.89x      6.8%    180.4%    180.7%      7.1%   1875.5%   1871.8%    0
+  99    500          339     184   70.89x      6.8%    180.4%    181.0%      7.1%   1860.9%   1909.5%    0
+    ── Per-chunk detail for T=99 ──
+      C  1  pred_d= 8.273ms  act_d=0.469ms  MAPE_D=1665.4%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C  2  pred_d= 8.273ms  act_d=0.425ms  MAPE_D=1847.6%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C  3  pred_d= 8.273ms  act_d=0.418ms  MAPE_D=1879.8%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C 33  pred_d= 8.273ms  act_d=0.403ms  MAPE_D=1950.8%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C 65  pred_d= 8.273ms  act_d=0.404ms  MAPE_D=1945.4%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C 97  pred_d= 8.273ms  act_d=0.403ms  MAPE_D=1952.5%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C129  pred_d= 8.273ms  act_d=0.404ms  MAPE_D=1948.9%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C161  pred_d= 8.273ms  act_d=0.403ms  MAPE_D=1954.2%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C193  pred_d= 8.273ms  act_d=0.416ms  MAPE_D=1888.3%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C225  pred_d= 8.273ms  act_d=0.417ms  MAPE_D=1883.1%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C257  pred_d= 8.273ms  act_d=0.418ms  MAPE_D=1879.3%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C289  pred_d= 8.273ms  act_d=0.417ms  MAPE_D=1885.2%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C318  pred_d= 8.273ms  act_d=0.416ms  MAPE_D=1886.5%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C319  pred_d= 8.273ms  act_d=0.425ms  MAPE_D=1846.5%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+      C320  pred_d= 8.273ms  act_d=0.417ms  MAPE_D=1883.6%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1%
+    ── end T=99 ──
+
+══════════════════════════════════════════════════════════════
+  Multi-timestep [nn-rl]: 100 writes (SGD=on, Explore=off)
+  Each timestep: 5 sim steps → H5Dwrite → collect MAPE
+══════════════════════════════════════════════════════════════
+
+NN: Loaded 19076 parameters from neural_net/weights/model.nnwt (74.8 KB on GPU)
+  T     SimStep   WrMs     RdMs     Ratio    sMAPE_R   sMAPE_C   sMAPE_D   MAPE_R    MAPE_C    MAPE_D    SGD 
+  ----  --------  -------  -------  -------  --------  --------  --------  --------  --------  --------  ----
+  0     5            394     189   70.89x     12.0%     23.5%    150.0%     11.4%    107.0%    616.7%   19
+    ── Per-chunk detail for T=0 ──
+      C  1  pred_d= 8.273ms  act_d=0.457ms  MAPE_D=1712.0%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1% [SGD]
+      C  2  pred_d= 8.273ms  act_d=0.419ms  MAPE_D=1874.7%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1% [SGD]
+      C  3  pred_d= 7.424ms  act_d=0.419ms  MAPE_D=1670.5%  pred_r=  72.3x  act_r=  71.1x  MAPE_R=  1.7% [SGD]
+      C 33  pred_d= 2.810ms  act_d=0.412ms  MAPE_D= 581.3%  pred_r=  62.9x  act_r=  71.1x  MAPE_R= 11.6%
+      C 65  pred_d= 2.810ms  act_d=0.406ms  MAPE_D= 592.3%  pred_r=  62.9x  act_r=  71.1x  MAPE_R= 11.6%
+      C 97  pred_d= 2.810ms  act_d=0.404ms  MAPE_D= 596.1%  pred_r=  62.9x  act_r=  71.1x  MAPE_R= 11.6%
+      C129  pred_d= 2.810ms  act_d=0.405ms  MAPE_D= 594.7%  pred_r=  62.9x  act_r=  71.1x  MAPE_R= 11.6%
+      C161  pred_d= 2.810ms  act_d=0.406ms  MAPE_D= 592.5%  pred_r=  62.9x  act_r=  71.1x  MAPE_R= 11.6%
+      C193  pred_d= 2.810ms  act_d=0.418ms  MAPE_D= 572.3%  pred_r=  62.9x  act_r=  71.1x  MAPE_R= 11.6%
+      C225  pred_d= 2.810ms  act_d=0.425ms  MAPE_D= 561.5%  pred_r=  62.9x  act_r=  71.1x  MAPE_R= 11.6%
+      C257  pred_d= 2.810ms  act_d=0.420ms  MAPE_D= 568.9%  pred_r=  62.9x  act_r=  71.1x  MAPE_R= 11.6%
+      C289  pred_d= 2.810ms  act_d=0.410ms  MAPE_D= 585.0%  pred_r=  62.9x  act_r=  71.1x  MAPE_R= 11.6%
+      C318  pred_d= 2.810ms  act_d=0.425ms  MAPE_D= 561.6%  pred_r=  62.9x  act_r=  71.1x  MAPE_R= 11.6%
+      C319  pred_d= 2.810ms  act_d=0.411ms  MAPE_D= 584.6%  pred_r=  62.9x  act_r=  71.1x  MAPE_R= 11.6%
+      C320  pred_d= 2.810ms  act_d=0.413ms  MAPE_D= 580.6%  pred_r=  62.9x  act_r=  71.1x  MAPE_R= 11.6% [SGD]
+    ── end T=0 ──
+  5     30           394     193   70.89x      9.6%     17.5%     56.7%      9.3%     17.0%     79.1%   21
+  10    55           404     189   70.89x     16.9%     22.3%     19.5%     16.2%     22.0%     21.9%   38
+  15    80           417     196   70.89x      9.4%     26.0%     17.0%     10.1%     28.4%     18.9%   80
+  20    105          410     191   70.89x      4.0%     16.0%     27.3%      4.2%     16.3%     32.0%   45
+  25    130          405     192   70.89x     12.1%     16.5%     28.4%     11.8%     16.4%     33.4%   35
+    ── Per-chunk detail for T=25 ──
+      C  1  pred_d= 0.464ms  act_d=0.478ms  MAPE_D=   3.0%  pred_r=  80.2x  act_r=  71.1x  MAPE_R= 12.7% [SGD]
+      C  2  pred_d= 0.464ms  act_d=0.424ms  MAPE_D=   9.3%  pred_r=  80.2x  act_r=  71.1x  MAPE_R= 12.7% [SGD]
+      C  3  pred_d= 0.454ms  act_d=0.427ms  MAPE_D=   6.4%  pred_r=  83.2x  act_r=  71.1x  MAPE_R= 17.1%
+      C 33  pred_d= 0.543ms  act_d=0.411ms  MAPE_D=  31.9%  pred_r=  66.0x  act_r=  71.1x  MAPE_R=  7.2%
+      C 65  pred_d= 0.469ms  act_d=0.415ms  MAPE_D=  13.0%  pred_r=  87.3x  act_r=  71.1x  MAPE_R= 22.7%
+      C 97  pred_d= 0.574ms  act_d=0.409ms  MAPE_D=  40.3%  pred_r=  62.9x  act_r=  71.1x  MAPE_R= 11.6%
+      C129  pred_d= 0.574ms  act_d=0.409ms  MAPE_D=  40.5%  pred_r=  62.9x  act_r=  71.1x  MAPE_R= 11.6%
+      C161  pred_d= 0.574ms  act_d=0.409ms  MAPE_D=  40.3%  pred_r=  62.9x  act_r=  71.1x  MAPE_R= 11.6%
+      C193  pred_d= 0.574ms  act_d=0.432ms  MAPE_D=  32.9%  pred_r=  62.9x  act_r=  71.1x  MAPE_R= 11.6%
+      C225  pred_d= 0.574ms  act_d=0.422ms  MAPE_D=  36.0%  pred_r=  62.9x  act_r=  71.1x  MAPE_R= 11.6%
+      C257  pred_d= 0.574ms  act_d=0.423ms  MAPE_D=  35.7%  pred_r=  62.9x  act_r=  71.1x  MAPE_R= 11.6%
+      C289  pred_d= 0.574ms  act_d=0.416ms  MAPE_D=  37.9%  pred_r=  62.9x  act_r=  71.1x  MAPE_R= 11.6%
+      C318  pred_d= 0.574ms  act_d=0.416ms  MAPE_D=  38.1%  pred_r=  62.9x  act_r=  71.1x  MAPE_R= 11.6%
+      C319  pred_d= 0.574ms  act_d=0.423ms  MAPE_D=  35.6%  pred_r=  62.9x  act_r=  71.1x  MAPE_R= 11.6%
+      C320  pred_d= 0.574ms  act_d=0.422ms  MAPE_D=  36.1%  pred_r=  62.9x  act_r=  71.1x  MAPE_R= 11.6% [SGD]
+    ── end T=25 ──
+  30    155          403     196   70.89x      5.5%     22.2%     34.5%      5.6%     22.0%     41.2%   35
+  35    180          405     199   70.89x      5.1%     10.4%     18.4%      5.2%     10.7%     20.4%   22
+  40    205          427     197   70.89x      4.2%     12.9%     15.4%      4.5%     13.9%     17.0%   55
+  45    230          416     195   70.89x      8.0%     14.4%     13.6%      8.1%     14.9%     14.8%   47
+  50    255          419     195   70.89x      5.2%     19.8%     30.7%      5.3%     20.6%     36.5%   62
+    ── Per-chunk detail for T=50 ──
+      C  1  pred_d= 0.530ms  act_d=0.465ms  MAPE_D=  13.9%  pred_r=  74.3x  act_r=  71.1x  MAPE_R=  4.4%
+      C  2  pred_d= 0.530ms  act_d=0.440ms  MAPE_D=  20.5%  pred_r=  74.3x  act_r=  71.1x  MAPE_R=  4.4% [SGD]
+      C  3  pred_d= 0.530ms  act_d=0.438ms  MAPE_D=  20.9%  pred_r=  74.3x  act_r=  71.1x  MAPE_R=  4.4% [SGD]
+      C 33  pred_d= 0.519ms  act_d=0.424ms  MAPE_D=  22.4%  pred_r=  83.6x  act_r=  71.1x  MAPE_R= 17.6%
+      C 65  pred_d= 0.526ms  act_d=0.424ms  MAPE_D=  24.2%  pred_r=  82.9x  act_r=  71.1x  MAPE_R= 16.6%
+      C 97  pred_d= 0.603ms  act_d=0.424ms  MAPE_D=  42.2%  pred_r=  69.1x  act_r=  71.1x  MAPE_R=  2.8%
+      C129  pred_d= 0.603ms  act_d=0.431ms  MAPE_D=  39.7%  pred_r=  69.1x  act_r=  71.1x  MAPE_R=  2.8%
+      C161  pred_d= 0.603ms  act_d=0.424ms  MAPE_D=  42.4%  pred_r=  69.1x  act_r=  71.1x  MAPE_R=  2.8%
+      C193  pred_d= 0.603ms  act_d=0.430ms  MAPE_D=  40.2%  pred_r=  69.1x  act_r=  71.1x  MAPE_R=  2.8%
+      C225  pred_d= 0.603ms  act_d=0.436ms  MAPE_D=  38.2%  pred_r=  69.1x  act_r=  71.1x  MAPE_R=  2.8%
+      C257  pred_d= 0.603ms  act_d=0.427ms  MAPE_D=  41.3%  pred_r=  69.1x  act_r=  71.1x  MAPE_R=  2.8%
+      C289  pred_d= 0.523ms  act_d=0.436ms  MAPE_D=  19.8%  pred_r=  79.8x  act_r=  71.1x  MAPE_R= 12.3% [SGD]
+      C318  pred_d= 0.591ms  act_d=0.427ms  MAPE_D=  38.4%  pred_r=  73.6x  act_r=  71.1x  MAPE_R=  3.5%
+      C319  pred_d= 0.591ms  act_d=0.419ms  MAPE_D=  41.0%  pred_r=  73.6x  act_r=  71.1x  MAPE_R=  3.5%
+      C320  pred_d= 0.591ms  act_d=0.433ms  MAPE_D=  36.4%  pred_r=  73.6x  act_r=  71.1x  MAPE_R=  3.5% [SGD]
+    ── end T=50 ──
+  55    280          437     195   70.89x      8.6%     20.0%     13.7%      8.9%     21.1%     15.0%   88
+  60    305          421     196   70.89x      6.4%     15.8%     15.0%      6.8%     16.5%     16.4%   53
+  65    330          421     196   70.89x      7.9%     13.8%     11.9%      7.9%     14.3%     12.7%   54
+  70    355          440     193   70.89x     10.5%     19.9%     15.8%     10.8%     20.7%     17.0%   85
+  75    380          412     196   70.89x      7.3%     13.9%     19.2%      7.4%     14.4%     21.4%   33
+    ── Per-chunk detail for T=75 ──
+      C  1  pred_d= 0.488ms  act_d=0.480ms  MAPE_D=   1.6%  pred_r=  82.2x  act_r=  71.1x  MAPE_R= 15.7%
+      C  2  pred_d= 0.488ms  act_d=0.439ms  MAPE_D=  11.0%  pred_r=  82.2x  act_r=  71.1x  MAPE_R= 15.7% [SGD]
+      C  3  pred_d= 0.488ms  act_d=0.439ms  MAPE_D=  11.0%  pred_r=  82.2x  act_r=  71.1x  MAPE_R= 15.7% [SGD]
+      C 33  pred_d= 0.535ms  act_d=0.445ms  MAPE_D=  20.3%  pred_r=  67.5x  act_r=  71.1x  MAPE_R=  5.1%
+      C 65  pred_d= 0.535ms  act_d=0.435ms  MAPE_D=  23.1%  pred_r=  67.5x  act_r=  71.1x  MAPE_R=  5.1%
+      C 97  pred_d= 0.535ms  act_d=0.434ms  MAPE_D=  23.1%  pred_r=  67.5x  act_r=  71.1x  MAPE_R=  5.1%
+      C129  pred_d= 0.535ms  act_d=0.428ms  MAPE_D=  25.1%  pred_r=  67.5x  act_r=  71.1x  MAPE_R=  5.1%
+      C161  pred_d= 0.535ms  act_d=0.429ms  MAPE_D=  24.7%  pred_r=  67.5x  act_r=  71.1x  MAPE_R=  5.1%
+      C193  pred_d= 0.535ms  act_d=0.436ms  MAPE_D=  22.8%  pred_r=  67.5x  act_r=  71.1x  MAPE_R=  5.1%
+      C225  pred_d= 0.535ms  act_d=0.442ms  MAPE_D=  20.9%  pred_r=  67.5x  act_r=  71.1x  MAPE_R=  5.1%
+      C257  pred_d= 0.535ms  act_d=0.441ms  MAPE_D=  21.4%  pred_r=  67.5x  act_r=  71.1x  MAPE_R=  5.1%
+      C289  pred_d= 0.519ms  act_d=0.434ms  MAPE_D=  19.5%  pred_r=  77.3x  act_r=  71.1x  MAPE_R=  8.7%
+      C318  pred_d= 0.472ms  act_d=0.438ms  MAPE_D=   7.8%  pred_r=  85.8x  act_r=  71.1x  MAPE_R= 20.7%
+      C319  pred_d= 0.472ms  act_d=0.432ms  MAPE_D=   9.2%  pred_r=  85.8x  act_r=  71.1x  MAPE_R= 20.7% [SGD]
+      C320  pred_d= 0.472ms  act_d=0.440ms  MAPE_D=   7.3%  pred_r=  85.8x  act_r=  71.1x  MAPE_R= 20.7% [SGD]
+    ── end T=75 ──
+  80    405          400     198   70.89x     10.1%      5.0%     31.8%      9.7%      5.1%     37.9%    9
+  85    430          462     198   70.89x      8.7%     27.8%      7.6%      8.9%     29.5%      8.0%  132
+  90    455          421     195   70.89x      4.7%     19.2%     19.2%      4.8%     20.0%     21.4%   60
+  95    480          397     189   70.89x     10.9%     22.4%     18.9%     10.6%     21.9%     21.1%   45
+  99    500          410     196   70.89x     12.7%      9.9%     18.1%     12.2%     10.1%     20.1%   30
+    ── Per-chunk detail for T=99 ──
+      C  1  pred_d= 0.459ms  act_d=0.479ms  MAPE_D=   4.2%  pred_r=  84.6x  act_r=  71.1x  MAPE_R= 19.0%
+      C  2  pred_d= 0.459ms  act_d=0.439ms  MAPE_D=   4.6%  pred_r=  84.6x  act_r=  71.1x  MAPE_R= 19.0% [SGD]
+      C  3  pred_d= 0.459ms  act_d=0.436ms  MAPE_D=   5.2%  pred_r=  84.6x  act_r=  71.1x  MAPE_R= 19.0% [SGD]
+      C 33  pred_d= 0.468ms  act_d=0.429ms  MAPE_D=   9.1%  pred_r=  68.7x  act_r=  71.1x  MAPE_R=  3.4%
+      C 65  pred_d= 0.530ms  act_d=0.427ms  MAPE_D=  24.1%  pred_r=  62.6x  act_r=  71.1x  MAPE_R= 11.9%
+      C 97  pred_d= 0.530ms  act_d=0.430ms  MAPE_D=  23.3%  pred_r=  62.6x  act_r=  71.1x  MAPE_R= 11.9%
+      C129  pred_d= 0.530ms  act_d=0.435ms  MAPE_D=  21.6%  pred_r=  62.6x  act_r=  71.1x  MAPE_R= 11.9%
+      C161  pred_d= 0.530ms  act_d=0.434ms  MAPE_D=  22.0%  pred_r=  62.6x  act_r=  71.1x  MAPE_R= 11.9%
+      C193  pred_d= 0.530ms  act_d=0.441ms  MAPE_D=  20.1%  pred_r=  62.6x  act_r=  71.1x  MAPE_R= 11.9%
+      C225  pred_d= 0.530ms  act_d=0.434ms  MAPE_D=  22.1%  pred_r=  62.6x  act_r=  71.1x  MAPE_R= 11.9%
+      C257  pred_d= 0.530ms  act_d=0.435ms  MAPE_D=  21.9%  pred_r=  62.6x  act_r=  71.1x  MAPE_R= 11.9%
+      C289  pred_d= 0.530ms  act_d=0.432ms  MAPE_D=  22.5%  pred_r=  62.6x  act_r=  71.1x  MAPE_R= 11.9%
+      C318  pred_d= 0.530ms  act_d=0.433ms  MAPE_D=  22.4%  pred_r=  62.6x  act_r=  71.1x  MAPE_R= 11.9%
+      C319  pred_d= 0.530ms  act_d=0.424ms  MAPE_D=  25.0%  pred_r=  62.6x  act_r=  71.1x  MAPE_R= 11.9%
+      C320  pred_d= 0.530ms  act_d=0.431ms  MAPE_D=  23.0%  pred_r=  62.6x  act_r=  71.1x  MAPE_R= 11.9% [SGD]
+    ── end T=99 ──
+
+══════════════════════════════════════════════════════════════
+  Multi-timestep [nn-rl+exp50]: 100 writes (SGD=on, Explore=on)
+  Each timestep: 5 sim steps → H5Dwrite → collect MAPE
+══════════════════════════════════════════════════════════════
+
+NN: Loaded 19076 parameters from neural_net/weights/model.nnwt (74.8 KB on GPU)
+  T     SimStep   WrMs     RdMs     Ratio    sMAPE_R   sMAPE_C   sMAPE_D   MAPE_R    MAPE_C    MAPE_D    SGD 
+  ----  --------  -------  -------  -------  --------  --------  --------  --------  --------  --------  ----
+  0     5            414     195   70.89x     42.4%     43.7%    149.5%     54.1%    219.7%    623.9%   29
+    ── Per-chunk detail for T=0 ──
+      C  1  pred_d= 8.273ms  act_d=0.470ms  MAPE_D=1659.3%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1% [SGD]
+      C  2  pred_d= 8.273ms  act_d=0.448ms  MAPE_D=1748.4%  pred_r=  76.1x  act_r=  71.1x  MAPE_R=  7.1% [SGD]
+      C  3  pred_d= 8.020ms  act_d=0.433ms  MAPE_D=1750.6%  pred_r=  92.8x  act_r=  71.1x  MAPE_R= 30.5% [SGD]
+      C 33  pred_d= 2.839ms  act_d=0.428ms  MAPE_D= 563.7%  pred_r= 109.2x  act_r=  71.1x  MAPE_R= 53.7%
+      C 65  pred_d= 2.839ms  act_d=0.433ms  MAPE_D= 556.2%  pred_r= 109.2x  act_r=  71.1x  MAPE_R= 53.7%
+      C 97  pred_d= 2.839ms  act_d=0.426ms  MAPE_D= 566.7%  pred_r= 109.2x  act_r=  71.1x  MAPE_R= 53.7%
+      C129  pred_d= 2.839ms  act_d=0.433ms  MAPE_D= 555.2%  pred_r= 109.2x  act_r=  71.1x  MAPE_R= 53.7%
+      C161  pred_d= 2.839ms  act_d=0.427ms  MAPE_D= 565.5%  pred_r= 109.2x  act_r=  71.1x  MAPE_R= 53.7%
+      C193  pred_d= 2.839ms  act_d=0.432ms  MAPE_D= 556.8%  pred_r= 109.2x  act_r=  71.1x  MAPE_R= 53.7%
+      C225  pred_d= 2.839ms  act_d=0.434ms  MAPE_D= 554.1%  pred_r= 109.2x  act_r=  71.1x  MAPE_R= 53.7%
+      C257  pred_d= 2.839ms  act_d=0.427ms  MAPE_D= 564.4%  pred_r= 109.2x  act_r=  71.1x  MAPE_R= 53.7%
+      C289  pred_d= 2.839ms  act_d=0.431ms  MAPE_D= 558.7%  pred_r= 109.2x  act_r=  71.1x  MAPE_R= 53.7%
+      C318  pred_d= 2.839ms  act_d=0.432ms  MAPE_D= 556.7%  pred_r= 109.2x  act_r=  71.1x  MAPE_R= 53.7%
+      C319  pred_d= 2.839ms  act_d=0.439ms  MAPE_D= 546.6%  pred_r= 109.2x  act_r=  71.1x  MAPE_R= 53.7%
+      C320  pred_d= 2.839ms  act_d=0.425ms  MAPE_D= 568.6%  pred_r= 109.2x  act_r=  71.1x  MAPE_R= 53.7% [SGD]
+    ── end T=0 ──
+  5     30           395     195   70.89x      2.3%     11.4%     57.3%      2.3%     11.1%     80.4%    5
+  10    55           415     200   70.89x      9.7%     14.4%     17.2%      9.7%     15.5%     18.5%   43
+  15    80           412     199   70.89x      7.9%     13.5%     17.5%      8.0%     13.5%     18.7%   38
+  20    105          434     194   70.89x     12.2%     18.8%     12.4%     12.2%     19.7%     13.5%   76
+  25    130          392     195   70.89x     17.3%      7.6%     19.4%     15.9%      7.8%     21.5%    4
+    ── Per-chunk detail for T=25 ──
+      C  1  pred_d= 0.433ms  act_d=0.469ms  MAPE_D=   7.5%  pred_r=  75.3x  act_r=  71.1x  MAPE_R=  5.9%
+      C  2  pred_d= 0.433ms  act_d=0.436ms  MAPE_D=   0.7%  pred_r=  75.3x  act_r=  71.1x  MAPE_R=  5.9% [SGD]
+      C  3  pred_d= 0.433ms  act_d=0.428ms  MAPE_D=   1.3%  pred_r=  75.3x  act_r=  71.1x  MAPE_R=  5.9% [SGD]
+      C 33  pred_d= 0.520ms  act_d=0.428ms  MAPE_D=  21.4%  pred_r=  59.7x  act_r=  71.1x  MAPE_R= 16.0%
+      C 65  pred_d= 0.520ms  act_d=0.428ms  MAPE_D=  21.5%  pred_r=  59.7x  act_r=  71.1x  MAPE_R= 16.0%
+      C 97  pred_d= 0.520ms  act_d=0.420ms  MAPE_D=  23.7%  pred_r=  59.7x  act_r=  71.1x  MAPE_R= 16.0%
+      C129  pred_d= 0.520ms  act_d=0.421ms  MAPE_D=  23.5%  pred_r=  59.7x  act_r=  71.1x  MAPE_R= 16.0%
+      C161  pred_d= 0.520ms  act_d=0.429ms  MAPE_D=  21.0%  pred_r=  59.7x  act_r=  71.1x  MAPE_R= 16.0%
+      C193  pred_d= 0.520ms  act_d=0.421ms  MAPE_D=  23.5%  pred_r=  59.7x  act_r=  71.1x  MAPE_R= 16.0%
+      C225  pred_d= 0.520ms  act_d=0.429ms  MAPE_D=  21.2%  pred_r=  59.7x  act_r=  71.1x  MAPE_R= 16.0%
+      C257  pred_d= 0.520ms  act_d=0.422ms  MAPE_D=  23.3%  pred_r=  59.7x  act_r=  71.1x  MAPE_R= 16.0%
+      C289  pred_d= 0.520ms  act_d=0.429ms  MAPE_D=  21.0%  pred_r=  59.7x  act_r=  71.1x  MAPE_R= 16.0%
+      C318  pred_d= 0.520ms  act_d=0.418ms  MAPE_D=  24.4%  pred_r=  59.7x  act_r=  71.1x  MAPE_R= 16.0%
+      C319  pred_d= 0.520ms  act_d=0.435ms  MAPE_D=  19.5%  pred_r=  59.7x  act_r=  71.1x  MAPE_R= 16.0%
+      C320  pred_d= 0.520ms  act_d=0.418ms  MAPE_D=  24.3%  pred_r=  59.7x  act_r=  71.1x  MAPE_R= 16.0% [SGD]
+    ── end T=25 ──
+  30    155          452     196   70.89x     10.3%     25.1%      7.7%     10.4%     26.2%      7.9%  114
+  35    180          457     196   70.89x     11.4%     26.2%      8.2%     11.3%     28.1%      8.7%  130
+  40    205          416     194   70.89x      6.6%     13.0%     15.5%      6.6%     13.5%     16.9%   38
+  45    230          448     195   70.89x      7.8%     27.6%      7.3%      8.1%     28.4%      7.6%  106
+  50    255          414     200   70.89x      8.1%     13.2%     30.4%      8.4%     14.0%     35.5%   43
+    ── Per-chunk detail for T=50 ──
+      C  1  pred_d= 0.464ms  act_d=0.468ms  MAPE_D=   0.9%  pred_r=  94.8x  act_r=  71.1x  MAPE_R= 33.3%
+      C  2  pred_d= 0.464ms  act_d=0.443ms  MAPE_D=   4.7%  pred_r=  94.8x  act_r=  71.1x  MAPE_R= 33.3% [SGD]
+      C  3  pred_d= 0.538ms  act_d=0.443ms  MAPE_D=  21.4%  pred_r=  78.3x  act_r=  71.1x  MAPE_R= 10.1%
+      C 33  pred_d= 0.585ms  act_d=0.428ms  MAPE_D=  36.7%  pred_r=  73.0x  act_r=  71.1x  MAPE_R=  2.7%
+      C 65  pred_d= 0.585ms  act_d=0.430ms  MAPE_D=  35.8%  pred_r=  73.0x  act_r=  71.1x  MAPE_R=  2.7%
+      C 97  pred_d= 0.517ms  act_d=0.430ms  MAPE_D=  20.3%  pred_r=  77.3x  act_r=  71.1x  MAPE_R=  8.7%
+      C129  pred_d= 0.613ms  act_d=0.436ms  MAPE_D=  40.7%  pred_r=  65.6x  act_r=  71.1x  MAPE_R=  7.7%
+      C161  pred_d= 0.613ms  act_d=0.438ms  MAPE_D=  39.8%  pred_r=  65.6x  act_r=  71.1x  MAPE_R=  7.7%
+      C193  pred_d= 0.613ms  act_d=0.427ms  MAPE_D=  43.5%  pred_r=  65.6x  act_r=  71.1x  MAPE_R=  7.7%
+      C225  pred_d= 0.592ms  act_d=0.422ms  MAPE_D=  40.5%  pred_r=  77.9x  act_r=  71.1x  MAPE_R=  9.6%
+      C257  pred_d= 0.592ms  act_d=0.423ms  MAPE_D=  40.1%  pred_r=  77.9x  act_r=  71.1x  MAPE_R=  9.6%
+      C289  pred_d= 0.592ms  act_d=0.423ms  MAPE_D=  39.8%  pred_r=  77.9x  act_r=  71.1x  MAPE_R=  9.6%
+      C318  pred_d= 0.592ms  act_d=0.422ms  MAPE_D=  40.2%  pred_r=  77.9x  act_r=  71.1x  MAPE_R=  9.6%
+      C319  pred_d= 0.592ms  act_d=0.429ms  MAPE_D=  38.0%  pred_r=  77.9x  act_r=  71.1x  MAPE_R=  9.6%
+      C320  pred_d= 0.592ms  act_d=0.424ms  MAPE_D=  39.6%  pred_r=  77.9x  act_r=  71.1x  MAPE_R=  9.6% [SGD]
+    ── end T=50 ──
+  55    280          428     196   70.89x     10.0%     20.7%     18.6%     10.0%     21.6%     20.7%   73
+  60    305          435     195   70.89x      7.5%     21.0%     11.0%      7.7%     22.1%     11.8%   82
+  65    330          465     195   70.89x     10.6%     31.2%      8.0%     11.2%     33.6%      8.5%  147
+  70    355          418     195   70.89x      5.1%     16.1%     27.2%      5.4%     17.1%     31.8%   54
+  75    380          391     195   70.89x      0.3%      8.4%     50.7%      0.3%      8.1%     68.0%    4
+    ── Per-chunk detail for T=75 ──
+      C  1  pred_d= 0.652ms  act_d=0.474ms  MAPE_D=  37.6%  pred_r=  79.8x  act_r=  71.1x  MAPE_R= 12.2%
+      C  2  pred_d= 0.652ms  act_d=0.435ms  MAPE_D=  49.9%  pred_r=  79.8x  act_r=  71.1x  MAPE_R= 12.2% [SGD]
+      C  3  pred_d= 0.652ms  act_d=0.436ms  MAPE_D=  49.4%  pred_r=  79.8x  act_r=  71.1x  MAPE_R= 12.2% [SGD]
+      C 33  pred_d= 0.719ms  act_d=0.422ms  MAPE_D=  70.4%  pred_r=  71.1x  act_r=  71.1x  MAPE_R=  0.0%
+      C 65  pred_d= 0.719ms  act_d=0.424ms  MAPE_D=  69.6%  pred_r=  71.1x  act_r=  71.1x  MAPE_R=  0.0%
+      C 97  pred_d= 0.719ms  act_d=0.430ms  MAPE_D=  67.1%  pred_r=  71.1x  act_r=  71.1x  MAPE_R=  0.0%
+      C129  pred_d= 0.719ms  act_d=0.423ms  MAPE_D=  70.1%  pred_r=  71.1x  act_r=  71.1x  MAPE_R=  0.0%
+      C161  pred_d= 0.719ms  act_d=0.416ms  MAPE_D=  73.1%  pred_r=  71.1x  act_r=  71.1x  MAPE_R=  0.0%
+      C193  pred_d= 0.719ms  act_d=0.434ms  MAPE_D=  65.7%  pred_r=  71.1x  act_r=  71.1x  MAPE_R=  0.0%
+      C225  pred_d= 0.719ms  act_d=0.428ms  MAPE_D=  67.9%  pred_r=  71.1x  act_r=  71.1x  MAPE_R=  0.0%
+      C257  pred_d= 0.719ms  act_d=0.429ms  MAPE_D=  67.8%  pred_r=  71.1x  act_r=  71.1x  MAPE_R=  0.0%
+      C289  pred_d= 0.719ms  act_d=0.437ms  MAPE_D=  64.7%  pred_r=  71.1x  act_r=  71.1x  MAPE_R=  0.0%
+      C318  pred_d= 0.719ms  act_d=0.429ms  MAPE_D=  67.6%  pred_r=  71.1x  act_r=  71.1x  MAPE_R=  0.0%
+      C319  pred_d= 0.719ms  act_d=0.427ms  MAPE_D=  68.5%  pred_r=  71.1x  act_r=  71.1x  MAPE_R=  0.0%
+      C320  pred_d= 0.719ms  act_d=0.428ms  MAPE_D=  68.0%  pred_r=  71.1x  act_r=  71.1x  MAPE_R=  0.0% [SGD]
+    ── end T=75 ──
+  80    405          414     195   70.89x      4.4%     12.6%     13.0%      4.5%     13.1%     14.0%   38
+  85    430          416     195   70.89x      5.9%     12.0%     15.4%      5.9%     12.5%     16.9%   45
+  90    455          428     195   70.89x      8.1%     18.9%     17.1%      8.1%     19.6%     19.1%   69
+  95    480          430     195   70.89x     10.8%     18.1%     16.0%     10.6%     19.4%     17.8%   75
+  99    500          459     196   70.89x      9.7%     27.4%      8.3%      9.7%     28.7%      8.8%  129
+    ── Per-chunk detail for T=99 ──
+      C  1  pred_d= 0.434ms  act_d=0.461ms  MAPE_D=   5.9%  pred_r=  81.9x  act_r=  71.1x  MAPE_R= 15.2%
+      C  2  pred_d= 0.434ms  act_d=0.443ms  MAPE_D=   2.0%  pred_r=  81.9x  act_r=  71.1x  MAPE_R= 15.2% [SGD]
+      C  3  pred_d= 0.434ms  act_d=0.432ms  MAPE_D=   0.4%  pred_r=  81.9x  act_r=  71.1x  MAPE_R= 15.2% [SGD]
+      C 33  pred_d= 0.468ms  act_d=0.432ms  MAPE_D=   8.3%  pred_r=  65.8x  act_r=  71.1x  MAPE_R=  7.5%
+      C 65  pred_d= 0.521ms  act_d=0.430ms  MAPE_D=  21.2%  pred_r=  59.7x  act_r=  71.1x  MAPE_R= 16.0%
+      C 97  pred_d= 0.414ms  act_d=0.430ms  MAPE_D=   3.7%  pred_r=  81.3x  act_r=  71.1x  MAPE_R= 14.4% [SGD]
+      C129  pred_d= 0.404ms  act_d=0.430ms  MAPE_D=   6.1%  pred_r=  82.4x  act_r=  71.1x  MAPE_R= 15.9% [SGD]
+      C161  pred_d= 0.410ms  act_d=0.430ms  MAPE_D=   4.7%  pred_r=  79.8x  act_r=  71.1x  MAPE_R= 12.3%
+      C193  pred_d= 0.490ms  act_d=0.438ms  MAPE_D=  11.9%  pred_r=  65.8x  act_r=  71.1x  MAPE_R=  7.5%
+      C225  pred_d= 0.485ms  act_d=0.434ms  MAPE_D=  11.9%  pred_r=  69.1x  act_r=  71.1x  MAPE_R=  2.8%
+      C257  pred_d= 0.437ms  act_d=0.438ms  MAPE_D=   0.2%  pred_r=  74.9x  act_r=  71.1x  MAPE_R=  5.4% [SGD]
+      C289  pred_d= 0.401ms  act_d=0.430ms  MAPE_D=   6.8%  pred_r=  79.1x  act_r=  71.1x  MAPE_R= 11.3%
+      C318  pred_d= 0.412ms  act_d=0.437ms  MAPE_D=   5.8%  pred_r=  80.6x  act_r=  71.1x  MAPE_R= 13.3%
+      C319  pred_d= 0.412ms  act_d=0.429ms  MAPE_D=   3.9%  pred_r=  80.6x  act_r=  71.1x  MAPE_R= 13.3% [SGD]
+      C320  pred_d= 0.412ms  act_d=0.436ms  MAPE_D=   5.5%  pred_r=  80.6x  act_r=  71.1x  MAPE_R= 13.3% [SGD]
+    ── end T=99 ──
+
+  Timestep CSV: benchmarks/grayscott/results/benchmark_grayscott_timesteps.csv
+  Timestep chunks CSV: benchmarks/grayscott/results/benchmark_grayscott_timestep_chunks.csv
+
+╔═══════════════════════════════════════════════════════════════════════════╗
+║  Gray-Scott VOL Benchmark Summary                                       ║
+║  Grid: 640^3 (1000 MB)  Chunks: 320 x 3.1 MB  Steps: 5               
+║  Pattern: F=0.0400  k=0.06075                                              
+╠══════════════╦══════════╦══════════╦═══════╦══════════╦══════╦═════════════╣
+║  Phase       ║  Sim     ║ Write    ║ Read  ║ Ratio   ║ File ║ Verify      ║
+║              ║  (ms)    ║ (MiB/s)  ║(MiB/s)║         ║(MiB) ║             ║
+╠══════════════╬══════════╬══════════╬═══════╬═════════╬══════╬═════════════╣
+║  no-comp     ║       43 ║      449 ║   438 ║  1.00x  ║ 1000 ║ PASS        ║
+║  nn          ║       43 ║     2719 ║  5326 ║ 70.77x  ║   14 ║ PASS        ║
+║  nn-rl       ║       43 ║     2485 ║  5236 ║ 70.77x  ║   14 ║ PASS        ║
+║  nn-rl+exp50 ║       43 ║     2608 ║  5240 ║ 70.77x  ║   14 ║ PASS        ║
+╚══════════════╩══════════╩══════════╩═══════╩═════════╩══════╩═════════════╝
+
+  nn             SGD: 0/320  Expl: 0/320  MAPE: ratio=6.8% comp=176.5% decomp=180.6%
+
+  nn-rl          SGD: 29/320  Expl: 0/320  MAPE: ratio=17.7% comp=27.6% decomp=149.7%
+
+  nn-rl+exp50    SGD: 19/320  Expl: 0/320  MAPE: ratio=4.2% comp=36.9% decomp=150.9%
+
+╔═════════════════════════════════════════════════════════════════════════════════════════════════╗
+║  GPU-Time Overhead Breakdown (cumulative across chunks, 8 concurrent workers)                  ║
+╠══════════════╦══════════╦══════════╦══════════╦══════════╦══════════╦══════════╦════════════════╣
+║  Phase       ║ Stats    ║ NN Infer ║ Preproc  ║ Compress ║ Explore  ║ SGD      ║ Total GPU-time ║
+╠══════════════╬══════════╬══════════╬══════════╬══════════╬══════════╬══════════╬════════════════╣
+║  nn          ║     0 ms ║     0 ms ║     0 ms ║   259 ms ║     0 ms ║     0 ms ║       259 ms   ║
+║  nn-rl       ║     0 ms ║     0 ms ║     0 ms ║   130 ms ║     0 ms ║    38 ms ║       168 ms   ║
+║  nn-rl+exp50 ║     0 ms ║     0 ms ║     0 ms ║   135 ms ║     0 ms ║    25 ms ║       160 ms   ║
+╠══════════════╬══════════╬══════════╬══════════╬══════════╬══════════╬══════════╬════════════════╣
+║  (% of GPU)  ║          ║          ║          ║          ║          ║          ║                ║
+║  nn          ║   0.0%   ║   0.0%   ║   0.0%   ║ 100.0%   ║   0.0%   ║   0.0%   ║   wall:  368 ms ║
+║  nn-rl       ║   0.0%   ║   0.0%   ║   0.0%   ║  77.4%   ║   0.0%   ║  22.6%   ║   wall:  402 ms ║
+║  nn-rl+exp50 ║   0.0%   ║   0.0%   ║   0.0%   ║  84.3%   ║   0.0%   ║  15.7%   ║   wall:  383 ms ║
+╚══════════════╩══════════╩══════════╩══════════╩══════════╩══════════╩══════════╩════════════════╝
+
+Aggregate CSV written to: benchmarks/grayscott/results/benchmark_grayscott_vol.csv
+Per-chunk CSV written to: benchmarks/grayscott/results/benchmark_grayscott_vol_chunks.csv
+
+=== Benchmark PASSED ===
