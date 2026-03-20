@@ -479,9 +479,10 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
 
         double ds = static_cast<double>(input_size);
         double bw = static_cast<double>(g_measured_bw_bytes_per_ms);
-        double w0 = static_cast<double>(g_rank_w0);
-        double w1 = static_cast<double>(g_rank_w1);
-        double w2 = static_cast<double>(g_rank_w2);
+        double ca = static_cast<double>(g_cost_alpha);
+        double cb = static_cast<double>(g_cost_beta);
+        double cg = static_cast<double>(g_cost_gamma);
+        double cd = static_cast<double>(g_cost_delta);
         double pred_dt = static_cast<double>(predicted_decomp_time);
         double pred_ct = static_cast<double>(predicted_comp_time);
         double pred_r  = static_cast<double>(predicted_ratio);
@@ -489,21 +490,22 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
         double act_dt  = (primary_decomp_time_ms > 0.0f)
                        ? static_cast<double>(primary_decomp_time_ms) : pred_dt;
 
-        double actual_cost = w0 * act_ct + w1 * act_dt
-                           + ((actual_ratio > 0.0) ? w2 * ds / (actual_ratio * bw) : 0.0);
-        double predicted_cost = w0 * pred_ct + w1 * pred_dt
-                              + ((pred_r > 0.0) ? w2 * ds / (pred_r * bw) : 0.0);
-        double error_pct = (actual_cost > 0.0)
-            ? std::abs(actual_cost - predicted_cost) / actual_cost : 0.0;
-
-        // cost = w0*ct + w1*dt + w2*ds/(ratio*bw)  — same formula as NN ranking
-        auto compute_explore_cost = [&](double ct, double dt, double r) -> double {
-            return w0 * ct + w1 * dt + ((r > 0.0) ? w2 * ds / (r * bw) : 1e30);
+        // Log-space cost: α*log(ct+γ*dt) + β*log(ds/(ratio*bw)) - δ*log(ratio)
+        auto compute_cost = [&](double ct, double dt, double r) -> double {
+            double log_t  = log(std::max(ct + cg * dt, 1e-6));
+            double io_arg = ds / (std::max(r, 0.1) * bw);
+            double log_io = log(std::max(io_arg, 1e-6));
+            double log_r  = log(std::max(r, 0.1));
+            return ca * log_t + cb * log_io - cd * log_r;
         };
+        double actual_cost    = compute_cost(act_ct, act_dt, actual_ratio);
+        double predicted_cost = compute_cost(pred_ct, pred_dt, pred_r);
+        double error_pct = std::abs(actual_cost - predicted_cost)
+                         / (std::abs(actual_cost) + 1e-6);
         struct ExploredResult { int action; double ratio; double comp_time_ms;
                                 double decomp_time_ms; double psnr; double cost; };
         std::vector<ExploredResult> explored_samples;
-        double primary_cost = compute_explore_cost(
+        double primary_cost = compute_cost(
             static_cast<double>(primary_comp_time_ms),
             (primary_decomp_time_ms > 0.0f) ? static_cast<double>(primary_decomp_time_ms) : pred_dt,
             actual_ratio);
@@ -708,7 +710,7 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
                 }
 
                 /* Use measured comp_time; decomp_time uses NN prediction (no decomp at write) */
-                double alt_cost = compute_explore_cost(
+                double alt_cost = compute_cost(
                     static_cast<double>(s.comp_time_ms), pred_dt, s.ratio);
                 explored_samples.push_back({s.action, s.ratio,
                     static_cast<double>(s.comp_time_ms), 0.0, alt_psnr, alt_cost});

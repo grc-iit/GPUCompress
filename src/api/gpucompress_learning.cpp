@@ -212,14 +212,21 @@ extern "C" void gpucompress_set_reinforcement(int /*enable*/, float learning_rat
     if (mape_threshold > 0.0f) g_reinforce_mape_threshold = mape_threshold;
 }
 
-extern "C" void gpucompress_set_ranking_weights(float w0, float w1, float w2) {
-    g_rank_w0 = w0;
-    g_rank_w1 = w1;
-    g_rank_w2 = w2;
+extern "C" void gpucompress_set_cost_mode(int mode) {
+    switch (mode) {
+    case 0: /* SPEED */      g_cost_alpha=1.0f; g_cost_beta=0.0f; g_cost_gamma=1.0f; g_cost_delta=0.0f; break;
+    case 1: /* BALANCED */   g_cost_alpha=1.0f; g_cost_beta=1.0f; g_cost_gamma=1.0f; g_cost_delta=0.5f; break;
+    case 2: /* RATIO */      g_cost_alpha=0.3f; g_cost_beta=1.0f; g_cost_gamma=1.0f; g_cost_delta=1.0f; break;
+    case 3: /* THROUGHPUT */ g_cost_alpha=1.0f; g_cost_beta=0.0f; g_cost_gamma=1.0f; g_cost_delta=1.0f; break;
+    default: break;
+    }
 }
 
-extern "C" void gpucompress_set_ratio_reward(float alpha) {
-    g_rank_alpha = (alpha >= 0.0f) ? alpha : 0.0f;
+extern "C" void gpucompress_set_cost_params(float alpha, float beta, float gamma, float delta) {
+    if (alpha >= 0.0f) g_cost_alpha = alpha;
+    if (beta  >= 0.0f) g_cost_beta  = beta;
+    if (gamma >  0.0f) g_cost_gamma = gamma;
+    if (delta >= 0.0f) g_cost_delta = delta;
 }
 
 extern "C" void gpucompress_set_bandwidth(float bw_gbps) {

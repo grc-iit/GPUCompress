@@ -418,42 +418,47 @@ void gpucompress_set_reinforcement(int enable, float learning_rate,
  * Cost-Based Ranking Configuration
  *
  * The NN predicts (comp_time, decomp_time, ratio) for 32 configs.
- * The ranking formula is:
- *   cost = w0 * comp_time + w1 * decomp_time + w2 * data_size / (ratio * bw)
- * The config with the lowest cost is selected.
+ * The log-space ranking formula is:
+ *   cost = α*log(ct + γ*dt) + β*log(ds/(ratio*bw)) - δ*log(ratio)
  *
- * Default: w0=1, w1=1, w2=1 with auto-probed bandwidth from gpucompress_init().
+ * Parameters:
+ *   α (alpha)  — weight on compute time
+ *   β (beta)   — weight on I/O cost (system-dependent)
+ *   γ (gamma)  — decomp vs comp emphasis (γ>1 = read-heavy workload)
+ *   δ (delta)  — weight on compression ratio utility
+ *   bw         — effective storage bandwidth (auto-probed or user-set)
+ *
+ * The config with the lowest cost is selected.
  * ============================================================ */
 
-/**
- * Set the cost-based ranking weights for NN algorithm selection.
- *
- * @param w0  Weight on predicted compression time (ms)
- * @param w1  Weight on predicted decompression time (ms)
- * @param w2  Weight on I/O cost: data_size / (ratio * bandwidth)
- */
-void gpucompress_set_ranking_weights(float w0, float w1, float w2);
+/** Cost model optimization mode presets. */
+#define GPUCOMPRESS_COST_SPEED      0  /* α=1 β=0 γ=1 δ=0   — minimize time       */
+#define GPUCOMPRESS_COST_BALANCED   1  /* α=1 β=1 γ=1 δ=0.5 — trade time vs ratio  */
+#define GPUCOMPRESS_COST_RATIO      2  /* α=0.3 β=1 γ=1 δ=1 — maximize compression */
+#define GPUCOMPRESS_COST_THROUGHPUT 3  /* α=1 β=0 γ=1 δ=1   — time per ratio       */
 
 /**
- * Set the log-ratio reward coefficient (alpha) for cost-based ranking.
+ * Set cost model mode (preset).
  *
- * The ranking formula is:
- *   cost = w0*ct + w1*dt + w2*ds/(ratio*bw) - alpha*log2(ratio)
- *
- * Alpha controls how many ms of extra compress time you're willing to pay
- * per doubling of compression ratio.  Default: 5.0.
- *   alpha=0  → pure speed (original formula, snappy always wins)
- *   alpha=5  → balanced (each 2x ratio improvement worth 5ms)
- *   alpha=15 → strongly favors high-ratio algorithms
- *
- * @param alpha  Log-ratio reward in ms per doubling (default 5.0)
+ * @param mode  One of GPUCOMPRESS_COST_SPEED, _BALANCED, _RATIO, _THROUGHPUT
  */
-void gpucompress_set_ratio_reward(float alpha);
+void gpucompress_set_cost_mode(int mode);
+
+/**
+ * Set cost model parameters directly.
+ *
+ * @param alpha  Weight on compute time term (default 1.0)
+ * @param beta   Weight on I/O cost term (default 1.0)
+ * @param gamma  Decomp emphasis: γ>1 favors fast decompression (default 1.0)
+ * @param delta  Weight on ratio utility term (default 0.5)
+ */
+void gpucompress_set_cost_params(float alpha, float beta, float gamma, float delta);
 
 /**
  * Override the auto-probed storage bandwidth used in cost-based ranking.
+ * For multi-backend, compute effective bw: 1/bw_eff = Σ(p_i/bw_i).
  *
- * @param bw_gbps  Bandwidth in GB/s (e.g. 3.0 for NVMe, 0.2 for HDD)
+ * @param bw_gbps  Effective bandwidth in GB/s (e.g. 3.0 for NVMe, 0.2 for HDD)
  */
 void gpucompress_set_bandwidth(float bw_gbps);
 
