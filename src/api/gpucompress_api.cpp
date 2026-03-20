@@ -40,9 +40,6 @@ using namespace nvcomp;
  * ============================================================ */
 
 extern "C" {
-    // From entropy_kernel.cu
-    double gpucompress_entropy_gpu_impl(const void* d_data, size_t num_bytes, void* stream);
-
     // From nn_gpu.cu
     int gpucompress_nn_load_impl(const char* filepath);
     int gpucompress_nn_is_loaded_impl(void);
@@ -344,124 +341,6 @@ extern "C" gpucompress_error_t gpucompress_get_original_size(
     }
 
     *original_size = header->original_size;
-    return GPUCOMPRESS_SUCCESS;
-}
-
-/* ============================================================
- * Entropy Calculation
- * ============================================================ */
-
-extern "C" gpucompress_error_t gpucompress_calculate_entropy(
-    const void* data,
-    size_t size,
-    double* entropy_out
-) {
-    if (!g_initialized.load()) {
-        return GPUCOMPRESS_ERROR_NOT_INITIALIZED;
-    }
-
-    if (data == nullptr || entropy_out == nullptr || size == 0) {
-        return GPUCOMPRESS_ERROR_INVALID_INPUT;
-    }
-
-    cudaStream_t stream = g_default_stream;
-    cudaError_t cuda_err;
-
-    // Allocate GPU buffer
-    uint8_t* d_data = nullptr;
-    cuda_err = cudaMalloc(&d_data, size);
-    if (cuda_err != cudaSuccess) {
-        return GPUCOMPRESS_ERROR_OUT_OF_MEMORY;
-    }
-
-    // Copy to GPU
-    cuda_err = cudaMemcpyAsync(d_data, data, size, cudaMemcpyHostToDevice, stream);
-    if (cuda_err != cudaSuccess) {
-        cudaFree(d_data);
-        return GPUCOMPRESS_ERROR_CUDA_FAILED;
-    }
-
-    // Calculate entropy
-    double entropy = gpucompress_entropy_gpu_impl(d_data, size, stream);
-
-    cudaFree(d_data);
-
-    if (entropy < 0.0) {
-        return GPUCOMPRESS_ERROR_CUDA_FAILED;
-    }
-
-    *entropy_out = entropy;
-    return GPUCOMPRESS_SUCCESS;
-}
-
-extern "C" gpucompress_error_t gpucompress_calculate_entropy_gpu(
-    const void* d_data,
-    size_t size,
-    double* entropy_out,
-    void* stream
-) {
-    if (!g_initialized.load()) {
-        return GPUCOMPRESS_ERROR_NOT_INITIALIZED;
-    }
-
-    if (d_data == nullptr || entropy_out == nullptr || size == 0) {
-        return GPUCOMPRESS_ERROR_INVALID_INPUT;
-    }
-
-    cudaStream_t cuda_stream = stream ? static_cast<cudaStream_t>(stream) : g_default_stream;
-    double entropy = gpucompress_entropy_gpu_impl(d_data, size, cuda_stream);
-
-    if (entropy < 0.0) {
-        return GPUCOMPRESS_ERROR_CUDA_FAILED;
-    }
-
-    *entropy_out = entropy;
-    return GPUCOMPRESS_SUCCESS;
-}
-
-/* ============================================================
- * Statistical Analysis
- * ============================================================ */
-
-extern "C" gpucompress_error_t gpucompress_compute_stats(
-    const void* data,
-    size_t size,
-    double* entropy,
-    double* mad,
-    double* second_derivative
-) {
-    if (!g_initialized.load()) {
-        return GPUCOMPRESS_ERROR_NOT_INITIALIZED;
-    }
-
-    if (data == nullptr || entropy == nullptr || mad == nullptr ||
-        second_derivative == nullptr || size == 0) {
-        return GPUCOMPRESS_ERROR_INVALID_INPUT;
-    }
-
-    if (size % sizeof(float) != 0) {
-        return GPUCOMPRESS_ERROR_INVALID_INPUT;
-    }
-
-    // Upload to GPU and compute stats via GPU kernels
-    void* d_data = nullptr;
-    cudaError_t cuda_err = cudaMalloc(&d_data, size);
-    if (cuda_err != cudaSuccess) {
-        return GPUCOMPRESS_ERROR_OUT_OF_MEMORY;
-    }
-    cuda_err = cudaMemcpy(d_data, data, size, cudaMemcpyHostToDevice);
-    if (cuda_err != cudaSuccess) {
-        cudaFree(d_data);
-        return GPUCOMPRESS_ERROR_CUDA_FAILED;
-    }
-
-    int rc = gpucompress::runStatsOnlyPipeline(d_data, size, g_default_stream,
-                                                entropy, mad, second_derivative);
-    cudaFree(d_data);
-    if (rc != 0) {
-        return GPUCOMPRESS_ERROR_INVALID_INPUT;
-    }
-
     return GPUCOMPRESS_SUCCESS;
 }
 

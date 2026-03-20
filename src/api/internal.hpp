@@ -270,7 +270,7 @@ int runNNInference(
  * Run stats-only pipeline on GPU (no NN inference or Q-Table lookup).
  *
  * Computes entropy, normalized MAD, and normalized second derivative
- * entirely on GPU. Used by gpucompress_compute_stats() public API.
+ * entirely on GPU.
  *
  * @param d_input      Float data already on GPU
  * @param input_size   Size in bytes

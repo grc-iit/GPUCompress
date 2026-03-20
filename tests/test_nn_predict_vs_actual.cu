@@ -215,11 +215,6 @@ static int run_pattern(const Pattern *pat, float *d_data, float *d_read,
     pat->generate(d_data, N_FLOATS);
     cudaDeviceSynchronize();
 
-    /* Compute data stats */
-    double ent, mad, sd;
-    gpucompress_compute_stats(d_data, DATASET_BYTES, &ent, &mad, &sd);
-    printf("  Data stats:  entropy=%.4f bits  MAD=%.6f  2nd_deriv=%.6f\n", ent, mad, sd);
-
     /* Reset diagnostics */
     gpucompress_reset_chunk_history();
     H5VL_gpucompress_reset_stats();

@@ -279,40 +279,6 @@ static int test_multiple_sizes(int& failures) {
 // Test: Compute stats API
 // ---------------------------------------------------------------------------
 
-static int test_compute_stats(int& failures) {
-    fprintf(stderr, "\n=== Test 4: Compute Stats API ===\n");
-
-    size_t num_floats = 65536;
-    auto data = gen_smooth(num_floats);
-    size_t data_size = num_floats * sizeof(float);
-
-    double entropy = 0, mad = 0, deriv = 0;
-    gpucompress_error_t rc = gpucompress_compute_stats(
-        data.data(), data_size, &entropy, &mad, &deriv);
-
-    CHECK(rc == GPUCOMPRESS_SUCCESS, "compute_stats succeeded");
-    CHECK(entropy >= 0.0 && entropy <= 8.0, "Entropy in valid range [0,8]");
-    CHECK(mad >= 0.0, "MAD is non-negative");
-    CHECK(deriv >= 0.0, "Second derivative is non-negative");
-
-    fprintf(stderr, "    Entropy: %.4f bits, MAD: %.6f, 2nd deriv: %.6f\n",
-            entropy, mad, deriv);
-
-    // High-entropy data should have higher entropy
-    auto random_data = gen_random(num_floats);
-    double ent2 = 0, mad2 = 0, deriv2 = 0;
-    rc = gpucompress_compute_stats(
-        random_data.data(), data_size, &ent2, &mad2, &deriv2);
-
-    CHECK(rc == GPUCOMPRESS_SUCCESS, "compute_stats random succeeded");
-    CHECK(ent2 > entropy, "Random data has higher entropy than smooth");
-
-    fprintf(stderr, "    Random: entropy=%.4f, MAD=%.6f, deriv=%.6f\n",
-            ent2, mad2, deriv2);
-
-    return 0;
-}
-
 // ---------------------------------------------------------------------------
 // Test: NN hot-reload
 // ---------------------------------------------------------------------------
@@ -389,7 +355,6 @@ int main(int argc, char** argv) {
     test_nn_inference(failures);
     test_active_learning_and_reinforce(failures);
     test_multiple_sizes(failures);
-    test_compute_stats(failures);
     test_nn_reload(failures);
 
     // Cleanup

@@ -367,10 +367,6 @@ static void test_not_initialized() {
     rc = gpucompress_decompress(buf, sizeof(buf), buf, &sz);
     ASSERT_EQ(rc, GPUCOMPRESS_ERROR_NOT_INITIALIZED, "decompress before init");
 
-    double entropy;
-    rc = gpucompress_calculate_entropy(buf, sizeof(buf), &entropy);
-    ASSERT_EQ(rc, GPUCOMPRESS_ERROR_NOT_INITIALIZED, "entropy before init");
-
     printf("  PASS\n");
     g_pass++;
 }

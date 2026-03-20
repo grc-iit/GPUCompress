@@ -5,7 +5,7 @@
  * atomicAdd(double*, double) (sm_60+) produces numerically correct stats.
  *
  * Strategy:
- *   For 5 float32 patterns, call gpucompress_compute_stats() (which runs the
+ *   For 5 float32 patterns, call runStatsOnlyPipeline() (which runs the
  *   GPU stats pipeline: statsPass1Kernel + madPass2Kernel, both using atomicAdd
  *   for double accumulation) and compare against CPU reference values.
  *
@@ -19,6 +19,7 @@
 #include <cstring>
 #include <cmath>
 #include "gpucompress.h"
+#include "api/internal.hpp"
 
 /* ── CPU reference ───────────────────────────────────────────────────── */
 
@@ -112,6 +113,13 @@ int main(void)
     float *h_data = (float *)malloc(N_FLOATS * sizeof(float));
     if (!h_data) { fprintf(stderr, "OOM\n"); gpucompress_cleanup(); return 1; }
 
+    float *d_data = nullptr;
+    size_t data_bytes = N_FLOATS * sizeof(float);
+    if (cudaMalloc(&d_data, data_bytes) != cudaSuccess) {
+        fprintf(stderr, "cudaMalloc failed\n");
+        free(h_data); gpucompress_cleanup(); return 1;
+    }
+
     /* 1% relative tolerance — well above FP rounding, well below
      * what a broken CAS accumulation would produce. */
     const double TOL = 0.01;
@@ -125,15 +133,18 @@ int main(void)
         double ref_mad     = cpu_mad_normalized(h_data, N_FLOATS);
         double ref_deriv   = cpu_deriv_normalized(h_data, N_FLOATS);
 
+        /* Upload to GPU */
+        cudaMemcpy(d_data, h_data, data_bytes, cudaMemcpyHostToDevice);
+
         /* GPU stats — exercises statsPass1Kernel + madPass2Kernel atomicAdd */
         double gpu_entropy = 0.0, gpu_mad = 0.0, gpu_deriv = 0.0;
-        gpucompress_error_t err = gpucompress_compute_stats(
-            h_data, N_FLOATS * sizeof(float),
+        int rc = gpucompress::runStatsOnlyPipeline(
+            d_data, data_bytes, nullptr,
             &gpu_entropy, &gpu_mad, &gpu_deriv);
 
-        if (err != GPUCOMPRESS_SUCCESS) {
-            printf("  [%-14s] FAIL: gpucompress_compute_stats error %d\n",
-                   PAT_NAMES[p], (int)err);
+        if (rc != 0) {
+            printf("  [%-14s] FAIL: runStatsOnlyPipeline error %d\n",
+                   PAT_NAMES[p], rc);
             continue;
         }
 
@@ -160,6 +171,7 @@ int main(void)
                ok ? "PASS" : "FAIL");
     }
 
+    cudaFree(d_data);
     free(h_data);
     gpucompress_cleanup();
 

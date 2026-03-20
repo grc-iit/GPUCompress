@@ -309,69 +309,6 @@ gpucompress_error_t gpucompress_decompress_gpu(
 int gpucompress_is_device_ptr(const void* ptr);
 
 /* ============================================================
- * Entropy Analysis (GPU-accelerated)
- * ============================================================ */
-
-/**
- * Calculate Shannon entropy of data (GPU-accelerated).
- *
- * Computes byte-level entropy using histogram approach on GPU.
- * Result range: 0.0 (all same byte) to 8.0 (uniform distribution).
- *
- * @param data        Data buffer (host memory)
- * @param size        Size in bytes
- * @param entropy_out Output: entropy in bits (0.0 to 8.0)
- * @return GPUCOMPRESS_SUCCESS or error code
- */
-gpucompress_error_t gpucompress_calculate_entropy(
-    const void* data,
-    size_t size,
-    double* entropy_out
-);
-
-/**
- * Calculate entropy of data in GPU memory.
- *
- * @param d_data      Data buffer (GPU memory)
- * @param size        Size in bytes
- * @param entropy_out Output: entropy in bits
- * @param stream      CUDA stream
- * @return GPUCOMPRESS_SUCCESS or error code
- */
-gpucompress_error_t gpucompress_calculate_entropy_gpu(
-    const void* d_data,
-    size_t size,
-    double* entropy_out,
-    void* stream
-);
-
-/* ============================================================
- * Statistical Analysis (GPU-accelerated)
- * ============================================================ */
-
-/**
- * Compute data statistics on GPU: entropy, MAD, second derivative.
- *
- * Interprets data as float32 array for MAD and derivative computation.
- * Entropy is computed at byte level (0.0 to 8.0 bits).
- * MAD and second derivative are normalized by data range to [0, 1].
- *
- * @param data               Data buffer (host memory, float32 array)
- * @param size               Size in bytes (must be multiple of 4)
- * @param entropy            Output: Shannon entropy in bits (0.0 to 8.0)
- * @param mad                Output: normalized Mean Absolute Deviation (0.0 to 1.0)
- * @param second_derivative  Output: normalized mean |x[i+1]-2x[i]+x[i-1]| (0.0 to 1.0)
- * @return GPUCOMPRESS_SUCCESS or error code
- */
-gpucompress_error_t gpucompress_compute_stats(
-    const void* data,
-    size_t size,
-    double* entropy,
-    double* mad,
-    double* second_derivative
-);
-
-/* ============================================================
  * Neural Network Model Management
  * ============================================================ */
 
