@@ -483,12 +483,16 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
         double cb = static_cast<double>(g_cost_beta);
         double cg = static_cast<double>(g_cost_gamma);
         double cd = static_cast<double>(g_cost_delta);
-        double pred_dt = static_cast<double>(predicted_decomp_time);
-        double pred_ct = static_cast<double>(predicted_comp_time);
+        // Ceil to 5ms increments (min 5ms) — matches NN kernel quantization
+        auto ceil5 = [](double v) -> double {
+            return std::max(5.0, std::ceil(v / 5.0) * 5.0);
+        };
+        double pred_dt = ceil5(static_cast<double>(predicted_decomp_time));
+        double pred_ct = ceil5(static_cast<double>(predicted_comp_time));
         double pred_r  = static_cast<double>(predicted_ratio);
-        double act_ct  = static_cast<double>(primary_comp_time_ms);
+        double act_ct  = ceil5(static_cast<double>(primary_comp_time_ms));
         double act_dt  = (primary_decomp_time_ms > 0.0f)
-                       ? static_cast<double>(primary_decomp_time_ms) : pred_dt;
+                       ? ceil5(static_cast<double>(primary_decomp_time_ms)) : pred_dt;
 
         // Log-space cost: α*log(ct+γ*dt) + β*log(ds/(ratio*bw)) - δ*log(ratio)
         auto compute_cost = [&](double ct, double dt, double r) -> double {

@@ -184,6 +184,11 @@ __device__ static void nnForwardPass(
     decomp_time = fmaxf(1e-6f, fminf(decomp_time, 1e6f));
     ratio       = fmaxf(0.1f,  fminf(ratio,        1e5f));
 
+    /* Ceil to 5ms increments (min 5ms) — reduces GPU timing jitter noise
+       in cost ranking and MAPE gating. */
+    comp_time   = fmaxf(5.0f, ceilf(comp_time   / 5.0f) * 5.0f);
+    decomp_time = fmaxf(5.0f, ceilf(decomp_time / 5.0f) * 5.0f);
+
     /* Log-space cost model:
      *   cost = α*log(ct + γ*dt) + β*log(ds/(ratio*bw)) - δ*log(ratio)
      * All terms are in log-space → scale-invariant, no unit mismatch.
