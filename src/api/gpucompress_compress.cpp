@@ -399,7 +399,7 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
         cudaEventSynchronize(ctx->t_stop);
         cudaEventElapsedTime(&primary_comp_time_ms, ctx->t_start, ctx->t_stop);
     }
-    diag_compression_ms = primary_comp_time_ms;
+    diag_compression_ms = std::max(5.0f, std::ceil(primary_comp_time_ms / 5.0f) * 5.0f);
 
     size_t compressed_size = compressor->get_compressed_output_size(d_comp_target);
     size_t total_size      = header_size + compressed_size;
@@ -495,8 +495,11 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
                        ? ceil5(static_cast<double>(primary_decomp_time_ms)) : pred_dt;
 
         // Log-space cost: α*log(ct+γ*dt) + β*log(ds/(ratio*bw)) - δ*log(ratio)
+        // ct/dt ceiled to 5ms increments inside to match NN kernel quantization.
         auto compute_cost = [&](double ct, double dt, double r) -> double {
-            double log_t  = log(std::max(ct + cg * dt, 1e-6));
+            double ct5 = std::max(5.0, std::ceil(ct / 5.0) * 5.0);
+            double dt5 = std::max(5.0, std::ceil(dt / 5.0) * 5.0);
+            double log_t  = log(std::max(ct5 + cg * dt5, 1e-6));
             double io_arg = ds / (std::max(r, 0.1) * bw);
             double log_io = log(std::max(io_arg, 1e-6));
             double log_r  = log(std::max(r, 0.1));

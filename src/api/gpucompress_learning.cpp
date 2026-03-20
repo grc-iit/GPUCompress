@@ -8,6 +8,7 @@
 #include <mutex>
 #include <cstring>
 #include <cstdio>
+#include <cmath>
 #include <vector>
 
 #include "gpucompress.h"
@@ -120,7 +121,7 @@ extern "C" int gpucompress_get_chunk_diag(int idx, gpucompress_chunk_diag_t *out
 extern "C" void gpucompress_record_chunk_decomp_ms(int idx, float ms) {
     std::lock_guard<std::mutex> lk(g_chunk_history_mutex);
     if (idx >= 0 && idx < g_chunk_history_count.load() && idx < g_chunk_history_cap)
-        g_chunk_history[idx].decompression_ms = ms;
+        g_chunk_history[idx].decompression_ms = std::max(5.0f, std::ceilf(ms / 5.0f) * 5.0f);
 }
 
 /* ============================================================
