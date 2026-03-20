@@ -212,6 +212,8 @@ extern "C" gpucompress_error_t gpucompress_init(const char* weights_path) {
                     // Use min of write and read BW (conservative)
                     g_measured_bw_bytes_per_ms = static_cast<float>(
                         static_cast<double>(probe_sz) / ms);
+                    fprintf(stderr, "gpucompress: storage bandwidth probe: %.1f MB/s (%.1f ms for %zu MB)\n",
+                            g_measured_bw_bytes_per_ms / 1000.0, ms, probe_sz >> 20);
                 }
             }
         }

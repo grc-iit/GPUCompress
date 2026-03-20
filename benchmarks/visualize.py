@@ -27,6 +27,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+import matplotlib.patheffects
+import matplotlib.patches
 import numpy as np
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -36,7 +38,7 @@ import numpy as np
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 
-PHASE_ORDER = ["no-comp", "exhaustive", "nn", "nn-rl", "nn-rl+exp50"]
+PHASE_ORDER = ["no-comp", "exhaustive", "nn", "nn-rl", "nn-rl+exp50", "nn-rl+exp"]
 
 PHASE_COLORS = {
     "no-comp":     "#999999",
@@ -44,6 +46,7 @@ PHASE_COLORS = {
     "nn":          "#e49444",
     "nn-rl":       "#6a9f58",
     "nn-rl+exp50": "#c85a5a",
+    "nn-rl+exp":   "#c85a5a",
 }
 
 PHASE_LABELS = {
@@ -52,11 +55,13 @@ PHASE_LABELS = {
     "nn":          "NN\n(Inference)",
     "nn-rl":       "NN+SGD",
     "nn-rl+exp50": "NN+SGD\n+Explore",
+    "nn-rl+exp":   "NN+SGD\n+Explore",
 }
 
 # Auto-detection paths
 DEFAULT_GS_AGG = [
     os.path.join(PROJECT_ROOT, "benchmarks/grayscott/results/benchmark_grayscott_vol.csv"),
+    os.path.join(PROJECT_ROOT, "results/benchmark_grayscott_vol.csv"),
     os.path.join(PROJECT_ROOT, "benchmarks/grayscott/benchmark_grayscott_vol.csv"),
 ]
 DEFAULT_VPIC_AGG = [
@@ -66,10 +71,16 @@ DEFAULT_VPIC_AGG = [
 ]
 DEFAULT_GS_TIMESTEPS = [
     os.path.join(PROJECT_ROOT, "benchmarks/grayscott/results/benchmark_grayscott_timesteps.csv"),
+    os.path.join(PROJECT_ROOT, "results/benchmark_grayscott_timesteps.csv"),
     os.path.join(PROJECT_ROOT, "benchmarks/grayscott/benchmark_grayscott_timesteps.csv"),
 ]
 DEFAULT_GS_TSTEP_CHUNKS = [
     os.path.join(PROJECT_ROOT, "benchmarks/grayscott/results/benchmark_grayscott_timestep_chunks.csv"),
+    os.path.join(PROJECT_ROOT, "results/benchmark_grayscott_timestep_chunks.csv"),
+]
+DEFAULT_GS_CHUNKS = [
+    os.path.join(PROJECT_ROOT, "benchmarks/grayscott/results/benchmark_grayscott_vol_chunks.csv"),
+    os.path.join(PROJECT_ROOT, "results/benchmark_grayscott_vol_chunks.csv"),
 ]
 DEFAULT_VPIC_TIMESTEPS = [
     os.path.join(PROJECT_ROOT, "benchmarks/vpic-kokkos/results/benchmark_vpic_timesteps.csv"),
@@ -172,7 +183,7 @@ def plot_file_sizes(ax, phases, rows):
                     f"{v:.0f}", ha="center", va="bottom", fontsize=8, color="#555")
     ax.set_xticks(x)
     ax.set_xticklabels([PHASE_LABELS.get(p, p) for p in phases], fontsize=9)
-    ax.set_ylabel("Size (MB)", fontsize=10)
+    ax.set_ylabel("Size (MiB)", fontsize=10)
     ax.set_title("Original vs Compressed File Size", fontsize=11, fontweight="bold")
     ax.legend(fontsize=8)
     ax.grid(axis="y", alpha=0.3, linestyle="--", zorder=0)
@@ -233,7 +244,7 @@ def plot_verification(ax, phases, rows):
                           f"{orig:.0f}", f"{comp:.1f}", f"{ratio:.2f}x", status])
         cell_colors.append([row_bg, row_bg, row_bg, row_bg, verify_color])
     table = ax.table(cellText=cell_text,
-                     colLabels=["Phase", "Orig (MB)", "Comp (MB)", "Ratio", "Verify"],
+                     colLabels=["Phase", "Orig (MiB)", "Comp (MiB)", "Ratio", "Verify"],
                      cellColours=cell_colors, loc="center", cellLoc="center")
     table.auto_set_font_size(False)
     table.set_fontsize(10)
@@ -267,10 +278,10 @@ def make_summary_figure(source_name, rows, output_path, meta_text=""):
               "Compression Ratio (higher = better)", "Ratio", fmt="%.2fx")
     ax2 = fig.add_subplot(gs[0, 1])
     plot_bars(ax2, phases, [g(r, "write_mibps", "write_mbps") for r in ordered],
-              "Write Throughput", "MB/s", fmt="%.0f")
+              "Write Throughput", "MiB/s", fmt="%.0f")
     ax3 = fig.add_subplot(gs[1, 0])
     plot_bars(ax3, phases, [g(r, "read_mibps", "read_mbps") for r in ordered],
-              "Read Throughput", "MB/s", fmt="%.0f")
+              "Read Throughput", "MiB/s", fmt="%.0f")
     ax4 = fig.add_subplot(gs[1, 1])
     plot_file_sizes(ax4, phases, ordered)
     ax5 = fig.add_subplot(gs[2, 0])
@@ -278,7 +289,7 @@ def make_summary_figure(source_name, rows, output_path, meta_text=""):
     ax6 = fig.add_subplot(gs[2, 1])
     plot_verification(ax6, phases, ordered)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved: {output_path}")
 
@@ -346,7 +357,7 @@ def make_timestep_figure(ts_csv_path, output_path):
 
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved: {output_path}")
 
@@ -454,7 +465,390 @@ def make_timestep_chunks_figure(tc_csv_path, output_path, phase_filter="nn-rl"):
 
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# View 3: Per-Chunk Algorithm Selection
+# ═══════════════════════════════════════════════════════════════════════
+
+# Canonical algorithm names
+ALGO_NAMES = ["lz4", "snappy", "deflate", "gdeflate",
+              "zstd", "ans", "cascaded", "bitcomp"]
+
+# Each of the 32 configs gets a fully distinct color.
+# Layout: 4 variants per algorithm × 8 algorithms.
+# Uses hatching patterns in the legend to reinforce preprocessing differences.
+CONFIG_ORDER = []    # list of canonical config strings
+CONFIG_COLORS = {}   # config string → hex color
+
+# Hand-picked 32-color palette grouped by algo family.
+# Within each algo: plain=solid, +shuf=stripe pattern (but distinct hue),
+# +quant=different hue, +shuf+quant=yet another hue.
+_CONFIG_PALETTE = {
+    # lz4 family: blues
+    "lz4":              "#2166ac",  # dark blue
+    "lz4+shuf":         "#67a9cf",  # medium blue
+    "lz4+quant":        "#053061",  # navy
+    "lz4+shuf+quant":   "#a6cee3",  # light blue
+    # snappy family: oranges
+    "snappy":           "#e08214",  # orange
+    "snappy+shuf":      "#fdb863",  # light orange
+    "snappy+quant":     "#b35806",  # dark orange
+    "snappy+shuf+quant":"#fee0b6",  # pale orange
+    # deflate family: reds
+    "deflate":          "#d6301d",  # red
+    "deflate+shuf":     "#fc8d59",  # salmon
+    "deflate+quant":    "#7f0000",  # dark red
+    "deflate+shuf+quant":"#fddbc7", # pale pink
+    # gdeflate family: teals
+    "gdeflate":         "#1b7837",  # dark green
+    "gdeflate+shuf":    "#7fbf7b",  # medium green
+    "gdeflate+quant":   "#00441b",  # forest
+    "gdeflate+shuf+quant":"#d9f0d3", # pale green
+    # zstd family: purples
+    "zstd":             "#762a83",  # purple
+    "zstd+shuf":        "#af8dc3",  # lavender
+    "zstd+quant":       "#40004b",  # dark purple
+    "zstd+shuf+quant":  "#e7d4e8",  # pale purple
+    # ans family: yellows/browns
+    "ans":              "#b8860b",  # dark goldenrod
+    "ans+shuf":         "#daa520",  # goldenrod
+    "ans+quant":        "#8b6914",  # dark gold
+    "ans+shuf+quant":   "#ffd700",  # gold
+    # cascaded family: magentas
+    "cascaded":         "#c51b7d",  # magenta
+    "cascaded+shuf":    "#e9a3c9",  # pink
+    "cascaded+quant":   "#8e0152",  # dark magenta
+    "cascaded+shuf+quant":"#fde0ef", # pale pink
+    # bitcomp family: cyans
+    "bitcomp":          "#01665e",  # dark teal
+    "bitcomp+shuf":     "#5ab4ac",  # teal
+    "bitcomp+quant":    "#003c30",  # very dark teal
+    "bitcomp+shuf+quant":"#c7eae5", # pale teal
+}
+
+for algo in ALGO_NAMES:
+    for suffix in ["", "+shuf", "+quant", "+shuf+quant"]:
+        name = algo + suffix
+        CONFIG_ORDER.append(name)
+        CONFIG_COLORS[name] = _CONFIG_PALETTE.get(name, "#cccccc")
+
+# Algo-only colors (plain variant)
+ALGO_COLORS = {a: CONFIG_COLORS[a] for a in ALGO_NAMES}
+
+
+def _normalize_action(action_str):
+    """Normalize action string to canonical form: 'algo[+quant][+shuf]'."""
+    if not action_str or action_str == "none":
+        return "none"
+    parts = action_str.lower().split("+")
+    algo = parts[0]
+    shuf = "shuf" in parts
+    quant = "quant" in parts
+    name = algo
+    if shuf:
+        name += "+shuf"
+    if quant:
+        name += "+quant"
+    return name
+
+
+def _build_config_cmap():
+    """Build colormap and norm for the full 32-config palette."""
+    from matplotlib.colors import ListedColormap, BoundaryNorm
+    colors = [CONFIG_COLORS.get(c, "#cccccc") for c in CONFIG_ORDER]
+    cmap = ListedColormap(colors)
+    norm = BoundaryNorm(np.arange(-0.5, len(CONFIG_ORDER) + 0.5, 1), cmap.N)
+    return cmap, norm
+
+
+def _config_to_idx(action_str):
+    """Map action string like 'zstd+shuf' to CONFIG_ORDER index."""
+    name = _normalize_action(str(action_str))
+    try:
+        return CONFIG_ORDER.index(name)
+    except ValueError:
+        return -1
+
+
+def _config_legend_patches():
+    """Build legend patches — only show configs that differ from plain algo."""
+    from matplotlib.patches import Patch
+    patches = []
+    for cfg in CONFIG_ORDER:
+        patches.append(Patch(facecolor=CONFIG_COLORS[cfg], edgecolor="black",
+                             linewidth=0.5, label=cfg))
+    return patches
+
+
+def _config_legend_patches_used(rows, action_key="action_final"):
+    """Build legend patches only for configs actually present in the data."""
+    from matplotlib.patches import Patch
+    used = set()
+    for r in rows:
+        action_str = r.get(action_key, r.get("action", "none"))
+        cfg = _normalize_action(str(action_str))
+        if cfg != "none":
+            used.add(cfg)
+    patches = []
+    for cfg in CONFIG_ORDER:
+        if cfg in used:
+            patches.append(Patch(facecolor=CONFIG_COLORS[cfg], edgecolor="black",
+                                 linewidth=0.5, label=cfg))
+    return patches
+
+
+def make_chunk_actions_figure(chunk_csv_path, output_path):
+    """Plot NN config selection (algo+preprocessing) per chunk across phases.
+
+    Generates:
+      - Top: per-chunk config as a colored strip (one row per phase)
+      - Bottom: config frequency bar chart per phase (grouped by algo, stacked by variant)
+    """
+    rows = parse_csv(chunk_csv_path)
+    if not rows:
+        print(f"  No chunk data in {chunk_csv_path}, skipping.")
+        return
+
+    # Group by phase
+    by_phase = {}
+    for r in rows:
+        ph = r.get("phase", "unknown")
+        by_phase.setdefault(ph, []).append(r)
+
+    phase_order = ["nn", "nn-rl", "nn-rl+exp50"]
+    phases_present = [p for p in phase_order if p in by_phase]
+    if not phases_present:
+        phases_present = list(by_phase.keys())
+
+    n_phases = len(phases_present)
+    if n_phases == 0:
+        return
+
+    fig, axes = plt.subplots(2, 1, figsize=(16, 3 + 1.5 * n_phases),
+                              gridspec_kw={"height_ratios": [n_phases, 2.5]})
+    fig.suptitle("NN Configuration Selection Per Chunk (algo + preprocessing)",
+                 fontsize=14, fontweight="bold", y=0.98)
+
+    cmap, norm = _build_config_cmap()
+
+    # ── Top: colored strip per phase ──
+    ax_strip = axes[0]
+    strip_data = []
+    for ph in phases_present:
+        ph_rows = sorted(by_phase[ph], key=lambda r: int(g(r, "chunk")))
+        row_vals = []
+        for r in ph_rows:
+            action_str = r.get("action_final", r.get("action", "none"))
+            row_vals.append(_config_to_idx(action_str))
+        strip_data.append(row_vals)
+
+    max_chunks = max(len(row) for row in strip_data) if strip_data else 0
+    for row in strip_data:
+        while len(row) < max_chunks:
+            row.append(-1)
+
+    strip_arr = np.array(strip_data, dtype=float)
+    strip_arr[strip_arr < 0] = np.nan
+
+    ax_strip.imshow(strip_arr, aspect="auto", cmap=cmap, norm=norm,
+                     interpolation="nearest")
+    ax_strip.set_yticks(range(n_phases))
+    ax_strip.set_yticklabels([PHASE_LABELS.get(p, p).replace("\n", " ")
+                               for p in phases_present], fontsize=10)
+    ax_strip.set_xlabel("Chunk Index", fontsize=10)
+    ax_strip.set_title("Config per Chunk (algo + preprocessing)", fontsize=11)
+
+    # Collect all rows for legend
+    all_phase_rows = [r for ph in phases_present for r in by_phase[ph]]
+    legend_patches = _config_legend_patches_used(all_phase_rows)
+    ax_strip.legend(handles=legend_patches, loc="upper right", fontsize=7,
+                     ncol=min(len(legend_patches), 6), framealpha=0.9)
+
+    # ── Bottom: frequency bar chart (full configs) ──
+    ax_bar = axes[1]
+
+    # Count configs actually used
+    used_configs = set()
+    for ph in phases_present:
+        for r in by_phase[ph]:
+            action_str = r.get("action_final", r.get("action", "none"))
+            cfg = _normalize_action(str(action_str))
+            if cfg != "none":
+                used_configs.add(cfg)
+
+    # Keep only used configs in CONFIG_ORDER order
+    bar_configs = [c for c in CONFIG_ORDER if c in used_configs]
+    if not bar_configs:
+        bar_configs = CONFIG_ORDER[:8]  # fallback to plain algos
+
+    x = np.arange(len(bar_configs))
+    width = 0.8 / max(n_phases, 1)
+    for pi, ph in enumerate(phases_present):
+        ph_rows = by_phase[ph]
+        counts = {c: 0 for c in bar_configs}
+        for r in ph_rows:
+            action_str = r.get("action_final", r.get("action", "none"))
+            cfg = _normalize_action(str(action_str))
+            if cfg in counts:
+                counts[cfg] += 1
+        total = max(sum(counts.values()), 1)
+        pcts = [100.0 * counts[c] / total for c in bar_configs]
+        offset = (pi - n_phases / 2 + 0.5) * width
+        ax_bar.bar(x + offset, pcts, width,
+                   color=PHASE_COLORS.get(ph, "#bdc3c7"),
+                   edgecolor="black", linewidth=0.5,
+                   label=PHASE_LABELS.get(ph, ph).replace("\n", " "))
+
+    ax_bar.set_xticks(x)
+    ax_bar.set_xticklabels(bar_configs, fontsize=8, rotation=40, ha="right")
+    ax_bar.set_ylabel("% of Chunks", fontsize=10)
+    ax_bar.set_title("Configuration Selection Frequency", fontsize=11)
+    ax_bar.legend(fontsize=8, loc="upper right")
+    ax_bar.grid(axis="y", alpha=0.3, linestyle="--")
+    for spine in ["top", "right"]:
+        ax_bar.spines[spine].set_visible(False)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
+def make_milestone_actions_figure(tc_csv_path, output_path, chunk_csv_path=None):
+    """Plot NN config selection per chunk at each milestone timestep.
+
+    Layout: 3 columns (NN Inference | NN+SGD | NN+SGD+Explore)
+    - Column 1 (NN Inference): static reference from single-shot data, repeated per row
+    - Column 2 (NN+SGD): from multi-timestep nn-rl milestones
+    - Column 3 (NN+SGD+Explore): from multi-timestep nn-rl+exp50 milestones
+    """
+    from matplotlib.patches import Patch
+
+    all_rows = parse_csv(tc_csv_path)
+    if not all_rows:
+        print(f"  No data in {tc_csv_path}, skipping milestone actions.")
+        return
+
+    # Group by (phase, timestep)
+    by_phase_ts = {}
+    for r in all_rows:
+        ph = r.get("phase", "nn-rl")
+        ts = int(g(r, "timestep"))
+        by_phase_ts.setdefault(ph, {}).setdefault(ts, []).append(r)
+
+    # Load single-shot nn phase for reference (static column)
+    nn_ref_strip = None
+    if chunk_csv_path:
+        try:
+            chunk_rows = parse_csv(chunk_csv_path)
+            nn_chunks = [r for r in chunk_rows if r.get("phase", "") == "nn"]
+            if nn_chunks:
+                nn_chunks.sort(key=lambda r: int(g(r, "chunk")))
+                nn_ref_strip = [_config_to_idx(
+                    r.get("action_final", r.get("action", "none")))
+                    for r in nn_chunks]
+        except Exception:
+            pass
+
+    # Build phase columns: nn (static ref) + available multi-timestep phases
+    phase_columns = []  # list of (label, data_source)
+    if nn_ref_strip is not None:
+        phase_columns.append(("NN Inference\n(static)", "nn_ref"))
+    ts_phase_order = ["nn-rl", "nn-rl+exp50"]
+    for ph in ts_phase_order:
+        if ph in by_phase_ts:
+            phase_columns.append((PHASE_LABELS.get(ph, ph), ph))
+
+    if not phase_columns:
+        return
+
+    # Get milestones from first available multi-timestep phase
+    ts_phases = [ph for _, ph in phase_columns if ph != "nn_ref"]
+    if not ts_phases:
+        return
+    milestones = sorted(by_phase_ts[ts_phases[0]].keys())
+    n_milestones = len(milestones)
+    n_cols = len(phase_columns)
+    if n_milestones == 0:
+        return
+
+    cmap, norm = _build_config_cmap()
+
+    # Compute max chunks
+    max_chunks = len(nn_ref_strip) if nn_ref_strip else 0
+    for ph in ts_phases:
+        for ts in milestones:
+            max_chunks = max(max_chunks, len(by_phase_ts[ph].get(ts, [])))
+
+    fig, axes = plt.subplots(n_milestones, n_cols,
+                              figsize=(max(10, 4.5 * n_cols), 1.4 * n_milestones + 3),
+                              squeeze=False)
+    fig.suptitle("NN Configuration Selection Over Time\n"
+                 "(per chunk at milestone timesteps)",
+                 fontsize=14, fontweight="bold", y=0.99)
+
+    for col, (col_label, col_source) in enumerate(phase_columns):
+        for row, ts in enumerate(milestones):
+            ax = axes[row, col]
+
+            if col_source == "nn_ref":
+                # Static NN inference reference — same strip every row
+                strip = list(nn_ref_strip)
+            else:
+                chunk_rows_ts = sorted(
+                    by_phase_ts[col_source].get(ts, []),
+                    key=lambda r: int(g(r, "chunk")))
+                strip = [_config_to_idx(str(r.get("action", "none")))
+                         for r in chunk_rows_ts]
+
+            while len(strip) < max_chunks:
+                strip.append(-1)
+
+            arr = np.array([strip], dtype=float)
+            arr[arr < 0] = np.nan
+
+            ax.imshow(arr, aspect="auto", cmap=cmap, norm=norm,
+                      interpolation="nearest")
+            ax.set_yticks([])
+
+            if row == 0:
+                ax.set_title(col_label, fontsize=11, fontweight="bold")
+            if col == 0:
+                ax.set_ylabel(f"T={ts}", fontsize=10, fontweight="bold")
+            if row == n_milestones - 1:
+                ax.set_xlabel("Chunk Index", fontsize=9)
+            else:
+                ax.set_xticks([])
+
+    # Legend — configs from all sources
+    all_legend_rows = list(all_rows)
+    if chunk_csv_path:
+        try:
+            all_legend_rows += [r for r in parse_csv(chunk_csv_path)
+                                if r.get("phase", "") == "nn"]
+        except Exception:
+            pass
+    legend_patches = _config_legend_patches_used(all_legend_rows, action_key="action")
+    # Also check action_final key
+    lp2 = _config_legend_patches_used(all_legend_rows, action_key="action_final")
+    seen = {p.get_label() for p in legend_patches}
+    for p in lp2:
+        if p.get_label() not in seen:
+            legend_patches.append(p)
+            seen.add(p.get_label())
+
+    fig.legend(handles=legend_patches, loc="lower center", fontsize=8,
+               ncol=min(len(legend_patches), 8), framealpha=0.9,
+               bbox_to_anchor=(0.5, 0.01))
+
+    fig.tight_layout(rect=[0, 0.06, 1, 0.95])
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved: {output_path}")
 
@@ -463,7 +857,7 @@ def make_timestep_chunks_figure(tc_csv_path, output_path, phase_filter="nn-rl"):
 # Main
 # ═══════════════════════════════════════════════════════════════════════
 
-ALL_VIEWS = ["summary", "timesteps"]
+ALL_VIEWS = ["summary", "timesteps", "actions"]
 
 
 def main():
@@ -484,8 +878,7 @@ def main():
     # Classify positional CSVs
     for csv_path in args.csvs:
         low = csv_path.lower()
-        is_vpic = "vpic" in low
-        if is_vpic:
+        if "vpic" in low:
             if not args.vpic_csv:
                 args.vpic_csv = csv_path
         else:
@@ -500,6 +893,13 @@ def main():
     found_any = False
 
     # ── Gray-Scott ──
+    # Resolve output directory once: --output-dir > alongside aggregate CSV > default
+    gs_out_dir = args.output_dir
+    if not gs_out_dir and gs_agg and os.path.exists(gs_agg):
+        gs_out_dir = os.path.dirname(os.path.abspath(gs_agg))
+    if not gs_out_dir:
+        gs_out_dir = os.path.join(SCRIPT_DIR, "grayscott", "results")
+
     if gs_agg and os.path.exists(gs_agg):
         found_any = True
         if "summary" in views:
@@ -513,27 +913,44 @@ def main():
             orig = g(r0, "orig_mib", "orig_mb")
             n_ch = int(g(r0, "n_chunks"))
             chunk_mb = orig / max(n_ch, 1)
-            meta = (f"Grid: {L}^3 ({orig:.0f} MB) | Chunks: {n_ch} x {chunk_mb:.0f} MB | "
+            meta = (f"Grid: {L}^3 ({orig:.0f} MiB) | Chunks: {n_ch} x {chunk_mb:.0f} MiB | "
                     f"Steps: {steps} | F={F_val}, k={k_val}")
-            out_dir = args.output_dir or os.path.join(SCRIPT_DIR, "grayscott", "results")
             make_summary_figure("Gray-Scott Simulation", rows,
-                                os.path.join(out_dir, "benchmark_grayscott.png"), meta)
+                                os.path.join(gs_out_dir, "benchmark_grayscott.png"), meta)
 
     if gs_tsteps and os.path.exists(gs_tsteps) and "timesteps" in views:
         found_any = True
         print(f"Loading Gray-Scott timestep adaptation: {gs_tsteps}")
-        out_dir = args.output_dir or os.path.dirname(os.path.abspath(gs_tsteps))
-        make_timestep_figure(gs_tsteps, os.path.join(out_dir, "sgd_accuracy_over_time.png"))
+        make_timestep_figure(gs_tsteps, os.path.join(gs_out_dir, "sgd_accuracy_over_time.png"))
 
-    gs_tc = find_csv(DEFAULT_GS_TSTEP_CHUNKS)
+    # Look for chunk/milestone CSVs alongside the aggregate CSV first, then defaults
+    gs_tc = find_csv([os.path.join(gs_out_dir, "benchmark_grayscott_timestep_chunks.csv")]
+                      + DEFAULT_GS_TSTEP_CHUNKS)
     if gs_tc and os.path.exists(gs_tc) and "timesteps" in views:
         found_any = True
         print(f"Loading Gray-Scott per-chunk milestones: {gs_tc}")
-        out_dir = args.output_dir or os.path.dirname(os.path.abspath(gs_tc))
         try:
-            make_timestep_chunks_figure(gs_tc, os.path.join(out_dir, "predicted_vs_actual_per_chunk.png"))
+            make_timestep_chunks_figure(gs_tc, os.path.join(gs_out_dir, "predicted_vs_actual_per_chunk.png"))
         except Exception as e:
             print(f"  Warning: per-chunk milestone plot failed: {e}")
+
+    # ── Gray-Scott: Per-chunk actions (used as nn-inference reference for evolution plot) ──
+    gs_chunks = find_csv([os.path.join(gs_out_dir, "benchmark_grayscott_vol_chunks.csv")]
+                          + DEFAULT_GS_CHUNKS)
+
+    # ── Gray-Scott: Milestone algorithm evolution ──
+    gs_tc = find_csv([os.path.join(gs_out_dir, "benchmark_grayscott_timestep_chunks.csv")]
+                      + DEFAULT_GS_TSTEP_CHUNKS)
+    if gs_tc and os.path.exists(gs_tc) and "actions" in views:
+        tc_rows = parse_csv(gs_tc)
+        if tc_rows:
+            found_any = True
+            print(f"Loading Gray-Scott milestone algorithm evolution: {gs_tc}")
+            try:
+                make_milestone_actions_figure(gs_tc, os.path.join(gs_out_dir, "nn_algorithm_evolution.png"),
+                                             chunk_csv_path=gs_chunks)
+            except Exception as e:
+                print(f"  Warning: milestone actions plot failed: {e}")
 
     # ── VPIC ──
     if vpic_agg and os.path.exists(vpic_agg):
@@ -545,7 +962,7 @@ def main():
             orig = g(r0, "orig_mib", "orig_mb")
             n_ch = int(g(r0, "n_chunks"))
             chunk_mb = orig / max(n_ch, 1)
-            meta = (f"Dataset: {orig:.0f} MB | Chunks: {n_ch} x {chunk_mb:.0f} MB | "
+            meta = (f"Dataset: {orig:.0f} MiB | Chunks: {n_ch} x {chunk_mb:.0f} MiB | "
                     f"Source: VPIC Harris Sheet")
             out_dir = args.output_dir or os.path.join(SCRIPT_DIR, "vpic-kokkos", "results")
             make_summary_figure("VPIC Harris Sheet Reconnection", rows,

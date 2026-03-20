@@ -428,17 +428,17 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     /* We need stats for SGD — run stats on this ctx for the SGD/exploration phase */
     auto t_explore_start = std::chrono::steady_clock::now();
 
+    /* Copy pre-computed stats for diagnostics (always) and SGD (when learning enabled). */
+    if (cfg.algorithm == GPUCOMPRESS_ALGO_AUTO && d_precomputed_stats) {
+        cuda_err = cudaMemcpyAsync(ctx->d_stats, d_precomputed_stats, sizeof(AutoStatsGPU),
+                                   cudaMemcpyDeviceToDevice, stream);
+        if (cuda_err != cudaSuccess) return GPUCOMPRESS_ERROR_CUDA_FAILED;
+        cuda_err = cudaStreamSynchronize(stream);
+        if (cuda_err != cudaSuccess) return GPUCOMPRESS_ERROR_CUDA_FAILED;
+        d_stats_ptr = ctx->d_stats;
+    }
+
     if (cfg.algorithm == GPUCOMPRESS_ALGO_AUTO && g_online_learning_enabled) {
-        /* Reuse pre-computed stats from Stage 1 (D→D copied from infer_ctx).
-         * d_precomputed_stats must be provided — stats are never recomputed here. */
-        if (d_precomputed_stats) {
-            cuda_err = cudaMemcpyAsync(ctx->d_stats, d_precomputed_stats, sizeof(AutoStatsGPU),
-                                       cudaMemcpyDeviceToDevice, stream);
-            if (cuda_err != cudaSuccess) return GPUCOMPRESS_ERROR_CUDA_FAILED;
-            cuda_err = cudaStreamSynchronize(stream);
-            if (cuda_err != cudaSuccess) return GPUCOMPRESS_ERROR_CUDA_FAILED;
-            d_stats_ptr = ctx->d_stats;
-        }
 
         double actual_ratio = static_cast<double>(input_size) /
                               static_cast<double>(compressed_size);
