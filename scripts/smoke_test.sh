@@ -120,10 +120,13 @@ fi
 
 # ── 6. VPIC ──
 if [ -f "$VPIC_BIN" ] && [ -f /tmp/hdf5-install/lib/libhdf5.so ]; then
-    # Restore JIT wrapper if it was overwritten by a previous compilation
-    VPIC_WRAPPER="/u/imuradli/vpic-kokkos/build-compress/bin/vpic"
-    if [ -f "$VPIC_WRAPPER" ]; then
-        cp "$VPIC_WRAPPER" "$VPIC_BIN"
+    # Only restore JIT wrapper if the binary is not already a valid ELF executable
+    # (build_vpic_benchmark.sh produces a pre-linked binary that should not be overwritten)
+    if ! file "$VPIC_BIN" | grep -q "ELF"; then
+        VPIC_WRAPPER="${VPIC_DIR:-$HOME/vpic-kokkos}/build-compress/bin/vpic"
+        if [ -f "$VPIC_WRAPPER" ]; then
+            cp "$VPIC_WRAPPER" "$VPIC_BIN"
+        fi
     fi
 
     echo ""
@@ -137,7 +140,7 @@ if [ -f "$VPIC_BIN" ] && [ -f /tmp/hdf5-install/lib/libhdf5.so ]; then
     VPIC_NX=64 VPIC_CHUNK_MB=4 VPIC_RUNS=1 \
     ./vpic_benchmark_deck.Linux vpic_benchmark_deck.cxx \
         > "$GPU_DIR/$VPIC_LOG" 2>&1
-    if [ $? -eq 0 ] || grep -q "single-shot complete" "$GPU_DIR/$VPIC_LOG" 2>/dev/null; then
+    if [ $? -eq 0 ] || grep -q "normal exit" "$GPU_DIR/$VPIC_LOG" 2>/dev/null; then
         echo "  ✓ VPIC — PASSED"
         PASS=$((PASS + 1))
     else
