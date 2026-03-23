@@ -562,6 +562,7 @@ static int run_phase_vol(float *d_data, float *d_read,
         }
 
         if (save_learning) gpucompress_enable_online_learning();
+        gpucompress_flush_manager_cache();  /* cold-start the timed run */
     }
 
     /* Write */

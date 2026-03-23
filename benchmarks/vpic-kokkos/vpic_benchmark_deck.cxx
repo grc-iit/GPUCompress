@@ -364,6 +364,7 @@ static int run_phase(const char* phase_name, const char* tmp_file,
             H5Fclose(wfile);
             remove(warmup_file);
         }
+        gpucompress_flush_manager_cache();  /* cold-start the timed run */
     }
 
     // VOL write
@@ -506,8 +507,8 @@ static int run_phase(const char* phase_name, const char* tmp_file,
                                    "%.4f,%.4f,%.4f,%d",
                         phase_name, i + 1, final_str, orig_str,
                         (double)d.actual_ratio, (double)d.predicted_ratio, mr,
-                        (double)d.compression_ms, (double)d.predicted_comp_time, mc,
-                        (double)d.decompression_ms, (double)d.predicted_decomp_time, md,
+                        (double)d.compression_ms_raw, (double)d.predicted_comp_time, mc,
+                        (double)d.decompression_ms_raw, (double)d.predicted_decomp_time, md,
                         d.sgd_fired, d.exploration_triggered,
                         (double)d.cost_model_error_pct,
                         (double)d.actual_cost, (double)d.predicted_cost,
@@ -529,7 +530,7 @@ static int run_phase(const char* phase_name, const char* tmp_file,
                 fprintf(chunk_csv, ",%.3f,%.3f,%.3f,%.3f,%.3f,"
                                    "%.4f,%.6f,%.6f,%.4f,%.4f\n",
                         (double)d.nn_inference_ms, (double)d.preprocessing_ms,
-                        (double)d.compression_ms, (double)d.exploration_ms,
+                        (double)d.compression_ms_raw, (double)d.exploration_ms,
                         (double)d.sgd_update_ms,
                         (double)d.feat_entropy, (double)d.feat_mad, (double)d.feat_deriv,
                         (double)d.feat_eb_enc, (double)d.feat_ds_enc);
@@ -882,6 +883,7 @@ begin_diagnostics {
                             double sum_mape_r, sum_mape_c, sum_mape_d;
                             int    sum_sgd, sum_expl, n_chunks_last;
                             size_t last_file_sz;
+                            double sum_file_sz;
                             int    count;
                         };
                         PhaseAccum pa[3] = {};
@@ -892,10 +894,11 @@ begin_diagnostics {
                             char ph[64]; int ts_idx;
                             double wr, rd, rat, mr, mc, md, wmbps, rmbps;
                             int sgd, expl, nch;
-                            unsigned long long mm;
-                            if (sscanf(line, "%63[^,],%d,%*[^,],%lf,%lf,%lf,%lf,%lf,%lf,%d,%d,%d,%llu,%lf,%lf",
+                            unsigned long long mm, fbytes = 0;
+                            int nf = sscanf(line, "%63[^,],%d,%*[^,],%lf,%lf,%lf,%lf,%lf,%lf,%d,%d,%d,%llu,%lf,%lf,%*d,%*d,%llu",
                                        ph, &ts_idx, &wr, &rd, &rat, &mr, &mc, &md,
-                                       &sgd, &expl, &nch, &mm, &wmbps, &rmbps) >= 12 && ts_idx >= WARMUP) {
+                                       &sgd, &expl, &nch, &mm, &wmbps, &rmbps, &fbytes);
+                            if (nf >= 12 && ts_idx >= WARMUP) {
                                 for (int pi = 0; pi < 3; pi++) {
                                     if (strcmp(ph, pnames[pi]) == 0) {
                                         pa[pi].sum_write += wr;
@@ -907,6 +910,8 @@ begin_diagnostics {
                                         pa[pi].sum_sgd  += sgd;
                                         pa[pi].sum_expl += expl;
                                         pa[pi].n_chunks_last = nch;
+                                        if (nf >= 15 && fbytes > 0)
+                                            pa[pi].sum_file_sz += (double)fbytes;
                                         pa[pi].count++;
                                         break;
                                     }
@@ -922,6 +927,16 @@ begin_diagnostics {
                             double avg_wr = pa[pi].sum_write / n;
                             double avg_rd = pa[pi].sum_read / n;
                             double avg_rat = pa[pi].sum_ratio / n;
+                            /* Use actual file sizes when available (avoids Jensen's
+                               inequality bias from orig/mean(ratio) != mean(orig/ratio)).
+                               Fall back to ratio-derived estimate for old CSV files
+                               that lack the file_bytes column. */
+                            double avg_file_mib = (pa[pi].sum_file_sz > 0)
+                                ? pa[pi].sum_file_sz / n / (double)(1 << 20)
+                                : orig_mib / avg_rat;
+                            double avg_ratio = (avg_file_mib > 0)
+                                ? orig_mib / avg_file_mib
+                                : avg_rat;
                             double wmbps = orig_mib / (avg_wr / 1000.0);
                             double rmbps = orig_mib / (avg_rd / 1000.0);
                             fprintf(agg, "vpic,%s,%d,%.2f,0.00,%.2f,0.00,"
@@ -930,7 +945,7 @@ begin_diagnostics {
                                          "0.00,0.00,0.00,0.00,0.00,0.00,0.00,"
                                          "%.2f,%.2f,%.2f\n",
                                     pnames[pi], n, avg_wr, avg_rd,
-                                    orig_mib / avg_rat, orig_mib, avg_rat,
+                                    avg_file_mib, orig_mib, avg_ratio,
                                     wmbps, rmbps,
                                     pa[pi].sum_sgd, pa[pi].sum_expl, pa[pi].n_chunks_last,
                                     fmin(200.0, pa[pi].sum_mape_r / n), fmin(200.0, pa[pi].sum_mape_c / n), fmin(200.0, pa[pi].sum_mape_d / n));
@@ -982,7 +997,8 @@ begin_diagnostics {
                 fprintf(global->ts_csv, "phase,timestep,sim_step,write_ms,read_ms,ratio,"
                         "mape_ratio,mape_comp,mape_decomp,"
                         "sgd_fires,explorations,n_chunks,mismatches,"
-                        "write_mbps,read_mbps,cache_hits,cache_misses\n");
+                        "write_mbps,read_mbps,cache_hits,cache_misses,"
+                        "file_bytes\n");
             }
             global->tc_csv = fopen(TSTEP_CHUNKS_CSV, "w");
             if (global->tc_csv) {
@@ -1177,12 +1193,12 @@ begin_diagnostics {
 
             if (global->ts_csv) {
                 fprintf(global->ts_csv,
-                        "%s,%d,%d,%.2f,%.2f,%.4f,%.2f,%.2f,%.2f,%d,%d,%d,%llu,%.1f,%.1f,%d,%d\n",
+                        "%s,%d,%d,%.2f,%.2f,%.4f,%.2f,%.2f,%.2f,%d,%d,%d,%llu,%.1f,%.1f,%d,%d,%zu\n",
                         phase_name, t, (int)step(), write_ms_t, read_ms_t, ratio_t,
                         real_mape_r, real_mape_c, real_mape_d,
                         sgd_t, expl_t, n_hist,
                         (unsigned long long)mm, wr_mbps, rd_mbps,
-                        c_hits, c_misses);
+                        c_hits, c_misses, file_sz);
                 fflush(global->ts_csv);
             }
 
@@ -1216,8 +1232,8 @@ begin_diagnostics {
                                 "%.4f,%.4f,%.4f,%d",
                                 phase_name, t, ci, action_str, orig_str,
                                 (double)dd.predicted_ratio, (double)dd.actual_ratio,
-                                (double)dd.predicted_comp_time, (double)dd.compression_ms,
-                                (double)dd.predicted_decomp_time, (double)dd.decompression_ms,
+                                (double)dd.predicted_comp_time, (double)dd.compression_ms_raw,
+                                (double)dd.predicted_decomp_time, (double)dd.decompression_ms_raw,
                                 mr, mc, md,
                                 dd.sgd_fired, dd.exploration_triggered,
                                 (double)dd.cost_model_error_pct,

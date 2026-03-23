@@ -306,6 +306,7 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     cudaError_t cuda_err = cudaSuccess;
 
     if (d_quantized || d_shuffled) {
+        cudaStreamSynchronize(stream);  /* ensure preprocessing kernels complete before timing */
         diag_preprocessing_ms = std::chrono::duration<float, std::milli>(
             std::chrono::steady_clock::now() - t_preproc_start).count();
     }
