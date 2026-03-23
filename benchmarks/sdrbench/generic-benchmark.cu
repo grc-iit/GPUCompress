@@ -31,7 +31,9 @@
  *   --chunk-mb N     Chunk size in MB (default 4)
  *   --runs N         Repeat single-shot phases N times (mean +/- std)
  *   --phase <name>   Run only specified phase(s). Repeat for multiple.
- *                    Valid: no-comp, fixed-lz4, fixed-gdeflate, fixed-zstd, nn, nn-rl, nn-rl+exp50
+ *                    Valid: no-comp, fixed-lz4, fixed-gdeflate, fixed-zstd,
+ *                           fixed-lz4+shuf, fixed-gdeflate+shuf, fixed-zstd+shuf,
+ *                           nn, nn-rl, nn-rl+exp50
  *   --out-dir DIR    Output directory for CSVs (default: benchmarks/sdrbench/results)
  *   --w0/w1/w2 F     Cost model weights (default 1/1/1)
  *
@@ -73,6 +75,9 @@
 #define TMP_FIX_LZ4   "/tmp/bm_generic_fix_lz4.h5"
 #define TMP_FIX_GDEFL "/tmp/bm_generic_fix_gdefl.h5"
 #define TMP_FIX_ZSTD  "/tmp/bm_generic_fix_zstd.h5"
+#define TMP_FIX_LZ4_S   "/tmp/bm_generic_fix_lz4_s.h5"
+#define TMP_FIX_GDEFL_S "/tmp/bm_generic_fix_gdefl_s.h5"
+#define TMP_FIX_ZSTD_S  "/tmp/bm_generic_fix_zstd_s.h5"
 #define TMP_NN        "/tmp/bm_generic_nn.h5"
 #define TMP_NN_RL     "/tmp/bm_generic_nn_rl.h5"
 #define TMP_NN_RLEXP  "/tmp/bm_generic_nn_rlexp.h5"
@@ -86,6 +91,9 @@
 #define P_FIX_LZ4     0x002
 #define P_FIX_GDEFL   0x004
 #define P_FIX_ZSTD    0x008
+#define P_FIX_LZ4_S   0x010
+#define P_FIX_GDEFL_S 0x020
+#define P_FIX_ZSTD_S  0x200
 #define P_NN          0x040
 #define P_NNRL        0x080
 #define P_NNRLEXP     0x100
@@ -126,6 +134,19 @@ typedef struct {
     double mape_decomp_pct;
     double comp_gbps;
     double decomp_gbps;
+    /* Per-component timing (cumulative across chunks, unclamped) */
+    double nn_ms;
+    double stats_ms;
+    double preproc_ms;
+    double comp_ms;
+    double decomp_ms;
+    double explore_ms;
+    double sgd_ms;
+    /* Wall-clock stage timing from VOL pipeline (ms) */
+    double stage1_ms;   /* stats + NN inference (main thread) */
+    double stage2_ms;   /* compression + D→H (parallel workers) */
+    double stage3_ms;   /* HDF5 chunk writes (I/O thread) */
+    /* Standard deviations (populated when --runs N > 1) */
     double write_ms_std;
     double read_ms_std;
     double comp_gbps_std;
@@ -396,20 +417,32 @@ static void collect_chunk_metrics(PhaseResult *r)
     r->mape_comp_pct    = mcnt_c ? (mape_c_sum / mcnt_c) * 100.0 : 0.0;
     r->mape_decomp_pct  = mcnt_d ? (mape_d_sum / mcnt_d) * 100.0 : 0.0;
 
-    /* Compute isolated compression throughput from per-chunk timing.
-     * orig_bytes is set by the caller; total comp/decomp time is summed
-     * from chunk diagnostics. */
+    /* Compute per-component timing and isolated throughput from chunk diagnostics. */
     double total_comp_ms = 0, total_decomp_ms = 0;
+    double total_nn_ms = 0, total_stats_ms = 0, total_preproc_ms = 0;
+    double total_explore_ms = 0, total_sgd_ms = 0;
     for (int ci = 0; ci < n_hist; ci++) {
         gpucompress_chunk_diag_t diag;
         if (gpucompress_get_chunk_diag(ci, &diag) != 0) continue;
-        total_comp_ms   += diag.compression_ms;
-        total_decomp_ms += diag.decompression_ms;
+        total_comp_ms    += diag.compression_ms_raw;  /* unclamped for accurate breakdown */
+        total_decomp_ms  += diag.decompression_ms_raw;  /* unclamped for breakdown */
+        total_nn_ms      += diag.nn_inference_ms;
+        total_stats_ms   += diag.stats_ms;
+        total_preproc_ms += diag.preprocessing_ms;
+        total_explore_ms += diag.exploration_ms;
+        total_sgd_ms     += diag.sgd_update_ms;
     }
     r->comp_gbps   = (total_comp_ms > 0)
         ? (double)r->orig_bytes / total_comp_ms / 1e6 : 0.0;
     r->decomp_gbps = (total_decomp_ms > 0)
         ? (double)r->orig_bytes / total_decomp_ms / 1e6 : 0.0;
+    r->nn_ms       = total_nn_ms;
+    r->stats_ms    = total_stats_ms;
+    r->preproc_ms  = total_preproc_ms;
+    r->comp_ms     = total_comp_ms;
+    r->decomp_ms   = total_decomp_ms;
+    r->explore_ms  = total_explore_ms;
+    r->sgd_ms      = total_sgd_ms;
 }
 
 /* ============================================================
@@ -582,6 +615,8 @@ static int run_phase_vol(float *d_data, float *d_read,
 
     if (wret < 0) { fprintf(stderr, "[%s] H5Dwrite failed\n", phase_name); return 1; }
 
+    /* Capture wall-clock stage timing from VOL pipeline */
+    H5VL_gpucompress_get_stage_timing(&r->stage1_ms, &r->stage2_ms, &r->stage3_ms, NULL);
     drop_pagecache(tmp_file);
 
     /* Read */
@@ -657,10 +692,11 @@ static void merge_phase_results(PhaseResult *runs, int n, PhaseResult *out)
         var_cg += (runs[i].comp_gbps - out->comp_gbps) * (runs[i].comp_gbps - out->comp_gbps);
         var_dg += (runs[i].decomp_gbps - out->decomp_gbps) * (runs[i].decomp_gbps - out->decomp_gbps);
     }
-    out->write_ms_std   = sqrt(var_w / n);
-    out->read_ms_std    = sqrt(var_r / n);
-    out->comp_gbps_std  = sqrt(var_cg / n);
-    out->decomp_gbps_std = sqrt(var_dg / n);
+    double denom = (n > 1) ? (n - 1) : 1;  /* sample std dev */
+    out->write_ms_std   = sqrt(var_w / denom);
+    out->read_ms_std    = sqrt(var_r / denom);
+    out->comp_gbps_std  = sqrt(var_cg / denom);
+    out->decomp_gbps_std = sqrt(var_dg / denom);
     out->n_runs = n;
 }
 
@@ -691,9 +727,22 @@ static void run_phase_all_fields(
     char fields[][MAX_PATH_LEN], int n_fields,
     PhaseResult *out, int *any_fail)
 {
+    /* Per-field arrays for std computation */
+    const int MAX_F = 256;
+    double *f_write = (double*)calloc(MAX_F, sizeof(double));
+    double *f_read  = (double*)calloc(MAX_F, sizeof(double));
+    double *f_cgbps = (double*)calloc(MAX_F, sizeof(double));
+    double *f_dgbps = (double*)calloc(MAX_F, sizeof(double));
+
     double sum_ratio = 0, sum_write_ms = 0, sum_read_ms = 0;
+    double sum_comp_gbps = 0, sum_decomp_gbps = 0;
+    double sum_nn_ms = 0, sum_stats_ms = 0, sum_preproc_ms = 0;
+    double sum_comp_ms = 0, sum_decomp_ms = 0, sum_explore_ms = 0, sum_sgd_ms = 0;
+    double sum_stage1 = 0, sum_stage2 = 0, sum_stage3 = 0;
     size_t sum_file_bytes = 0;
+    int sum_sgd_fires = 0, sum_explorations = 0;
     int count = 0;
+    int first_n_chunks = 0;
 
     for (int fi = 0; fi < n_fields; fi++) {
         if (load_field_to_gpu(fields[fi], d_data, total_bytes)) {
@@ -706,30 +755,85 @@ static void run_phase_all_fields(
                     chunk_dims, phase_name, tmp_file, dcpl, &fr);
         if (rc) *any_fail = 1;
 
+        if (count == 0) first_n_chunks = fr.n_chunks;
+
         const char *fname = strrchr(fields[fi], '/');
         fname = fname ? fname + 1 : fields[fi];
         printf("  field %d/%d: %-30s ratio=%.2fx  write=%.0f MiB/s\n",
                fi + 1, n_fields, fname, fr.ratio, fr.write_mbps);
 
-        sum_ratio      += fr.ratio;
-        sum_write_ms   += fr.write_ms;
-        sum_read_ms    += fr.read_ms;
-        sum_file_bytes += fr.file_bytes;
+        if (count < MAX_F) {
+            f_write[count] = fr.write_ms;
+            f_read[count]  = fr.read_ms;
+            f_cgbps[count] = fr.comp_gbps;
+            f_dgbps[count] = fr.decomp_gbps;
+        }
+
+        sum_ratio        += fr.ratio;
+        sum_write_ms     += fr.write_ms;
+        sum_read_ms      += fr.read_ms;
+        sum_file_bytes   += fr.file_bytes;
+        sum_comp_gbps    += fr.comp_gbps;
+        sum_decomp_gbps  += fr.decomp_gbps;
+        sum_nn_ms        += fr.nn_ms;
+        sum_stats_ms     += fr.stats_ms;
+        sum_preproc_ms   += fr.preproc_ms;
+        sum_comp_ms      += fr.comp_ms;
+        sum_decomp_ms    += fr.decomp_ms;
+        sum_explore_ms   += fr.explore_ms;
+        sum_sgd_ms       += fr.sgd_ms;
+        sum_stage1       += fr.stage1_ms;
+        sum_stage2       += fr.stage2_ms;
+        sum_stage3       += fr.stage3_ms;
+        sum_sgd_fires    += fr.sgd_fires;
+        sum_explorations += fr.explorations;
         count++;
     }
 
     if (count > 0) {
         *out = {};
         snprintf(out->phase, sizeof(out->phase), "%s", phase_name);
-        out->ratio      = sum_ratio / count;
-        out->write_ms   = sum_write_ms / count;
-        out->read_ms    = sum_read_ms / count;
-        out->file_bytes = sum_file_bytes / count;
-        out->orig_bytes = total_bytes;
-        out->write_mbps = (double)total_bytes / (1 << 20) / (out->write_ms / 1000.0);
-        out->read_mbps  = (double)total_bytes / (1 << 20) / (out->read_ms / 1000.0);
-        out->n_runs     = count;
+        out->ratio        = sum_ratio / count;
+        out->write_ms     = sum_write_ms / count;
+        out->read_ms      = sum_read_ms / count;
+        out->file_bytes   = sum_file_bytes / count;
+        out->orig_bytes   = total_bytes;
+        out->write_mbps   = (double)total_bytes / (1 << 20) / (out->write_ms / 1000.0);
+        out->read_mbps    = (double)total_bytes / (1 << 20) / (out->read_ms / 1000.0);
+        out->comp_gbps    = sum_comp_gbps / count;
+        out->decomp_gbps  = sum_decomp_gbps / count;
+        out->nn_ms        = sum_nn_ms / count;
+        out->stats_ms     = sum_stats_ms / count;
+        out->preproc_ms   = sum_preproc_ms / count;
+        out->comp_ms      = sum_comp_ms / count;
+        out->decomp_ms    = sum_decomp_ms / count;
+        out->explore_ms   = sum_explore_ms / count;
+        out->sgd_ms       = sum_sgd_ms / count;
+        out->stage1_ms    = sum_stage1 / count;
+        out->stage2_ms    = sum_stage2 / count;
+        out->stage3_ms    = sum_stage3 / count;
+        out->sgd_fires    = sum_sgd_fires;
+        out->explorations = sum_explorations;
+        out->n_runs       = count;
+        out->n_chunks     = first_n_chunks;
+
+        /* Compute std across fields (sample std, n-1) */
+        int n = (count < MAX_F) ? count : MAX_F;
+        double var_w = 0, var_r = 0, var_cg = 0, var_dg = 0;
+        for (int i = 0; i < n; i++) {
+            var_w  += (f_write[i] - out->write_ms) * (f_write[i] - out->write_ms);
+            var_r  += (f_read[i]  - out->read_ms)  * (f_read[i]  - out->read_ms);
+            var_cg += (f_cgbps[i] - out->comp_gbps) * (f_cgbps[i] - out->comp_gbps);
+            var_dg += (f_dgbps[i] - out->decomp_gbps) * (f_dgbps[i] - out->decomp_gbps);
+        }
+        double denom = (n > 1) ? (n - 1) : 1;
+        out->write_ms_std    = sqrt(var_w / denom);
+        out->read_ms_std     = sqrt(var_r / denom);
+        out->comp_gbps_std   = sqrt(var_cg / denom);
+        out->decomp_gbps_std = sqrt(var_dg / denom);
     }
+
+    free(f_write); free(f_read); free(f_cgbps); free(f_dgbps);
 }
 
 /* ============================================================
@@ -749,6 +853,8 @@ static void write_summary_csv(const char *dataset_name,
             "mape_ratio,mape_comp,mape_decomp,"
             "sgd_fires,explorations,n_chunks,"
             "comp_gbps,decomp_gbps,"
+            "nn_ms,stats_ms,preproc_ms,comp_ms,decomp_ms,explore_ms,sgd_ms,"
+            "stage1_ms,stage2_ms,stage3_ms,"
             "write_ms_std,read_ms_std,comp_gbps_std,decomp_gbps_std,n_runs\n");
 
     for (int i = 0; i < n_phases; i++) {
@@ -759,6 +865,8 @@ static void write_summary_csv(const char *dataset_name,
                 "%.2f,%.2f,%.2f,"
                 "%d,%d,%d,"
                 "%.4f,%.4f,"
+                "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,"
+                "%.2f,%.2f,%.2f,"
                 "%.2f,%.2f,%.4f,%.4f,%d\n",
                 dataset_name, r->phase, r->write_ms, r->read_ms,
                 r->ratio, r->file_bytes, r->orig_bytes,
@@ -767,6 +875,9 @@ static void write_summary_csv(const char *dataset_name,
                 r->mape_ratio_pct, r->mape_comp_pct, r->mape_decomp_pct,
                 r->sgd_fires, r->explorations, r->n_chunks,
                 r->comp_gbps, r->decomp_gbps,
+                r->nn_ms, r->stats_ms, r->preproc_ms,
+                r->comp_ms, r->decomp_ms, r->explore_ms, r->sgd_ms,
+                r->stage1_ms, r->stage2_ms, r->stage3_ms,
                 r->write_ms_std, r->read_ms_std,
                 r->comp_gbps_std, r->decomp_gbps_std, r->n_runs);
     }
@@ -794,7 +905,8 @@ static void write_chunk_csv(const char *phase_name)
                 "predicted_decomp_ms,actual_decomp_ms,"
                 "smape_ratio,smape_comp,smape_decomp,"
                 "mape_ratio,mape_comp,mape_decomp,"
-                "sgd_fired,exploration_triggered\n");
+                "sgd_fired,exploration_triggered,"
+                "feat_entropy,feat_mad,feat_deriv\n");
     }
 
     for (int ci = 0; ci < n_hist; ci++) {
@@ -822,13 +934,15 @@ static void write_chunk_csv(const char *phase_name)
             md = fabs(diag.predicted_decomp_time - diag.decompression_ms) / fabs(diag.decompression_ms) * 100.0;
 
         fprintf(f, "%s,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
-                "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d\n",
+                "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,"
+                "%.4f,%.6f,%.6f\n",
                 phase_name, ci, diag.nn_action,
                 diag.predicted_ratio, diag.actual_ratio,
                 diag.predicted_comp_time, diag.compression_ms,
                 diag.predicted_decomp_time, diag.decompression_ms,
                 sr, sc, sd, mr, mc, md,
-                diag.sgd_fired, diag.exploration_triggered);
+                diag.sgd_fired, diag.exploration_triggered,
+                diag.feat_entropy, diag.feat_mad, diag.feat_deriv);
     }
     fclose(f);
 }
@@ -879,6 +993,9 @@ int main(int argc, char **argv)
             else if (strcmp(argv[i], "fixed-lz4") == 0) phase_mask |= P_FIX_LZ4;
             else if (strcmp(argv[i], "fixed-gdeflate") == 0) phase_mask |= P_FIX_GDEFL;
             else if (strcmp(argv[i], "fixed-zstd") == 0) phase_mask |= P_FIX_ZSTD;
+            else if (strcmp(argv[i], "fixed-lz4+shuf") == 0) phase_mask |= P_FIX_LZ4_S;
+            else if (strcmp(argv[i], "fixed-gdeflate+shuf") == 0) phase_mask |= P_FIX_GDEFL_S;
+            else if (strcmp(argv[i], "fixed-zstd+shuf") == 0) phase_mask |= P_FIX_ZSTD_S;
             else if (strcmp(argv[i], "nn") == 0) phase_mask |= P_NN;
             else if (strcmp(argv[i], "nn-rl") == 0) phase_mask |= P_NNRL;
             else if (strcmp(argv[i], "nn-rl+exp50") == 0) phase_mask |= P_NNRLEXP;
@@ -912,7 +1029,8 @@ int main(int argc, char **argv)
             "  --ext EXT          File extension filter (default: %s)\n"
             "  --chunk-mb N       Chunk size in MB (default: %d)\n"
             "  --runs N           Repeat single-shot phases N times\n"
-            "  --phase <name>     Run specific phase(s): no-comp, fixed-lz4, fixed-gdeflate, fixed-zstd, nn, nn-rl, nn-rl+exp50\n"
+            "  --phase <name>     Run specific phase(s): no-comp, fixed-lz4, fixed-gdeflate, fixed-zstd,\n"
+            "                     fixed-lz4+shuf, fixed-gdeflate+shuf, fixed-zstd+shuf, nn, nn-rl, nn-rl+exp50\n"
             "  --out-dir DIR      Output directory (default: %s)\n"
             "  --w0/w1/w2 F       Cost model weights\n"
             "  --lr F             SGD learning rate (default: %.2f)\n"
@@ -929,6 +1047,7 @@ int main(int argc, char **argv)
     }
 
     if (phase_mask == 0) phase_mask = P_NOCOMP | P_FIX_LZ4 | P_FIX_GDEFL | P_FIX_ZSTD
+                                    | P_FIX_LZ4_S | P_FIX_GDEFL_S | P_FIX_ZSTD_S
                                     | P_NN | P_NNRL | P_NNRLEXP;
 
     /* ── Discover field files ── */
@@ -1115,8 +1234,11 @@ int main(int argc, char **argv)
             { P_FIX_LZ4,     "fixed-lz4",           TMP_FIX_LZ4,                    GPUCOMPRESS_ALGO_LZ4,      0 },
             { P_FIX_GDEFL,   "fixed-gdeflate",       TMP_FIX_GDEFL,                  GPUCOMPRESS_ALGO_GDEFLATE, 0 },
             { P_FIX_ZSTD,    "fixed-zstd",           TMP_FIX_ZSTD,                   GPUCOMPRESS_ALGO_ZSTD,     0 },
+            { P_FIX_LZ4_S,   "fixed-lz4+shuf",      TMP_FIX_LZ4_S,                  GPUCOMPRESS_ALGO_LZ4,      GPUCOMPRESS_PREPROC_SHUFFLE_4 },
+            { P_FIX_GDEFL_S, "fixed-gdeflate+shuf",  TMP_FIX_GDEFL_S,                GPUCOMPRESS_ALGO_GDEFLATE, GPUCOMPRESS_PREPROC_SHUFFLE_4 },
+            { P_FIX_ZSTD_S,  "fixed-zstd+shuf",      TMP_FIX_ZSTD_S,                 GPUCOMPRESS_ALGO_ZSTD,     GPUCOMPRESS_PREPROC_SHUFFLE_4 },
         };
-        for (int fi = 0; fi < 3; fi++) {
+        for (int fi = 0; fi < 6; fi++) {
             if (!(phase_mask & fixed_phases[fi].mask)) continue;
             printf("\n── Phase %d: %s ─────────────────────────────────────\n",
                    n_phases + 1, fixed_phases[fi].name);
@@ -1207,6 +1329,21 @@ int main(int argc, char **argv)
                     "write_mbps,read_mbps\n");
         }
 
+        /* Open timestep-chunks CSV for milestone fields */
+        FILE *tc_csv = fopen(OUT_TSTEP_CHUNKS, "w");
+        if (tc_csv) {
+            fprintf(tc_csv, "phase,field_idx,field_name,chunk,action,action_orig,"
+                    "predicted_ratio,actual_ratio,"
+                    "predicted_comp_ms,actual_comp_ms,"
+                    "predicted_decomp_ms,actual_decomp_ms,"
+                    "smape_ratio,smape_comp,smape_decomp,"
+                    "mape_ratio,mape_comp,mape_decomp,"
+                    "sgd_fired,exploration_triggered,"
+                    "feat_entropy,feat_mad,feat_deriv\n");
+        }
+        /* Milestone indices: 0%, 25%, 50%, 75%, last */
+        int milestones[5] = {0, n_fields/4, n_fields/2, 3*n_fields/4, n_fields-1};
+
         for (int pi = 0; pi < 2; pi++) {
             if (!(phase_mask & ts_all[pi].mask)) continue;
 
@@ -1239,10 +1376,18 @@ int main(int argc, char **argv)
                    "F#", "Field", "WrMs", "RdMs", "Ratio", "MAPE_R", "SGD", "EXP");
             printf("  ----  %-30s  -------  -------  -------  --------  ----  ----\n", "-----");
 
-            const int WARMUP_SKIP = 3;
+            const int WARMUP_SKIP = 0;
+            const int MAX_F = 256;
+            double *f_write_ms = (double*)calloc(MAX_F, sizeof(double));
+            double *f_read_ms  = (double*)calloc(MAX_F, sizeof(double));
+            double *f_cgbps    = (double*)calloc(MAX_F, sizeof(double));
+            double *f_dgbps    = (double*)calloc(MAX_F, sizeof(double));
             double sum_write_ms = 0, sum_read_ms = 0;
             double sum_ratio = 0;
             double sum_mape_r = 0, sum_mape_c = 0, sum_mape_d = 0;
+            double sum_nn_ms = 0, sum_stats_ms = 0, sum_preproc_ms = 0;
+            double sum_comp_ms = 0, sum_decomp_ms = 0, sum_explore_ms = 0, sum_sgd_ms = 0;
+            double sum_comp_gbps = 0, sum_decomp_gbps = 0;
             int    sum_sgd = 0, sum_expl = 0;
             size_t last_file_sz = 0;
             int n_steady = 0;
@@ -1308,9 +1453,24 @@ int main(int argc, char **argv)
                 collect_chunk_metrics(&field_r);
 
                 if (fi >= WARMUP_SKIP) {
+                    if (n_steady < MAX_F) {
+                        f_write_ms[n_steady] = write_ms_t;
+                        f_read_ms[n_steady]  = read_ms_t;
+                        f_cgbps[n_steady]    = field_r.comp_gbps;
+                        f_dgbps[n_steady]    = field_r.decomp_gbps;
+                    }
                     sum_mape_r += field_r.mape_ratio_pct;
                     sum_mape_c += field_r.mape_comp_pct;
                     sum_mape_d += field_r.mape_decomp_pct;
+                    sum_nn_ms       += field_r.nn_ms;
+                    sum_stats_ms    += field_r.stats_ms;
+                    sum_preproc_ms  += field_r.preproc_ms;
+                    sum_comp_ms     += field_r.comp_ms;
+                    sum_decomp_ms   += field_r.decomp_ms;
+                    sum_explore_ms  += field_r.explore_ms;
+                    sum_sgd_ms      += field_r.sgd_ms;
+                    sum_comp_gbps   += field_r.comp_gbps;
+                    sum_decomp_gbps += field_r.decomp_gbps;
                     sum_sgd    += field_r.sgd_fires;
                     sum_expl   += field_r.explorations;
                 }
@@ -1342,6 +1502,45 @@ int main(int argc, char **argv)
                             (double)total_bytes / (1 << 20) / (write_ms_t / 1000.0),
                             (double)total_bytes / (1 << 20) / (read_ms_t / 1000.0));
                 }
+
+                /* Write per-chunk detail at milestone fields */
+                bool is_milestone = false;
+                for (int mi = 0; mi < 5; mi++)
+                    if (fi == milestones[mi]) { is_milestone = true; break; }
+                if (is_milestone && tc_csv) {
+                    int nh = gpucompress_get_chunk_history_count();
+                    for (int ci = 0; ci < nh; ci++) {
+                        gpucompress_chunk_diag_t d;
+                        if (gpucompress_get_chunk_diag(ci, &d) != 0) continue;
+                        double sr = 0, mr = 0, sc = 0, mc = 0, sd = 0, md = 0;
+                        if (d.actual_ratio > 0 && d.predicted_ratio > 0) {
+                            double dn = (fabs(d.actual_ratio)+fabs(d.predicted_ratio))/2.0;
+                            if (dn > 0) sr = fabs(d.actual_ratio-d.predicted_ratio)/dn*100.0;
+                            mr = fabs(d.predicted_ratio-d.actual_ratio)/fabs(d.actual_ratio)*100.0;
+                        }
+                        if (d.compression_ms > 0 && d.predicted_comp_time > 0) {
+                            double dn = (fabs(d.compression_ms)+fabs(d.predicted_comp_time))/2.0;
+                            if (dn > 0) sc = fabs(d.compression_ms-d.predicted_comp_time)/dn*100.0;
+                            mc = fabs(d.predicted_comp_time-d.compression_ms)/fabs(d.compression_ms)*100.0;
+                        }
+                        if (d.decompression_ms > 0 && d.predicted_decomp_time > 0) {
+                            double dn = (fabs(d.decompression_ms)+fabs(d.predicted_decomp_time))/2.0;
+                            if (dn > 0) sd = fabs(d.decompression_ms-d.predicted_decomp_time)/dn*100.0;
+                            md = fabs(d.predicted_decomp_time-d.decompression_ms)/fabs(d.decompression_ms)*100.0;
+                        }
+                        fprintf(tc_csv, "%s,%d,%s,%d,%d,%d,"
+                                "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
+                                "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,"
+                                "%d,%d,%.4f,%.6f,%.6f\n",
+                                phase_name, fi, fname, ci, d.nn_action, d.nn_original_action,
+                                d.predicted_ratio, d.actual_ratio,
+                                d.predicted_comp_time, d.compression_ms,
+                                d.predicted_decomp_time, d.decompression_ms,
+                                sr, sc, sd, mr, mc, md,
+                                d.sgd_fired, d.exploration_triggered,
+                                d.feat_entropy, d.feat_mad, d.feat_deriv);
+                    }
+                }
             }
 
             /* Store final result for summary */
@@ -1361,14 +1560,42 @@ int main(int argc, char **argv)
                 pr->mape_ratio_pct  = sum_mape_r / n_steady;
                 pr->mape_comp_pct   = sum_mape_c / n_steady;
                 pr->mape_decomp_pct = sum_mape_d / n_steady;
+                pr->nn_ms       = sum_nn_ms / n_steady;
+                pr->stats_ms    = sum_stats_ms / n_steady;
+                pr->preproc_ms  = sum_preproc_ms / n_steady;
+                pr->comp_ms     = sum_comp_ms / n_steady;
+                pr->decomp_ms   = sum_decomp_ms / n_steady;
+                pr->explore_ms  = sum_explore_ms / n_steady;
+                pr->sgd_ms      = sum_sgd_ms / n_steady;
+                pr->comp_gbps   = sum_comp_gbps / n_steady;
+                pr->decomp_gbps = sum_decomp_gbps / n_steady;
                 pr->sgd_fires   = sum_sgd;
                 pr->explorations = sum_expl;
+
+                /* Compute std across steady-state fields */
+                int ns = (n_steady < MAX_F) ? n_steady : MAX_F;
+                if (ns > 1) {
+                    double var_w = 0, var_r = 0, var_cg = 0, var_dg = 0;
+                    for (int i = 0; i < ns; i++) {
+                        var_w  += (f_write_ms[i] - pr->write_ms) * (f_write_ms[i] - pr->write_ms);
+                        var_r  += (f_read_ms[i]  - pr->read_ms)  * (f_read_ms[i]  - pr->read_ms);
+                        var_cg += (f_cgbps[i] - pr->comp_gbps) * (f_cgbps[i] - pr->comp_gbps);
+                        var_dg += (f_dgbps[i] - pr->decomp_gbps) * (f_dgbps[i] - pr->decomp_gbps);
+                    }
+                    double d = ns - 1;
+                    pr->write_ms_std    = sqrt(var_w / d);
+                    pr->read_ms_std     = sqrt(var_r / d);
+                    pr->comp_gbps_std   = sqrt(var_cg / d);
+                    pr->decomp_gbps_std = sqrt(var_dg / d);
+                }
             }
             n_phases++;
+            free(f_write_ms); free(f_read_ms); free(f_cgbps); free(f_dgbps);
         }
 
         H5Pclose(dcpl_ts);
         if (ts_csv) fclose(ts_csv);
+        if (tc_csv) fclose(tc_csv);
     }
 
     /* ── Write summary CSV ── */
@@ -1382,6 +1609,9 @@ int main(int argc, char **argv)
     remove(TMP_FIX_LZ4);
     remove(TMP_FIX_GDEFL);
     remove(TMP_FIX_ZSTD);
+    remove(TMP_FIX_LZ4_S);
+    remove(TMP_FIX_GDEFL_S);
+    remove(TMP_FIX_ZSTD_S);
     remove(TMP_NN);
     remove(TMP_NN_RL);
     remove(TMP_NN_RLEXP);

@@ -26,7 +26,8 @@ set +e  # Don't exit on error
 L=${L:-400}                   # Grid size: L^3 * 4 bytes (~244 MB for L=400)
 CHUNK_MB=${CHUNK_MB:-4}       # Chunk size in MB
 TIMESTEPS=${TIMESTEPS:-100}   # Number of multi-timestep writes
-RUNS=${RUNS:-1}               # Single-shot repetitions
+STEPS=${STEPS:-5000}          # PDE steps per timestep (5000+ for realistic patterns)
+RUNS=${RUNS:-3}               # Single-shot repetitions (3 for error bars)
 DEBUG_NN=${DEBUG_NN:-1}       # 1=print NN rankings, 0=quiet
 
 # ── Paths ──
@@ -68,6 +69,7 @@ echo "  Gray-Scott Benchmark Evaluation Suite"
 echo "============================================================"
 echo "  Grid       : ${L}^3  (~${DATASET_MB} MB)"
 echo "  Chunks     : ${CHUNK_MB} MB  (~${N_CHUNKS} chunks)"
+echo "  PDE steps  : ${STEPS}"
 echo "  Timesteps  : ${TIMESTEPS}"
 echo "  Runs       : ${RUNS}"
 echo "  Configs    : ${#CONFIGS[@]}"
@@ -97,7 +99,7 @@ for cfg_line in "${CONFIGS[@]}"; do
     RUN_START=$(date +%s)
     GPUCOMPRESS_DEBUG_NN=$DEBUG_NN \
     "$GS_BIN" "$WEIGHTS" \
-        --L $L --chunk-mb $CHUNK_MB --timesteps $TIMESTEPS --runs $RUNS \
+        --L $L --steps $STEPS --chunk-mb $CHUNK_MB --timesteps $TIMESTEPS --runs $RUNS \
         --w0 $W0 --w1 $W1 --w2 $W2 \
         --out-dir "$RUN_DIR" \
         > "$LOG_FILE" 2>&1 &

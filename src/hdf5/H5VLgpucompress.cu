@@ -381,6 +381,19 @@ static size_t s_d2d_bytes = 0;   /* total bytes copied device→device */
 static int    s_h2d_count = 0;   /* number of H→D cudaMemcpy calls  */
 static int    s_d2h_count = 0;   /* number of D→H cudaMemcpy calls  */
 static int    s_d2d_count = 0;   /* number of D→D cudaMemcpy calls  */
+/* Wall-clock stage timing (ms) for the last H5Dwrite call */
+static double s_stage1_ms = 0;   /* Stage 1: stats + NN inference (main thread) */
+static double s_stage2_ms = 0;   /* Stage 2: compression + D→H (worker threads wall clock) */
+static double s_stage3_ms = 0;   /* Stage 3: HDF5 chunk writes (I/O thread wall clock) */
+static double s_total_ms  = 0;   /* Total wall clock for the pipeline */
+/* Max per-worker wall-clock time (bottleneck worker = actual Stage 2 wall time) */
+static double s_max_worker_comp_ms = 0;
+
+static double _now_ms() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
 
 /* Wrapper: track and execute cudaMemcpy */
 static inline cudaError_t vol_memcpy(void *dst, const void *src,
@@ -402,6 +415,24 @@ H5VL_gpucompress_reset_stats(void)
     s_chunks_comp.store(0);     s_chunks_decomp.store(0);
     s_h2d_bytes = s_d2h_bytes = s_d2d_bytes = 0;
     s_h2d_count = s_d2h_count = s_d2d_count = 0;
+    s_stage1_ms = s_stage2_ms = s_stage3_ms = s_total_ms = 0;
+    s_max_worker_comp_ms = 0;
+}
+
+extern "C" void
+H5VL_gpucompress_get_stage_timing(double *stage1_ms, double *stage2_ms,
+                                   double *stage3_ms, double *total_ms)
+{
+    if (stage1_ms) *stage1_ms = s_stage1_ms;
+    if (stage2_ms) *stage2_ms = s_stage2_ms;
+    if (stage3_ms) *stage3_ms = s_stage3_ms;
+    if (total_ms)  *total_ms  = s_total_ms;
+}
+
+extern "C" void
+H5VL_gpucompress_get_worker_timing(double *max_worker_ms)
+{
+    if (max_worker_ms) *max_worker_ms = s_max_worker_comp_ms;
 }
 
 extern "C" void
@@ -1044,6 +1075,9 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
 
         /* All pipeline-local variables declared up-front (before any goto,
          * nvcc requires no init-bypass for non-trivial types). */
+        double _pipeline_start = 0, _s1_start = 0;
+        double worker_comp_ms[M4_N_COMP_WORKERS];
+        memset(worker_comp_ms, 0, sizeof(worker_comp_ms));
         hsize_t *d_dset_dims = NULL, *d_chunk_dims = NULL, *d_chunk_start = NULL;
         uint8_t* d_comp_w[N_COMP_WORKERS] = {};
         std::atomic<herr_t>     worker_err{0};
@@ -1128,15 +1162,17 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
             workers.reserve(N_COMP_WORKERS);
             for (int w = 0; w < N_COMP_WORKERS; w++) {
                 workers.emplace_back([&, w]() {
+                    double w_total = 0;
                     while (true) {
                         WorkItem wi;
                         { std::unique_lock<std::mutex> lk(wq_mtx);
                           wq_ready_cv.wait(lk, [&]{ return !wq.empty() || worker_err.load() != 0; });
-                          if (wq.empty()) break;  /* woken by error — exit */
+                          if (wq.empty()) break;
                           wi = wq.front(); wq.pop(); }
                         wq_full_cv.notify_one();
                         if (!wi.valid) break;
 
+                        double _w_start = _now_ms();
                         size_t comp_sz = max_comp;
                         gpucompress_stats_t wstats = {};
                         gpucompress_error_t ce;
@@ -1152,6 +1188,8 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                             ce = gpucompress_compress_gpu(
                                 wi.src, wi.sz, d_comp_w[w], &comp_sz, &cfg, &wstats, NULL);
                         }
+
+                        w_total += _now_ms() - _w_start;
 
                         /* Free per-chunk owned buffers after compression completes */
                         if (wi.d_owned) { cudaFree(wi.d_owned); wi.d_owned = NULL; }
@@ -1198,10 +1236,14 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                           io_q.push(item); }
                         io_cv.notify_one();
                     }
+                    /* Store per-worker total wall time */
+                    worker_comp_ms[w] = w_total;
                 });
             }
 
             /* ---- Stage 1: iterate chunks, sequential inference + post WorkItems ---- */
+            _pipeline_start = _now_ms();
+            _s1_start = _pipeline_start;
             {
                 /* Non-default stream for gather kernel: avoids null-stream serialization
                  * against the 8 CompContext worker streams. */
@@ -1420,6 +1462,7 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                 }
                 cudaStreamDestroy(gather_stream);
             } /* Stage 1 scope */
+            s_stage1_ms = _now_ms() - _s1_start;
 
             /* ---- Send sentinel WorkItems to stop all workers ---- */
             for (int w = 0; w < N_COMP_WORKERS; w++) {
@@ -1434,6 +1477,11 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
 
             /* ---- Join workers and propagate errors ---- */
             for (auto &t : workers) t.join();
+            s_stage2_ms = _now_ms() - _pipeline_start;
+            /* Compute max per-worker total wall time (= bottleneck worker) */
+            for (int w = 0; w < N_COMP_WORKERS; w++) {
+                if (worker_comp_ms[w] > s_max_worker_comp_ms) s_max_worker_comp_ms = worker_comp_ms[w];
+            }
             if (worker_err.load() != 0 && ret == 0) ret = (herr_t)-1;
 
         } /* workers + Stage 1 scope */
@@ -1444,6 +1492,10 @@ done_write:
             { std::lock_guard<std::mutex> lk(io_mtx); io_done_flag = true; }
             io_cv.notify_all();
             io_thr.join();
+            s_total_ms = _now_ms() - _pipeline_start;  /* total wall clock */
+            /* Stage 3 = total - stage2 (I/O finishes after workers) */
+            s_stage3_ms = s_total_ms - s_stage2_ms;
+            if (s_stage3_ms < 0) s_stage3_ms = 0;
             if (io_err < 0 && ret == 0) ret = -1;
         }
 

@@ -11,9 +11,9 @@
 #     balanced_w1-1-1/
 #       vpic_benchmark.log
 #       benchmark_vpic_deck.csv
-#       benchmark_vpic_timesteps.csv
-#       benchmark_vpic_timestep_chunks.csv
-#       benchmark_vpic_chunks.csv
+#       benchmark_vpic_deck_timesteps.csv
+#       benchmark_vpic_deck_timestep_chunks.csv
+#       benchmark_vpic_deck_chunks.csv
 #     ratio_only_w0-0-1/
 #       ...
 #     speed_only_w1-1-0/
@@ -26,7 +26,7 @@ set +e  # Don't exit on error — VPIC cleanup may segfault after benchmark comp
 NX=${NX:-156}                  # Grid size: (NX+2)^3 * 16 * 4 bytes (~253 MB for NX=156)
 CHUNK_MB=${CHUNK_MB:-4}        # Chunk size in MB
 TIMESTEPS=${TIMESTEPS:-100}    # Number of multi-timestep writes
-RUNS=${RUNS:-1}                # Single-shot repetitions
+RUNS=${RUNS:-3}                # Single-shot repetitions (3 for error bars)
 WARMUP_STEPS=${WARMUP_STEPS:-100}  # VPIC physics warmup steps
 DEBUG_NN=${DEBUG_NN:-1}        # 1=print NN rankings, 0=quiet
 
@@ -125,8 +125,8 @@ for cfg_line in "${CONFIGS[@]}"; do
 
     # Move result CSVs into the run directory
     SRC_DIR="$GPU_DIR/benchmarks/vpic-kokkos/results"
-    for csv in benchmark_vpic_deck.csv benchmark_vpic_timesteps.csv \
-               benchmark_vpic_timestep_chunks.csv benchmark_vpic_chunks.csv; do
+    for csv in benchmark_vpic_deck.csv benchmark_vpic_deck_timesteps.csv \
+               benchmark_vpic_deck_timestep_chunks.csv benchmark_vpic_deck_chunks.csv; do
         if [ -f "$SRC_DIR/$csv" ]; then
             cp "$SRC_DIR/$csv" "$RUN_DIR/$csv"
         fi

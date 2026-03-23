@@ -73,8 +73,10 @@ extern "C" int gpucompress_get_chunk_diag(int idx, gpucompress_chunk_diag_t *out
 
 extern "C" void gpucompress_record_chunk_decomp_ms(int idx, float ms) {
     std::lock_guard<std::mutex> lk(g_chunk_history_mutex);
-    if (idx >= 0 && idx < g_chunk_history_count.load() && idx < g_chunk_history_cap)
-        g_chunk_history[idx].decompression_ms = std::max(5.0f, ms);
+    if (idx >= 0 && idx < g_chunk_history_count.load() && idx < g_chunk_history_cap) {
+        g_chunk_history[idx].decompression_ms = std::max(5.0f, ms);  /* clamped for MAPE */
+        g_chunk_history[idx].decompression_ms_raw = ms;              /* unclamped for breakdown */
+    }
 }
 
 /* ============================================================
@@ -125,6 +127,7 @@ void recordChunkDiagnostic(const ChunkDiagInput& d)
         h->stats_ms              = d.stats_ms;
         h->preprocessing_ms      = d.preprocessing_ms;
         h->compression_ms        = d.compression_ms;
+        h->compression_ms_raw   = d.compression_ms_raw;
         h->exploration_ms        = d.exploration_ms;
         h->sgd_update_ms         = d.sgd_ms;
         size_t comp_sz = (d.primary_compressed_size > 0) ? d.primary_compressed_size : d.compressed_size;

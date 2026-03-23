@@ -34,7 +34,9 @@
  *   --k val          Kill rate (default 0.06075)
  *   --phase <name>   Run only the specified phase(s). Can be repeated to
  *                    select multiple phases. If omitted, all 4 phases run.
- *                    Valid names: no-comp, nn, nn-rl, nn-rl+exp50
+ *                    Valid names: no-comp, fixed-lz4, fixed-gdeflate, fixed-zstd,
+ *                                fixed-lz4+shuf, fixed-gdeflate+shuf, fixed-zstd+shuf,
+ *                                nn, nn-rl, nn-rl+exp50
  *
  * Examples:
  *   # Run all phases with 1 GB dataset and 64 MB chunks:
@@ -95,6 +97,9 @@
 #define TMP_FIX_LZ4   "/tmp/bm_gs_fix_lz4.h5"
 #define TMP_FIX_GDEFL "/tmp/bm_gs_fix_gdefl.h5"
 #define TMP_FIX_ZSTD  "/tmp/bm_gs_fix_zstd.h5"
+#define TMP_FIX_LZ4_S   "/tmp/bm_gs_fix_lz4_s.h5"
+#define TMP_FIX_GDEFL_S "/tmp/bm_gs_fix_gdefl_s.h5"
+#define TMP_FIX_ZSTD_S  "/tmp/bm_gs_fix_zstd_s.h5"
 #define TMP_NN        "/tmp/bm_gs_nn.h5"
 #define TMP_NN_RL    "/tmp/bm_gs_nn_rl.h5"
 #define TMP_NN_RLEXP "/tmp/bm_gs_nn_rlexp.h5"
@@ -663,8 +668,8 @@ static int run_phase_vol(float *d_v, float *d_read,
             total_nn_ms      += d.nn_inference_ms;
             total_stats_ms   += d.stats_ms;
             total_preproc_ms += d.preprocessing_ms;
-            total_comp_ms    += d.compression_ms;
-            total_decomp_ms  += d.decompression_ms;
+            total_comp_ms    += d.compression_ms_raw;  /* unclamped for breakdown */
+            total_decomp_ms  += d.decompression_ms_raw;  /* unclamped for breakdown */
             total_explore_ms += d.exploration_ms;
             total_sgd_ms     += d.sgd_update_ms;
 
@@ -1015,6 +1020,7 @@ int main(int argc, char **argv)
 
     /* Phase selection: bit flags */
     enum { P_NOCOMP = 0x001, P_FIX_LZ4 = 0x002, P_FIX_GDEFL = 0x004, P_FIX_ZSTD = 0x008,
+           P_FIX_LZ4_S = 0x010, P_FIX_GDEFL_S = 0x020, P_FIX_ZSTD_S = 0x200,
            P_NN = 0x040, P_NNRL = 0x080, P_NNRLEXP = 0x100 };
     unsigned int phase_mask = 0;  /* 0 = run all */
 
@@ -1058,11 +1064,15 @@ int main(int argc, char **argv)
             else if (strcmp(p, "fixed-lz4") == 0)           phase_mask |= P_FIX_LZ4;
             else if (strcmp(p, "fixed-gdeflate") == 0)       phase_mask |= P_FIX_GDEFL;
             else if (strcmp(p, "fixed-zstd") == 0)          phase_mask |= P_FIX_ZSTD;
+            else if (strcmp(p, "fixed-lz4+shuf") == 0)      phase_mask |= P_FIX_LZ4_S;
+            else if (strcmp(p, "fixed-gdeflate+shuf") == 0)  phase_mask |= P_FIX_GDEFL_S;
+            else if (strcmp(p, "fixed-zstd+shuf") == 0)     phase_mask |= P_FIX_ZSTD_S;
             else if (strcmp(p, "nn") == 0)                  phase_mask |= P_NN;
             else if (strcmp(p, "nn-rl") == 0)               phase_mask |= P_NNRL;
             else if (strcmp(p, "nn-rl+exp50") == 0)         phase_mask |= P_NNRLEXP;
             else { fprintf(stderr, "Unknown phase: %s\n"
                            "  Valid: no-comp, fixed-lz4, fixed-gdeflate, fixed-zstd,\n"
+                           "         fixed-lz4+shuf, fixed-gdeflate+shuf, fixed-zstd+shuf,\n"
                            "         nn, nn-rl, nn-rl+exp50\n", p);
                    return 1; }
         } else if (strcmp(argv[i], "--verbose-chunks") == 0) {
@@ -1083,11 +1093,13 @@ int main(int argc, char **argv)
                 "              w0=comp_time, w1=decomp_time, w2=IO_cost\n"
                 "              e.g. --w0 0 --w1 0 --w2 1  (ratio-only ranking)\n"
                 "  Phases: no-comp, fixed-lz4, fixed-gdeflate, fixed-zstd,\n"
+                "         fixed-lz4+shuf, fixed-gdeflate+shuf, fixed-zstd+shuf,\n"
                 "         nn, nn-rl, nn-rl+exp50\n"
                 "  Use --phase multiple times to select specific phases.\n", argv[0]);
         return 1;
     }
     if (phase_mask == 0) phase_mask = P_NOCOMP | P_FIX_LZ4 | P_FIX_GDEFL | P_FIX_ZSTD
+                                    | P_FIX_LZ4_S | P_FIX_GDEFL_S | P_FIX_ZSTD_S
                                     | P_NN | P_NNRL | P_NNRLEXP;
 
     /* Compute chunk_z from chunk_mb if not explicitly set */
@@ -1200,30 +1212,157 @@ int main(int argc, char **argv)
 
     int rc = 0;
 
+    /* ── Helper: run a single-shot phase across all timesteps for fair comparison ── */
+    /* When timesteps > 1, single-shot phases also evolve the simulation and average
+     * results across all timesteps, matching what nn-rl/nn-rl+exp50 see. */
+
+    auto run_single_shot_multi_ts = [&](const char *phase_name,
+                                         const char *tmp_file,
+                                         hid_t dcpl,
+                                         int is_nocomp,
+                                         PhaseResult *out) -> int
+    {
+        /* Re-create simulation for fresh start */
+        gpucompress_grayscott_destroy(sim);
+        sim = NULL;
+        gpucompress_grayscott_create(&sim, &s);
+        gpucompress_grayscott_init(sim);
+
+        gpucompress_disable_online_learning();
+        gpucompress_set_exploration(0);
+
+        /* Store per-timestep values for std computation */
+        const int MAX_TS = 1024;
+        double *ts_write = (double*)calloc(MAX_TS, sizeof(double));
+        double *ts_read  = (double*)calloc(MAX_TS, sizeof(double));
+        double *ts_cgbps = (double*)calloc(MAX_TS, sizeof(double));
+        double *ts_dgbps = (double*)calloc(MAX_TS, sizeof(double));
+
+        double sum_ratio = 0, sum_write_ms = 0, sum_read_ms = 0;
+        double sum_nn_ms = 0, sum_stats_ms = 0, sum_preproc_ms = 0;
+        double sum_comp_ms = 0, sum_decomp_ms = 0, sum_explore_ms = 0, sum_sgd_ms = 0;
+        double sum_comp_gbps = 0, sum_decomp_gbps = 0;
+        size_t sum_file_bytes = 0;
+        int sum_sgd_fires = 0, sum_explorations = 0;
+        int count = 0;
+        int fail = 0;
+
+        for (int t = 0; t < timesteps && t < MAX_TS; t++) {
+            gpucompress_grayscott_run(sim, steps);
+            cudaDeviceSynchronize();
+            gpucompress_grayscott_get_device_ptrs(sim, &d_read, &d_v);
+
+            PhaseResult tr;
+            int trc;
+            if (is_nocomp) {
+                trc = run_phase_nocomp(d_v, d_read, d_count,
+                                       n_floats, L, chunk_z, &tr);
+            } else {
+                trc = run_phase_vol(d_v, d_read, d_count,
+                                    n_floats, L, chunk_z,
+                                    phase_name, tmp_file, dcpl, &tr);
+            }
+            if (trc) fail = 1;
+
+            printf("  timestep %d/%d: ratio=%.2fx  write=%.0f MiB/s\n",
+                   t + 1, timesteps, tr.ratio, tr.write_mbps);
+
+            ts_write[count] = tr.write_ms;
+            ts_read[count]  = tr.read_ms;
+            ts_cgbps[count] = tr.comp_gbps;
+            ts_dgbps[count] = tr.decomp_gbps;
+
+            sum_ratio       += tr.ratio;
+            sum_write_ms    += tr.write_ms;
+            sum_read_ms     += tr.read_ms;
+            sum_file_bytes  += tr.file_bytes;
+            sum_nn_ms       += tr.nn_ms;
+            sum_stats_ms    += tr.stats_ms;
+            sum_preproc_ms  += tr.preproc_ms;
+            sum_comp_ms     += tr.comp_ms;
+            sum_decomp_ms   += tr.decomp_ms;
+            sum_explore_ms  += tr.explore_ms;
+            sum_sgd_ms      += tr.sgd_ms;
+            sum_comp_gbps   += tr.comp_gbps;
+            sum_decomp_gbps += tr.decomp_gbps;
+            sum_sgd_fires   += tr.sgd_fires;
+            sum_explorations += tr.explorations;
+            count++;
+        }
+
+        if (count > 0) {
+            memset(out, 0, sizeof(*out));
+            snprintf(out->phase, sizeof(out->phase), "%s", phase_name);
+            out->ratio       = sum_ratio / count;
+            out->write_ms    = sum_write_ms / count;
+            out->read_ms     = sum_read_ms / count;
+            out->file_bytes  = sum_file_bytes / count;
+            out->orig_bytes  = total_bytes;
+            out->write_mbps  = (double)total_bytes / (1 << 20) / (out->write_ms / 1000.0);
+            out->read_mbps   = (double)total_bytes / (1 << 20) / (out->read_ms / 1000.0);
+            out->nn_ms       = sum_nn_ms / count;
+            out->stats_ms    = sum_stats_ms / count;
+            out->preproc_ms  = sum_preproc_ms / count;
+            out->comp_ms     = sum_comp_ms / count;
+            out->decomp_ms   = sum_decomp_ms / count;
+            out->explore_ms  = sum_explore_ms / count;
+            out->sgd_ms      = sum_sgd_ms / count;
+            out->comp_gbps   = sum_comp_gbps / count;
+            out->decomp_gbps = sum_decomp_gbps / count;
+            out->sgd_fires   = sum_sgd_fires;
+            out->explorations = sum_explorations;
+            out->n_runs      = count;
+            out->n_chunks    = n_chunks;
+
+            /* Compute std across timesteps (sample std, n-1) */
+            double var_w = 0, var_r = 0, var_cg = 0, var_dg = 0;
+            for (int i = 0; i < count; i++) {
+                var_w  += (ts_write[i] - out->write_ms) * (ts_write[i] - out->write_ms);
+                var_r  += (ts_read[i]  - out->read_ms)  * (ts_read[i]  - out->read_ms);
+                var_cg += (ts_cgbps[i] - out->comp_gbps) * (ts_cgbps[i] - out->comp_gbps);
+                var_dg += (ts_dgbps[i] - out->decomp_gbps) * (ts_dgbps[i] - out->decomp_gbps);
+            }
+            double denom = (count > 1) ? (count - 1) : 1;
+            out->write_ms_std    = sqrt(var_w / denom);
+            out->read_ms_std     = sqrt(var_r / denom);
+            out->comp_gbps_std   = sqrt(var_cg / denom);
+            out->decomp_gbps_std = sqrt(var_dg / denom);
+        }
+
+        free(ts_write); free(ts_read); free(ts_cgbps); free(ts_dgbps);
+        return fail;
+    };
+
     /* ── Phase 1: no-comp ──────────────────────────────────────────── */
     if (phase_mask & P_NOCOMP) {
         printf("\n── Phase %d: no-comp (GPU->Host->HDF5) ────────────────────────\n", n_phases + 1);
         gpucompress_disable_online_learning();
         gpucompress_set_exploration(0);
-        PhaseResult runs_buf[32];
-        int eff_runs = (n_runs > 32) ? 32 : n_runs;
-        for (int run = 0; run < eff_runs; run++) {
-            if (eff_runs > 1) printf("  Run %d/%d... ", run + 1, eff_runs);
-            else printf("  Writing... ");
-            fflush(stdout);
-            double t0 = now_ms();
-            rc = run_phase_nocomp(d_v, d_read, d_count,
-                                      n_floats, L, chunk_z,
-                                      &runs_buf[run]);
-            printf("done (%.1fs)\n", (now_ms() - t0) / 1000.0);
-            runs_buf[run].sim_ms = sim_ms;
+        if (timesteps > 1) {
+            printf("  Running across %d timesteps for fair comparison...\n", timesteps);
+            rc = run_single_shot_multi_ts("no-comp", NULL, H5I_INVALID_HID, 1, &results[n_phases]);
             if (rc) any_fail = 1;
+        } else {
+            PhaseResult runs_buf[32];
+            int eff_runs = (n_runs > 32) ? 32 : n_runs;
+            for (int run = 0; run < eff_runs; run++) {
+                if (eff_runs > 1) printf("  Run %d/%d... ", run + 1, eff_runs);
+                else printf("  Writing... ");
+                fflush(stdout);
+                double t0 = now_ms();
+                rc = run_phase_nocomp(d_v, d_read, d_count,
+                                          n_floats, L, chunk_z,
+                                          &runs_buf[run]);
+                printf("done (%.1fs)\n", (now_ms() - t0) / 1000.0);
+                runs_buf[run].sim_ms = sim_ms;
+                if (rc) any_fail = 1;
+            }
+            if (eff_runs > 1)
+                merge_phase_results(runs_buf, eff_runs, &results[n_phases]);
+            else
+                results[n_phases] = runs_buf[0];
+            results[n_phases].n_runs = eff_runs;
         }
-        if (eff_runs > 1)
-            merge_phase_results(runs_buf, eff_runs, &results[n_phases]);
-        else
-            results[n_phases] = runs_buf[0];
-        results[n_phases].n_runs = eff_runs;
         n_phases++;
     }
 
@@ -1239,34 +1378,44 @@ int main(int argc, char **argv)
         { P_FIX_LZ4,      "fixed-lz4",           TMP_FIX_LZ4,             GPUCOMPRESS_ALGO_LZ4,      0 },
         { P_FIX_GDEFL,    "fixed-gdeflate",       TMP_FIX_GDEFL,           GPUCOMPRESS_ALGO_GDEFLATE, 0 },
         { P_FIX_ZSTD,     "fixed-zstd",           TMP_FIX_ZSTD,            GPUCOMPRESS_ALGO_ZSTD,     0 },
+        { P_FIX_LZ4_S,    "fixed-lz4+shuf",      TMP_FIX_LZ4_S,           GPUCOMPRESS_ALGO_LZ4,      GPUCOMPRESS_PREPROC_SHUFFLE_4 },
+        { P_FIX_GDEFL_S,  "fixed-gdeflate+shuf",  TMP_FIX_GDEFL_S,         GPUCOMPRESS_ALGO_GDEFLATE, GPUCOMPRESS_PREPROC_SHUFFLE_4 },
+        { P_FIX_ZSTD_S,   "fixed-zstd+shuf",      TMP_FIX_ZSTD_S,          GPUCOMPRESS_ALGO_ZSTD,     GPUCOMPRESS_PREPROC_SHUFFLE_4 },
     };
-    for (int fi = 0; fi < 3; fi++) {
+    for (int fi = 0; fi < 6; fi++) {
         if (!(phase_mask & fixed_phases[fi].mask)) continue;
         printf("\n── Phase %d: %s ─────────────────────────────────────\n",
                n_phases + 1, fixed_phases[fi].name);
         gpucompress_disable_online_learning();
         gpucompress_set_exploration(0);
         hid_t dcpl_f = make_dcpl_fixed(L, chunk_z, fixed_phases[fi].algo, fixed_phases[fi].preproc);
-        PhaseResult runs_buf[32];
-        int eff_runs = (n_runs > 32) ? 32 : n_runs;
-        for (int run = 0; run < eff_runs; run++) {
-            if (eff_runs > 1) printf("  Run %d/%d... ", run + 1, eff_runs);
-            else printf("  Write + Read + Verify... ");
-            fflush(stdout);
-            double t0 = now_ms();
-            rc = run_phase_vol(d_v, d_read, d_count,
-                               n_floats, L, chunk_z,
-                               fixed_phases[fi].name, fixed_phases[fi].tmp_file,
-                               dcpl_f, &runs_buf[run]);
-            printf("done (%.1fs)\n", (now_ms() - t0) / 1000.0);
-            runs_buf[run].sim_ms = sim_ms;
+        if (timesteps > 1) {
+            printf("  Running across %d timesteps for fair comparison...\n", timesteps);
+            rc = run_single_shot_multi_ts(fixed_phases[fi].name, fixed_phases[fi].tmp_file,
+                                           dcpl_f, 0, &results[n_phases]);
             if (rc) any_fail = 1;
+        } else {
+            PhaseResult runs_buf[32];
+            int eff_runs = (n_runs > 32) ? 32 : n_runs;
+            for (int run = 0; run < eff_runs; run++) {
+                if (eff_runs > 1) printf("  Run %d/%d... ", run + 1, eff_runs);
+                else printf("  Write + Read + Verify... ");
+                fflush(stdout);
+                double t0 = now_ms();
+                rc = run_phase_vol(d_v, d_read, d_count,
+                                   n_floats, L, chunk_z,
+                                   fixed_phases[fi].name, fixed_phases[fi].tmp_file,
+                                   dcpl_f, &runs_buf[run]);
+                printf("done (%.1fs)\n", (now_ms() - t0) / 1000.0);
+                runs_buf[run].sim_ms = sim_ms;
+                if (rc) any_fail = 1;
+            }
+            if (eff_runs > 1)
+                merge_phase_results(runs_buf, eff_runs, &results[n_phases]);
+            else
+                results[n_phases] = runs_buf[0];
+            results[n_phases].n_runs = eff_runs;
         }
-        if (eff_runs > 1)
-            merge_phase_results(runs_buf, eff_runs, &results[n_phases]);
-        else
-            results[n_phases] = runs_buf[0];
-        results[n_phases].n_runs = eff_runs;
         H5Pclose(dcpl_f);
         n_phases++;
     }
@@ -1277,26 +1426,32 @@ int main(int argc, char **argv)
         gpucompress_disable_online_learning();
         gpucompress_set_exploration(0);
         hid_t dcpl_nn = make_dcpl_auto(L, chunk_z, error_bound);
-        PhaseResult runs_buf[32];
-        int eff_runs = (n_runs > 32) ? 32 : n_runs;
-        for (int run = 0; run < eff_runs; run++) {
-            if (eff_runs > 1) printf("  Run %d/%d... ", run + 1, eff_runs);
-            else printf("  Write + Read + Verify... ");
-            fflush(stdout);
-            double t0 = now_ms();
-            rc = run_phase_vol(d_v, d_read, d_count,
-                               n_floats, L, chunk_z,
-                               "nn", TMP_NN, dcpl_nn,
-                               &runs_buf[run]);
-            printf("done (%.1fs)\n", (now_ms() - t0) / 1000.0);
-            runs_buf[run].sim_ms = sim_ms;
+        if (timesteps > 1) {
+            printf("  Running across %d timesteps for fair comparison...\n", timesteps);
+            rc = run_single_shot_multi_ts("nn", TMP_NN, dcpl_nn, 0, &results[n_phases]);
             if (rc) any_fail = 1;
+        } else {
+            PhaseResult runs_buf[32];
+            int eff_runs = (n_runs > 32) ? 32 : n_runs;
+            for (int run = 0; run < eff_runs; run++) {
+                if (eff_runs > 1) printf("  Run %d/%d... ", run + 1, eff_runs);
+                else printf("  Write + Read + Verify... ");
+                fflush(stdout);
+                double t0 = now_ms();
+                rc = run_phase_vol(d_v, d_read, d_count,
+                                   n_floats, L, chunk_z,
+                                   "nn", TMP_NN, dcpl_nn,
+                                   &runs_buf[run]);
+                printf("done (%.1fs)\n", (now_ms() - t0) / 1000.0);
+                runs_buf[run].sim_ms = sim_ms;
+                if (rc) any_fail = 1;
+            }
+            if (eff_runs > 1)
+                merge_phase_results(runs_buf, eff_runs, &results[n_phases]);
+            else
+                results[n_phases] = runs_buf[0];
+            results[n_phases].n_runs = eff_runs;
         }
-        if (eff_runs > 1)
-            merge_phase_results(runs_buf, eff_runs, &results[n_phases]);
-        else
-            results[n_phases] = runs_buf[0];
-        results[n_phases].n_runs = eff_runs;
         H5Pclose(dcpl_nn);
         write_chunk_csv("nn", n_chunks);  /* last run's chunks */
         n_phases++;
@@ -1395,9 +1550,13 @@ int main(int argc, char **argv)
                    "--------  --------  --------  "
                    "--------  --------  --------  ----  ----\n");
 
-            /* Accumulators for averaged throughput (skip first WARMUP_SKIP timesteps) */
-            const int WARMUP_SKIP = 5;
+            /* Accumulators for averaged throughput */
+            const int WARMUP_SKIP = 0;
             double sum_write_ms = 0, sum_read_ms = 0;
+            double sum_nn_ms = 0, sum_stats_ms = 0, sum_preproc_ms = 0;
+            double sum_comp_ms = 0, sum_decomp_ms = 0, sum_explore_ms = 0, sum_sgd_ms = 0;
+            double sum_comp_gbps = 0, sum_decomp_gbps = 0;
+            size_t last_file_sz = 0;
             int    n_steady = 0;
             /* Final timestep MAPE (overwritten each iteration, last value is final) */
             double final_smape_r = 0, final_smape_c = 0, final_smape_d = 0;
@@ -1479,6 +1638,7 @@ int main(int argc, char **argv)
 
                 /* File size for ratio */
                 size_t file_sz = file_size(TMP_NN_RL);
+                last_file_sz = file_sz;
                 double ratio_t = (file_sz > 0) ? (double)total_bytes / (double)file_sz : 1.0;
 
                 /* Collect per-chunk sMAPE (symmetric, bounded 0–200%) AND real MAPE */
@@ -1488,11 +1648,20 @@ int main(int argc, char **argv)
                 int    cnt_r = 0, cnt_c = 0, cnt_d = 0;
                 int    mcnt_r = 0, mcnt_c = 0, mcnt_d = 0;
                 int    sgd_t = 0, expl_t = 0;
+                double ts_nn_ms = 0, ts_stats_ms = 0, ts_preproc_ms = 0;
+                double ts_comp_ms = 0, ts_decomp_ms = 0, ts_explore_ms = 0, ts_sgd_ms = 0;
                 for (int ci = 0; ci < n_hist; ci++) {
                     gpucompress_chunk_diag_t diag;
                     if (gpucompress_get_chunk_diag(ci, &diag) != 0) continue;
                     if (diag.sgd_fired) sgd_t++;
                     if (diag.exploration_triggered) expl_t++;
+                    ts_nn_ms      += diag.nn_inference_ms;
+                    ts_stats_ms   += diag.stats_ms;
+                    ts_preproc_ms += diag.preprocessing_ms;
+                    ts_comp_ms    += diag.compression_ms_raw;  /* unclamped for breakdown */
+                    ts_decomp_ms  += diag.decompression_ms_raw;  /* unclamped */
+                    ts_explore_ms += diag.exploration_ms;
+                    ts_sgd_ms     += diag.sgd_update_ms;
                     if (diag.actual_ratio > 0 && diag.predicted_ratio > 0) {
                         double denom = (fabs(diag.actual_ratio) + fabs(diag.predicted_ratio)) / 2.0;
                         if (denom > 0) { ape_r += fabs(diag.actual_ratio - diag.predicted_ratio) / denom; cnt_r++; }
@@ -1536,6 +1705,23 @@ int main(int argc, char **argv)
                 final_expl   = expl_t;
                 cum_sgd     += sgd_t;
                 cum_expl    += expl_t;
+
+                /* Accumulate per-component timing (skip warmup) */
+                if (t >= WARMUP_SKIP) {
+                    sum_nn_ms       += ts_nn_ms;
+                    sum_stats_ms    += ts_stats_ms;
+                    sum_preproc_ms  += ts_preproc_ms;
+                    sum_comp_ms     += ts_comp_ms;
+                    sum_decomp_ms   += ts_decomp_ms;
+                    sum_explore_ms  += ts_explore_ms;
+                    sum_sgd_ms      += ts_sgd_ms;
+                    double ts_comp_gbps = (ts_comp_ms > 0)
+                        ? (double)total_bytes / ts_comp_ms / 1e6 : 0.0;
+                    double ts_decomp_gbps = (ts_decomp_ms > 0)
+                        ? (double)total_bytes / ts_decomp_ms / 1e6 : 0.0;
+                    sum_comp_gbps   += ts_comp_gbps;
+                    sum_decomp_gbps += ts_decomp_gbps;
+                }
 
                 double wr_mbps = (write_ms_t > 0) ? dataset_mb / (write_ms_t / 1000.0) : 0;
                 double rd_mbps = (read_ms_t > 0)  ? dataset_mb / (read_ms_t  / 1000.0) : 0;
@@ -1661,31 +1847,42 @@ int main(int argc, char **argv)
                 printf("] %d/%d              \n\n", timesteps, timesteps);
             }
 
-            /* Store averaged throughput and final-timestep MAPE in the matching
-             * single-shot PhaseResult so the summary table reflects multi-timestep state. */
-            for (int ri = 0; ri < n_phases; ri++) {
-                if (strcmp(results[ri].phase, phase_name) == 0) {
-                    if (n_steady > 0) {
-                        double avg_wr = sum_write_ms / n_steady;
-                        double avg_rd = sum_read_ms  / n_steady;
-                        results[ri].write_ms_avg = avg_wr;
-                        results[ri].read_ms_avg  = avg_rd;
-                        results[ri].write_mbps = dataset_mb / (avg_wr / 1000.0);
-                        results[ri].read_mbps  = dataset_mb / (avg_rd / 1000.0);
-                    }
-                    /* Overwrite with final timestep values (not single-shot) */
-                    results[ri].smape_ratio_pct  = final_smape_r;
-                    results[ri].smape_comp_pct   = final_smape_c;
-                    results[ri].smape_decomp_pct = final_smape_d;
-                    results[ri].mape_ratio_pct   = final_mape_r;
-                    results[ri].mape_comp_pct    = final_mape_c;
-                    results[ri].mape_decomp_pct  = final_mape_d;
-                    /* Cumulative SGD/exploration across all timesteps */
-                    results[ri].sgd_fires   = cum_sgd;
-                    results[ri].explorations = cum_expl;
-                    results[ri].n_chunks    = n_chunks * timesteps;
-                    break;
+            /* Store multi-timestep results: create a new PhaseResult entry */
+            {
+                PhaseResult *pr = &results[n_phases];
+                memset(pr, 0, sizeof(*pr));
+                snprintf(pr->phase, sizeof(pr->phase), "%s", phase_name);
+                pr->orig_bytes = total_bytes;
+                pr->n_chunks   = n_chunks;
+                pr->n_runs     = timesteps;
+                if (n_steady > 0) {
+                    double avg_wr = sum_write_ms / n_steady;
+                    double avg_rd = sum_read_ms  / n_steady;
+                    pr->write_ms    = avg_wr;
+                    pr->read_ms     = avg_rd;
+                    pr->write_mbps  = dataset_mb / (avg_wr / 1000.0);
+                    pr->read_mbps   = dataset_mb / (avg_rd / 1000.0);
+                    pr->ratio       = (last_file_sz > 0) ? (double)total_bytes / (double)last_file_sz : 1.0;
+                    pr->file_bytes  = last_file_sz;
+                    pr->nn_ms       = sum_nn_ms / n_steady;
+                    pr->stats_ms    = sum_stats_ms / n_steady;
+                    pr->preproc_ms  = sum_preproc_ms / n_steady;
+                    pr->comp_ms     = sum_comp_ms / n_steady;
+                    pr->decomp_ms   = sum_decomp_ms / n_steady;
+                    pr->explore_ms  = sum_explore_ms / n_steady;
+                    pr->sgd_ms      = sum_sgd_ms / n_steady;
+                    pr->comp_gbps   = sum_comp_gbps / n_steady;
+                    pr->decomp_gbps = sum_decomp_gbps / n_steady;
                 }
+                pr->smape_ratio_pct  = final_smape_r;
+                pr->smape_comp_pct   = final_smape_c;
+                pr->smape_decomp_pct = final_smape_d;
+                pr->mape_ratio_pct   = final_mape_r;
+                pr->mape_comp_pct    = final_mape_c;
+                pr->mape_decomp_pct  = final_mape_d;
+                pr->sgd_fires   = cum_sgd;
+                pr->explorations = cum_expl;
+                n_phases++;
             }
         } /* end phase loop */
 
@@ -1717,6 +1914,9 @@ int main(int argc, char **argv)
     remove(TMP_FIX_LZ4);
     remove(TMP_FIX_GDEFL);
     remove(TMP_FIX_ZSTD);
+    remove(TMP_FIX_LZ4_S);
+    remove(TMP_FIX_GDEFL_S);
+    remove(TMP_FIX_ZSTD_S);
     remove(TMP_NN);
     remove(TMP_NN_RL);
     remove(TMP_NN_RLEXP);

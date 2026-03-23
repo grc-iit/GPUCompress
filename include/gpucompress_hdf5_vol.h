@@ -88,6 +88,24 @@ herr_t H5Pset_fapl_gpucompress(hid_t fapl_id, hid_t under_vol_id,
 void H5VL_gpucompress_reset_stats(void);
 
 /**
+ * Get wall-clock stage timing from the last H5Dwrite call (ms).
+ * Stage 1: stats + NN inference (main thread, sequential per chunk)
+ * Stage 2: compression + D→H (parallel workers, wall clock)
+ * Stage 3: HDF5 chunk writes to disk (I/O thread, wall clock)
+ * Total:   end-to-end pipeline wall clock
+ * Note: stages overlap due to pipelining, so stage1+stage2+stage3 > total.
+ */
+void H5VL_gpucompress_get_stage_timing(double *stage1_ms, double *stage2_ms,
+                                        double *stage3_ms, double *total_ms);
+
+/**
+ * Get the max per-worker wall-clock time from the last H5Dwrite call (ms).
+ * This is the bottleneck worker's total time (compression + exploration + SGD + D->H).
+ * Represents the actual Stage 2 wall-clock contribution.
+ */
+void H5VL_gpucompress_get_worker_timing(double *max_worker_ms);
+
+/**
  * Enable (on=1) or disable (on=0) call-sequence tracing.
  * When enabled, every VOL callback and every underlying H5VL* native call
  * is printed to stdout with a [VOL] prefix, indented to show call depth.

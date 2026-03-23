@@ -566,7 +566,8 @@ typedef struct {
     float  nn_inference_ms;      /* NN forward pass kernel + result D→H   */
     float  stats_ms;             /* stats kernels + stats D→H copies      */
     float  preprocessing_ms;     /* quantization + byte shuffle           */
-    float  compression_ms;       /* primary nvCOMP kernel only            */
+    float  compression_ms;       /* primary nvCOMP kernel only (clamped to 5ms floor for MAPE) */
+    float  compression_ms_raw;  /* unclamped nvCOMP kernel time (for latency breakdown)     */
     float  exploration_ms;       /* exploration loop (0 if not triggered) */
     float  sgd_update_ms;        /* SGD weight update (0 if not fired)    */
 
@@ -578,7 +579,8 @@ typedef struct {
     float  predicted_psnr;       /* NN-predicted PSNR in dB               */
 
     /* Filled during read (decompression) — 0 until VOL read completes   */
-    float  decompression_ms;     /* actual decompression time (nvCOMP)    */
+    float  decompression_ms;     /* actual decompression time (clamped to 5ms floor for MAPE) */
+    float  decompression_ms_raw; /* unclamped decompression time (for latency breakdown)    */
 
     /* Cost model diagnostics */
     float  cost_model_error_pct; /* |actual_cost - predicted_cost| / actual_cost */

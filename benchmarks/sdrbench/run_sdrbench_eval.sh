@@ -24,7 +24,7 @@ set +e
 # ── Configuration ──
 # Override with env vars: RUNS=1 bash benchmarks/sdrbench/run_sdrbench_eval.sh
 CHUNK_MB=${CHUNK_MB:-4}
-RUNS=${RUNS:-5}
+RUNS=${RUNS:-3}
 DEBUG_NN=${DEBUG_NN:-0}
 
 # ── Paths ──

@@ -35,7 +35,11 @@
 // GPUCompress + HDF5 headers
 // ============================================================
 #ifndef GPU_DIR
-#define GPU_DIR "/u/imuradli/GPUCompress"
+/* GPU_DIR is set via -DGPU_DIR=... by build_vpic_benchmark.sh.
+ * This fallback is used only if the build script doesn't set it. */
+#ifndef GPU_DIR
+#define GPU_DIR "."
+#endif
 #endif
 #include "gpucompress.h"
 #include "gpucompress_vpic.h"
@@ -62,18 +66,21 @@
 #define H5Z_FILTER_GPUCOMPRESS    305
 #define H5Z_GPUCOMPRESS_CD_NELMTS 5
 
-#define N_PHASES 10
+#define N_PHASES 10  /* no-comp, 6 fixed (3+3 shuf), nn, nn-rl, nn-rl+exp50 */
 
 #define TMP_NOCOMP    "/tmp/bm_vpic_nocomp.h5"
 #define TMP_FIX_LZ4   "/tmp/bm_vpic_fix_lz4.h5"
 #define TMP_FIX_GDEFL "/tmp/bm_vpic_fix_gdefl.h5"
 #define TMP_FIX_ZSTD  "/tmp/bm_vpic_fix_zstd.h5"
+#define TMP_FIX_LZ4_S   "/tmp/bm_vpic_fix_lz4_s.h5"
+#define TMP_FIX_GDEFL_S "/tmp/bm_vpic_fix_gdefl_s.h5"
+#define TMP_FIX_ZSTD_S  "/tmp/bm_vpic_fix_zstd_s.h5"
 #define TMP_NN        "/tmp/bm_vpic_nn.h5"
 #define TMP_NN_RL    "/tmp/bm_vpic_nn_rl.h5"
 #define TMP_NN_RLEXP "/tmp/bm_vpic_nn_rlexp.h5"
-#define CHUNKS_CSV        GPU_DIR "/benchmarks/vpic-kokkos/results/benchmark_vpic_chunks.csv"
-#define TSTEP_CSV         GPU_DIR "/benchmarks/vpic-kokkos/results/benchmark_vpic_timesteps.csv"
-#define TSTEP_CHUNKS_CSV  GPU_DIR "/benchmarks/vpic-kokkos/results/benchmark_vpic_timestep_chunks.csv"
+#define CHUNKS_CSV        GPU_DIR "/benchmarks/vpic-kokkos/results/benchmark_vpic_deck_chunks.csv"
+#define TSTEP_CSV         GPU_DIR "/benchmarks/vpic-kokkos/results/benchmark_vpic_deck_timesteps.csv"
+#define TSTEP_CHUNKS_CSV  GPU_DIR "/benchmarks/vpic-kokkos/results/benchmark_vpic_deck_timestep_chunks.csv"
 
 // ============================================================
 // Globals: persist across timesteps
@@ -194,6 +201,7 @@ struct PhaseResult {
     double nn_ms;
     double preproc_ms;
     double comp_ms;
+    double decomp_ms;
     double explore_ms;
     double sgd_ms;
     /* Standard deviations (populated when VPIC_RUNS > 1) */
@@ -424,6 +432,7 @@ static int run_phase(const char* phase_name, const char* tmp_file,
     double total_nn_ms      = 0.0;
     double total_preproc_ms = 0.0;
     double total_comp_ms    = 0.0;
+    double total_decomp_ms  = 0.0;
     double total_explore_ms = 0.0;
     double total_sgd_ms     = 0.0;
     int n_hist       = gpucompress_get_chunk_history_count();
@@ -460,7 +469,8 @@ static int run_phase(const char* phase_name, const char* tmp_file,
             total_stats_ms   += d.stats_ms;
             total_nn_ms      += d.nn_inference_ms;
             total_preproc_ms += d.preprocessing_ms;
-            total_comp_ms    += d.compression_ms;
+            total_comp_ms    += d.compression_ms_raw;   /* unclamped for breakdown */
+            total_decomp_ms  += d.decompression_ms_raw; /* unclamped for breakdown */
             total_explore_ms += d.exploration_ms;
             total_sgd_ms     += d.sgd_update_ms;
             /* sMAPE (symmetric, bounded 0–200%) */
@@ -577,6 +587,7 @@ static int run_phase(const char* phase_name, const char* tmp_file,
     r->nn_ms        = total_nn_ms;
     r->preproc_ms   = total_preproc_ms;
     r->comp_ms      = total_comp_ms;
+    r->decomp_ms    = total_decomp_ms;
     r->explore_ms   = total_explore_ms;
     r->sgd_ms       = total_sgd_ms;
     r->write_ms_std = 0;
@@ -882,6 +893,87 @@ begin_diagnostics {
             }
             printf("\n=== VPIC Multi-Timestep complete (%d timesteps x %d phases) ===\n",
                    global->ts_count, 3);
+
+            /* Append nn-rl and nn-rl+exp50 steady-state averages to aggregate CSV.
+             * Read from timestep CSV, skip warmup (first 5 timesteps), average the rest. */
+            {
+                const char* csv_path = GPU_DIR "/benchmarks/vpic-kokkos/results/benchmark_vpic_deck.csv";
+                FILE* agg = fopen(csv_path, "a");  /* append to existing single-shot CSV */
+                if (agg && global->ts_csv == NULL) {
+                    /* Parse timestep CSV to compute steady-state averages per phase */
+                    FILE* ts = fopen(TSTEP_CSV, "r");
+                    if (ts) {
+                        char line[4096];
+                        fgets(line, sizeof(line), ts);  /* skip header */
+
+                        struct PhaseAccum {
+                            double sum_write, sum_read, sum_ratio;
+                            double sum_mape_r, sum_mape_c, sum_mape_d;
+                            double sum_smape_r, sum_smape_c, sum_smape_d;
+                            int    sum_sgd, sum_expl, n_chunks_last;
+                            size_t last_file_sz;
+                            int    count;
+                        };
+                        PhaseAccum pa[3] = {};
+                        const char* pnames[3] = {"nn", "nn-rl", "nn-rl+exp50"};
+                        const int WARMUP = 0;
+
+                        while (fgets(line, sizeof(line), ts)) {
+                            char ph[64]; int ts_idx;
+                            double wr, rd, rat, sr, sc, sd, mr, mc, md, wmbps, rmbps;
+                            int sgd, expl, nch;
+                            unsigned long long mm;
+                            if (sscanf(line, "%63[^,],%d,%*[^,],%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%d,%d,%d,%llu,%lf,%lf",
+                                       ph, &ts_idx, &wr, &rd, &rat, &sr, &sc, &sd, &mr, &mc, &md,
+                                       &sgd, &expl, &nch, &mm, &wmbps, &rmbps) >= 15 && ts_idx >= WARMUP) {
+                                for (int pi = 0; pi < 3; pi++) {
+                                    if (strcmp(ph, pnames[pi]) == 0) {
+                                        pa[pi].sum_write += wr;
+                                        pa[pi].sum_read  += rd;
+                                        pa[pi].sum_ratio += rat;
+                                        pa[pi].sum_mape_r += mr;
+                                        pa[pi].sum_mape_c += mc;
+                                        pa[pi].sum_mape_d += md;
+                                        pa[pi].sum_smape_r += sr;
+                                        pa[pi].sum_smape_c += sc;
+                                        pa[pi].sum_smape_d += sd;
+                                        pa[pi].sum_sgd  += sgd;
+                                        pa[pi].sum_expl += expl;
+                                        pa[pi].n_chunks_last = nch;
+                                        pa[pi].count++;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        fclose(ts);
+
+                        /* Write averaged results for nn-rl and nn-rl+exp50 (skip nn, already in single-shot) */
+                        for (int pi = 1; pi < 3; pi++) {
+                            if (pa[pi].count <= 0) continue;
+                            int n = pa[pi].count;
+                            double avg_wr = pa[pi].sum_write / n;
+                            double avg_rd = pa[pi].sum_read / n;
+                            double avg_rat = pa[pi].sum_ratio / n;
+                            double wmbps = orig_mib / (avg_wr / 1000.0);
+                            double rmbps = orig_mib / (avg_rd / 1000.0);
+                            fprintf(agg, "vpic,%s,%d,%.2f,0.00,%.2f,0.00,"
+                                         "%.2f,%.2f,%.4f,"
+                                         "%.1f,%.1f,0,%d,%d,%d,"
+                                         "0.00,0.00,0.00,0.00,0.00,0.00,0.00,"
+                                         "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n",
+                                    pnames[pi], n, avg_wr, avg_rd,
+                                    orig_mib / avg_rat, orig_mib, avg_rat,
+                                    wmbps, rmbps,
+                                    pa[pi].sum_sgd, pa[pi].sum_expl, pa[pi].n_chunks_last,
+                                    pa[pi].sum_smape_r / n, pa[pi].sum_smape_c / n, pa[pi].sum_smape_d / n,
+                                    pa[pi].sum_mape_r / n, pa[pi].sum_mape_c / n, pa[pi].sum_mape_d / n);
+                        }
+                    }
+                }
+                if (agg) fclose(agg);
+            }
+
             global->benchmark_done = 1;
             cudaFree(global->d_read);
             free(global->h_orig);
@@ -899,6 +991,9 @@ begin_diagnostics {
             remove(TMP_FIX_LZ4);
             remove(TMP_FIX_GDEFL);
             remove(TMP_FIX_ZSTD);
+            remove(TMP_FIX_LZ4_S);
+            remove(TMP_FIX_GDEFL_S);
+            remove(TMP_FIX_ZSTD_S);
             remove(TMP_NN);
             remove(TMP_NN_RL);
             remove(TMP_NN_RLEXP);
@@ -1003,7 +1098,7 @@ begin_diagnostics {
             gpucompress_set_exploration(do_expl);
             if (do_expl) {
                 gpucompress_set_exploration_threshold(0.20);
-                gpucompress_set_exploration_k(31);
+                gpucompress_set_exploration_k(4);
             }
 
             /* Print header on first timestep for each phase */
@@ -1261,6 +1356,15 @@ begin_diagnostics {
     int n_phases = 0;
     int any_fail = 0;
 
+    // ── Single-shot phases ──────────────────────────────────────────
+    // KNOWN LIMITATION: Single-shot phases compress ONE snapshot only.
+    // Unlike Gray-Scott and SDRBench, which run single-shot phases across
+    // all timesteps/fields and average for fair comparison, VPIC cannot
+    // restart the simulation for each phase because the simulation state
+    // is managed by VPIC's main loop, not by our benchmark code.
+    // Multi-timestep phases (nn-rl, nn-rl+exp50) DO run across all timesteps.
+    // ──────────────────────────────────────────────────────────────────
+
     // ── Phase 1: no-comp ──────────────────────────────────────────
     if (phase_enabled("no-comp")) {
     sim_log("── Phase 1: no-comp (GPU→Host→HDF5, VOL-2 fallback) ────────");
@@ -1300,8 +1404,11 @@ begin_diagnostics {
             { "fixed-lz4",           TMP_FIX_LZ4,                    GPUCOMPRESS_ALGO_LZ4,      0 },
             { "fixed-gdeflate",      TMP_FIX_GDEFL,                  GPUCOMPRESS_ALGO_GDEFLATE, 0 },
             { "fixed-zstd",          TMP_FIX_ZSTD,                   GPUCOMPRESS_ALGO_ZSTD,     0 },
+            { "fixed-lz4+shuf",      TMP_FIX_LZ4_S,                  GPUCOMPRESS_ALGO_LZ4,      GPUCOMPRESS_PREPROC_SHUFFLE_4 },
+            { "fixed-gdeflate+shuf", TMP_FIX_GDEFL_S,                GPUCOMPRESS_ALGO_GDEFLATE, GPUCOMPRESS_PREPROC_SHUFFLE_4 },
+            { "fixed-zstd+shuf",     TMP_FIX_ZSTD_S,                 GPUCOMPRESS_ALGO_ZSTD,     GPUCOMPRESS_PREPROC_SHUFFLE_4 },
         };
-        for (int fi = 0; fi < 3; fi++) {
+        for (int fi = 0; fi < 6; fi++) {
             if (!phase_enabled(fixed_phases[fi].name)) continue;
             { char _msg[128]; snprintf(_msg, sizeof(_msg),
               "── Phase %d: %s ────────────────────────────",
@@ -1442,7 +1549,7 @@ begin_diagnostics {
             fprintf(csv, "source,phase,n_runs,write_ms,write_ms_std,read_ms,read_ms_std,"
                          "file_mib,orig_mib,ratio,"
                          "write_mibps,read_mibps,mismatches,sgd_fires,explorations,n_chunks,"
-                         "nn_ms,stats_ms,preproc_ms,comp_ms,explore_ms,sgd_ms,"
+                         "nn_ms,stats_ms,preproc_ms,comp_ms,decomp_ms,explore_ms,sgd_ms,"
                          "smape_ratio_pct,smape_comp_pct,smape_decomp_pct,"
                          "mape_ratio_pct,mape_comp_pct,mape_decomp_pct\n");
             for (int i = 0; i < n_phases; i++) {
@@ -1450,7 +1557,7 @@ begin_diagnostics {
                 fprintf(csv, "vpic,%s,%d,%.2f,%.2f,%.2f,%.2f,"
                              "%.2f,%.2f,%.4f,"
                              "%.1f,%.1f,%llu,%d,%d,%d,"
-                             "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,"
+                             "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,"
                              "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n",
                         rr->phase, rr->n_runs,
                         rr->write_ms, rr->write_ms_std,
@@ -1460,7 +1567,7 @@ begin_diagnostics {
                         rr->write_mbps, rr->read_mbps,
                         rr->mismatches, rr->sgd_fires, rr->explorations, rr->n_chunks,
                         rr->nn_ms, rr->stats_ms, rr->preproc_ms,
-                        rr->comp_ms, rr->explore_ms, rr->sgd_ms,
+                        rr->comp_ms, rr->decomp_ms, rr->explore_ms, rr->sgd_ms,
                         rr->smape_ratio_pct, rr->smape_comp_pct, rr->smape_decomp_pct,
                         rr->mape_ratio_pct, rr->mape_comp_pct, rr->mape_decomp_pct);
             }
@@ -1491,6 +1598,9 @@ begin_diagnostics {
         remove(TMP_FIX_LZ4);
         remove(TMP_FIX_GDEFL);
         remove(TMP_FIX_ZSTD);
+        remove(TMP_FIX_LZ4_S);
+        remove(TMP_FIX_GDEFL_S);
+        remove(TMP_FIX_ZSTD_S);
         remove(TMP_NN);
         remove(TMP_NN_RL);
         remove(TMP_NN_RLEXP);

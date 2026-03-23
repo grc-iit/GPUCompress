@@ -31,6 +31,22 @@ import matplotlib.patheffects
 import matplotlib.patches
 import numpy as np
 
+# ── SC publication-quality global defaults ──
+plt.rcParams.update({
+    'font.family':          'serif',
+    'font.serif':           ['DejaVu Serif', 'Times New Roman', 'serif'],
+    'font.size':            11,
+    'axes.titlesize':       13,
+    'axes.labelsize':       12,
+    'xtick.labelsize':      10,
+    'ytick.labelsize':      10,
+    'legend.fontsize':      10,
+    'figure.dpi':           300,
+    'savefig.dpi':          300,
+    'axes.spines.top':      False,
+    'axes.spines.right':    False,
+})
+
 # ═══════════════════════════════════════════════════════════════════════
 # Constants & Utilities
 # ═══════════════════════════════════════════════════════════════════════
@@ -41,18 +57,42 @@ PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 PHASE_ORDER = [
     "no-comp",
     "fixed-lz4", "fixed-gdeflate", "fixed-zstd",
-    "nn", "nn-rl", "nn-rl+exp50", "nn-rl+exp",
+    "fixed-lz4+shuf", "fixed-gdeflate+shuf", "fixed-zstd+shuf",
+    "nn", "nn-rl", "nn-rl+exp50",
 ]
 
 PHASE_COLORS = {
-    "no-comp":                "#999999",   # grey
-    "fixed-lz4":              "#5dade2",   # light blue
-    "fixed-gdeflate":         "#2e86c1",   # medium blue
+    "no-comp":                "#7f8c8d",   # muted grey
+    "fixed-lz4":              "#3498db",   # blue
+    "fixed-gdeflate":         "#2980b9",   # darker blue
     "fixed-zstd":             "#1a5276",   # dark blue
-    "nn":                     "#e49444",   # orange
+    "fixed-lz4+shuf":         "#85c1e9",   # light blue
+    "fixed-gdeflate+shuf":    "#5dade2",   # medium light blue
+    "fixed-zstd+shuf":        "#2471a3",   # medium dark blue
+    "nn":                     "#e67e22",   # orange
     "nn-rl":                  "#8e44ad",   # purple
     "nn-rl+exp50":            "#c0392b",   # red
-    "nn-rl+exp":              "#c0392b",   # red
+}
+
+# Hatching patterns for accessibility (colorblind-friendly)
+PHASE_HATCHES = {
+    "no-comp":                "",
+    "fixed-lz4":              "",
+    "fixed-gdeflate":         "",
+    "fixed-zstd":             "",
+    "fixed-lz4+shuf":         "//",
+    "fixed-gdeflate+shuf":    "//",
+    "fixed-zstd+shuf":        "//",
+    "nn":                     "",
+    "nn-rl":                  "\\\\",
+    "nn-rl+exp50":            "xx",
+}
+
+# Line styles for line plots (accessibility)
+PHASE_LINESTYLES = {
+    "nn":          ":",
+    "nn-rl":       "-",
+    "nn-rl+exp50": "--",
 }
 
 PHASE_LABELS = {
@@ -60,10 +100,12 @@ PHASE_LABELS = {
     "fixed-lz4":              "Fixed\nLZ4",
     "fixed-gdeflate":         "Fixed\nGDeflate",
     "fixed-zstd":             "Fixed\nZstd",
+    "fixed-lz4+shuf":         "Fixed\nLZ4+Shuf",
+    "fixed-gdeflate+shuf":    "Fixed\nGDefl+Shuf",
+    "fixed-zstd+shuf":        "Fixed\nZstd+Shuf",
     "nn":                     "NN\n(Inference)",
     "nn-rl":                  "NN+SGD",
     "nn-rl+exp50":            "NN+SGD\n+Explore",
-    "nn-rl+exp":              "NN+SGD\n+Explore",
 }
 
 # Auto-detection paths
@@ -216,91 +258,118 @@ def _ordered(rows):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# SC Figure Styling Helpers
+# ═══════════════════════════════════════════════════════════════════════
+
+def _sc_figure_border(fig):
+    """Add subtle figure border."""
+    fig.patch.set_edgecolor('#cccccc')
+    fig.patch.set_linewidth(0.5)
+
+
+def _sc_watermark(fig):
+    """Add subtle GPUCompress watermark."""
+    fig.text(0.99, 0.01, "GPUCompress", fontsize=10, color='grey',
+             alpha=0.05, ha='right', va='bottom',
+             fontweight='bold', fontstyle='italic')
+
+
+def _sc_finalize(fig, pad=1.5, rect=None):
+    """Common finalization: tight_layout, border, watermark."""
+    if rect:
+        fig.tight_layout(pad=pad, rect=rect)
+    else:
+        fig.tight_layout(pad=pad)
+    _sc_figure_border(fig)
+    _sc_watermark(fig)
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # View 1: Aggregate Summary
 # ═══════════════════════════════════════════════════════════════════════
 
 def plot_bars(ax, phases, values, title, ylabel, fmt="%.2f", annotate=True):
     x = np.arange(len(phases))
     colors = [PHASE_COLORS.get(p, "#bdc3c7") for p in phases]
-    bars = ax.bar(x, values, color=colors, edgecolor="black", linewidth=0.5,
+    hatches = [PHASE_HATCHES.get(p, "") for p in phases]
+    bars = ax.bar(x, values, color=colors, edgecolor="black", linewidth=0.4,
                   width=0.6, zorder=3)
+    for bar, h in zip(bars, hatches):
+        bar.set_hatch(h)
     if annotate:
         for bar, v in zip(bars, values):
             if v > 0:
                 ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
-                        fmt % v, ha="center", va="bottom", fontsize=9, fontweight="bold")
+                        fmt % v, ha="center", va="bottom", fontsize=8)
     ax.set_xticks(x)
-    ax.set_xticklabels([PHASE_LABELS.get(p, p) for p in phases], fontsize=9)
-    ax.set_ylabel(ylabel, fontsize=10)
-    ax.set_title(title, fontsize=11, fontweight="bold")
-    ax.grid(axis="y", alpha=0.3, linestyle="--", zorder=0)
+    ax.set_xticklabels([PHASE_LABELS.get(p, p) for p in phases], rotation=30, ha='right')
+    ax.set_ylabel(ylabel)
+    ax.set_title(title, fontweight="bold")
+    ax.grid(axis="y", alpha=0.2, linestyle="--", zorder=0)
     ax.set_axisbelow(True)
-    for spine in ["top", "right"]:
-        ax.spines[spine].set_visible(False)
+    ax.ticklabel_format(axis='y', style='sci', scilimits=(-3, 4))
 
 
 def plot_file_sizes(ax, phases, rows):
     x = np.arange(len(phases))
     colors = [PHASE_COLORS.get(p, "#bdc3c7") for p in phases]
+    hatches = [PHASE_HATCHES.get(p, "") for p in phases]
     orig = [g(r, "orig_mib", "orig_mb") for r in rows]
     comp = [g(r, "file_mib", "file_mb") for r in rows]
     w = 0.3
-    ax.bar(x - w / 2, orig, w, color="#cccccc", edgecolor="black", linewidth=0.5,
-           label="Original", zorder=3)
-    cbars = ax.bar(x + w / 2, comp, w, color=colors, edgecolor="black", linewidth=0.5,
-                   label="Compressed", zorder=3)
+    orig_bars = ax.bar(x - w / 2, orig, w, color="#cccccc", edgecolor="black",
+                       linewidth=0.4, label="Original", zorder=3)
+    cbars = ax.bar(x + w / 2, comp, w, color=colors, edgecolor="black",
+                   linewidth=0.4, label="Compressed", zorder=3)
+    for bar, h in zip(cbars, hatches):
+        bar.set_hatch(h)
     for bar, v in zip(cbars, comp):
         if v > 0:
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
-                    f"{v:.1f}", ha="center", va="bottom", fontsize=9, fontweight="bold")
-    for bar, v in zip(ax.containers[0], orig):
+                    f"{v:.1f}", ha="center", va="bottom", fontsize=8)
+    for bar, v in zip(orig_bars, orig):
         if v > 0:
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
                     f"{v:.0f}", ha="center", va="bottom", fontsize=8, color="#555")
     ax.set_xticks(x)
-    ax.set_xticklabels([PHASE_LABELS.get(p, p) for p in phases], fontsize=9)
-    ax.set_ylabel("Size (MiB)", fontsize=10)
-    ax.set_title("Original vs Compressed File Size", fontsize=11, fontweight="bold")
-    ax.legend(fontsize=8)
-    ax.grid(axis="y", alpha=0.3, linestyle="--", zorder=0)
+    ax.set_xticklabels([PHASE_LABELS.get(p, p) for p in phases], rotation=30, ha='right')
+    ax.set_ylabel("Size (MiB)")
+    ax.set_title("Original vs Compressed File Size", fontweight="bold")
+    ax.legend()
+    ax.grid(axis="y", alpha=0.2, linestyle="--", zorder=0)
     ax.set_axisbelow(True)
-    for spine in ["top", "right"]:
-        ax.spines[spine].set_visible(False)
+    ax.ticklabel_format(axis='y', style='sci', scilimits=(-3, 4))
 
 
 def plot_nn_stats(ax, phases, rows):
     nn_idx = [i for i, p in enumerate(phases) if p in ("nn", "nn-rl", "nn-rl+exp50")]
     if not nn_idx:
         ax.text(0.5, 0.5, "No NN phases", ha="center", va="center",
-                transform=ax.transAxes, fontsize=12, color="gray")
-        ax.set_title("NN Adaptation", fontsize=12, fontweight="bold")
+                transform=ax.transAxes, color="gray")
+        ax.set_title("NN Adaptation", fontweight="bold")
         return
     nn_x = np.arange(len(nn_idx))
     nn_labels = [PHASE_LABELS.get(phases[i], phases[i]) for i in nn_idx]
     w = 0.3
     sgd_pct = [100.0 * g(rows[i], "sgd_fires") / max(g(rows[i], "n_chunks"), 1) for i in nn_idx]
     expl_pct = [100.0 * g(rows[i], "explorations") / max(g(rows[i], "n_chunks"), 1) for i in nn_idx]
-    ax.bar(nn_x - w / 2, sgd_pct, w, color="#e49444", edgecolor="black", linewidth=0.5,
-           label="SGD Fires %", zorder=3)
-    ax.bar(nn_x + w / 2, expl_pct, w, color="#c85a5a", edgecolor="black", linewidth=0.5,
-           label="Explorations %", zorder=3)
+    sgd_bars = ax.bar(nn_x - w / 2, sgd_pct, w, color="#e67e22", edgecolor="black",
+                      linewidth=0.4, label="SGD Fires (%)", zorder=3)
+    exp_bars = ax.bar(nn_x + w / 2, expl_pct, w, color="#c0392b", edgecolor="black",
+                      linewidth=0.4, label="Explorations (%)", zorder=3, hatch="//")
     ymax = max(max(sgd_pct, default=0), max(expl_pct, default=0))
     for xi, (s, e) in enumerate(zip(sgd_pct, expl_pct)):
-        ax.text(xi - w / 2, s, f"{s:.0f}%", ha="center", va="bottom", fontsize=9,
-                fontweight="bold")
+        ax.text(xi - w / 2, s, f"{s:.0f}%", ha="center", va="bottom", fontsize=8)
         if e > 0:
-            ax.text(xi + w / 2, e, f"{e:.0f}%", ha="center", va="bottom", fontsize=9,
-                    fontweight="bold")
+            ax.text(xi + w / 2, e, f"{e:.0f}%", ha="center", va="bottom", fontsize=8)
     ax.set_xticks(nn_x)
-    ax.set_xticklabels(nn_labels, fontsize=9)
-    ax.set_ylabel("% of chunks", fontsize=10)
+    ax.set_xticklabels(nn_labels, rotation=30, ha='right')
+    ax.set_ylabel("Chunks (%)")
     ax.set_ylim(0, ymax * 1.3 + 5)
-    ax.set_title("Online Learning Activity", fontsize=11, fontweight="bold")
-    ax.legend(fontsize=8, loc="upper right")
-    ax.grid(axis="y", alpha=0.3, linestyle="--", zorder=0)
+    ax.set_title("Online Learning Activity", fontweight="bold")
+    ax.legend(loc="upper right")
+    ax.grid(axis="y", alpha=0.2, linestyle="--", zorder=0)
     ax.set_axisbelow(True)
-    for spine in ["top", "right"]:
-        ax.spines[spine].set_visible(False)
 
 
 def plot_verification(ax, phases, rows):
@@ -333,7 +402,7 @@ def plot_verification(ax, phases, rows):
             cell.set_facecolor("#d9e2ec")
         else:
             cell.set_text_props(fontsize=9)
-    ax.set_title("Summary & Verification", fontsize=11, fontweight="bold", pad=20)
+    ax.set_title("Summary & Verification", fontweight="bold", pad=20)
 
 
 def make_summary_figure(source_name, rows, output_path, meta_text=""):
@@ -341,13 +410,13 @@ def make_summary_figure(source_name, rows, output_path, meta_text=""):
     if not phases:
         print(f"  {source_name}: no valid phases, skipping summary.")
         return
-    fig = plt.figure(figsize=(16, 10), facecolor="white")
+    fig = plt.figure(figsize=(14, 10), facecolor="white")
     fig.text(0.5, 0.99, f"GPUCompress Benchmark: {source_name}",
              ha="center", fontsize=14, fontweight="bold", va="top")
     if meta_text:
         fig.text(0.5, 0.965, meta_text, ha="center", fontsize=9,
                  color="#444", va="top", fontfamily="monospace")
-    gs = gridspec.GridSpec(2, 2, hspace=0.40, wspace=0.30,
+    gs = gridspec.GridSpec(2, 2, hspace=0.50, wspace=0.30,
                            top=0.92, bottom=0.08, left=0.07, right=0.97)
     ax1 = fig.add_subplot(gs[0, 0])
     plot_bars(ax1, phases, [g(r, "ratio") for r in ordered],
@@ -367,17 +436,18 @@ def make_summary_figure(source_name, rows, output_path, meta_text=""):
         color = PHASE_COLORS.get(p, "#bdc3c7")
         label = PHASE_LABELS.get(p, p).replace("\n", " ")
         ax4.scatter(ratio, wtp, s=120, color=color, edgecolors="black",
-                    linewidth=0.8, zorder=5, label=label)
+                    linewidth=0.8, zorder=5, label=label,
+                    marker={'nn': 'D', 'nn-rl': 's', 'nn-rl+exp50': '^'}.get(p, 'o'))
         ax4.annotate(label, (ratio, wtp), textcoords="offset points",
                      xytext=(6, 6), fontsize=8, color="#333")
-    ax4.set_xlabel("Compression Ratio", fontsize=10)
-    ax4.set_ylabel("Write Throughput (MiB/s)", fontsize=10)
-    ax4.set_title("Ratio vs Throughput (Pareto)", fontsize=11, fontweight="bold")
-    ax4.grid(alpha=0.3, linestyle="--", zorder=0)
+    ax4.set_xlabel("Compression Ratio")
+    ax4.set_ylabel("Write Throughput (MiB/s)")
+    ax4.set_title("Ratio vs Throughput (Pareto)", fontweight="bold")
+    ax4.grid(alpha=0.2, linestyle="--", zorder=0)
     ax4.set_axisbelow(True)
-    for spine in ["top", "right"]:
-        ax4.spines[spine].set_visible(False)
+    ax4.ticklabel_format(axis='y', style='sci', scilimits=(-3, 4))
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    _sc_finalize(fig, pad=1.5, rect=[0, 0, 1, 0.92])
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved: {output_path}")
@@ -394,6 +464,29 @@ def make_timestep_figure(ts_csv_path, output_path):
         print(f"  No timestep data in {ts_csv_path}, skipping.")
         return
 
+    # Detect whether this is timestep-based or field-based data
+    has_field_idx = "field_idx" in rows[0] if rows else False
+    has_field_name = "field_name" in rows[0] if rows else False
+    has_timestep = "timestep" in rows[0] if rows else False
+    is_field_based = has_field_idx and not has_timestep
+    x_label = "Field" if is_field_based else "Timestep"
+
+    # Collect field names for x-tick labels if available
+    field_names = []
+    if has_field_name:
+        seen = set()
+        for r in rows:
+            fn = r.get("field_name", "")
+            idx = r.get("field_idx", r.get("timestep", ""))
+            key = f"{idx}_{fn}"
+            if key not in seen:
+                seen.add(key)
+                # Shorten: remove extension, truncate long names
+                short = fn.replace(".f32", "").replace(".dat", "").replace(".bin", "")
+                if len(short) > 20:
+                    short = short[:18] + ".."
+                field_names.append(short)
+
     # Group by phase (new CSV has 'phase' column; old CSV doesn't)
     has_phase = "phase" in rows[0] if rows else False
     by_phase = {}
@@ -403,9 +496,9 @@ def make_timestep_figure(ts_csv_path, output_path):
 
     phase_order = ["nn", "nn-rl", "nn-rl+exp50"]
     phase_styles = {
-        "nn":          {"color": "#999999", "ls": ":",  "marker": "s", "lw": 1.5},
-        "nn-rl":       {"color": "#6a9f58", "ls": "-",  "marker": "o", "lw": 2.0},
-        "nn-rl+exp50": {"color": "#c85a5a", "ls": "--", "marker": "D", "lw": 1.8},
+        "nn":          {"color": "#7f8c8d", "ls": ":",    "marker": "s", "lw": 2.0},
+        "nn-rl":       {"color": "#8e44ad", "ls": "-",    "marker": "o", "lw": 2.0},
+        "nn-rl+exp50": {"color": "#c0392b", "ls": "--",   "marker": "D", "lw": 2.0},
     }
     phases_present = [p for p in phase_order if p in by_phase]
 
@@ -415,37 +508,44 @@ def make_timestep_figure(ts_csv_path, output_path):
         ("Decompression Time", "mape_decomp", "smape_decomp"),
     ]
 
-    fig, axes = plt.subplots(3, 1, figsize=(14, 12))
-    fig.suptitle("NN Prediction Accuracy Over Timesteps\n"
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10))
+    title_suffix = "Fields" if is_field_based else "Timesteps"
+    fig.suptitle(f"NN Prediction Accuracy Over {title_suffix}\n"
                  "(per-metric MAPE averaged across all chunks)",
                  fontsize=14, fontweight="bold", y=0.99)
 
     for ax, (label, mape_key, smape_key) in zip(axes, metric_keys):
         for ph in phases_present:
             ph_rows = by_phase[ph]
-            timesteps = np.array([g(r, "timestep") for r in ph_rows])
+            timesteps = np.array([g(r, "timestep", "field_idx") for r in ph_rows])
             mape = np.array([g(r, mape_key, default=-1) for r in ph_rows])
             if mape[0] < 0:
                 mape = np.array([g(r, smape_key) for r in ph_rows])
             clipped = np.clip(mape, 0, 200)
 
-            sty = phase_styles.get(ph, {"color": "black", "ls": "-", "marker": ".", "lw": 1.5})
+            sty = phase_styles.get(ph, {"color": "black", "ls": "-", "marker": ".", "lw": 2.0})
             ax.plot(timesteps, clipped, color=sty["color"], linestyle=sty["ls"],
-                    marker=sty["marker"], markersize=4, linewidth=sty["lw"],
+                    marker=sty["marker"], markersize=6, linewidth=2.0,
                     label=ph, alpha=0.9, zorder=3)
 
         ax.axhline(20, color="#e67e22", linewidth=1, linestyle="--", alpha=0.6)
-        ax.set_ylabel(f"{label}\nMAPE (%)", fontsize=11, fontweight="bold")
+        ax.set_ylabel(f"{label}\nMAPE (%)", fontweight="bold")
         ax.set_ylim(0, 200)
-        ax.grid(axis="y", alpha=0.3, linestyle="--")
-        ax.tick_params(axis="both", labelsize=9)
-        ax.legend(fontsize=9, loc="upper right")
-        for spine in ["top", "right"]:
-            ax.spines[spine].set_visible(False)
+        ax.grid(axis="y", alpha=0.2, linestyle="--")
+        ax.grid(axis="y", which='minor', alpha=0.1, linestyle=':')
+        ax.minorticks_on()
+        ax.legend(loc="upper right")
 
-    axes[-1].set_xlabel("Timestep", fontsize=11, fontweight="bold")
+    axes[-1].set_xlabel(x_label, fontweight="bold")
 
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    # Use field names as x-tick labels if available
+    if is_field_based and field_names:
+        for ax in axes:
+            n_fields = len(field_names)
+            ax.set_xticks(range(n_fields))
+            ax.set_xticklabels(field_names, rotation=30, ha="right", fontsize=9)
+
+    _sc_finalize(fig, pad=1.5, rect=[0, 0, 1, 0.96])
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
@@ -459,6 +559,26 @@ def make_sgd_exploration_figure(ts_csv_path, output_path):
         print(f"  No timestep data in {ts_csv_path}, skipping SGD/EXP plot.")
         return
 
+    # Detect field-based vs timestep-based data
+    is_field_based = "field_idx" in rows[0] and "timestep" not in rows[0]
+    x_label = "Field" if is_field_based else "Timestep"
+    unit_label = "field" if is_field_based else "timestep"
+
+    # Collect field names for x-tick labels
+    field_names = []
+    if is_field_based and "field_name" in rows[0]:
+        seen = set()
+        for r in rows:
+            fn = r.get("field_name", "")
+            idx = r.get("field_idx", "")
+            key = f"{idx}_{fn}"
+            if key not in seen:
+                seen.add(key)
+                short = fn.replace(".f32", "").replace(".dat", "").replace(".bin", "")
+                if len(short) > 20:
+                    short = short[:18] + ".."
+                field_names.append(short)
+
     by_phase = {}
     for r in rows:
         ph = r.get("phase", "nn-rl")
@@ -466,52 +586,57 @@ def make_sgd_exploration_figure(ts_csv_path, output_path):
 
     phase_order = ["nn", "nn-rl", "nn-rl+exp50"]
     phase_styles = {
-        "nn":          {"color": "#999999", "ls": ":",  "marker": "s", "lw": 1.5},
-        "nn-rl":       {"color": "#6a9f58", "ls": "-",  "marker": "o", "lw": 2.0},
-        "nn-rl+exp50": {"color": "#c85a5a", "ls": "--", "marker": "D", "lw": 1.8},
+        "nn":          {"color": "#7f8c8d", "ls": ":",  "marker": "s", "lw": 2.0},
+        "nn-rl":       {"color": "#8e44ad", "ls": "-",  "marker": "o", "lw": 2.0},
+        "nn-rl+exp50": {"color": "#c0392b", "ls": "--", "marker": "D", "lw": 2.0},
     }
     phases_present = [p for p in phase_order if p in by_phase]
 
-    fig, (ax_sgd, ax_exp) = plt.subplots(2, 1, figsize=(14, 8))
-    fig.suptitle("SGD & Exploration Firing Over Timesteps\n"
+    title_suffix = "Fields" if is_field_based else "Timesteps"
+    fig, (ax_sgd, ax_exp) = plt.subplots(2, 1, figsize=(14, 5))
+    fig.suptitle(f"SGD & Exploration Firing Over {title_suffix}\n"
                  "(per-chunk cost model error triggers: SGD > 10%, Explore > 20%)",
                  fontsize=14, fontweight="bold", y=0.99)
 
     for ph in phases_present:
         ph_rows = by_phase[ph]
-        timesteps = np.array([g(r, "timestep") for r in ph_rows])
+        timesteps = np.array([g(r, "timestep", "field_idx") for r in ph_rows])
         sgd = np.array([g(r, "sgd_fires") for r in ph_rows])
         expl = np.array([g(r, "explorations", default=0) for r in ph_rows])
-        sty = phase_styles.get(ph, {"color": "black", "ls": "-", "marker": ".", "lw": 1.5})
+        sty = phase_styles.get(ph, {"color": "black", "ls": "-", "marker": ".", "lw": 2.0})
 
         ax_sgd.plot(timesteps, sgd, color=sty["color"], linestyle=sty["ls"],
-                    marker=sty["marker"], markersize=4, linewidth=sty["lw"],
+                    marker=sty["marker"], markersize=6, linewidth=2.0,
                     label=PHASE_LABELS.get(ph, ph).replace("\n", " "),
                     alpha=0.9, zorder=3)
         if expl.sum() > 0:
             ax_exp.plot(timesteps, expl, color=sty["color"], linestyle=sty["ls"],
-                        marker=sty["marker"], markersize=4, linewidth=sty["lw"],
+                        marker=sty["marker"], markersize=6, linewidth=2.0,
                         label=PHASE_LABELS.get(ph, ph).replace("\n", " "),
                         alpha=0.9, zorder=3)
 
-    ax_sgd.set_ylabel("SGD Fires\n(chunks per timestep)", fontsize=11, fontweight="bold")
-    ax_sgd.set_title("SGD Weight Updates (chunks where cost_model_error > 10%)", fontsize=11)
-    ax_sgd.grid(axis="y", alpha=0.3, linestyle="--")
-    ax_sgd.tick_params(axis="both", labelsize=9)
-    ax_sgd.legend(fontsize=9, loc="upper right")
-    for spine in ["top", "right"]:
-        ax_sgd.spines[spine].set_visible(False)
+    ax_sgd.set_ylabel(f"SGD Fires\n(chunks per {unit_label})", fontweight="bold")
+    ax_sgd.set_title(f"SGD Weight Updates (chunks where cost_model_error > 10%)")
+    ax_sgd.grid(axis="y", alpha=0.2, linestyle="--")
+    ax_sgd.grid(axis="y", which='minor', alpha=0.1, linestyle=':')
+    ax_sgd.minorticks_on()
+    ax_sgd.legend(loc="upper right")
 
-    ax_exp.set_ylabel("Explorations\n(chunks per timestep)", fontsize=11, fontweight="bold")
-    ax_exp.set_xlabel("Timestep", fontsize=11, fontweight="bold")
-    ax_exp.set_title("Exploration Triggers (chunks where cost_model_error > 20%)", fontsize=11)
-    ax_exp.grid(axis="y", alpha=0.3, linestyle="--")
-    ax_exp.tick_params(axis="both", labelsize=9)
-    ax_exp.legend(fontsize=9, loc="upper right")
-    for spine in ["top", "right"]:
-        ax_exp.spines[spine].set_visible(False)
+    ax_exp.set_ylabel(f"Explorations\n(chunks per {unit_label})", fontweight="bold")
+    ax_exp.set_xlabel(x_label, fontweight="bold")
+    ax_exp.set_title(f"Exploration Triggers (chunks where cost_model_error > 20%)")
 
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    # Use field names as x-tick labels if available
+    if is_field_based and field_names:
+        for ax in [ax_sgd, ax_exp]:
+            ax.set_xticks(range(len(field_names)))
+            ax.set_xticklabels(field_names, rotation=30, ha="right", fontsize=9)
+    ax_exp.grid(axis="y", alpha=0.2, linestyle="--")
+    ax_exp.grid(axis="y", which='minor', alpha=0.1, linestyle=':')
+    ax_exp.minorticks_on()
+    ax_exp.legend(loc="upper right")
+
+    _sc_finalize(fig, pad=1.5, rect=[0, 0, 1, 0.96])
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
@@ -540,15 +665,29 @@ def make_timestep_chunks_figure(tc_csv_path, output_path, phase_filter="nn-rl"):
     else:
         rows = all_rows
 
-    # Group by timestep
+    # Detect field-based vs timestep-based
+    is_field_based = "field_idx" in rows[0] if rows else False
+    unit_word = "Field" if is_field_based else "Timestep"
+
+    # Collect field name mapping if available
+    field_name_map = {}
+    if is_field_based:
+        for r in rows:
+            idx = int(g(r, "field_idx", "timestep"))
+            fn = r.get("field_name", "")
+            if fn and idx not in field_name_map:
+                short = fn.replace(".f32", "").replace(".dat", "").replace(".bin", "")
+                field_name_map[idx] = short
+
+    # Group by timestep/field
     by_ts = {}
     for r in rows:
-        ts = int(g(r, "timestep"))
+        ts = int(g(r, "timestep", "field_idx"))
         by_ts.setdefault(ts, []).append(r)
     all_ts = sorted(by_ts.keys())
     if len(all_ts) == 0:
         return
-    # Pick 5 milestones: 0%, 25%, 50%, 75%, 100% of available timesteps
+    # Pick 5 milestones: 0%, 25%, 50%, 75%, 100%
     indices = [0, len(all_ts) // 4, len(all_ts) // 2, 3 * len(all_ts) // 4, len(all_ts) - 1]
     seen = set()
     timestep_list = [all_ts[i] for i in indices if not (all_ts[i] in seen or seen.add(all_ts[i]))]
@@ -560,10 +699,11 @@ def make_timestep_chunks_figure(tc_csv_path, output_path, phase_filter="nn-rl"):
         ("Decomp Time",        "predicted_decomp_ms","actual_decomp_ms",  "ms", "mape_decomp"),
     ]
 
-    fig, axes = plt.subplots(n_ts, 3, figsize=(20, 3.2 * n_ts + 2),
+    fig, axes = plt.subplots(n_ts, 3, figsize=(14, 3.2 * n_ts + 2),
                               squeeze=False)
     phase_label = phase_filter if has_phase else "nn-rl"
-    fig.suptitle(f"NN Predicted vs Actual Metrics Per Chunk at Milestone Timesteps\n"
+    milestone_word = "Fields" if is_field_based else "Timesteps"
+    fig.suptitle(f"NN Predicted vs Actual Metrics Per Chunk at Milestone {milestone_word}\n"
                  f"[{phase_label}] (ratio, compression time, decompression time)",
                  fontsize=14, fontweight="bold", y=0.99)
 
@@ -580,10 +720,10 @@ def make_timestep_chunks_figure(tc_csv_path, output_path, phase_filter="nn-rl"):
             mape_vals = np.array([g(r, mape_key) for r in chunk_rows])[sort_idx]
 
             # Lines with shaded error region
-            ax.plot(chunks, act, color="#2c3e50", linewidth=1.8, label="Actual",
-                    zorder=3)
-            ax.plot(chunks, pred, color="#3498db", linewidth=1.5, linestyle="--",
-                    alpha=0.9, label="Predicted", zorder=3)
+            ax.plot(chunks, act, color="#2c3e50", linewidth=2.0, label="Actual",
+                    zorder=3, marker='o', markersize=3)
+            ax.plot(chunks, pred, color="#3498db", linewidth=2.0, linestyle="--",
+                    alpha=0.9, label="Predicted", zorder=3, marker='s', markersize=3)
             ax.fill_between(chunks, act, pred, color="#3498db", alpha=0.15,
                             zorder=2)
 
@@ -594,15 +734,19 @@ def make_timestep_chunks_figure(tc_csv_path, output_path, phase_filter="nn-rl"):
                            zorder=4, marker="x", linewidths=1.5)
 
             if row_idx == 0:
-                ax.set_title(f"{label} ({unit})", fontsize=12, fontweight="bold")
+                ax.set_title(f"{label} ({unit})", fontweight="bold")
             if row_idx == 0 and col_idx == 2:
-                ax.legend(fontsize=9, loc="upper left", framealpha=0.9)
+                ax.legend(loc="upper left", framealpha=0.9)
             if row_idx == n_ts - 1:
-                ax.set_xlabel("Chunk Index", fontsize=10)
+                ax.set_xlabel("Chunk Index")
             if col_idx == 0:
-                ax.set_ylabel(f"T={ts}", fontsize=11, fontweight="bold")
+                if is_field_based and ts in field_name_map:
+                    ax.set_ylabel(field_name_map[ts], fontweight="bold", fontsize=9)
+                else:
+                    ax.set_ylabel(f"T={ts}", fontweight="bold")
             ax.grid(alpha=0.2, linestyle="-")
-            ax.tick_params(labelsize=8)
+            ax.grid(which='minor', alpha=0.1, linestyle=':')
+            ax.minorticks_on()
 
             # Cap y-axis
             all_vals = np.concatenate([pred, act])
@@ -620,7 +764,7 @@ def make_timestep_chunks_figure(tc_csv_path, output_path, phase_filter="nn-rl"):
                     bbox=dict(facecolor="white", alpha=0.9, edgecolor="#bbb",
                               boxstyle="round,pad=0.3"))
 
-    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    _sc_finalize(fig, pad=1.5, rect=[0, 0, 1, 0.97])
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
@@ -785,7 +929,7 @@ def make_chunk_actions_figure(chunk_csv_path, output_path):
     if n_phases == 0:
         return
 
-    fig, axes = plt.subplots(2, 1, figsize=(16, 3 + 1.5 * n_phases),
+    fig, axes = plt.subplots(2, 1, figsize=(14, 3 + 1.5 * n_phases),
                               gridspec_kw={"height_ratios": [n_phases, 2.5]})
     fig.suptitle("NN Configuration Selection Per Chunk (algo + preprocessing)",
                  fontsize=14, fontweight="bold", y=0.98)
@@ -861,15 +1005,13 @@ def make_chunk_actions_figure(chunk_csv_path, output_path):
                    label=PHASE_LABELS.get(ph, ph).replace("\n", " "))
 
     ax_bar.set_xticks(x)
-    ax_bar.set_xticklabels(bar_configs, fontsize=8, rotation=40, ha="right")
-    ax_bar.set_ylabel("% of Chunks", fontsize=10)
-    ax_bar.set_title("Configuration Selection Frequency", fontsize=11)
-    ax_bar.legend(fontsize=8, loc="upper right")
-    ax_bar.grid(axis="y", alpha=0.3, linestyle="--")
-    for spine in ["top", "right"]:
-        ax_bar.spines[spine].set_visible(False)
+    ax_bar.set_xticklabels(bar_configs, rotation=30, ha="right")
+    ax_bar.set_ylabel("Chunks (%)")
+    ax_bar.set_title("Configuration Selection Frequency")
+    ax_bar.legend(loc="upper right")
+    ax_bar.grid(axis="y", alpha=0.2, linestyle="--")
 
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    _sc_finalize(fig, pad=1.5, rect=[0, 0, 1, 0.96])
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
@@ -895,7 +1037,7 @@ def make_milestone_actions_figure(tc_csv_path, output_path, chunk_csv_path=None)
     by_phase_ts = {}
     for r in all_rows:
         ph = r.get("phase", "nn-rl")
-        ts = int(g(r, "timestep"))
+        ts = int(g(r, "timestep", "field_idx"))
         by_phase_ts.setdefault(ph, {}).setdefault(ts, []).append(r)
 
     # Load single-shot nn phase for reference (static column)
@@ -948,7 +1090,7 @@ def make_milestone_actions_figure(tc_csv_path, output_path, chunk_csv_path=None)
                               figsize=(fig_w, fig_h),
                               squeeze=False)
     fig.suptitle("NN Algorithm Selection per Chunk Over Time",
-                 fontsize=16, fontweight="bold", y=0.97)
+                 fontsize=14, fontweight="bold", y=0.97)
 
     for col, (col_label, col_source) in enumerate(phase_columns):
         for row, ts in enumerate(milestones):
@@ -1008,12 +1150,13 @@ def make_milestone_actions_figure(tc_csv_path, output_path, chunk_csv_path=None)
             legend_patches.append(p)
             seen.add(p.get_label())
 
-    fig.legend(handles=legend_patches, loc="lower center", fontsize=10,
-               ncol=min(len(legend_patches), 6), framealpha=0.95,
-               edgecolor="#cccccc", fancybox=True,
-               bbox_to_anchor=(0.5, 0.005))
+    if legend_patches:
+        fig.legend(handles=legend_patches, loc="lower center", fontsize=10,
+                   ncol=min(len(legend_patches), 6), framealpha=0.95,
+                   edgecolor="#cccccc", fancybox=True,
+                   bbox_to_anchor=(0.5, 0.005))
 
-    fig.tight_layout(rect=[0.05, 0.08, 1, 0.93])
+    _sc_finalize(fig, pad=1.5, rect=[0.05, 0.08, 1, 0.93])
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     fig.savefig(output_path, dpi=300, bbox_inches="tight", facecolor="white")
     plt.close(fig)
@@ -1046,7 +1189,7 @@ def make_multi_dataset_figure(all_datasets, output_path):
     n_datasets = len(all_datasets)
     n_phases = len(phases)
 
-    fig, axes = plt.subplots(2, 1, figsize=(max(14, n_phases * 1.5), 10), facecolor="white")
+    fig, axes = plt.subplots(2, 1, figsize=(14, 10), facecolor="white")
     fig.suptitle("Multi-Dataset Comparison: GPUCompress Phases", fontsize=14, fontweight="bold")
 
     x = np.arange(n_phases)
@@ -1065,17 +1208,17 @@ def make_multi_dataset_figure(all_datasets, output_path):
             vals = [g(by_phase.get(p, {}), metric, f"{metric}ps") for p in phases]
             offset = (di - n_datasets / 2 + 0.5) * width
             bars = ax.bar(x + offset, vals, width * 0.9, label=ds_name,
+                          edgecolor="black", linewidth=0.4,
                           zorder=3, alpha=0.85)
 
         ax.set_xticks(x)
-        ax.set_xticklabels([PHASE_LABELS.get(p, p) for p in phases], fontsize=8)
-        ax.set_ylabel(ylabel, fontsize=10)
-        ax.legend(fontsize=8, loc="upper right")
-        ax.grid(axis="y", alpha=0.3, linestyle="--", zorder=0)
-        for spine in ["top", "right"]:
-            ax.spines[spine].set_visible(False)
+        ax.set_xticklabels([PHASE_LABELS.get(p, p) for p in phases], rotation=30, ha='right')
+        ax.set_ylabel(ylabel)
+        ax.legend(loc="upper right")
+        ax.grid(axis="y", alpha=0.2, linestyle="--", zorder=0)
+        ax.ticklabel_format(axis='y', style='sci', scilimits=(-3, 4))
 
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    _sc_finalize(fig, pad=1.5, rect=[0, 0, 1, 0.95])
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
@@ -1109,7 +1252,7 @@ def make_per_dataset_phase_comparison(all_datasets, output_path):
     n_datasets = len(all_datasets)
     n_phases = len(phases)
 
-    fig, axes = plt.subplots(2, 1, figsize=(max(14, n_datasets * 3), 12), facecolor="white")
+    fig, axes = plt.subplots(2, 1, figsize=(max(14, n_datasets * 3), 10), facecolor="white")
     fig.suptitle("Phase Comparison per Dataset", fontsize=14, fontweight="bold")
 
     x = np.arange(n_datasets)
@@ -1117,7 +1260,7 @@ def make_per_dataset_phase_comparison(all_datasets, output_path):
 
     for panel, (metric, ylabel) in enumerate([
         ("ratio", "Compression Ratio (higher = better)"),
-        ("write_mbps", "Write Throughput MiB/s (higher = better)"),
+        ("write_mbps", "Write Throughput (MiB/s, higher = better)"),
     ]):
         ax = axes[panel]
         for pi, phase in enumerate(phases):
@@ -1131,26 +1274,26 @@ def make_per_dataset_phase_comparison(all_datasets, output_path):
 
             offset = (pi - n_phases / 2 + 0.5) * width
             color = PHASE_COLORS.get(phase, "#bdc3c7")
+            hatch = PHASE_HATCHES.get(phase, "")
             label = PHASE_LABELS.get(phase, phase).replace("\n", " ")
             bars = ax.bar(x + offset, vals, width * 0.9, label=label,
-                          color=color, edgecolor="black", linewidth=0.3,
-                          zorder=3, alpha=0.85)
+                          color=color, edgecolor="black", linewidth=0.4,
+                          zorder=3, alpha=0.85, hatch=hatch)
 
             # Annotate the best value per dataset
             for i, v in enumerate(vals):
-                if v > 0 and n_phases <= 8:  # only annotate if not too many phases
+                if v > 0 and n_phases <= 8:
                     ax.text(x[i] + offset, v, f"{v:.1f}", ha="center", va="bottom",
                             fontsize=6, rotation=90)
 
         ax.set_xticks(x)
-        ax.set_xticklabels([name for name, _ in all_datasets], fontsize=10)
-        ax.set_ylabel(ylabel, fontsize=10)
-        ax.legend(fontsize=7, loc="upper right", ncol=3)
-        ax.grid(axis="y", alpha=0.3, linestyle="--", zorder=0)
-        for spine in ["top", "right"]:
-            ax.spines[spine].set_visible(False)
+        ax.set_xticklabels([name for name, _ in all_datasets], rotation=30, ha='right')
+        ax.set_ylabel(ylabel)
+        ax.legend(loc="upper right", ncol=3)
+        ax.grid(axis="y", alpha=0.2, linestyle="--", zorder=0)
+        ax.ticklabel_format(axis='y', style='sci', scilimits=(-3, 4))
 
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    _sc_finalize(fig, pad=1.5, rect=[0, 0, 1, 0.95])
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
@@ -1162,57 +1305,105 @@ def make_per_dataset_phase_comparison(all_datasets, output_path):
 # ═══════════════════════════════════════════════════════════════════════
 
 def make_latency_breakdown_figure(rows, output_path, source_name=""):
-    """Stacked bar showing stats/NN/preproc/compress time per phase."""
+    """End-to-end write time per phase with NN overhead annotation.
+
+    Shows write_ms as the total bar for each phase. For NN phases,
+    annotates the NN inference + stats overhead as a percentage.
+    Uses a 3-stage pipelined architecture where stages overlap,
+    so component times do NOT sum to wall-clock time.
+    """
     _normalize_rows(rows)
     phases, ordered = _ordered(rows)
-    # Only show phases that have timing breakdown data
+    # Only show phases with write_ms > 0
     valid = [(p, r) for p, r in zip(phases, ordered)
-             if g(r, "comp_ms") > 0 or g(r, "nn_ms") > 0]
+             if g(r, "write_ms") > 0]
     if not valid:
         return
 
     phases_v = [p for p, _ in valid]
     rows_v = [r for _, r in valid]
+    n = len(phases_v)
 
-    components = [
-        ("stats_ms",   "Stats Kernel",  "#4daf4a"),
-        ("nn_ms",      "NN Inference",  "#e49444"),
-        ("preproc_ms", "Preprocessing", "#b07cc6"),
-        ("comp_ms",    "Compression",   "#377eb8"),
-        ("explore_ms", "Exploration",   "#c85a5a"),
-        ("sgd_ms",     "SGD Update",    "#ff7f00"),
-    ]
+    fig, ax = plt.subplots(figsize=(max(10, 1.2 * n + 2), 6), facecolor="white")
 
-    fig, ax = plt.subplots(figsize=(max(10, len(phases_v) * 1.5), 6), facecolor="white")
-    x = np.arange(len(phases_v))
-    bottom = np.zeros(len(phases_v))
+    x = np.arange(n)
+    write_times = np.array([g(r, "write_ms") for r in rows_v])
+    nn_times = np.array([g(r, "nn_ms") for r in rows_v])
+    stats_times = np.array([g(r, "stats_ms") for r in rows_v])
+    explore_times = np.array([g(r, "explore_ms") for r in rows_v])
+    sgd_times = np.array([g(r, "sgd_ms") for r in rows_v])
+    nn_overhead = nn_times + stats_times  # sequential on main thread
 
-    for key, label, color in components:
-        vals = np.array([g(r, key) for r in rows_v])
-        if np.sum(vals) > 0:
-            ax.bar(x, vals, bottom=bottom, label=label, color=color,
-                   edgecolor="black", linewidth=0.3, width=0.6, zorder=3)
-            bottom += vals
+    colors = [PHASE_COLORS.get(p, "#bdc3c7") for p in phases_v]
+    hatches = [PHASE_HATCHES.get(p, "") for p in phases_v]
 
-    # Annotate total on top
-    for i, total in enumerate(bottom):
-        if total > 0:
-            ax.text(i, total, f"{total:.1f}ms", ha="center", va="bottom",
-                    fontsize=8, fontweight="bold")
+    # Main bars: end-to-end write_ms
+    bars = ax.bar(x, write_times, color=colors, edgecolor="black",
+                  linewidth=0.5, width=0.6, zorder=3, alpha=0.85)
+    for i, (bar, h) in enumerate(zip(bars, hatches)):
+        if h:
+            bar.set_hatch(h)
+
+    # Overlay: only NN+Stats as bar segment (sequential on main thread, accurate)
+    # Exploration and SGD are cumulative across parallel workers — text annotation only
+    nn_phase_names = {"nn", "nn-rl", "nn-rl+exp50"}
+    nn_label_done = False
+    for i, p in enumerate(phases_v):
+        if p not in nn_phase_names:
+            continue
+        oh = nn_overhead[i]
+        if oh > 0:
+            ax.bar(i, oh, color="#e67e22", edgecolor="black",
+                   linewidth=0.5, width=0.6, zorder=4, alpha=0.9,
+                   hatch="//", label="NN + Stats Overhead" if not nn_label_done else "")
+            nn_label_done = True
+
+    # Annotate: sequential metrics as %, cumulative as absolute with worker count
+    N_WORKERS = 8
+    for i, (wt, p) in enumerate(zip(write_times, phases_v)):
+        oh = nn_overhead[i]
+        sgd = sgd_times[i]
+        exp = explore_times[i]
+        label_parts = [f"{wt:.0f} ms"]
+        if p in nn_phase_names and oh > 0 and wt > 0:
+            label_parts.append(f"NN+Stats: {100*oh/wt:.0f}%")
+        if sgd > 0:
+            label_parts.append(f"SGD: {sgd:.0f} ms ({N_WORKERS}w)")
+        if exp > 0:
+            label_parts.append(f"Exp: {exp:.0f} ms ({N_WORKERS}w)")
+        ax.text(i, wt + write_times.max() * 0.02,
+                "\n".join(label_parts),
+                ha="center", va="bottom", fontsize=9, fontweight="bold")
 
     ax.set_xticks(x)
-    ax.set_xticklabels([PHASE_LABELS.get(p, p) for p in phases_v], fontsize=9)
-    ax.set_ylabel("Time (ms)", fontsize=10)
-    title = "Latency Breakdown per Phase"
-    if source_name:
-        title += f" — {source_name}"
-    ax.set_title(title, fontsize=11, fontweight="bold")
-    ax.legend(fontsize=8, loc="upper right")
-    ax.grid(axis="y", alpha=0.3, linestyle="--", zorder=0)
-    for spine in ["top", "right"]:
-        ax.spines[spine].set_visible(False)
+    labels = [PHASE_LABELS.get(p, p).replace("\n", " ") for p in phases_v]
+    ax.set_xticklabels(labels, rotation=25, ha='right', fontsize=11)
+    ax.set_ylabel("End-to-End Write Time (ms)", fontsize=13, fontweight="bold")
+    ax.set_ylim(0, write_times.max() * 1.25)
 
-    plt.tight_layout()
+    title = "Per-Phase Write Latency"
+    if source_name:
+        title += f" ({source_name})"
+    ax.set_title(title, fontsize=14, fontweight="bold", pad=12)
+    ax.grid(axis="y", alpha=0.15, linestyle="--", zorder=0)
+
+    # Legend
+    handles, lbls = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend(handles, lbls, loc="upper left", fontsize=10,
+                  framealpha=0.95, edgecolor="#cccccc", fancybox=True)
+
+    # Caption note
+    ax.text(0.98, 0.02,
+            "NN overhead (orange) is sequential on main thread.\n"
+            "*SGD/Exploration times are cumulative across\n"
+            " parallel workers (overlap with compression).",
+            transform=ax.transAxes, fontsize=8, color="#666",
+            ha="right", va="bottom",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
+                      edgecolor="#ccc", alpha=0.9))
+
+    _sc_finalize(fig, pad=2.0)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
@@ -1273,7 +1464,7 @@ def make_algorithm_histogram(chunk_csv_paths, output_path):
     n_actions = len(all_actions)
     n_datasets = len(all_counts)
 
-    fig, ax = plt.subplots(figsize=(max(10, n_actions * 0.8), 6), facecolor="white")
+    fig, ax = plt.subplots(figsize=(max(7, n_actions * 0.8), 5), facecolor="white")
     x = np.arange(n_actions)
     width = 0.8 / n_datasets
 
@@ -1283,18 +1474,333 @@ def make_algorithm_histogram(chunk_csv_paths, output_path):
         total = sum(vals) or 1
         pcts = [v / total * 100 for v in vals]
         offset = (di - n_datasets / 2 + 0.5) * width
-        ax.bar(x + offset, pcts, width * 0.9, label=ds_name, zorder=3, alpha=0.85)
+        ax.bar(x + offset, pcts, width * 0.9, label=ds_name,
+               edgecolor="black", linewidth=0.4, zorder=3, alpha=0.85)
 
     ax.set_xticks(x)
-    ax.set_xticklabels(all_actions, fontsize=8, rotation=45, ha="right")
-    ax.set_ylabel("Selection Frequency (%)", fontsize=10)
-    ax.set_title("Algorithm Selection Distribution (NN phases)", fontsize=11, fontweight="bold")
-    ax.legend(fontsize=8, loc="upper right")
-    ax.grid(axis="y", alpha=0.3, linestyle="--", zorder=0)
-    for spine in ["top", "right"]:
-        ax.spines[spine].set_visible(False)
+    ax.set_xticklabels(all_actions, rotation=30, ha="right")
+    ax.set_ylabel("Selection Frequency (%)")
+    ax.set_title("Algorithm Selection Distribution (NN phases)", fontweight="bold")
+    ax.legend(loc="upper right")
+    ax.grid(axis="y", alpha=0.2, linestyle="--", zorder=0)
 
-    plt.tight_layout()
+    _sc_finalize(fig, pad=1.5)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# C4: Cross-Dataset Convergence Comparison
+# ═══════════════════════════════════════════════════════════════════════
+
+def make_cross_dataset_convergence_figure(ts_csv_paths, dataset_names, output_path):
+    """Overlay MAPE convergence curves from multiple datasets on one plot.
+
+    Args:
+        ts_csv_paths: list of timestep CSV file paths
+        dataset_names: list of dataset display names (same order)
+        output_path: output PNG path
+    """
+    dataset_colors = ["#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#9b59b6",
+                      "#1abc9c", "#e67e22", "#34495e"]
+    dataset_linestyles = ["-", "--", "-.", ":", "-", "--", "-.", ":"]
+    dataset_markers = ["o", "s", "D", "^", "v", "<", ">", "p"]
+    fig, ax = plt.subplots(figsize=(7, 5))
+
+    for i, (csv_path, ds_name) in enumerate(zip(ts_csv_paths, dataset_names)):
+        if not os.path.exists(csv_path):
+            continue
+        rows = parse_csv(csv_path)
+        # Filter to nn-rl phase
+        rl_rows = [r for r in rows if r.get("phase", "nn-rl") == "nn-rl"]
+        if not rl_rows:
+            rl_rows = rows  # fallback for old CSV without phase column
+        timesteps = np.array([g(r, "timestep") for r in rl_rows])
+        mape = np.array([g(r, "mape_ratio", default=-1) for r in rl_rows])
+        if mape[0] < 0:
+            mape = np.array([g(r, "smape_ratio") for r in rl_rows])
+        clipped = np.clip(mape, 0, 300)
+        color = dataset_colors[i % len(dataset_colors)]
+        ls = dataset_linestyles[i % len(dataset_linestyles)]
+        marker = dataset_markers[i % len(dataset_markers)]
+        ax.plot(timesteps, clipped, color=color, linewidth=2.0, marker=marker,
+                markersize=6, linestyle=ls, label=ds_name, alpha=0.85)
+
+    ax.axhline(20, color="#e67e22", linewidth=1, linestyle="--", alpha=0.6,
+               label="20% target")
+    ax.set_xlabel("Timestep", fontweight="bold")
+    ax.set_ylabel("Ratio MAPE (%)", fontweight="bold")
+    ax.set_title("Online Learning Convergence Across Datasets (nn-rl)",
+                 fontweight="bold")
+    ax.set_ylim(0, 300)
+    ax.legend(loc="upper right")
+    ax.grid(axis="y", alpha=0.2, linestyle="--")
+    ax.grid(axis="y", which='minor', alpha=0.1, linestyle=':')
+    ax.minorticks_on()
+
+    _sc_finalize(fig, pad=1.5)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# E1: Policy Mode Comparison
+# ═══════════════════════════════════════════════════════════════════════
+
+def make_policy_comparison_figure(policy_data, output_path):
+    """Compare ratio and throughput across cost model policies.
+
+    Args:
+        policy_data: dict of {policy_label: [PhaseResult rows]}
+                     e.g. {"balanced": rows, "ratio-only": rows, "speed-only": rows}
+        output_path: output PNG path
+    """
+    policy_colors = {"balanced": "#3498db", "ratio-only": "#e74c3c",
+                     "speed-only": "#2ecc71"}
+    policies = list(policy_data.keys())
+    nn_phases = ["nn", "nn-rl", "nn-rl+exp50"]
+
+    fig, axes = plt.subplots(1, 3, figsize=(14, 5))
+    fig.suptitle("Cost Model Policy Comparison (NN phases)",
+                 fontsize=14, fontweight="bold")
+
+    # Panel 1: Ratio per policy
+    ax = axes[0]
+    x = np.arange(len(policies))
+    ratios = []
+    for pol in policies:
+        rows = policy_data[pol]
+        nn_rows = [r for r in rows if r.get("phase", "") in nn_phases]
+        if nn_rows:
+            ratios.append(max(g(r, "ratio") for r in nn_rows))
+        else:
+            ratios.append(0)
+    colors = [policy_colors.get(p, "#bdc3c7") for p in policies]
+    bars = ax.bar(x, ratios, color=colors, edgecolor="black", linewidth=0.4)
+    for i, v in enumerate(ratios):
+        ax.text(i, v, f"{v:.2f}x", ha="center", va="bottom", fontsize=8)
+    ax.set_xticks(x)
+    ax.set_xticklabels(policies, rotation=30, ha='right')
+    ax.set_ylabel("Best NN Compression Ratio")
+    ax.set_title("Compression Ratio", fontweight="bold")
+    ax.grid(axis="y", alpha=0.2, linestyle="--")
+
+    # Panel 2: Throughput per policy
+    ax = axes[1]
+    throughputs = []
+    for pol in policies:
+        rows = policy_data[pol]
+        nn_rows = [r for r in rows if r.get("phase", "") in nn_phases]
+        if nn_rows:
+            throughputs.append(max(g(r, "write_mibps", "write_mbps") for r in nn_rows))
+        else:
+            throughputs.append(0)
+    bars = ax.bar(x, throughputs, color=colors, edgecolor="black", linewidth=0.4)
+    for i, v in enumerate(throughputs):
+        ax.text(i, v, f"{v:.0f}", ha="center", va="bottom", fontsize=8)
+    ax.set_xticks(x)
+    ax.set_xticklabels(policies, rotation=30, ha='right')
+    ax.set_ylabel("Best NN Write Throughput (MiB/s)")
+    ax.set_title("Write Throughput", fontweight="bold")
+    ax.grid(axis="y", alpha=0.2, linestyle="--")
+    ax.ticklabel_format(axis='y', style='sci', scilimits=(-3, 4))
+
+    # Panel 3: Pareto scatter (ratio vs throughput, one point per policy+phase)
+    ax = axes[2]
+    for pol in policies:
+        rows = policy_data[pol]
+        color = policy_colors.get(pol, "#bdc3c7")
+        for r in rows:
+            phase = r.get("phase", "")
+            if phase not in nn_phases:
+                continue
+            ratio = g(r, "ratio")
+            wtp = g(r, "write_mibps", "write_mbps")
+            label_text = PHASE_LABELS.get(phase, phase).replace("\n", " ")
+            ax.scatter(ratio, wtp, s=100, color=color, edgecolors="black",
+                       linewidth=0.8, zorder=5)
+            ax.annotate(f"{pol}\n{label_text}", (ratio, wtp),
+                        textcoords="offset points", xytext=(6, 6),
+                        fontsize=7, color="#333")
+    ax.set_xlabel("Compression Ratio")
+    ax.set_ylabel("Write Throughput (MiB/s)")
+    ax.set_title("Ratio vs Throughput (Pareto)", fontweight="bold")
+    ax.grid(alpha=0.2, linestyle="--")
+    ax.ticklabel_format(axis='y', style='sci', scilimits=(-3, 4))
+
+    _sc_finalize(fig, pad=1.5, rect=[0, 0, 1, 0.94])
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# F1: Chunk-Size Scaling
+# ═══════════════════════════════════════════════════════════════════════
+
+def make_chunk_scaling_figure(chunk_data, output_path):
+    """Plot ratio and throughput vs chunk size.
+
+    Args:
+        chunk_data: dict of {chunk_mb: {phase: {"ratio": float, "write": float}}}
+        output_path: output PNG path
+    """
+    chunk_sizes = sorted(chunk_data.keys())
+    phases = ["fixed-zstd", "nn", "nn-rl"]
+    phase_styles = {
+        "fixed-zstd": {"color": "#1a5276", "marker": "s", "ls": "-"},
+        "nn":         {"color": "#e67e22", "marker": "o", "ls": "--"},
+        "nn-rl":      {"color": "#8e44ad", "marker": "D", "ls": "-."},
+    }
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle("Chunk-Size Scaling Study", fontsize=14, fontweight="bold")
+
+    for phase in phases:
+        sty = phase_styles.get(phase, {"color": "black", "marker": ".", "ls": "-"})
+        ratios = [chunk_data[c].get(phase, {}).get("ratio", 0) for c in chunk_sizes]
+        writes = [chunk_data[c].get(phase, {}).get("write", 0) for c in chunk_sizes]
+        label = PHASE_LABELS.get(phase, phase).replace("\n", " ")
+
+        ax1.plot(chunk_sizes, ratios, color=sty["color"], marker=sty["marker"],
+                 linestyle=sty["ls"], linewidth=2.0, markersize=6, label=label)
+        ax2.plot(chunk_sizes, writes, color=sty["color"], marker=sty["marker"],
+                 linestyle=sty["ls"], linewidth=2.0, markersize=6, label=label)
+
+    for ax, ylabel, title in [
+        (ax1, "Compression Ratio", "Ratio vs Chunk Size"),
+        (ax2, "Write Throughput (MiB/s)", "Throughput vs Chunk Size"),
+    ]:
+        ax.set_xlabel("Chunk Size (MB)", fontweight="bold")
+        ax.set_ylabel(ylabel, fontweight="bold")
+        ax.set_title(title, fontweight="bold")
+        ax.set_xscale("log", base=2)
+        ax.set_xticks(chunk_sizes)
+        ax.set_xticklabels([str(c) for c in chunk_sizes])
+        ax.legend()
+        ax.grid(alpha=0.2, linestyle="--")
+        ax.grid(which='minor', alpha=0.1, linestyle=':')
+        ax.minorticks_on()
+        ax.ticklabel_format(axis='y', style='sci', scilimits=(-3, 4))
+
+    _sc_finalize(fig, pad=1.5, rect=[0, 0, 1, 0.94])
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# F2: Data-Size Scaling
+# ═══════════════════════════════════════════════════════════════════════
+
+def make_size_scaling_figure(size_data, output_path):
+    """Plot ratio and throughput vs dataset size.
+
+    Args:
+        size_data: dict of {size_mb: {phase: {"ratio": float, "write": float}}}
+        output_path: output PNG path
+    """
+    sizes = sorted(size_data.keys())
+    phases = ["no-comp", "fixed-zstd", "nn", "nn-rl"]
+    phase_styles = {
+        "no-comp":    {"color": "#7f8c8d", "marker": "x", "ls": ":"},
+        "fixed-zstd": {"color": "#1a5276", "marker": "s", "ls": "-"},
+        "nn":         {"color": "#e67e22", "marker": "o", "ls": "--"},
+        "nn-rl":      {"color": "#8e44ad", "marker": "D", "ls": "-."},
+    }
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle("Data-Size Scaling Study (Gray-Scott)", fontsize=14, fontweight="bold")
+
+    for phase in phases:
+        sty = phase_styles.get(phase, {"color": "black", "marker": ".", "ls": "-"})
+        ratios = [size_data[s].get(phase, {}).get("ratio", 0) for s in sizes]
+        writes = [size_data[s].get(phase, {}).get("write", 0) for s in sizes]
+        label = PHASE_LABELS.get(phase, phase).replace("\n", " ")
+
+        ax1.plot(sizes, ratios, color=sty["color"], marker=sty["marker"],
+                 linestyle=sty["ls"], linewidth=2.0, markersize=6, label=label)
+        ax2.plot(sizes, writes, color=sty["color"], marker=sty["marker"],
+                 linestyle=sty["ls"], linewidth=2.0, markersize=6, label=label)
+
+    for ax, ylabel, title in [
+        (ax1, "Compression Ratio", "Ratio vs Dataset Size"),
+        (ax2, "Write Throughput (MiB/s)", "Throughput vs Dataset Size"),
+    ]:
+        ax.set_xlabel("Dataset Size (MB)", fontweight="bold")
+        ax.set_ylabel(ylabel, fontweight="bold")
+        ax.set_title(title, fontweight="bold")
+        ax.set_xscale("log")
+        ax.legend()
+        ax.grid(alpha=0.2, linestyle="--")
+        ax.grid(which='minor', alpha=0.1, linestyle=':')
+        ax.minorticks_on()
+        ax.ticklabel_format(axis='y', style='sci', scilimits=(-3, 4))
+
+    _sc_finalize(fig, pad=1.5, rect=[0, 0, 1, 0.94])
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# I1: Rate-Distortion Curves
+# ═══════════════════════════════════════════════════════════════════════
+
+def make_rate_distortion_figure(rd_data, output_path):
+    """Plot compression ratio vs error bound for lossy evaluation.
+
+    Args:
+        rd_data: dict of {error_bound_str: {phase: {"ratio": float, "write": float}}}
+        output_path: output PNG path
+    """
+    ebs = sorted(rd_data.keys(), key=lambda x: float(x) if x != "lossless" else 0)
+    phases = ["nn", "nn-rl", "nn-rl+exp50"]
+    phase_styles = {
+        "nn":          {"color": "#e67e22", "marker": "o", "ls": "--"},
+        "nn-rl":       {"color": "#8e44ad", "marker": "D", "ls": "-"},
+        "nn-rl+exp50": {"color": "#c0392b", "marker": "s", "ls": "-."},
+    }
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle("Lossy Rate-Distortion (Hurricane Isabel)", fontsize=14, fontweight="bold")
+
+    eb_floats = [float(e) if e != "lossless" else 0 for e in ebs]
+
+    for phase in phases:
+        sty = phase_styles.get(phase, {"color": "black", "marker": ".", "ls": "-"})
+        ratios = [rd_data[e].get(phase, {}).get("ratio", 0) for e in ebs]
+        writes = [rd_data[e].get(phase, {}).get("write", 0) for e in ebs]
+        label = PHASE_LABELS.get(phase, phase).replace("\n", " ")
+
+        ax1.plot(range(len(ebs)), ratios, color=sty["color"], marker=sty["marker"],
+                 linestyle=sty["ls"], linewidth=2.0, markersize=6, label=label)
+        ax2.plot(range(len(ebs)), writes, color=sty["color"], marker=sty["marker"],
+                 linestyle=sty["ls"], linewidth=2.0, markersize=6, label=label)
+
+    for ax, ylabel, title in [
+        (ax1, "Compression Ratio", "Ratio vs Error Bound"),
+        (ax2, "Write Throughput (MiB/s)", "Throughput vs Error Bound"),
+    ]:
+        ax.set_xlabel("Error Bound", fontweight="bold")
+        ax.set_ylabel(ylabel, fontweight="bold")
+        ax.set_title(title, fontweight="bold")
+        ax.set_xticks(range(len(ebs)))
+        ax.set_xticklabels(ebs)
+        ax.legend()
+        ax.grid(alpha=0.2, linestyle="--")
+        ax.grid(which='minor', alpha=0.1, linestyle=':')
+        ax.minorticks_on()
+        ax.ticklabel_format(axis='y', style='sci', scilimits=(-3, 4))
+
+    _sc_finalize(fig, pad=1.5, rect=[0, 0, 1, 0.94])
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)

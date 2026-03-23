@@ -371,10 +371,19 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
 
     if (need_timing) {
         cudaEventRecord(ctx->t_stop, stream);
-        cudaEventSynchronize(ctx->t_stop);
+    }
+    /* Always sync the stream so that get_compressed_output_size() can safely
+     * read the compressed output metadata.  cudaEventSynchronize alone is
+     * insufficient when nvcomp's get_compressed_output_size() does an
+     * internal cudaMemcpy on a different (default) stream — the event sync
+     * blocks the host but does not establish cross-stream memory visibility
+     * in per-thread default-stream mode. */
+    cudaStreamSynchronize(stream);
+    if (need_timing) {
         cudaEventElapsedTime(&primary_comp_time_ms, ctx->t_start, ctx->t_stop);
     }
-    diag_compression_ms = std::max(5.0f, primary_comp_time_ms);
+    diag_compression_ms = std::max(5.0f, primary_comp_time_ms);  /* clamped for MAPE */
+    float diag_compression_ms_raw = primary_comp_time_ms;       /* unclamped for breakdown */
 
     size_t compressed_size = compressor->get_compressed_output_size(d_comp_target);
     size_t total_size      = header_size + compressed_size;
@@ -837,6 +846,7 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
         di.stats_ms = diag_stats_ms;
         di.preprocessing_ms = diag_preprocessing_ms;
         di.compression_ms = diag_compression_ms;
+        di.compression_ms_raw = diag_compression_ms_raw;
         di.exploration_ms = diag_exploration_ms;
         di.sgd_ms = diag_sgd_ms;
         di.input_size = input_size;

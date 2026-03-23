@@ -233,7 +233,7 @@ struct ChunkDiagInput {
     int nn_action, nn_original_action;
     bool exploration_triggered, sgd_fired;
     float nn_inference_ms, stats_ms, preprocessing_ms;
-    float compression_ms, exploration_ms, sgd_ms;
+    float compression_ms, compression_ms_raw, exploration_ms, sgd_ms;
     size_t input_size, primary_compressed_size, compressed_size;
     float predicted_ratio, predicted_comp_time, predicted_decomp_time, predicted_psnr;
     double error_bound;
