@@ -60,6 +60,7 @@
 
 #include "gpucompress.h"
 #include "gpucompress_hdf5_vol.h"
+#include "../kendall_tau_profiler.cuh"
 
 /* ============================================================
  * Compile-time constants
@@ -104,6 +105,7 @@ static char OUT_CSV[MAX_PATH_LEN];
 static char OUT_CHUNKS[MAX_PATH_LEN];
 static char OUT_TSTEP[MAX_PATH_LEN];
 static char OUT_TSTEP_CHUNKS[MAX_PATH_LEN];
+static char OUT_RANKING[MAX_PATH_LEN];
 
 /* HDF5 filter ID */
 #define H5Z_FILTER_GPUCOMPRESS    305
@@ -1172,6 +1174,8 @@ int main(int argc, char **argv)
         snprintf(OUT_TSTEP, sizeof(OUT_TSTEP), "%s/benchmark_%s_timesteps.csv", od, dataset_name);
         snprintf(OUT_TSTEP_CHUNKS, sizeof(OUT_TSTEP_CHUNKS),
                  "%s/benchmark_%s_timestep_chunks.csv", od, dataset_name);
+        snprintf(OUT_RANKING, sizeof(OUT_RANKING),
+                 "%s/benchmark_%s_ranking.csv", od, dataset_name);
     }
     mkdirs(OUT_DIR);
     remove(OUT_CHUNKS);
@@ -1360,6 +1364,11 @@ int main(int argc, char **argv)
                     "sgd_fired,exploration_triggered,"
                     "feat_entropy,feat_mad,feat_deriv\n");
         }
+        /* Open ranking quality CSV */
+        FILE *ranking_csv = fopen(OUT_RANKING, "w");
+        if (ranking_csv)
+            write_ranking_csv_header(ranking_csv);
+
         /* Milestone indices: 0%, 25%, 50%, 75%, last */
         int milestones[5] = {0, n_fields/4, n_fields/2, 3*n_fields/4, n_fields-1};
 
@@ -1561,6 +1570,22 @@ int main(int argc, char **argv)
                                 d.feat_entropy, d.feat_mad, d.feat_deriv);
                     }
                 }
+
+                /* Kendall τ ranking quality at milestones */
+                if (ranking_csv && is_ranking_milestone(fi, n_fields)) {
+                    size_t sdr_chunk_bytes = slice_floats * last_chunk * sizeof(float);
+                    float bw = gpucompress_get_bandwidth_bytes_per_ms();
+                    RankingMilestoneResult tau_result = {};
+                    run_ranking_profiler(
+                        d_data, total_bytes, sdr_chunk_bytes,
+                        error_bound, rank_w0, rank_w1, rank_w2, bw,
+                        3, ranking_csv, phase_name, fi, &tau_result);
+                    printf("    [τ] F=%d: τ=%.3f  top1=%.0f%%  regret=%.3fx  (%.0fms)\n",
+                           fi, tau_result.mean_tau,
+                           tau_result.top1_accuracy * 100.0,
+                           tau_result.mean_regret,
+                           tau_result.profiling_ms);
+                }
             }
 
             /* Store final result for summary */
@@ -1621,6 +1646,7 @@ int main(int argc, char **argv)
         H5Pclose(dcpl_ts);
         if (ts_csv) fclose(ts_csv);
         if (tc_csv) fclose(tc_csv);
+        if (ranking_csv) { fclose(ranking_csv); printf("  Ranking quality CSV: %s\n", OUT_RANKING); }
     }
 
     /* ── Write summary CSV ── */

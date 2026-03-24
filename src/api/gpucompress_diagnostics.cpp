@@ -159,6 +159,14 @@ void recordChunkDiagnostic(const ChunkDiagInput& d)
             h->explore_costs[i]        = d.explore_costs[i];
         }
 
+        /* NN predicted ranking (all configs sorted by predicted cost) */
+        h->predicted_ranking_count = d.top_actions_count;
+        if (d.top_actions && d.top_actions_count > 0) {
+            int nc = std::min(d.top_actions_count, 32);
+            for (int i = 0; i < nc; i++)
+                h->predicted_ranking[i] = d.top_actions[i];
+        }
+
         /* Features for deferred decomp SGD */
         h->feat_action   = d.nn_original_action;
         h->feat_eb_enc   = static_cast<float>(log10(fmax(d.error_bound, 1e-7)));

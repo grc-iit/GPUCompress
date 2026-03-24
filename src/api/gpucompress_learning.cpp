@@ -210,3 +210,7 @@ extern "C" void gpucompress_set_bandwidth(float bw_gbps) {
     if (bw_gbps > 0.0f)
         g_measured_bw_bytes_per_ms = bw_gbps * 1e6f;
 }
+
+extern "C" float gpucompress_get_bandwidth_bytes_per_ms(void) {
+    return g_measured_bw_bytes_per_ms;
+}

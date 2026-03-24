@@ -248,6 +248,9 @@ struct ChunkDiagInput {
     float explore_ratios[31];
     float explore_comp_ms[31];
     float explore_costs[31];
+    /* NN predicted ranking (all 32 configs sorted by predicted cost) */
+    const int* top_actions;  /* nullptr if non-AUTO path */
+    int top_actions_count;   /* 32 if AUTO, 0 otherwise */
 };
 
 /**

@@ -78,6 +78,7 @@
 #include "gpucompress.h"
 #include "gpucompress_grayscott.h"
 #include "gpucompress_hdf5_vol.h"
+#include "../kendall_tau_profiler.cuh"
 
 /* ============================================================
  * Compile-time constants
@@ -112,6 +113,7 @@ static char OUT_CSV[512];
 static char OUT_CHUNKS[512];
 static char OUT_TSTEP[512];
 static char OUT_TSTEP_CHUNKS[512];
+static char OUT_RANKING[512];
 
 /* HDF5 filter ID */
 #define H5Z_FILTER_GPUCOMPRESS    305
@@ -1138,6 +1140,7 @@ int main(int argc, char **argv)
         snprintf(OUT_CHUNKS, sizeof(OUT_CHUNKS), "%s/benchmark_grayscott_vol_chunks.csv", od);
         snprintf(OUT_TSTEP, sizeof(OUT_TSTEP), "%s/benchmark_grayscott_timesteps.csv", od);
         snprintf(OUT_TSTEP_CHUNKS, sizeof(OUT_TSTEP_CHUNKS), "%s/benchmark_grayscott_timestep_chunks.csv", od);
+        snprintf(OUT_RANKING, sizeof(OUT_RANKING), "%s/benchmark_grayscott_ranking.csv", od);
     }
 
     /* Create output directory (recursive) and clear stale chunks CSV */
@@ -1503,6 +1506,11 @@ int main(int argc, char **argv)
             fprintf(tc_csv, ",feat_entropy,feat_mad,feat_deriv\n");
         }
 
+        /* Open ranking quality CSV (shared across phases) */
+        FILE *ranking_csv = fopen(OUT_RANKING, "w");
+        if (ranking_csv)
+            write_ranking_csv_header(ranking_csv);
+
         for (int pi = 0; pi < n_ts_phases; pi++) {
             const char *phase_name = ts_phases[pi].name;
             int do_sgd   = ts_phases[pi].sgd;
@@ -1828,6 +1836,23 @@ int main(int argc, char **argv)
                     }
                 }
 
+                /* ── Kendall τ ranking quality at milestones ── */
+                if (ranking_csv && is_ranking_milestone(t, timesteps)) {
+                    size_t gs_chunk_bytes = (size_t)L * L * chunk_z * sizeof(float);
+                    size_t gs_total_bytes = (size_t)L * L * L * sizeof(float);
+                    float bw = gpucompress_get_bandwidth_bytes_per_ms();
+                    RankingMilestoneResult tau_result = {};
+                    run_ranking_profiler(
+                        d_v, gs_total_bytes, gs_chunk_bytes,
+                        error_bound, rank_w0, rank_w1, rank_w2, bw,
+                        3, ranking_csv, phase_name, t, &tau_result);
+                    printf("    [τ] T=%d: τ=%.3f  top1=%.0f%%  regret=%.3fx  (%.0fms)\n",
+                           t, tau_result.mean_tau,
+                           tau_result.top1_accuracy * 100.0,
+                           tau_result.mean_regret,
+                           tau_result.profiling_ms);
+                }
+
                 if (ts_csv) {
                     fprintf(ts_csv, "%s,%d,%d,%.2f,%.2f,%.4f,%.2f,%.2f,%.2f,%d,%d,%d,%llu,%.1f,%.1f,%zu,"
                             "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
@@ -1902,6 +1927,10 @@ int main(int argc, char **argv)
         if (tc_csv) {
             fclose(tc_csv);
             printf("  Timestep chunks CSV: %s\n", OUT_TSTEP_CHUNKS);
+        }
+        if (ranking_csv) {
+            fclose(ranking_csv);
+            printf("  Ranking quality CSV: %s\n", OUT_RANKING);
         }
 
         gpucompress_disable_online_learning();

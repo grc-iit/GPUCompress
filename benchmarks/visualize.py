@@ -652,30 +652,168 @@ def make_r2_figure(ts_csv_path, output_path):
     }
     phases_present = [p for p in phase_order if p in by_phase]
 
-    fig, ax = plt.subplots(1, 1, figsize=(14, 5))
     title_suffix = "Fields" if is_field_based else "Timesteps"
-    fig.suptitle(f"Compression Ratio Prediction R² Over {title_suffix}\n"
-                 "(coefficient of determination, per-timestep two-pass computation)",
-                 fontsize=14, fontweight="bold", y=0.99)
 
+    # Collect all data first
+    phase_data = {}
     for ph in phases_present:
         ph_rows = by_phase[ph]
         timesteps = np.array([g(r, "timestep", "field_idx") for r in ph_rows])
         r2 = np.array([g(r, "r2_ratio") for r in ph_rows])
+        phase_data[ph] = (timesteps, r2)
 
+    # Check if we need a split view (nn phase has very negative R²)
+    all_r2 = np.concatenate([r2 for _, r2 in phase_data.values()])
+    needs_split = np.min(all_r2) < -2.0 and np.max(all_r2) > 0.5
+
+    if needs_split:
+        fig, (ax_full, ax_zoom) = plt.subplots(2, 1, figsize=(14, 8),
+                                                 gridspec_kw={"height_ratios": [1, 2]})
+        fig.suptitle(f"Compression Ratio Prediction R² Over {title_suffix}\n"
+                     "(coefficient of determination, per-timestep two-pass computation)",
+                     fontsize=14, fontweight="bold", y=0.99)
+
+        for ph in phases_present:
+            ts, r2 = phase_data[ph]
+            sty = phase_styles.get(ph, {"color": "black", "ls": "-", "marker": ".", "lw": 2.0})
+            for ax in (ax_full, ax_zoom):
+                ax.plot(ts, r2, color=sty["color"], linestyle=sty["ls"],
+                        marker=sty["marker"], markersize=5, linewidth=2.0,
+                        label=ph, alpha=0.9, zorder=3)
+
+        # Full range panel
+        ax_full.axhline(0.0, color="#e74c3c", linewidth=1, linestyle="--", alpha=0.4)
+        ax_full.set_ylabel("R² (full range)", fontweight="bold")
+        ax_full.grid(axis="y", alpha=0.2, linestyle="--")
+        ax_full.legend(loc="lower right", fontsize=9)
+        ax_full.set_title("All phases (full scale)", fontsize=10, loc="left")
+
+        # Zoomed panel — focus on learning phases
+        ax_zoom.axhline(1.0, color="#27ae60", linewidth=1, linestyle="--", alpha=0.6, label="Perfect (R²=1)")
+        ax_zoom.axhline(0.0, color="#e74c3c", linewidth=1, linestyle="--", alpha=0.4, label="R²=0 (mean baseline)")
+        ax_zoom.set_ylim(-0.5, 1.05)
+        ax_zoom.set_ylabel("R² (zoomed)", fontweight="bold")
+        ax_zoom.set_xlabel(x_label, fontweight="bold")
+        ax_zoom.grid(axis="y", alpha=0.2, linestyle="--")
+        ax_zoom.grid(axis="y", which='minor', alpha=0.1, linestyle=':')
+        ax_zoom.minorticks_on()
+        ax_zoom.legend(loc="lower right", fontsize=9)
+        ax_zoom.set_title("Learning phases detail (R² > -0.5)", fontsize=10, loc="left")
+    else:
+        fig, ax = plt.subplots(1, 1, figsize=(14, 5))
+        fig.suptitle(f"Compression Ratio Prediction R² Over {title_suffix}\n"
+                     "(coefficient of determination, per-timestep two-pass computation)",
+                     fontsize=14, fontweight="bold", y=0.99)
+
+        for ph in phases_present:
+            ts, r2 = phase_data[ph]
+            sty = phase_styles.get(ph, {"color": "black", "ls": "-", "marker": ".", "lw": 2.0})
+            ax.plot(ts, r2, color=sty["color"], linestyle=sty["ls"],
+                    marker=sty["marker"], markersize=6, linewidth=2.0,
+                    label=ph, alpha=0.9, zorder=3)
+
+        ax.axhline(1.0, color="#27ae60", linewidth=1, linestyle="--", alpha=0.6, label="Perfect (R²=1)")
+        ax.axhline(0.0, color="#e74c3c", linewidth=1, linestyle="--", alpha=0.4, label="R²=0 (mean baseline)")
+        ax.set_ylabel("R² Score", fontweight="bold")
+        ax.set_xlabel(x_label, fontweight="bold")
+        ax.grid(axis="y", alpha=0.2, linestyle="--")
+        ax.grid(axis="y", which='minor', alpha=0.1, linestyle=':')
+        ax.minorticks_on()
+        ax.legend(loc="lower right")
+
+    _sc_finalize(fig, pad=1.5, rect=[0, 0, 1, 0.96])
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
+def make_ranking_quality_figure(ranking_csv_path, output_path):
+    """Plot Kendall tau-b, top-1 accuracy, and top-1 regret over milestone timesteps."""
+    rows = parse_csv(ranking_csv_path)
+    if not rows:
+        print(f"  No ranking data in {ranking_csv_path}, skipping.")
+        return
+
+    if "kendall_tau_b" not in rows[0]:
+        print(f"  No kendall_tau_b column in {ranking_csv_path}, skipping.")
+        return
+
+    by_phase = {}
+    for r in rows:
+        ph = r.get("phase", "nn-rl")
+        by_phase.setdefault(ph, []).append(r)
+
+    phase_order = ["nn", "nn-rl", "nn-rl+exp50"]
+    phase_styles = {
+        "nn":          {"color": "#7f8c8d", "ls": ":",  "marker": "s", "lw": 2.0},
+        "nn-rl":       {"color": "#8e44ad", "ls": "-",  "marker": "o", "lw": 2.0},
+        "nn-rl+exp50": {"color": "#c0392b", "ls": "--", "marker": "D", "lw": 2.0},
+    }
+    phases_present = [p for p in phase_order if p in by_phase]
+
+    # Aggregate per-phase per-timestep: mean tau, top1 accuracy, mean regret
+    def aggregate(ph_rows):
+        ts_map = {}
+        for r in ph_rows:
+            t = int(g(r, "timestep"))
+            ts_map.setdefault(t, []).append(r)
+        timesteps = sorted(ts_map.keys())
+        mean_tau, std_tau, top1_acc, mean_regret = [], [], [], []
+        for t in timesteps:
+            chunk_rows = ts_map[t]
+            taus = [g(r, "kendall_tau_b") for r in chunk_rows]
+            top1s = [g(r, "top1_correct") for r in chunk_rows]
+            regrets = [g(r, "top1_regret") for r in chunk_rows]
+            mean_tau.append(np.mean(taus))
+            std_tau.append(np.std(taus))
+            top1_acc.append(np.mean(top1s) * 100.0)
+            mean_regret.append(np.mean(regrets))
+        return np.array(timesteps), np.array(mean_tau), np.array(std_tau), np.array(top1_acc), np.array(mean_regret)
+
+    fig, (ax_tau, ax_top1, ax_regret) = plt.subplots(3, 1, figsize=(14, 10))
+    fig.suptitle("NN Algorithm Ranking Quality Over Timesteps\n"
+                 "(Kendall \u03c4-b, Top-1 Accuracy, Top-1 Regret at milestones)",
+                 fontsize=14, fontweight="bold", y=0.99)
+
+    for ph in phases_present:
+        ts, mt, st, t1, mr = aggregate(by_phase[ph])
         sty = phase_styles.get(ph, {"color": "black", "ls": "-", "marker": ".", "lw": 2.0})
-        ax.plot(timesteps, r2, color=sty["color"], linestyle=sty["ls"],
-                marker=sty["marker"], markersize=6, linewidth=2.0,
-                label=ph, alpha=0.9, zorder=3)
 
-    ax.axhline(1.0, color="#27ae60", linewidth=1, linestyle="--", alpha=0.6, label="Perfect (R²=1)")
-    ax.axhline(0.0, color="#e74c3c", linewidth=1, linestyle="--", alpha=0.4, label="R²=0 (mean baseline)")
-    ax.set_ylabel("R² Score", fontweight="bold")
-    ax.set_xlabel(x_label, fontweight="bold")
-    ax.grid(axis="y", alpha=0.2, linestyle="--")
-    ax.grid(axis="y", which='minor', alpha=0.1, linestyle=':')
-    ax.minorticks_on()
-    ax.legend(loc="lower right")
+        ax_tau.plot(ts, mt, color=sty["color"], linestyle=sty["ls"],
+                    marker=sty["marker"], markersize=6, linewidth=2.0,
+                    label=ph, alpha=0.9, zorder=3)
+        ax_tau.fill_between(ts, mt - st, mt + st, color=sty["color"], alpha=0.1)
+
+        ax_top1.plot(ts, t1, color=sty["color"], linestyle=sty["ls"],
+                     marker=sty["marker"], markersize=6, linewidth=2.0,
+                     label=ph, alpha=0.9, zorder=3)
+
+        ax_regret.plot(ts, mr, color=sty["color"], linestyle=sty["ls"],
+                       marker=sty["marker"], markersize=6, linewidth=2.0,
+                       label=ph, alpha=0.9, zorder=3)
+
+    # Tau panel
+    ax_tau.axhline(1.0, color="#27ae60", linewidth=1, linestyle="--", alpha=0.4, label="Perfect (\u03c4=1)")
+    ax_tau.axhline(0.0, color="#e74c3c", linewidth=1, linestyle="--", alpha=0.4, label="Random (\u03c4=0)")
+    ax_tau.set_ylabel("Kendall \u03c4-b", fontweight="bold")
+    ax_tau.set_ylim(-0.2, 1.05)
+    ax_tau.grid(axis="y", alpha=0.2, linestyle="--")
+    ax_tau.legend(loc="lower right", fontsize=9)
+
+    # Top-1 panel
+    ax_top1.set_ylabel("Top-1 Accuracy (%)", fontweight="bold")
+    ax_top1.set_ylim(-5, 105)
+    ax_top1.grid(axis="y", alpha=0.2, linestyle="--")
+    ax_top1.legend(loc="lower right", fontsize=9)
+
+    # Regret panel
+    ax_regret.axhline(1.0, color="#27ae60", linewidth=1, linestyle="--", alpha=0.4, label="Optimal (1.0x)")
+    ax_regret.set_ylabel("Top-1 Regret (x)", fontweight="bold")
+    ax_regret.set_xlabel("Timestep", fontweight="bold")
+    ax_regret.set_ylim(bottom=0.95)
+    ax_regret.grid(axis="y", alpha=0.2, linestyle="--")
+    ax_regret.legend(loc="upper right", fontsize=9)
 
     _sc_finalize(fig, pad=1.5, rect=[0, 0, 1, 0.96])
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)

@@ -57,6 +57,20 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+/* Kendall tau ranking profiler (CUDA, linked from vpic_ranking_profiler.cu) */
+struct RankingMilestoneResult {
+    int timestep; int n_chunks;
+    double mean_tau, std_tau, top1_accuracy, mean_regret, profiling_ms;
+};
+extern "C" int vpic_run_ranking_profiler(
+    const void* d_data, size_t total_bytes, size_t chunk_bytes,
+    double error_bound, float w0, float w1, float w2, float bw_bytes_per_ms,
+    int n_repeats, FILE* csv, const char* phase_name, int timestep,
+    int total_timesteps, RankingMilestoneResult* out);
+extern "C" int vpic_is_ranking_milestone(int t, int total);
+extern "C" void vpic_write_ranking_csv_header(FILE* csv);
+extern "C" float gpucompress_get_bandwidth_bytes_per_ms(void);
+
 // ============================================================
 // Constants
 // ============================================================
@@ -84,6 +98,7 @@ static char RESULTS_DIR[512];
 static char CHUNKS_CSV[600];
 static char TSTEP_CSV[600];
 static char TSTEP_CHUNKS_CSV[600];
+static char RANKING_CSV[600];
 static char AGG_CSV[600];
 
 static void init_csv_paths() {
@@ -101,6 +116,8 @@ static void init_csv_paths() {
              "%s/benchmark_vpic_deck_timesteps.csv", RESULTS_DIR);
     snprintf(TSTEP_CHUNKS_CSV, sizeof(TSTEP_CHUNKS_CSV),
              "%s/benchmark_vpic_deck_timestep_chunks.csv", RESULTS_DIR);
+    snprintf(RANKING_CSV, sizeof(RANKING_CSV),
+             "%s/benchmark_vpic_deck_ranking.csv", RESULTS_DIR);
     snprintf(AGG_CSV, sizeof(AGG_CSV),
              "%s/benchmark_vpic_deck.csv", RESULTS_DIR);
 }
@@ -137,6 +154,10 @@ begin_globals {
     float              reinforce_lr;      // SGD learning rate (default 0.9, env VPIC_LR)
     float              reinforce_mape;    // MAPE threshold for SGD (default 0.20, env VPIC_MAPE_THRESHOLD)
     int                n_runs;            // Number of single-shot repetitions (default 1, env VPIC_RUNS)
+
+    // Ranking quality profiler
+    FILE*              ranking_csv;       // Kendall tau ranking CSV
+    float              rank_w0, rank_w1, rank_w2;  // Cost model weights for profiler
 };
 
 // ============================================================
@@ -868,6 +889,9 @@ begin_initialization {
     H5Eset_auto2(H5E_DEFAULT, NULL, NULL);
     H5VL_gpucompress_set_trace(0);
     gpucompress_set_ranking_weights(rank_w0, rank_w1, rank_w2);
+    global->rank_w0 = rank_w0;
+    global->rank_w1 = rank_w1;
+    global->rank_w2 = rank_w2;
     global->gpucompress_ready = 1;
 
     // Create VPIC adapter handle for fields
@@ -942,6 +966,11 @@ begin_diagnostics {
                 fclose(global->tc_csv);
                 global->tc_csv = NULL;
                 printf("  Timestep chunks CSV: %s\n", TSTEP_CHUNKS_CSV);
+            }
+            if (global->ranking_csv) {
+                fclose(global->ranking_csv);
+                global->ranking_csv = NULL;
+                printf("  Ranking quality CSV: %s\n", RANKING_CSV);
             }
             printf("\n=== VPIC Multi-Timestep complete (%d timesteps x %d phases) ===\n",
                    global->ts_count, 3);
@@ -1137,6 +1166,9 @@ begin_diagnostics {
                             ei, ei, ei, ei);
                 fprintf(global->tc_csv, ",feat_entropy,feat_mad,feat_deriv\n");
             }
+            global->ranking_csv = fopen(RANKING_CSV, "w");
+            if (global->ranking_csv)
+                vpic_write_ranking_csv_header(global->ranking_csv);
 
             /* Reload NN and allocate per-phase weight snapshots so that
              * nn-rl and nn-rl+exp50 start from identical pretrained weights
@@ -1425,6 +1457,23 @@ begin_diagnostics {
                     }
                     fflush(global->tc_csv);
                 }
+            }
+
+            /* Kendall τ ranking quality at milestones */
+            if (global->ranking_csv && vpic_is_ranking_milestone(t, global->timesteps)) {
+                float bw = gpucompress_get_bandwidth_bytes_per_ms();
+                RankingMilestoneResult tau_result = {};
+                vpic_run_ranking_profiler(
+                    d_fields, n_floats * sizeof(float), global->chunk_bytes,
+                    global->diag_error_bound,
+                    global->rank_w0, global->rank_w1, global->rank_w2, bw,
+                    3, global->ranking_csv, phase_name, t,
+                    global->timesteps, &tau_result);
+                printf("    [τ] T=%d: τ=%.3f  top1=%.0f%%  regret=%.3fx  (%.0fms)\n",
+                       t, tau_result.mean_tau,
+                       tau_result.top1_accuracy * 100.0,
+                       tau_result.mean_regret,
+                       tau_result.profiling_ms);
             }
 
             /* Save this phase's updated weights for next timestep */

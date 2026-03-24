@@ -12,6 +12,16 @@ export NVCC_WRAPPER_DEFAULT_COMPILER=${CXX:-g++}
 
 DECK_PATH="${GPU_DIR}/benchmarks/vpic-kokkos/vpic_benchmark_deck.cxx"
 
+# Compile ranking profiler (CUDA) as a separate object
+echo "Compiling vpic_ranking_profiler.cu ..."
+"${VPIC_DIR}/kokkos/bin/nvcc_wrapper" \
+  -I"${GPU_DIR}/include" \
+  -I"${GPU_DIR}/benchmarks" \
+  -std=c++17 \
+  -c "${SCRIPT_DIR}/vpic_ranking_profiler.cu" \
+  -o "${SCRIPT_DIR}/vpic_ranking_profiler.o" \
+  -x cu -expt-extended-lambda -arch=sm_80
+
 # Compile and link the deck
 echo "Compiling vpic_benchmark_deck ..."
 "${VPIC_DIR}/kokkos/bin/nvcc_wrapper" \
@@ -33,6 +43,7 @@ echo "Compiling vpic_benchmark_deck ..."
   -DUSE_LEGACY_PARTICLE_ARRAY -DVPIC_ENABLE_AUTO_TUNING \
   "${VPIC_DIR}/deck/main.cc" \
   "${VPIC_DIR}/deck/wrapper.cc" \
+  "${SCRIPT_DIR}/vpic_ranking_profiler.o" \
   -o vpic_benchmark_deck.Linux \
   -Wl,-rpath,"${VPIC_BUILD}" \
   -L"${VPIC_BUILD}" -lvpic \

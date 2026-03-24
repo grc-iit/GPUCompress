@@ -881,6 +881,9 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
                 di.explore_costs[i] = static_cast<float>(e.cost);
             }
         }
+        /* NN predicted ranking (all 32 configs sorted by predicted cost) */
+        di.top_actions = top_actions;
+        di.top_actions_count = top_actions ? 32 : 0;
         gpucompress::recordChunkDiagnostic(di);
     }
 

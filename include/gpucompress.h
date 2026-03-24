@@ -489,6 +489,13 @@ void gpucompress_set_ranking_weights(float w0, float w1, float w2);
 void gpucompress_set_bandwidth(float bw_gbps);
 
 /**
+ * Get the current storage bandwidth in bytes/ms (used in cost model).
+ *
+ * @return Bandwidth in bytes per millisecond
+ */
+float gpucompress_get_bandwidth_bytes_per_ms(void);
+
+/**
  * Hot-reload neural network weights from a new .nnwt file.
  *
  * Replaces the current NN model without restarting the library.
@@ -606,6 +613,10 @@ typedef struct {
     float  feat_deriv;           /* normalized 2nd derivative */
     float  feat_eb_enc;          /* log10(clip(error_bound, 1e-7)) */
     float  feat_ds_enc;          /* log2(max(data_size, 1)) */
+
+    /* NN predicted ranking (sorted by predicted cost, best first) */
+    int    predicted_ranking[32]; /* action IDs sorted by predicted cost   */
+    int    predicted_ranking_count; /* valid entries (0 if non-AUTO path)  */
 } gpucompress_chunk_diag_t;
 
 /**

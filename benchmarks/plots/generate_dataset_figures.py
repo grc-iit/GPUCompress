@@ -11,6 +11,7 @@ Produces up to 7 figures:
   5b_sgd_exploration_firing.png - SGD/exploration firing rates (balanced only)
   5c_mae_over_time.png     - MAE convergence over timesteps (balanced only)
   5d_r2_over_time.png      - R² score over timesteps (balanced only)
+  5e_ranking_quality.png   - Kendall tau, top-1 accuracy, regret at milestones
 
 Usage:
   python3 generate_dataset_figures.py --dataset hurricane_isabel
@@ -161,6 +162,20 @@ def generate_figures(dataset, policy, out_dir):
 
         out_r2 = os.path.join(out_dir, "5d_r2_over_time.png")
         viz.make_r2_figure(ts_csv, out_r2)
+        count += 1
+
+    # ── 5e. Ranking quality (Kendall tau) ──
+    if csv_base:
+        ranking_csv = os.path.join(data_dir, f"{csv_base}_ranking.csv")
+    elif dataset in DATASETS:
+        ranking_csv = os.path.join(data_dir,
+            DATASETS[dataset].get("agg_csv", "").replace(".csv", "_ranking.csv"))
+    else:
+        ranking_csv = os.path.join(data_dir, f"benchmark_{dataset}_ranking.csv")
+
+    if os.path.exists(ranking_csv):
+        out_ranking = os.path.join(out_dir, "5e_ranking_quality.png")
+        viz.make_ranking_quality_figure(ranking_csv, out_ranking)
         count += 1
 
     return count
