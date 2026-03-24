@@ -2,12 +2,15 @@
 """
 Generate all figures for a single dataset + policy combination.
 
-Produces up to 5 figures:
+Produces up to 7 figures:
   1_summary.png            - 4-panel: ratio, write, read, Pareto (all policies)
   2_latency_breakdown.png  - stacked bar: comp, NN, stats, SGD (balanced only)
   3_algorithm_evolution.png - heatmap: algo per chunk over time (all policies)
   4_predicted_vs_actual.png - per-chunk accuracy at milestones (balanced only)
-  5_learning_dynamics.png  - MAPE convergence + firing rates (balanced only)
+  5a_sgd_convergence.png   - MAPE convergence over timesteps (balanced only)
+  5b_sgd_exploration_firing.png - SGD/exploration firing rates (balanced only)
+  5c_mae_over_time.png     - MAE convergence over timesteps (balanced only)
+  5d_r2_over_time.png      - R² score over timesteps (balanced only)
 
 Usage:
   python3 generate_dataset_figures.py --dataset hurricane_isabel
@@ -150,6 +153,14 @@ def generate_figures(dataset, policy, out_dir):
 
         out_firing = os.path.join(out_dir, "5b_sgd_exploration_firing.png")
         viz.make_sgd_exploration_figure(ts_csv, out_firing)
+        count += 1
+
+        out_mae = os.path.join(out_dir, "5c_mae_over_time.png")
+        viz.make_mae_figure(ts_csv, out_mae)
+        count += 1
+
+        out_r2 = os.path.join(out_dir, "5d_r2_over_time.png")
+        viz.make_r2_figure(ts_csv, out_r2)
         count += 1
 
     return count

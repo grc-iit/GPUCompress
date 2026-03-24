@@ -133,10 +133,13 @@ DEFAULT_GS_CHUNKS = [
     os.path.join(PROJECT_ROOT, "results/benchmark_grayscott_vol_chunks.csv"),
 ]
 DEFAULT_VPIC_TIMESTEPS = [
+    os.path.join(PROJECT_ROOT, "benchmarks/vpic-kokkos/results/benchmark_vpic_deck_timesteps.csv"),
     os.path.join(PROJECT_ROOT, "benchmarks/vpic-kokkos/results/benchmark_vpic_timesteps.csv"),
+    os.path.join(PROJECT_ROOT, "benchmarks/vpic-kokkos/benchmark_vpic_deck_timesteps.csv"),
     os.path.join(PROJECT_ROOT, "benchmarks/vpic-kokkos/benchmark_vpic_timesteps.csv"),
 ]
 DEFAULT_VPIC_TSTEP_CHUNKS = [
+    os.path.join(PROJECT_ROOT, "benchmarks/vpic-kokkos/results/benchmark_vpic_deck_timestep_chunks.csv"),
     os.path.join(PROJECT_ROOT, "benchmarks/vpic-kokkos/results/benchmark_vpic_timestep_chunks.csv"),
 ]
 
@@ -547,6 +550,132 @@ def make_timestep_figure(ts_csv_path, output_path):
             n_fields = len(field_names)
             ax.set_xticks(range(n_fields))
             ax.set_xticklabels(field_names, rotation=30, ha="right", fontsize=9)
+
+    _sc_finalize(fig, pad=1.5, rect=[0, 0, 1, 0.96])
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
+def make_mae_figure(ts_csv_path, output_path):
+    """Plot MAE for ratio/comp_time/decomp_time over timesteps, one line per phase."""
+    rows = parse_csv(ts_csv_path)
+    if not rows:
+        print(f"  No timestep data in {ts_csv_path}, skipping MAE plot.")
+        return
+
+    # Check that MAE columns exist
+    if "mae_ratio" not in rows[0]:
+        print(f"  No MAE columns in {ts_csv_path}, skipping MAE plot.")
+        return
+
+    is_field_based = "field_idx" in rows[0] and "timestep" not in rows[0]
+    x_label = "Field" if is_field_based else "Timestep"
+
+    by_phase = {}
+    for r in rows:
+        ph = r.get("phase", "nn-rl")
+        by_phase.setdefault(ph, []).append(r)
+
+    phase_order = ["nn", "nn-rl", "nn-rl+exp50"]
+    phase_styles = {
+        "nn":          {"color": "#7f8c8d", "ls": ":",  "marker": "s", "lw": 2.0},
+        "nn-rl":       {"color": "#8e44ad", "ls": "-",  "marker": "o", "lw": 2.0},
+        "nn-rl+exp50": {"color": "#c0392b", "ls": "--", "marker": "D", "lw": 2.0},
+    }
+    phases_present = [p for p in phase_order if p in by_phase]
+
+    metric_keys = [
+        ("Compression Ratio", "mae_ratio", ""),
+        ("Compression Time",  "mae_comp_ms", " (ms)"),
+        ("Decompression Time", "mae_decomp_ms", " (ms)"),
+    ]
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10))
+    title_suffix = "Fields" if is_field_based else "Timesteps"
+    fig.suptitle(f"NN Prediction MAE Over {title_suffix}\n"
+                 "(per-metric Mean Absolute Error averaged across all chunks)",
+                 fontsize=14, fontweight="bold", y=0.99)
+
+    for ax, (label, mae_key, unit) in zip(axes, metric_keys):
+        for ph in phases_present:
+            ph_rows = by_phase[ph]
+            timesteps = np.array([g(r, "timestep", "field_idx") for r in ph_rows])
+            mae = np.array([g(r, mae_key) for r in ph_rows])
+
+            sty = phase_styles.get(ph, {"color": "black", "ls": "-", "marker": ".", "lw": 2.0})
+            ax.plot(timesteps, mae, color=sty["color"], linestyle=sty["ls"],
+                    marker=sty["marker"], markersize=6, linewidth=2.0,
+                    label=ph, alpha=0.9, zorder=3)
+
+        ax.set_ylabel(f"{label}\nMAE{unit}", fontweight="bold")
+        ax.set_ylim(bottom=0)
+        ax.grid(axis="y", alpha=0.2, linestyle="--")
+        ax.grid(axis="y", which='minor', alpha=0.1, linestyle=':')
+        ax.minorticks_on()
+        ax.legend(loc="upper right")
+
+    axes[-1].set_xlabel(x_label, fontweight="bold")
+
+    _sc_finalize(fig, pad=1.5, rect=[0, 0, 1, 0.96])
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
+def make_r2_figure(ts_csv_path, output_path):
+    """Plot R² score for compression ratio prediction over timesteps."""
+    rows = parse_csv(ts_csv_path)
+    if not rows:
+        print(f"  No timestep data in {ts_csv_path}, skipping R² plot.")
+        return
+
+    if "r2_ratio" not in rows[0]:
+        print(f"  No R² column in {ts_csv_path}, skipping R² plot.")
+        return
+
+    is_field_based = "field_idx" in rows[0] and "timestep" not in rows[0]
+    x_label = "Field" if is_field_based else "Timestep"
+
+    by_phase = {}
+    for r in rows:
+        ph = r.get("phase", "nn-rl")
+        by_phase.setdefault(ph, []).append(r)
+
+    phase_order = ["nn", "nn-rl", "nn-rl+exp50"]
+    phase_styles = {
+        "nn":          {"color": "#7f8c8d", "ls": ":",  "marker": "s", "lw": 2.0},
+        "nn-rl":       {"color": "#8e44ad", "ls": "-",  "marker": "o", "lw": 2.0},
+        "nn-rl+exp50": {"color": "#c0392b", "ls": "--", "marker": "D", "lw": 2.0},
+    }
+    phases_present = [p for p in phase_order if p in by_phase]
+
+    fig, ax = plt.subplots(1, 1, figsize=(14, 5))
+    title_suffix = "Fields" if is_field_based else "Timesteps"
+    fig.suptitle(f"Compression Ratio Prediction R² Over {title_suffix}\n"
+                 "(coefficient of determination, per-timestep two-pass computation)",
+                 fontsize=14, fontweight="bold", y=0.99)
+
+    for ph in phases_present:
+        ph_rows = by_phase[ph]
+        timesteps = np.array([g(r, "timestep", "field_idx") for r in ph_rows])
+        r2 = np.array([g(r, "r2_ratio") for r in ph_rows])
+
+        sty = phase_styles.get(ph, {"color": "black", "ls": "-", "marker": ".", "lw": 2.0})
+        ax.plot(timesteps, r2, color=sty["color"], linestyle=sty["ls"],
+                marker=sty["marker"], markersize=6, linewidth=2.0,
+                label=ph, alpha=0.9, zorder=3)
+
+    ax.axhline(1.0, color="#27ae60", linewidth=1, linestyle="--", alpha=0.6, label="Perfect (R²=1)")
+    ax.axhline(0.0, color="#e74c3c", linewidth=1, linestyle="--", alpha=0.4, label="R²=0 (mean baseline)")
+    ax.set_ylabel("R² Score", fontweight="bold")
+    ax.set_xlabel(x_label, fontweight="bold")
+    ax.grid(axis="y", alpha=0.2, linestyle="--")
+    ax.grid(axis="y", which='minor', alpha=0.1, linestyle=':')
+    ax.minorticks_on()
+    ax.legend(loc="lower right")
 
     _sc_finalize(fig, pad=1.5, rect=[0, 0, 1, 0.96])
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -1957,7 +2086,8 @@ def main():
             out_dir = args.output_dir or os.path.join(SCRIPT_DIR, "vpic-kokkos", "results")
 
             # Merge multi-timestep phases into VPIC summary
-            _vpic_ts_search = ([os.path.join(args.vpic_dir, "benchmark_vpic_timesteps.csv")]
+            _vpic_ts_search = ([os.path.join(args.vpic_dir, "benchmark_vpic_deck_timesteps.csv"),
+                                os.path.join(args.vpic_dir, "benchmark_vpic_timesteps.csv")]
                                if args.vpic_dir else []) + DEFAULT_VPIC_TIMESTEPS
             _vpic_ts = find_csv(_vpic_ts_search)
             _merge_timestep_phases(rows, _vpic_ts, orig)
@@ -1965,7 +2095,8 @@ def main():
             make_summary_figure("VPIC Harris Sheet Reconnection", rows,
                                 os.path.join(out_dir, "benchmark_vpic.png"), meta)
 
-    _vpic_ts_search = ([os.path.join(args.vpic_dir, "benchmark_vpic_timesteps.csv")]
+    _vpic_ts_search = ([os.path.join(args.vpic_dir, "benchmark_vpic_deck_timesteps.csv"),
+                        os.path.join(args.vpic_dir, "benchmark_vpic_timesteps.csv")]
                        if args.vpic_dir else []) + ([] if only_gs else DEFAULT_VPIC_TIMESTEPS)
     vpic_tsteps = find_csv(_vpic_ts_search)
     if vpic_tsteps and os.path.exists(vpic_tsteps) and "timesteps" in views:
@@ -1975,7 +2106,8 @@ def main():
         make_timestep_figure(vpic_tsteps, os.path.join(out_dir, "vpic_sgd_accuracy_over_time.png"))
         make_sgd_exploration_figure(vpic_tsteps, os.path.join(out_dir, "vpic_sgd_exploration_firing.png"))
 
-    _vpic_tc_search = ([os.path.join(args.vpic_dir, "benchmark_vpic_timestep_chunks.csv")]
+    _vpic_tc_search = ([os.path.join(args.vpic_dir, "benchmark_vpic_deck_timestep_chunks.csv"),
+                        os.path.join(args.vpic_dir, "benchmark_vpic_timestep_chunks.csv")]
                        if args.vpic_dir else []) + ([] if only_gs else DEFAULT_VPIC_TSTEP_CHUNKS)
     vpic_tc = find_csv(_vpic_tc_search)
     if vpic_tc and os.path.exists(vpic_tc) and "timesteps" in views:
@@ -1990,7 +2122,7 @@ def main():
     # VPIC: Algorithm evolution (same as Gray-Scott)
     _vpic_chunks_search = [os.path.join(
         args.vpic_dir or args.output_dir or os.path.join(SCRIPT_DIR, "vpic-kokkos", "results"),
-        "benchmark_vpic_chunks.csv")]
+        f) for f in ("benchmark_vpic_deck_chunks.csv", "benchmark_vpic_chunks.csv")]
     vpic_chunks = find_csv(_vpic_chunks_search)
     if vpic_tc and os.path.exists(vpic_tc) and "actions" in views:
         found_any = True
