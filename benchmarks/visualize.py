@@ -689,9 +689,9 @@ def make_timestep_chunks_figure(tc_csv_path, output_path, phase_filter="nn-rl"):
     n_ts = len(timestep_list)
 
     metrics = [
-        ("Compression Ratio",  "predicted_ratio",    "actual_ratio",      "x",  "mape_ratio"),
-        ("Comp Time",          "predicted_comp_ms",  "actual_comp_ms",    "ms", "mape_comp"),
-        ("Decomp Time",        "predicted_decomp_ms","actual_decomp_ms",  "ms", "mape_decomp"),
+        ("Compression Ratio",  "predicted_ratio",    ("actual_ratio",),                          "x",  "mape_ratio"),
+        ("Comp Time",          "predicted_comp_ms",  ("actual_comp_ms_raw", "actual_comp_ms"),    "ms", "mape_comp"),
+        ("Decomp Time",        "predicted_decomp_ms",("actual_decomp_ms_raw", "actual_decomp_ms"),"ms", "mape_decomp"),
     ]
 
     fig, axes = plt.subplots(n_ts, 3, figsize=(14, 3.2 * n_ts + 2),
@@ -711,7 +711,11 @@ def make_timestep_chunks_figure(tc_csv_path, output_path, phase_filter="nn-rl"):
         for col_idx, (label, pred_key, act_key, unit, mape_key) in enumerate(metrics):
             ax = axes[row_idx, col_idx]
             pred = np.array([g(r, pred_key) for r in chunk_rows])[sort_idx]
-            act = np.array([g(r, act_key) for r in chunk_rows])[sort_idx]
+            act_keys = act_key if isinstance(act_key, tuple) else (act_key,)
+            act = np.array([g(r, *act_keys) for r in chunk_rows])[sort_idx]
+            # Comp/decomp: clamp actuals to 5ms floor (matches NN training baseline)
+            if col_idx > 0:
+                act = np.maximum(act, 5.0)
             mape_vals = np.array([g(r, mape_key) for r in chunk_rows])[sort_idx]
 
             # Lines with shaded error region
@@ -743,11 +747,19 @@ def make_timestep_chunks_figure(tc_csv_path, output_path, phase_filter="nn-rl"):
             ax.grid(which='minor', alpha=0.1, linestyle=':')
             ax.minorticks_on()
 
-            # Cap y-axis
+            # Y-axis: tight range for timing, zero-based for ratio
             all_vals = np.concatenate([pred, act])
             pos = all_vals[all_vals > 0]
-            p95 = np.percentile(pos, 95) if len(pos) > 0 else 1
-            ax.set_ylim(0, p95 * 1.6)
+            if col_idx == 0:
+                # Ratio: start at 0
+                p95 = np.percentile(pos, 95) if len(pos) > 0 else 1
+                ax.set_ylim(0, p95 * 1.6)
+            else:
+                # Comp/Decomp time: tight range so gap is visible
+                vmin = np.min(pos) if len(pos) > 0 else 0
+                vmax = np.max(pos) if len(pos) > 0 else 1
+                margin = max((vmax - vmin) * 0.3, vmax * 0.1, 0.5)
+                ax.set_ylim(max(0, vmin - margin), vmax + margin)
 
             # Stats box
             avg_mape = np.mean(mape_vals)
