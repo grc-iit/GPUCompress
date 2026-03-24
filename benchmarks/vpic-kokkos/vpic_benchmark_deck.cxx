@@ -85,11 +85,13 @@ extern "C" float gpucompress_get_bandwidth_bytes_per_ms(void);
 
 #define TMP_NOCOMP    "/tmp/bm_vpic_nocomp.h5"
 #define TMP_FIX_LZ4   "/tmp/bm_vpic_fix_lz4.h5"
+#define TMP_FIX_SNAPPY "/tmp/bm_vpic_fix_snappy.h5"
+#define TMP_FIX_DEFL  "/tmp/bm_vpic_fix_deflate.h5"
 #define TMP_FIX_GDEFL "/tmp/bm_vpic_fix_gdefl.h5"
 #define TMP_FIX_ZSTD  "/tmp/bm_vpic_fix_zstd.h5"
-#define TMP_FIX_LZ4_S   "/tmp/bm_vpic_fix_lz4_s.h5"
-#define TMP_FIX_GDEFL_S "/tmp/bm_vpic_fix_gdefl_s.h5"
-#define TMP_FIX_ZSTD_S  "/tmp/bm_vpic_fix_zstd_s.h5"
+#define TMP_FIX_ANS   "/tmp/bm_vpic_fix_ans.h5"
+#define TMP_FIX_CASC  "/tmp/bm_vpic_fix_cascaded.h5"
+#define TMP_FIX_BITCOMP "/tmp/bm_vpic_fix_bitcomp.h5"
 #define TMP_NN        "/tmp/bm_vpic_nn.h5"
 #define TMP_NN_RL    "/tmp/bm_vpic_nn_rl.h5"
 #define TMP_NN_RLEXP "/tmp/bm_vpic_nn_rlexp.h5"
@@ -973,7 +975,7 @@ begin_diagnostics {
                 global->ranking_csv = NULL;
                 printf("  Ranking quality CSV: %s\n", RANKING_CSV);
             }
-            printf("\n=== VPIC Multi-Timestep complete (%d timesteps x 10 phases) ===\n",
+            printf("\n=== VPIC Multi-Timestep complete (%d timesteps x 12 phases) ===\n",
                    global->ts_count);
 
             /* Append nn-rl and nn-rl+exp50 steady-state averages to aggregate CSV.
@@ -1006,12 +1008,12 @@ begin_diagnostics {
                             double sum_mae_r, sum_mae_c, sum_mae_d, sum_r2;
                             int    count;
                         };
-                        const int N_AGG_PHASES = 10;
+                        const int N_AGG_PHASES = 12;
                         PhaseAccum pa[N_AGG_PHASES] = {};
                         const char* pnames[N_AGG_PHASES] = {
-                            "no-comp", "fixed-lz4", "fixed-gdeflate", "fixed-zstd",
-                            "fixed-lz4+shuf", "fixed-gdeflate+shuf", "fixed-zstd+shuf",
-                            "nn", "nn-rl", "nn-rl+exp50"
+                            "no-comp", "fixed-lz4", "fixed-snappy", "fixed-deflate",
+                            "fixed-gdeflate", "fixed-zstd", "fixed-ans", "fixed-cascaded",
+                            "fixed-bitcomp", "nn", "nn-rl", "nn-rl+exp50"
                         };
                         const int WARMUP = 0;
 
@@ -1137,9 +1139,11 @@ begin_diagnostics {
             remove(TMP_FIX_LZ4);
             remove(TMP_FIX_GDEFL);
             remove(TMP_FIX_ZSTD);
-            remove(TMP_FIX_LZ4_S);
-            remove(TMP_FIX_GDEFL_S);
-            remove(TMP_FIX_ZSTD_S);
+            remove(TMP_FIX_SNAPPY);
+            remove(TMP_FIX_DEFL);
+            remove(TMP_FIX_ANS);
+            remove(TMP_FIX_CASC);
+            remove(TMP_FIX_BITCOMP);
             remove(TMP_NN);
             remove(TMP_NN_RL);
             remove(TMP_NN_RLEXP);
@@ -1217,18 +1221,20 @@ begin_diagnostics {
             unsigned int preproc;
         };
         TsPhase phases[] = {
-            { "no-comp",           TMP_NOCOMP,    0, 0, -1, (gpucompress_algorithm_t)0, 0 },
-            { "fixed-lz4",         TMP_FIX_LZ4,   0, 0, -1, GPUCOMPRESS_ALGO_LZ4,      0 },
-            { "fixed-gdeflate",    TMP_FIX_GDEFL,  0, 0, -1, GPUCOMPRESS_ALGO_GDEFLATE, 0 },
-            { "fixed-zstd",        TMP_FIX_ZSTD,   0, 0, -1, GPUCOMPRESS_ALGO_ZSTD,     0 },
-            { "fixed-lz4+shuf",    TMP_FIX_LZ4_S,  0, 0, -1, GPUCOMPRESS_ALGO_LZ4,      GPUCOMPRESS_PREPROC_SHUFFLE_4 },
-            { "fixed-gdeflate+shuf",TMP_FIX_GDEFL_S,0, 0, -1, GPUCOMPRESS_ALGO_GDEFLATE, GPUCOMPRESS_PREPROC_SHUFFLE_4 },
-            { "fixed-zstd+shuf",   TMP_FIX_ZSTD_S, 0, 0, -1, GPUCOMPRESS_ALGO_ZSTD,     GPUCOMPRESS_PREPROC_SHUFFLE_4 },
-            { "nn",                TMP_NN,         0, 0,  0, (gpucompress_algorithm_t)0, 0 },
-            { "nn-rl",             TMP_NN_RL,      1, 0,  1, (gpucompress_algorithm_t)0, 0 },
-            { "nn-rl+exp50",       TMP_NN_RLEXP,   1, 1,  2, (gpucompress_algorithm_t)0, 0 },
+            { "no-comp",           TMP_NOCOMP,     0, 0, -1, (gpucompress_algorithm_t)0, 0 },
+            { "fixed-lz4",         TMP_FIX_LZ4,    0, 0, -1, GPUCOMPRESS_ALGO_LZ4,      0 },
+            { "fixed-snappy",      TMP_FIX_SNAPPY,  0, 0, -1, GPUCOMPRESS_ALGO_SNAPPY,   0 },
+            { "fixed-deflate",     TMP_FIX_DEFL,    0, 0, -1, GPUCOMPRESS_ALGO_DEFLATE,  0 },
+            { "fixed-gdeflate",    TMP_FIX_GDEFL,   0, 0, -1, GPUCOMPRESS_ALGO_GDEFLATE, 0 },
+            { "fixed-zstd",        TMP_FIX_ZSTD,    0, 0, -1, GPUCOMPRESS_ALGO_ZSTD,     0 },
+            { "fixed-ans",         TMP_FIX_ANS,     0, 0, -1, GPUCOMPRESS_ALGO_ANS,      0 },
+            { "fixed-cascaded",    TMP_FIX_CASC,    0, 0, -1, GPUCOMPRESS_ALGO_CASCADED,  0 },
+            { "fixed-bitcomp",     TMP_FIX_BITCOMP, 0, 0, -1, GPUCOMPRESS_ALGO_BITCOMP,   0 },
+            { "nn",                TMP_NN,          0, 0,  0, (gpucompress_algorithm_t)0, 0 },
+            { "nn-rl",             TMP_NN_RL,       1, 0,  1, (gpucompress_algorithm_t)0, 0 },
+            { "nn-rl+exp50",       TMP_NN_RLEXP,    1, 1,  2, (gpucompress_algorithm_t)0, 0 },
         };
-        int n_phases_ts = 10;
+        int n_phases_ts = 12;
 
         hsize_t dims[1] = { (hsize_t)n_floats };
 
@@ -1550,11 +1556,13 @@ begin_diagnostics {
         H5VLclose(global->vol_id);
         remove(TMP_NOCOMP);
         remove(TMP_FIX_LZ4);
+        remove(TMP_FIX_SNAPPY);
+        remove(TMP_FIX_DEFL);
         remove(TMP_FIX_GDEFL);
         remove(TMP_FIX_ZSTD);
-        remove(TMP_FIX_LZ4_S);
-        remove(TMP_FIX_GDEFL_S);
-        remove(TMP_FIX_ZSTD_S);
+        remove(TMP_FIX_ANS);
+        remove(TMP_FIX_CASC);
+        remove(TMP_FIX_BITCOMP);
         remove(TMP_NN);
         remove(TMP_NN_RL);
         remove(TMP_NN_RLEXP);

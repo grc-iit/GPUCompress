@@ -95,12 +95,14 @@
 #define REINFORCE_MAPE      0.10f
 
 #define TMP_NOCOMP    "/tmp/bm_gs_nocomp.h5"
-#define TMP_FIX_LZ4   "/tmp/bm_gs_fix_lz4.h5"
-#define TMP_FIX_GDEFL "/tmp/bm_gs_fix_gdefl.h5"
-#define TMP_FIX_ZSTD  "/tmp/bm_gs_fix_zstd.h5"
-#define TMP_FIX_LZ4_S   "/tmp/bm_gs_fix_lz4_s.h5"
-#define TMP_FIX_GDEFL_S "/tmp/bm_gs_fix_gdefl_s.h5"
-#define TMP_FIX_ZSTD_S  "/tmp/bm_gs_fix_zstd_s.h5"
+#define TMP_FIX_LZ4     "/tmp/bm_gs_fix_lz4.h5"
+#define TMP_FIX_SNAPPY  "/tmp/bm_gs_fix_snappy.h5"
+#define TMP_FIX_DEFL    "/tmp/bm_gs_fix_deflate.h5"
+#define TMP_FIX_GDEFL   "/tmp/bm_gs_fix_gdefl.h5"
+#define TMP_FIX_ZSTD    "/tmp/bm_gs_fix_zstd.h5"
+#define TMP_FIX_ANS     "/tmp/bm_gs_fix_ans.h5"
+#define TMP_FIX_CASC    "/tmp/bm_gs_fix_cascaded.h5"
+#define TMP_FIX_BITCOMP "/tmp/bm_gs_fix_bitcomp.h5"
 #define TMP_NN        "/tmp/bm_gs_nn.h5"
 #define TMP_NN_RL    "/tmp/bm_gs_nn_rl.h5"
 #define TMP_NN_RLEXP "/tmp/bm_gs_nn_rlexp.h5"
@@ -1013,7 +1015,8 @@ int main(int argc, char **argv)
 
     /* Phase selection: bit flags */
     enum { P_NOCOMP = 0x001, P_FIX_LZ4 = 0x002, P_FIX_GDEFL = 0x004, P_FIX_ZSTD = 0x008,
-           P_FIX_LZ4_S = 0x010, P_FIX_GDEFL_S = 0x020, P_FIX_ZSTD_S = 0x200,
+           P_FIX_SNAPPY = 0x010, P_FIX_DEFL = 0x020, P_FIX_ANS = 0x200,
+           P_FIX_CASC = 0x400, P_FIX_BITCOMP = 0x800,
            P_NN = 0x040, P_NNRL = 0x080, P_NNRLEXP = 0x100 };
     unsigned int phase_mask = 0;  /* 0 = run all */
 
@@ -1055,18 +1058,20 @@ int main(int argc, char **argv)
             const char *p = argv[++i];
             if      (strcmp(p, "no-comp") == 0)              phase_mask |= P_NOCOMP;
             else if (strcmp(p, "fixed-lz4") == 0)           phase_mask |= P_FIX_LZ4;
-            else if (strcmp(p, "fixed-gdeflate") == 0)       phase_mask |= P_FIX_GDEFL;
+            else if (strcmp(p, "fixed-snappy") == 0)        phase_mask |= P_FIX_SNAPPY;
+            else if (strcmp(p, "fixed-deflate") == 0)       phase_mask |= P_FIX_DEFL;
+            else if (strcmp(p, "fixed-gdeflate") == 0)      phase_mask |= P_FIX_GDEFL;
             else if (strcmp(p, "fixed-zstd") == 0)          phase_mask |= P_FIX_ZSTD;
-            else if (strcmp(p, "fixed-lz4+shuf") == 0)      phase_mask |= P_FIX_LZ4_S;
-            else if (strcmp(p, "fixed-gdeflate+shuf") == 0)  phase_mask |= P_FIX_GDEFL_S;
-            else if (strcmp(p, "fixed-zstd+shuf") == 0)     phase_mask |= P_FIX_ZSTD_S;
+            else if (strcmp(p, "fixed-ans") == 0)           phase_mask |= P_FIX_ANS;
+            else if (strcmp(p, "fixed-cascaded") == 0)      phase_mask |= P_FIX_CASC;
+            else if (strcmp(p, "fixed-bitcomp") == 0)       phase_mask |= P_FIX_BITCOMP;
             else if (strcmp(p, "nn") == 0)                  phase_mask |= P_NN;
             else if (strcmp(p, "nn-rl") == 0)               phase_mask |= P_NNRL;
             else if (strcmp(p, "nn-rl+exp50") == 0)         phase_mask |= P_NNRLEXP;
             else { fprintf(stderr, "Unknown phase: %s\n"
-                           "  Valid: no-comp, fixed-lz4, fixed-gdeflate, fixed-zstd,\n"
-                           "         fixed-lz4+shuf, fixed-gdeflate+shuf, fixed-zstd+shuf,\n"
-                           "         nn, nn-rl, nn-rl+exp50\n", p);
+                           "  Valid: no-comp, fixed-lz4, fixed-snappy, fixed-deflate,\n"
+                           "         fixed-gdeflate, fixed-zstd, fixed-ans, fixed-cascaded,\n"
+                           "         fixed-bitcomp, nn, nn-rl, nn-rl+exp50\n", p);
                    return 1; }
         } else if (strcmp(argv[i], "--verbose-chunks") == 0) {
             verbose_chunks = 1;
@@ -1091,8 +1096,9 @@ int main(int argc, char **argv)
                 "  Use --phase multiple times to select specific phases.\n", argv[0]);
         return 1;
     }
-    if (phase_mask == 0) phase_mask = P_NOCOMP | P_FIX_LZ4 | P_FIX_GDEFL | P_FIX_ZSTD
-                                    | P_FIX_LZ4_S | P_FIX_GDEFL_S | P_FIX_ZSTD_S
+    if (phase_mask == 0) phase_mask = P_NOCOMP | P_FIX_LZ4 | P_FIX_SNAPPY | P_FIX_DEFL
+                                    | P_FIX_GDEFL | P_FIX_ZSTD | P_FIX_ANS
+                                    | P_FIX_CASC | P_FIX_BITCOMP
                                     | P_NN | P_NNRL | P_NNRLEXP;
 
     /* Compute chunk_z from chunk_mb if not explicitly set */
@@ -1371,13 +1377,15 @@ int main(int argc, char **argv)
     };
     FixedAlgoPhase fixed_phases[] = {
         { P_FIX_LZ4,      "fixed-lz4",           TMP_FIX_LZ4,             GPUCOMPRESS_ALGO_LZ4,      0 },
+        { P_FIX_SNAPPY,   "fixed-snappy",         TMP_FIX_SNAPPY,          GPUCOMPRESS_ALGO_SNAPPY,   0 },
+        { P_FIX_DEFL,     "fixed-deflate",        TMP_FIX_DEFL,            GPUCOMPRESS_ALGO_DEFLATE,  0 },
         { P_FIX_GDEFL,    "fixed-gdeflate",       TMP_FIX_GDEFL,           GPUCOMPRESS_ALGO_GDEFLATE, 0 },
         { P_FIX_ZSTD,     "fixed-zstd",           TMP_FIX_ZSTD,            GPUCOMPRESS_ALGO_ZSTD,     0 },
-        { P_FIX_LZ4_S,    "fixed-lz4+shuf",      TMP_FIX_LZ4_S,           GPUCOMPRESS_ALGO_LZ4,      GPUCOMPRESS_PREPROC_SHUFFLE_4 },
-        { P_FIX_GDEFL_S,  "fixed-gdeflate+shuf",  TMP_FIX_GDEFL_S,         GPUCOMPRESS_ALGO_GDEFLATE, GPUCOMPRESS_PREPROC_SHUFFLE_4 },
-        { P_FIX_ZSTD_S,   "fixed-zstd+shuf",      TMP_FIX_ZSTD_S,          GPUCOMPRESS_ALGO_ZSTD,     GPUCOMPRESS_PREPROC_SHUFFLE_4 },
+        { P_FIX_ANS,      "fixed-ans",            TMP_FIX_ANS,             GPUCOMPRESS_ALGO_ANS,      0 },
+        { P_FIX_CASC,     "fixed-cascaded",       TMP_FIX_CASC,            GPUCOMPRESS_ALGO_CASCADED, 0 },
+        { P_FIX_BITCOMP,  "fixed-bitcomp",        TMP_FIX_BITCOMP,         GPUCOMPRESS_ALGO_BITCOMP,  0 },
     };
-    for (int fi = 0; fi < 6; fi++) {
+    for (int fi = 0; fi < 8; fi++) {
         if (!(phase_mask & fixed_phases[fi].mask)) continue;
         printf("\n── Phase %d: %s ─────────────────────────────────────\n",
                n_phases + 1, fixed_phases[fi].name);
@@ -1951,11 +1959,13 @@ int main(int argc, char **argv)
 
     remove(TMP_NOCOMP);
     remove(TMP_FIX_LZ4);
+    remove(TMP_FIX_SNAPPY);
+    remove(TMP_FIX_DEFL);
     remove(TMP_FIX_GDEFL);
     remove(TMP_FIX_ZSTD);
-    remove(TMP_FIX_LZ4_S);
-    remove(TMP_FIX_GDEFL_S);
-    remove(TMP_FIX_ZSTD_S);
+    remove(TMP_FIX_ANS);
+    remove(TMP_FIX_CASC);
+    remove(TMP_FIX_BITCOMP);
     remove(TMP_NN);
     remove(TMP_NN_RL);
     remove(TMP_NN_RLEXP);
