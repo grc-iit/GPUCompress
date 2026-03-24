@@ -78,9 +78,32 @@
 #define TMP_NN        "/tmp/bm_vpic_nn.h5"
 #define TMP_NN_RL    "/tmp/bm_vpic_nn_rl.h5"
 #define TMP_NN_RLEXP "/tmp/bm_vpic_nn_rlexp.h5"
-#define CHUNKS_CSV        GPU_DIR "/benchmarks/vpic-kokkos/results/benchmark_vpic_deck_chunks.csv"
-#define TSTEP_CSV         GPU_DIR "/benchmarks/vpic-kokkos/results/benchmark_vpic_deck_timesteps.csv"
-#define TSTEP_CHUNKS_CSV  GPU_DIR "/benchmarks/vpic-kokkos/results/benchmark_vpic_deck_timestep_chunks.csv"
+/* CSV output directory: set VPIC_RESULTS_DIR env var to override.
+ * The eval script sets this per-run so CSVs land in the right subdirectory. */
+static char RESULTS_DIR[512];
+static char CHUNKS_CSV[600];
+static char TSTEP_CSV[600];
+static char TSTEP_CHUNKS_CSV[600];
+static char AGG_CSV[600];
+
+static void init_csv_paths() {
+    const char* env = getenv("VPIC_RESULTS_DIR");
+    if (env && env[0]) {
+        snprintf(RESULTS_DIR, sizeof(RESULTS_DIR), "%s", env);
+    } else {
+        snprintf(RESULTS_DIR, sizeof(RESULTS_DIR),
+                 "%s/benchmarks/vpic-kokkos/results", GPU_DIR);
+    }
+    mkdir(RESULTS_DIR, 0755);
+    snprintf(CHUNKS_CSV, sizeof(CHUNKS_CSV),
+             "%s/benchmark_vpic_deck_chunks.csv", RESULTS_DIR);
+    snprintf(TSTEP_CSV, sizeof(TSTEP_CSV),
+             "%s/benchmark_vpic_deck_timesteps.csv", RESULTS_DIR);
+    snprintf(TSTEP_CHUNKS_CSV, sizeof(TSTEP_CHUNKS_CSV),
+             "%s/benchmark_vpic_deck_timestep_chunks.csv", RESULTS_DIR);
+    snprintf(AGG_CSV, sizeof(AGG_CSV),
+             "%s/benchmark_vpic_deck.csv", RESULTS_DIR);
+}
 
 // ============================================================
 // Globals: persist across timesteps
@@ -869,6 +892,10 @@ begin_diagnostics {
     if (step() < global->sim_steps) return;
     if (!global->gpucompress_ready) return;
 
+    /* Initialize CSV paths on first invocation */
+    static bool csv_paths_init = false;
+    if (!csv_paths_init) { init_csv_paths(); csv_paths_init = true; }
+
     // Attach GPU-resident field data (fresh pointer each step — fields evolve)
     vpic_attach_fields(global->vpic_fields_h, field_array->k_f_d);
 
@@ -903,8 +930,7 @@ begin_diagnostics {
             /* Append nn-rl and nn-rl+exp50 steady-state averages to aggregate CSV.
              * Read from timestep CSV, skip warmup (first 5 timesteps), average the rest. */
             {
-                const char* csv_path = GPU_DIR "/benchmarks/vpic-kokkos/results/benchmark_vpic_deck.csv";
-                FILE* agg = fopen(csv_path, "a");  /* append to existing single-shot CSV */
+                FILE* agg = fopen(AGG_CSV, "a");  /* append to existing single-shot CSV */
                 if (agg && global->ts_csv == NULL) {
                     /* Parse timestep CSV to compute steady-state averages per phase */
                     FILE* ts = fopen(TSTEP_CSV, "r");
@@ -1056,8 +1082,6 @@ begin_diagnostics {
             printf("  Each step = 1 VPIC physics step → H5Dwrite → collect MAPE\n");
             printf("══════════════════════════════════════════════════════════════\n\n");
 
-            const char* csv_dir = GPU_DIR "/benchmarks/vpic-kokkos/results";
-            mkdir(csv_dir, 0755);
             global->ts_csv = fopen(TSTEP_CSV, "w");
             if (global->ts_csv) {
                 fprintf(global->ts_csv, "phase,timestep,sim_step,write_ms,read_ms,ratio,"
@@ -1604,10 +1628,7 @@ begin_diagnostics {
 
     // Write summary CSV
     {
-        const char* csv_dir  = GPU_DIR "/benchmarks/vpic-kokkos/results";
-        const char* csv_path = GPU_DIR "/benchmarks/vpic-kokkos/results/benchmark_vpic_deck.csv";
-        mkdir(csv_dir, 0755);
-        FILE* csv = fopen(csv_path, "w");
+        FILE* csv = fopen(AGG_CSV, "w");
         if (csv) {
             fprintf(csv, "source,phase,n_runs,write_ms,write_ms_std,read_ms,read_ms_std,"
                          "file_mib,orig_mib,ratio,"

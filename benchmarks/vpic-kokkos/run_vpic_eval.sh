@@ -110,6 +110,7 @@ for cfg_line in "${CONFIGS[@]}"; do
     VPIC_W0=$W0 \
     VPIC_W1=$W1 \
     VPIC_W2=$W2 \
+    VPIC_RESULTS_DIR="$RUN_DIR" \
     "$VPIC_BIN" "$VPIC_DECK" > "$LOG_FILE" 2>&1 &
     PID=$!
 
@@ -122,15 +123,6 @@ for cfg_line in "${CONFIGS[@]}"; do
     printf "\r                          \r"
     wait $PID 2>/dev/null || true
     RC=$?
-
-    # Move result CSVs into the run directory
-    SRC_DIR="$GPU_DIR/benchmarks/vpic-kokkos/results"
-    for csv in benchmark_vpic_deck.csv benchmark_vpic_deck_timesteps.csv \
-               benchmark_vpic_deck_timestep_chunks.csv benchmark_vpic_deck_chunks.csv; do
-        if [ -f "$SRC_DIR/$csv" ]; then
-            cp "$SRC_DIR/$csv" "$RUN_DIR/$csv"
-        fi
-    done
 
     # Report status
     ELAPSED=$(( $(date +%s) - STARTED ))

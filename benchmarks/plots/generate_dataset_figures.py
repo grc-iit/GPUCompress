@@ -188,7 +188,21 @@ def main():
             policies = policies_to_run
 
         for pol in policies:
-            out_dir = os.path.join(PER_DATASET, ds, pol)
+            # Include eval parameters in output dir so results aren't overwritten
+            data_dir = get_data_dir(ds, pol)
+            eval_name = ""
+            if data_dir:
+                # Walk up to find the eval_* directory name
+                # e.g., .../results/eval_NX254_chunk16mb_ts100/ratio_only_w0-0-1
+                parts = data_dir.replace("\\", "/").split("/")
+                for p in parts:
+                    if p.startswith("eval_"):
+                        eval_name = p
+                        break
+            if eval_name:
+                out_dir = os.path.join(PER_DATASET, ds, eval_name, pol)
+            else:
+                out_dir = os.path.join(PER_DATASET, ds, pol)
             print(f"\n{'='*60}")
             print(f"  {ds} / {pol}")
             print(f"{'='*60}")
