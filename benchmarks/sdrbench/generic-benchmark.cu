@@ -1226,20 +1226,55 @@ int main(int argc, char **argv)
         printf("── Phase %d: no-comp ─────────────────────────────────────────\n", n_phases + 1);
         gpucompress_disable_online_learning();
         gpucompress_set_exploration(0);
-        PhaseResult runs_buf[32];
-        int eff_runs = (n_runs > 32) ? 32 : n_runs;
-        for (int run = 0; run < eff_runs; run++) {
-            if (eff_runs > 1) printf("  Run %d/%d\n", run + 1, eff_runs);
-            run_phase_nocomp(d_data, d_read, d_count,
-                             n_floats, ndims, h5_dims, chunk_dims,
-                             &runs_buf[run]);
+        if (n_fields > 1) {
+            /* Run on all fields and average for fair comparison */
+            double sum_wr = 0, sum_rd = 0, sum_rat = 0;
+            size_t sum_fb = 0;
+            int count = 0;
+            for (int fi = 0; fi < n_fields; fi++) {
+                if (load_field_to_gpu(fields[fi], d_data, total_bytes)) continue;
+                PhaseResult fr;
+                run_phase_nocomp(d_data, d_read, d_count,
+                                 n_floats, ndims, h5_dims, chunk_dims, &fr);
+                sum_wr += fr.write_ms;
+                sum_rd += fr.read_ms;
+                sum_rat += fr.ratio;
+                sum_fb += fr.file_bytes;
+                count++;
+                const char *fname = strrchr(fields[fi], '/');
+                fname = fname ? fname + 1 : fields[fi];
+                printf("  field %d/%d: %-30s ratio=%.2fx  write=%.0f MiB/s\n",
+                       fi + 1, n_fields, fname, fr.ratio, fr.write_mbps);
+            }
+            if (count > 0) {
+                results[n_phases] = {};
+                snprintf(results[n_phases].phase, sizeof(results[n_phases].phase), "no-comp");
+                results[n_phases].write_ms = sum_wr / count;
+                results[n_phases].read_ms = sum_rd / count;
+                results[n_phases].ratio = sum_rat / count;
+                results[n_phases].file_bytes = sum_fb / count;
+                results[n_phases].orig_bytes = total_bytes;
+                results[n_phases].write_mbps = (double)total_bytes / (1 << 20) / (results[n_phases].write_ms / 1000.0);
+                results[n_phases].read_mbps = (double)total_bytes / (1 << 20) / (results[n_phases].read_ms / 1000.0);
+                results[n_phases].n_runs = count;
+                results[n_phases].n_chunks = n_chunks;
+            }
+        } else {
+            PhaseResult runs_buf[32];
+            int eff_runs = (n_runs > 32) ? 32 : n_runs;
+            for (int run = 0; run < eff_runs; run++) {
+                if (eff_runs > 1) printf("  Run %d/%d\n", run + 1, eff_runs);
+                run_phase_nocomp(d_data, d_read, d_count,
+                                 n_floats, ndims, h5_dims, chunk_dims,
+                                 &runs_buf[run]);
+            }
+            if (eff_runs > 1)
+                merge_phase_results(runs_buf, eff_runs, &results[n_phases]);
+            else
+                results[n_phases] = runs_buf[0];
+            results[n_phases].n_runs = eff_runs;
+            results[n_phases].n_chunks = n_chunks;
         }
-        if (eff_runs > 1)
-            merge_phase_results(runs_buf, eff_runs, &results[n_phases]);
-        else
-            results[n_phases] = runs_buf[0];
-        results[n_phases].n_runs = eff_runs;
-        results[n_phases].n_chunks = n_chunks;
         n_phases++;
     }
 
@@ -1428,6 +1463,7 @@ int main(int argc, char **argv)
                     continue;
                 }
 
+                gpucompress_flush_manager_cache();  /* cold-start each field, matching single-shot phases */
                 gpucompress_reset_chunk_history();
                 gpucompress_set_debug_context(phase_name, fi);
                 H5VL_gpucompress_reset_stats();

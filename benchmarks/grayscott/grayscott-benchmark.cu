@@ -1586,6 +1586,7 @@ int main(int argc, char **argv)
                 gpucompress_grayscott_get_device_ptrs(sim, &d_read, &d_v);
 
                 /* Write via VOL */
+                gpucompress_flush_manager_cache();  /* cold-start each timestep, matching single-shot phases */
                 gpucompress_reset_chunk_history();
                 gpucompress_set_debug_context(phase_name, t);
                 remove(TMP_NN_RL);
