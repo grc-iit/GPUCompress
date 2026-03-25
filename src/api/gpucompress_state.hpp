@@ -31,6 +31,9 @@ extern int               g_exploration_k_override;
 extern float             g_reinforce_lr;
 extern float             g_reinforce_mape_threshold;
 
+/* ---- Detailed timing (GPUCOMPRESS_DETAILED_TIMING=1) ---- */
+extern bool g_detailed_timing;
+
 /* ---- Last NN action (per-call query) ---- */
 extern std::atomic<int>  g_last_nn_action;
 extern std::atomic<int>  g_last_nn_original_action;

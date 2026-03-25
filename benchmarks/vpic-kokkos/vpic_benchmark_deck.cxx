@@ -1033,7 +1033,8 @@ begin_diagnostics {
                                  "comp_gbps,decomp_gbps,"
                                  "mape_ratio_pct,mape_comp_pct,mape_decomp_pct,"
                                  "mae_ratio,mae_comp_ms,mae_decomp_ms,r2_ratio,"
-                                 "comp_gbps_std,decomp_gbps_std\n");
+                                 "comp_gbps_std,decomp_gbps_std,"
+                                 "vol_stage1_ms,vol_stage2_ms,vol_stage3_ms\n");
                     /* Parse timestep CSV to compute steady-state averages per phase */
                     FILE* ts = fopen(TSTEP_CSV, "r");
                     if (ts) {
@@ -1049,6 +1050,7 @@ begin_diagnostics {
                             double sum_stats_ms, sum_nn_ms, sum_preproc_ms;
                             double sum_comp_ms, sum_decomp_ms, sum_explore_ms, sum_sgd_ms;
                             double sum_mae_r, sum_mae_c, sum_mae_d, sum_r2;
+                            double sum_vs1, sum_vs2, sum_vs3;
                             int    count;
                         };
                         const int N_AGG_PHASES = 12;
@@ -1067,14 +1069,17 @@ begin_diagnostics {
                             unsigned long long mm, fbytes = 0;
                             double t_stats = 0, t_nn = 0, t_pre = 0, t_comp = 0, t_dec = 0, t_expl = 0, t_sgd = 0;
                             double t_mae_r = 0, t_mae_c = 0, t_mae_d = 0, t_r2 = 0;
+                            double t_vs1 = 0, t_vs2 = 0, t_vs3 = 0;
                             int nf = sscanf(line, "%63[^,],%d,%*[^,],%lf,%lf,%lf,%lf,%lf,%lf,%d,%d,%d,%llu,%lf,%lf,"
                                        "%llu,"
                                        "%lf,%lf,%lf,%lf,%lf,%lf,%lf,"
-                                       "%lf,%lf,%lf,%lf",
+                                       "%lf,%lf,%lf,%lf,"
+                                       "%lf,%lf,%lf",
                                        ph, &ts_idx, &wr, &rd, &rat, &mr, &mc, &md,
                                        &sgd, &expl, &nch, &mm, &wmbps, &rmbps, &fbytes,
                                        &t_stats, &t_nn, &t_pre, &t_comp, &t_dec, &t_expl, &t_sgd,
-                                       &t_mae_r, &t_mae_c, &t_mae_d, &t_r2);
+                                       &t_mae_r, &t_mae_c, &t_mae_d, &t_r2,
+                                       &t_vs1, &t_vs2, &t_vs3);
                             if (nf >= 12 && ts_idx >= WARMUP) {
                                 for (int pi = 0; pi < N_AGG_PHASES; pi++) {
                                     if (strcmp(ph, pnames[pi]) == 0) {
@@ -1105,6 +1110,12 @@ begin_diagnostics {
                                             pa[pi].sum_mae_c += t_mae_c;
                                             pa[pi].sum_mae_d += t_mae_d;
                                             pa[pi].sum_r2    += t_r2;
+                                        }
+                                        /* VOL stage timing (columns 30-32, nf >= 29) */
+                                        if (nf >= 29) {
+                                            pa[pi].sum_vs1 += t_vs1;
+                                            pa[pi].sum_vs2 += t_vs2;
+                                            pa[pi].sum_vs3 += t_vs3;
                                         }
                                         pa[pi].count++;
                                         break;
@@ -1147,7 +1158,8 @@ begin_diagnostics {
                                          "%.4f,%.4f,"
                                          "%.2f,%.2f,%.2f,"
                                          "%.4f,%.4f,%.4f,%.4f,"
-                                         "0.0000,0.0000\n",
+                                         "0.0000,0.0000,"
+                                         "%.2f,%.2f,%.2f\n",
                                     pnames[pi], n, avg_wr, avg_rd,
                                     avg_file_mib, orig_mib, avg_ratio,
                                     wmbps, rmbps,
@@ -1158,7 +1170,8 @@ begin_diagnostics {
                                     cgbps, dgbps,
                                     fmin(200.0, pa[pi].sum_mape_r / n), fmin(200.0, pa[pi].sum_mape_c / n), fmin(200.0, pa[pi].sum_mape_d / n),
                                     pa[pi].sum_mae_r / n, pa[pi].sum_mae_c / n, pa[pi].sum_mae_d / n,
-                                    pa[pi].sum_r2 / n);
+                                    pa[pi].sum_r2 / n,
+                                    pa[pi].sum_vs1 / n, pa[pi].sum_vs2 / n, pa[pi].sum_vs3 / n);
                         }
                     }
                 }
@@ -1210,7 +1223,10 @@ begin_diagnostics {
                         "write_mbps,read_mbps,"
                         "file_bytes,"
                         "stats_ms,nn_ms,preproc_ms,comp_ms,decomp_ms,explore_ms,sgd_ms,"
-                        "mae_ratio,mae_comp_ms,mae_decomp_ms,r2_ratio\n");
+                        "mae_ratio,mae_comp_ms,mae_decomp_ms,r2_ratio,"
+                        "vol_stage1_ms,vol_stage2_ms,vol_stage3_ms,"
+                        "h5dwrite_ms,cuda_sync_ms,h5dclose_ms,h5fclose_ms,"
+                        "vol_setup_ms,vol_pipeline_ms,vol_join_ms\n");
             }
             global->tc_csv = fopen(TSTEP_CHUNKS_CSV, "w");
             if (global->tc_csv) {
@@ -1365,10 +1381,26 @@ begin_diagnostics {
             double tw0 = now_ms();
             herr_t wret = H5Dwrite(dset, H5T_NATIVE_FLOAT,
                                     H5S_ALL, H5S_ALL, H5P_DEFAULT, d_fields);
+            double tw_after_write = now_ms();
             cudaDeviceSynchronize();
-            H5Dclose(dset); H5Fclose(file);
+            double tw_after_sync = now_ms();
+            H5Dclose(dset);
+            double tw_after_dclose = now_ms();
+            H5Fclose(file);
             double tw1 = now_ms();
             double write_ms_t = tw1 - tw0;
+
+            /* Fine-grained write path breakdown */
+            double h5dwrite_ms  = tw_after_write - tw0;
+            double cuda_sync_ms = tw_after_sync - tw_after_write;
+            double h5dclose_ms  = tw_after_dclose - tw_after_sync;
+            double h5fclose_ms  = tw1 - tw_after_dclose;
+
+            /* Capture VOL pipeline stage timing */
+            double vol_s1 = 0, vol_s2 = 0, vol_s3 = 0, vol_total = 0;
+            H5VL_gpucompress_get_stage_timing(&vol_s1, &vol_s2, &vol_s3, &vol_total);
+            double vol_setup = 0, vol_func = 0, vol_join = 0;
+            H5VL_gpucompress_get_vol_func_timing(&vol_setup, &vol_func, &vol_join);
 
             if (wret < 0) {
                 printf("  %-4d  [%s] H5Dwrite failed\n", t, phase_name);
@@ -1487,7 +1519,10 @@ begin_diagnostics {
                         "%s,%d,%d,%.2f,%.2f,%.4f,%.2f,%.2f,%.2f,%d,%d,%d,%llu,%.1f,%.1f,"
                         "%zu,"
                         "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
-                        "%.4f,%.4f,%.4f,%.4f\n",
+                        "%.4f,%.4f,%.4f,%.4f,"
+                        "%.2f,%.2f,%.2f,"
+                        "%.2f,%.2f,%.2f,%.2f,"
+                        "%.2f,%.2f,%.2f\n",
                         phase_name, t, (int)step(), write_ms_t, read_ms_t, ratio_t,
                         real_mape_r, real_mape_c, real_mape_d,
                         sgd_t, expl_t, n_hist,
@@ -1495,7 +1530,10 @@ begin_diagnostics {
                         file_sz,
                         ts_stats_ms, ts_nn_ms, ts_preproc_ms,
                         ts_comp_ms, ts_decomp_ms, ts_explore_ms, ts_sgd_ms,
-                        ts_mae_r, ts_mae_c, ts_mae_d, ts_r2);
+                        ts_mae_r, ts_mae_c, ts_mae_d, ts_r2,
+                        vol_s1, vol_s2, vol_s3,
+                        h5dwrite_ms, cuda_sync_ms, h5dclose_ms, h5fclose_ms,
+                        vol_setup, vol_total, vol_join);
                 fflush(global->ts_csv);
             }
 

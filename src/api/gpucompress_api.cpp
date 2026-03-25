@@ -100,6 +100,7 @@ std::atomic<int> g_selection_mode{GPUCOMPRESS_SELECT_NN};
 std::atomic<bool> g_best_mode{false};
 
 bool g_debug_nn = false;
+bool g_detailed_timing = false;
 
 float g_reinforce_lr = 0.01f;
 float g_reinforce_mape_threshold = 0.10f;
@@ -235,6 +236,11 @@ extern "C" gpucompress_error_t gpucompress_init(const char* weights_path) {
     const char* dbg_env = getenv("GPUCOMPRESS_DEBUG_NN");
     if (dbg_env && (dbg_env[0] == '1' || dbg_env[0] == 'y' || dbg_env[0] == 'Y'))
         g_debug_nn = true;
+
+    /* Check detailed timing env var */
+    const char* dt_env = getenv("GPUCOMPRESS_DETAILED_TIMING");
+    if (dt_env && (dt_env[0] == '1' || dt_env[0] == 'y' || dt_env[0] == 'Y'))
+        g_detailed_timing = true;
 
     g_initialized.store(true);
     return GPUCOMPRESS_SUCCESS;

@@ -269,12 +269,20 @@ struct ChunkDiagInput {
     const int* top_actions;       /* nullptr if non-AUTO path */
     int top_actions_count;        /* 32 if AUTO, 0 otherwise */
     const float* predicted_costs; /* nullptr if non-AUTO path, indexed by action ID */
+    /* Detailed timing (zero when g_detailed_timing is off) */
+    float ctx_acquire_ms, mgr_acquire_ms, configure_comp_ms;
+    float temp_alloc_ms, compress_launch_ms, stream_sync_ms;
+    float get_comp_size_ms, header_write_ms, stats_copy_ms;
+    float diag_record_ms, final_sync_ms;
+    /* VOL Stage 1 per-chunk */
+    float vol_stats_malloc_ms, vol_stats_copy_ms, vol_wq_post_wait_ms;
 };
 
 /**
  * Record per-chunk diagnostic entry to history buffer.
+ * Returns the history slot index (for post-hoc updates like diag_record_ms).
  */
-void recordChunkDiagnostic(const ChunkDiagInput& d);
+int recordChunkDiagnostic(const ChunkDiagInput& d);
 
 /**
  * Run neural network inference to find best compression config.
@@ -478,6 +486,7 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     const float* predicted_costs = nullptr,
     float stage1_nn_ms = 0.0f,
     float stage1_stats_ms = 0.0f,
-    AutoStatsGPU* d_precomputed_stats = nullptr);
+    AutoStatsGPU* d_precomputed_stats = nullptr,
+    int* out_diag_slot = nullptr);
 
 #endif /* INTERNAL_HPP */

@@ -106,6 +106,13 @@ void H5VL_gpucompress_get_stage_timing(double *stage1_ms, double *stage2_ms,
 void H5VL_gpucompress_get_worker_timing(double *max_worker_ms);
 
 /**
+ * Get VOL function-level timing: setup (VolWriteCtx alloc + thread creation)
+ * and total gpu_aware_chunked_write wall clock.
+ */
+void H5VL_gpucompress_get_vol_func_timing(double *setup_ms, double *vol_func_ms,
+                                          double *join_ms);
+
+/**
  * Enable (on=1) or disable (on=0) call-sequence tracing.
  * When enabled, every VOL callback and every underlying H5VL* native call
  * is printed to stdout with a [VOL] prefix, indented to show call depth.

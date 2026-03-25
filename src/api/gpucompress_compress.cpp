@@ -29,6 +29,14 @@
 
 using namespace nvcomp;
 
+/* Detailed timing helpers — zero overhead when g_detailed_timing is false */
+#define DT_START(var) \
+    auto var = g_detailed_timing ? std::chrono::steady_clock::now() \
+                                 : std::chrono::steady_clock::time_point{}
+#define DT_MS(start) \
+    (g_detailed_timing ? std::chrono::duration<float, std::milli>( \
+        std::chrono::steady_clock::now() - (start)).count() : 0.0f)
+
 extern "C" {
     int gpucompress_nn_is_loaded_impl(void);
 }
@@ -209,7 +217,8 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     const float* predicted_costs,
     float stage1_nn_ms,
     float stage1_stats_ms,
-    AutoStatsGPU* d_precomputed_stats)
+    AutoStatsGPU* d_precomputed_stats,
+    int* out_diag_slot)
 {
     if (!g_initialized.load()) return GPUCOMPRESS_ERROR_NOT_INITIALIZED;
     if (!d_input || !d_output || !output_size) return GPUCOMPRESS_ERROR_INVALID_INPUT;
@@ -218,7 +227,9 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     gpucompress_config_t cfg = config ? *config : gpucompress_default_config();
 
     /* Acquire a per-slot context (blocks until one is free) */
+    DT_START(_dt_ctx);
     ContextGuard guard{gpucompress::acquireCompContext()};
+    float dt_ctx_acquire = DT_MS(_dt_ctx);
     if (!guard.ctx) return GPUCOMPRESS_ERROR_CUDA_FAILED;
     CompContext* ctx = guard.ctx;
     cudaStream_t stream = ctx->stream;
@@ -324,15 +335,19 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     }
 
     /* ---- Compression ---- */
+    DT_START(_dt_mgr);
     CompressionAlgorithm internal_algo = gpucompress::toInternalAlgorithm(algo_to_use);
     auto* compressor = gpucompress::getOrCreateCompManager(ctx, internal_algo);
+    float dt_mgr_acquire = DT_MS(_dt_mgr);
     if (!compressor) {
         if (d_quantized && owns_quantized) cudaFree(d_quantized);
         if (d_shuffled && owns_shuffled)  cudaFree(d_shuffled);
         return GPUCOMPRESS_ERROR_COMPRESSION;
     }
 
+    DT_START(_dt_cfg);
     CompressionConfig comp_config = compressor->configure_compression(compress_input_size);
+    float dt_configure_comp = DT_MS(_dt_cfg);
     size_t max_compressed_size = comp_config.max_compressed_buffer_size;
 
     if (max_compressed_size == 0) {
@@ -353,13 +368,16 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     uint8_t* d_temp_out = nullptr;
     uint8_t* d_comp_target;
 
+    float dt_temp_alloc = 0.0f;
     if (total_max_needed > *output_size) {
+        DT_START(_dt_ta);
         if (cudaMalloc(&d_temp_out, total_max_needed) != cudaSuccess) {
             if (d_quantized && owns_quantized) cudaFree(d_quantized);
             if (d_shuffled && owns_shuffled)   cudaFree(d_shuffled);
             return GPUCOMPRESS_ERROR_OUT_OF_MEMORY;
         }
         d_comp_target = d_temp_out + header_size;
+        dt_temp_alloc = DT_MS(_dt_ta);
     } else {
         d_comp_target = d_out + header_size;
     }
@@ -368,6 +386,7 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     bool need_timing = timing_ok && (stats != nullptr || g_online_learning_enabled);
     if (need_timing) cudaEventRecord(ctx->t_start, stream);
 
+    DT_START(_dt_launch);
     try {
         compressor->compress(d_compress_input, d_comp_target, comp_config);
     } catch (const std::exception& e) {
@@ -382,6 +401,8 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
         return GPUCOMPRESS_ERROR_COMPRESSION;
     }
 
+    float dt_compress_launch = DT_MS(_dt_launch);
+
     if (need_timing) {
         cudaEventRecord(ctx->t_stop, stream);
     }
@@ -391,14 +412,18 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
      * internal cudaMemcpy on a different (default) stream — the event sync
      * blocks the host but does not establish cross-stream memory visibility
      * in per-thread default-stream mode. */
+    DT_START(_dt_sync);
     cudaStreamSynchronize(stream);
+    float dt_stream_sync = DT_MS(_dt_sync);
     if (need_timing) {
         cudaEventElapsedTime(&primary_comp_time_ms, ctx->t_start, ctx->t_stop);
     }
     diag_compression_ms = std::max(5.0f, primary_comp_time_ms);  /* clamped for MAPE */
     float diag_compression_ms_raw = primary_comp_time_ms;       /* unclamped for breakdown */
 
+    DT_START(_dt_gcs);
     size_t compressed_size = compressor->get_compressed_output_size(d_comp_target);
+    float dt_get_comp_size = DT_MS(_dt_gcs);
     size_t total_size      = header_size + compressed_size;
 
     float primary_decomp_time_ms = 0.0f;
@@ -427,6 +452,7 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     }
     header.setAlgorithmId((uint8_t)algo_to_use);
 
+    DT_START(_dt_hdr);
     if (d_temp_out) {
         cuda_err = cudaMemcpyAsync(d_temp_out, &header, sizeof(CompressionHeader),
                                    cudaMemcpyHostToDevice, stream);
@@ -441,6 +467,7 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
         cuda_err = cudaMemcpyAsync(d_out, &header, sizeof(CompressionHeader),
                                    cudaMemcpyHostToDevice, stream);
     }
+    float dt_header_write = DT_MS(_dt_hdr);
 
     /* P1: only free if we allocated (not pre-allocated from CompContext) */
     if (d_quantized && owns_quantized) { cudaFree(d_quantized); d_quantized = nullptr; }
@@ -456,6 +483,7 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     auto t_explore_start = std::chrono::steady_clock::now();
 
     /* Copy pre-computed stats for diagnostics (always) and SGD (when learning enabled). */
+    DT_START(_dt_sc);
     if (cfg.algorithm == GPUCOMPRESS_ALGO_AUTO && d_precomputed_stats) {
         cuda_err = cudaMemcpyAsync(ctx->d_stats, d_precomputed_stats, sizeof(AutoStatsGPU),
                                    cudaMemcpyDeviceToDevice, stream);
@@ -464,6 +492,7 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
         if (cuda_err != cudaSuccess) return GPUCOMPRESS_ERROR_CUDA_FAILED;
         d_stats_ptr = ctx->d_stats;
     }
+    float dt_stats_copy = DT_MS(_dt_sc);
 
     if (cfg.algorithm == GPUCOMPRESS_ALGO_AUTO && g_online_learning_enabled) {
 
@@ -828,7 +857,9 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     }
 
     /* Synchronize ctx->stream before releasing context */
+    DT_START(_dt_fsync);
     cuda_err = cudaStreamSynchronize(stream);
+    float dt_final_sync = DT_MS(_dt_fsync);
     if (cuda_err != cudaSuccess) return GPUCOMPRESS_ERROR_CUDA_FAILED;
 
     /* Fill stats */
@@ -920,7 +951,28 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
         di.top_actions = top_actions;
         di.top_actions_count = top_actions ? 32 : 0;
         di.predicted_costs = predicted_costs;
-        gpucompress::recordChunkDiagnostic(di);
+        /* Detailed timing fields */
+        di.ctx_acquire_ms     = dt_ctx_acquire;
+        di.mgr_acquire_ms     = dt_mgr_acquire;
+        di.configure_comp_ms  = dt_configure_comp;
+        di.temp_alloc_ms      = dt_temp_alloc;
+        di.compress_launch_ms = dt_compress_launch;
+        di.stream_sync_ms     = dt_stream_sync;
+        di.get_comp_size_ms   = dt_get_comp_size;
+        di.header_write_ms    = dt_header_write;
+        di.stats_copy_ms      = dt_stats_copy;
+        di.final_sync_ms      = dt_final_sync;
+
+        DT_START(_dt_diag);
+        int diag_slot = gpucompress::recordChunkDiagnostic(di);
+        float dt_diag_record = DT_MS(_dt_diag);
+        /* Post-hoc: write diag_record_ms back (mutex for TSan compliance) */
+        if (g_detailed_timing && diag_slot >= 0 && diag_slot < g_chunk_history_cap) {
+            std::lock_guard<std::mutex> lk(g_chunk_history_mutex);
+            g_chunk_history[diag_slot].diag_record_ms = dt_diag_record;
+        }
+        /* Propagate slot index to caller for VOL timing writeback */
+        if (out_diag_slot) *out_diag_slot = diag_slot;
     }
 
     if (caller_stream) {

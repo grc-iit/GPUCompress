@@ -106,7 +106,7 @@ extern "C" void gpucompress_get_cache_stats(int *hits, int *misses) {
 
 namespace gpucompress {
 
-void recordChunkDiagnostic(const ChunkDiagInput& d)
+int recordChunkDiagnostic(const ChunkDiagInput& d)
 {
     std::lock_guard<std::mutex> lk(g_chunk_history_mutex);
     int idx = g_chunk_history_count.fetch_add(1);
@@ -182,6 +182,23 @@ void recordChunkDiagnostic(const ChunkDiagInput& d)
             h->feat_deriv   = d.h_feat_deriv;
         }
 
+        /* Detailed timing breakdown (zero when g_detailed_timing is off) */
+        h->ctx_acquire_ms     = d.ctx_acquire_ms;
+        h->mgr_acquire_ms     = d.mgr_acquire_ms;
+        h->configure_comp_ms  = d.configure_comp_ms;
+        h->temp_alloc_ms      = d.temp_alloc_ms;
+        h->compress_launch_ms = d.compress_launch_ms;
+        h->stream_sync_ms     = d.stream_sync_ms;
+        h->get_comp_size_ms   = d.get_comp_size_ms;
+        h->header_write_ms    = d.header_write_ms;
+        h->stats_copy_ms      = d.stats_copy_ms;
+        h->final_sync_ms      = d.final_sync_ms;
+        /* VOL Stage 1 timing (carried through WorkItem) */
+        h->vol_stats_malloc_ms = d.vol_stats_malloc_ms;
+        h->vol_stats_copy_ms   = d.vol_stats_copy_ms;
+        h->vol_wq_post_wait_ms = d.vol_wq_post_wait_ms;
+        /* diag_record_ms set post-hoc by caller after this function returns */
+
         /* Debug: print per-chunk predicted vs actual summary.
          * Skip non-AUTO compressions (predicted_ratio==0) to suppress noise
          * from Kendall tau profiler and fixed-algo phases. */
@@ -222,6 +239,29 @@ void recordChunkDiagnostic(const ChunkDiagInput& d)
                         d.exploration_triggered ? " [EXP]" : "");
             }
         }
+    }
+    return idx;
+}
+
+extern "C" void gpucompress_record_chunk_vol_timing(int idx,
+    float pool_acquire_ms, float d2h_copy_ms, float io_queue_wait_ms)
+{
+    std::lock_guard<std::mutex> lk(g_chunk_history_mutex);
+    if (idx >= 0 && idx < g_chunk_history_count.load() && idx < g_chunk_history_cap) {
+        g_chunk_history[idx].vol_pool_acquire_ms  = pool_acquire_ms;
+        g_chunk_history[idx].vol_d2h_copy_ms      = d2h_copy_ms;
+        g_chunk_history[idx].vol_io_queue_wait_ms = io_queue_wait_ms;
+    }
+}
+
+extern "C" void gpucompress_record_chunk_s1_timing(int idx,
+    float stats_malloc_ms, float stats_copy_ms, float wq_post_wait_ms)
+{
+    std::lock_guard<std::mutex> lk(g_chunk_history_mutex);
+    if (idx >= 0 && idx < g_chunk_history_count.load() && idx < g_chunk_history_cap) {
+        g_chunk_history[idx].vol_stats_malloc_ms  = stats_malloc_ms;
+        g_chunk_history[idx].vol_stats_copy_ms    = stats_copy_ms;
+        g_chunk_history[idx].vol_wq_post_wait_ms  = wq_post_wait_ms;
     }
 }
 

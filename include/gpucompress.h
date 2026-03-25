@@ -618,6 +618,27 @@ typedef struct {
     int    predicted_ranking[32]; /* action IDs sorted by predicted cost   */
     int    predicted_ranking_count; /* valid entries (0 if non-AUTO path)  */
     float  predicted_costs[32];  /* per-config predicted cost (indexed by action ID) */
+
+    /* Detailed timing breakdown (ms, 0.0 unless GPUCOMPRESS_DETAILED_TIMING=1)
+     * These capture host-side blocking that CUDA events miss. */
+    float  ctx_acquire_ms;        /* CompContext pool acquire wait              */
+    float  mgr_acquire_ms;        /* getOrCreateCompManager (cache miss cost)   */
+    float  configure_comp_ms;     /* nvcomp configure_compression               */
+    float  temp_alloc_ms;         /* cudaMalloc for oversized output buffer     */
+    float  compress_launch_ms;    /* compress() async launch overhead           */
+    float  stream_sync_ms;        /* cudaStreamSynchronize after compress       */
+    float  get_comp_size_ms;      /* get_compressed_output_size                 */
+    float  header_write_ms;       /* header memcpy + optional D→D copy          */
+    float  stats_copy_ms;         /* pre-computed stats D→D copy + sync         */
+    float  diag_record_ms;        /* diagnostic recording overhead              */
+    float  final_sync_ms;         /* final cudaStreamSynchronize                */
+    /* VOL pipeline per-chunk timing */
+    float  vol_stats_malloc_ms;   /* Stage 1: cudaMalloc for stats D→D copy     */
+    float  vol_stats_copy_ms;     /* Stage 1: stats D→D + sync                  */
+    float  vol_wq_post_wait_ms;   /* Stage 1: work queue bounded-post wait      */
+    float  vol_pool_acquire_ms;   /* Stage 2: pinned buffer pool acquire wait   */
+    float  vol_d2h_copy_ms;       /* Stage 2: compressed chunk D→H cudaMemcpy   */
+    float  vol_io_queue_wait_ms;  /* Stage 2: I/O queue backpressure wait       */
 } gpucompress_chunk_diag_t;
 
 /**
@@ -652,6 +673,19 @@ int  gpucompress_get_chunk_diag(int idx, gpucompress_chunk_diag_t *out);
  * Record actual decompression time for chunk @p idx (called from VOL read).
  */
 void gpucompress_record_chunk_decomp_ms(int idx, float ms);
+
+/**
+ * Record VOL pipeline timing for chunk @p idx (called from VOL Stage 2 worker).
+ * Thread-safe: takes g_chunk_history_mutex.
+ */
+void gpucompress_record_chunk_vol_timing(int idx,
+    float pool_acquire_ms, float d2h_copy_ms, float io_queue_wait_ms);
+
+/**
+ * Record VOL Stage 1 timing for chunk @p idx (called from VOL Stage 2 worker).
+ */
+void gpucompress_record_chunk_s1_timing(int idx,
+    float stats_malloc_ms, float stats_copy_ms, float wq_post_wait_ms);
 
 /**
  * Batched deferred decomp SGD: update W3[1]+b3[1] from all chunks' decomp times.
