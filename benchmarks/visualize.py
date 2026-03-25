@@ -56,9 +56,15 @@ PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 
 PHASE_ORDER = [
     "no-comp",
+    # With fixed- prefix (timestep-major deck)
     "fixed-lz4", "fixed-snappy", "fixed-deflate",
     "fixed-gdeflate", "fixed-zstd",
     "fixed-ans", "fixed-cascaded", "fixed-bitcomp",
+    # Without fixed- prefix (phase-major deck)
+    "lz4", "snappy", "deflate",
+    "gdeflate", "zstd",
+    "ans", "cascaded", "bitcomp",
+    # NN phases
     "nn", "nn-rl", "nn-rl+exp50",
 ]
 
@@ -72,6 +78,15 @@ PHASE_COLORS = {
     "fixed-ans":              "#148f77",   # teal
     "fixed-cascaded":         "#1abc9c",   # turquoise
     "fixed-bitcomp":          "#0e6655",   # dark teal
+    # Same colors without fixed- prefix
+    "lz4":                    "#3498db",
+    "snappy":                 "#5dade2",
+    "deflate":                "#2e86c1",
+    "gdeflate":               "#2980b9",
+    "zstd":                   "#1a5276",
+    "ans":                    "#148f77",
+    "cascaded":               "#1abc9c",
+    "bitcomp":                "#0e6655",
     "nn":                     "#e67e22",   # orange
     "nn-rl":                  "#8e44ad",   # purple
     "nn-rl+exp50":            "#c0392b",   # red
@@ -80,14 +95,14 @@ PHASE_COLORS = {
 # Hatching patterns for accessibility (colorblind-friendly)
 PHASE_HATCHES = {
     "no-comp":                "",
-    "fixed-lz4":              "",
-    "fixed-snappy":           "",
-    "fixed-deflate":          "",
-    "fixed-gdeflate":         "",
-    "fixed-zstd":             "",
-    "fixed-ans":              "",
-    "fixed-cascaded":         "",
-    "fixed-bitcomp":          "",
+    "fixed-lz4":              "",  "lz4":        "",
+    "fixed-snappy":           "",  "snappy":     "",
+    "fixed-deflate":          "",  "deflate":    "",
+    "fixed-gdeflate":         "",  "gdeflate":   "",
+    "fixed-zstd":             "",  "zstd":       "",
+    "fixed-ans":              "",  "ans":        "",
+    "fixed-cascaded":         "",  "cascaded":   "",
+    "fixed-bitcomp":          "",  "bitcomp":    "",
     "nn":                     "",
     "nn-rl":                  "\\\\",
     "nn-rl+exp50":            "xx",
@@ -102,14 +117,14 @@ PHASE_LINESTYLES = {
 
 PHASE_LABELS = {
     "no-comp":                "No Comp",
-    "fixed-lz4":              "Fixed\nLZ4",
-    "fixed-snappy":           "Fixed\nSnappy",
-    "fixed-deflate":          "Fixed\nDeflate",
-    "fixed-gdeflate":         "Fixed\nGDeflate",
-    "fixed-zstd":             "Fixed\nZstd",
-    "fixed-ans":              "Fixed\nANS",
-    "fixed-cascaded":         "Fixed\nCascaded",
-    "fixed-bitcomp":          "Fixed\nBitcomp",
+    "fixed-lz4":              "LZ4",       "lz4":        "LZ4",
+    "fixed-snappy":           "Snappy",    "snappy":     "Snappy",
+    "fixed-deflate":          "Deflate",   "deflate":    "Deflate",
+    "fixed-gdeflate":         "GDeflate",  "gdeflate":   "GDeflate",
+    "fixed-zstd":             "Zstd",      "zstd":       "Zstd",
+    "fixed-ans":              "ANS",       "ans":        "ANS",
+    "fixed-cascaded":         "Cascaded",  "cascaded":   "Cascaded",
+    "fixed-bitcomp":          "Bitcomp",   "bitcomp":    "Bitcomp",
     "nn":                     "NN\n(Inference)",
     "nn-rl":                  "NN+SGD",
     "nn-rl+exp50":            "NN+SGD\n+Explore",
@@ -1889,6 +1904,231 @@ def make_algorithm_histogram(chunk_csv_paths, output_path):
 
     _sc_finalize(fig, pad=1.5)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Write Path Decomposition + Pipeline Waterfall
+# ═══════════════════════════════════════════════════════════════════════
+
+def make_write_path_decomposition(ts_csv_path, output_path):
+    """Stacked bar: write_ms = h5dwrite + cuda_sync + h5dclose + h5fclose per timestep.
+
+    100% additive — these are consecutive chrono slices of the write path.
+    Shows one panel per phase, timesteps on x-axis.
+    """
+    all_rows = parse_csv(ts_csv_path)
+    if not all_rows or "h5dwrite_ms" not in all_rows[0]:
+        return
+
+    # Group by phase
+    by_phase = {}
+    for r in all_rows:
+        ph = r.get("phase", "")
+        by_phase.setdefault(ph, []).append(r)
+
+    # Only plot NN phases
+    nn_phases = [ph for ph in ["nn", "nn-rl", "nn-rl+exp50"] if ph in by_phase]
+    if not nn_phases:
+        nn_phases = list(by_phase.keys())[:3]
+    n = len(nn_phases)
+    if n == 0:
+        return
+
+    fig, axes = plt.subplots(1, n, figsize=(5 * n + 2, 5), squeeze=False)
+
+    colors = {"h5dwrite_ms": "#3498db", "cuda_sync_ms": "#e74c3c",
+              "h5dclose_ms": "#f39c12", "h5fclose_ms": "#95a5a6"}
+    labels = {"h5dwrite_ms": "H5Dwrite (VOL pipeline)",
+              "cuda_sync_ms": "cudaDeviceSync",
+              "h5dclose_ms": "H5Dclose (metadata)",
+              "h5fclose_ms": "H5Fclose"}
+    components = ["h5dwrite_ms", "cuda_sync_ms", "h5dclose_ms", "h5fclose_ms"]
+
+    phase_labels = {"nn": "NN Inference", "nn-rl": "NN + SGD",
+                    "nn-rl+exp50": "NN + SGD + Explore"}
+
+    for col, ph in enumerate(nn_phases):
+        ax = axes[0, col]
+        rows = sorted(by_phase[ph], key=lambda r: int(g(r, "timestep")))
+        ts = [int(g(r, "timestep")) for r in rows]
+        bottom = np.zeros(len(rows))
+
+        for comp in components:
+            vals = np.array([g(r, comp) for r in rows])
+            ax.bar(ts, vals, bottom=bottom, color=colors[comp],
+                   label=labels[comp], width=0.8, edgecolor="white", linewidth=0.3)
+            bottom += vals
+
+        ax.set_xlabel("Timestep")
+        if col == 0:
+            ax.set_ylabel("Time (ms)")
+        ax.set_title(phase_labels.get(ph, ph), fontweight="bold")
+        if col == n - 1:
+            ax.legend(loc="upper right", fontsize=7, framealpha=0.9)
+        ax.grid(axis="y", alpha=0.2)
+
+    fig.suptitle("Write Path Decomposition (100% additive)",
+                 fontsize=13, fontweight="bold")
+    _sc_finalize(fig, pad=1.5, rect=[0, 0, 1, 0.95])
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
+def make_pipeline_waterfall(ts_csv_path, output_path):
+    """Gantt-style waterfall: setup | S1 | S2 | S3 | join within h5dwrite.
+
+    Shows overlapping pipeline stages per timestep. One panel per phase.
+    """
+    all_rows = parse_csv(ts_csv_path)
+    if not all_rows or "vol_setup_ms" not in all_rows[0]:
+        return
+
+    by_phase = {}
+    for r in all_rows:
+        ph = r.get("phase", "")
+        by_phase.setdefault(ph, []).append(r)
+
+    nn_phases = [ph for ph in ["nn", "nn-rl", "nn-rl+exp50"] if ph in by_phase]
+    if not nn_phases:
+        nn_phases = list(by_phase.keys())[:3]
+    n = len(nn_phases)
+    if n == 0:
+        return
+
+    stage_colors = {
+        "vol_setup_ms":    "#95a5a6",
+        "vol_stage1_ms":   "#3498db",
+        "vol_stage2_ms":   "#2ecc71",
+        "vol_stage3_ms":   "#e74c3c",
+        "vol_join_ms":     "#9b59b6",
+    }
+    stage_labels = {
+        "vol_setup_ms":    "Setup (threads + alloc)",
+        "vol_stage1_ms":   "S1: Inference",
+        "vol_stage2_ms":   "S2: Compression",
+        "vol_stage3_ms":   "S3: I/O Write",
+        "vol_join_ms":     "Thread Join",
+    }
+    stages = list(stage_colors.keys())
+
+    phase_labels = {"nn": "NN Inference", "nn-rl": "NN + SGD",
+                    "nn-rl+exp50": "NN + SGD + Explore"}
+
+    # Pick last timestep for each phase (steady state)
+    fig, axes = plt.subplots(n, 1, figsize=(10, 2.5 * n + 2), squeeze=False)
+
+    for row, ph in enumerate(nn_phases):
+        ax = axes[row, 0]
+        rows = sorted(by_phase[ph], key=lambda r: int(g(r, "timestep")))
+
+        # Show last 5 timesteps (or all if < 5)
+        show_rows = rows[-5:] if len(rows) > 5 else rows
+
+        y_labels = []
+        for i, r in enumerate(show_rows):
+            ts = int(g(r, "timestep"))
+            y_labels.append(f"T={ts}")
+            x_offset = 0
+            for stage in stages:
+                val = g(r, stage)
+                if val > 0:
+                    ax.barh(i, val, left=x_offset, height=0.6,
+                            color=stage_colors[stage],
+                            edgecolor="white", linewidth=0.5)
+                # Stages overlap in pipeline — show them stacked for visual
+                # but note they run concurrently
+                x_offset += val
+
+            # Show h5dwrite wall time as a reference line
+            h5w = g(r, "h5dwrite_ms")
+            ax.axvline(h5w, color="black", linestyle="--", alpha=0.4, linewidth=1)
+
+        ax.set_yticks(range(len(y_labels)))
+        ax.set_yticklabels(y_labels)
+        ax.set_xlabel("Time (ms)")
+        ax.set_title(f"{phase_labels.get(ph, ph)} — Pipeline Stages "
+                     f"(dashed = h5dwrite wall clock)", fontweight="bold", fontsize=10)
+        ax.grid(axis="x", alpha=0.2)
+        ax.invert_yaxis()
+
+        if row == 0:
+            # Legend
+            from matplotlib.patches import Patch
+            handles = [Patch(facecolor=stage_colors[s], label=stage_labels[s])
+                       for s in stages]
+            ax.legend(handles=handles, loc="upper right", fontsize=7, framealpha=0.9)
+
+    fig.suptitle("VOL Pipeline Waterfall (stages overlap — sum > h5dwrite)",
+                 fontsize=13, fontweight="bold")
+    _sc_finalize(fig, pad=1.5, rect=[0, 0, 1, 0.95])
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
+def make_gpu_breakdown_over_time(ts_csv_path, output_path):
+    """Stacked bar: per-chunk GPU component breakdown over timesteps.
+
+    Shows stats + nn + preproc + comp + explore + sgd per timestep.
+    One panel per NN phase. These are the sum across all chunks in one timestep.
+    """
+    all_rows = parse_csv(ts_csv_path)
+    if not all_rows:
+        return
+
+    by_phase = {}
+    for r in all_rows:
+        ph = r.get("phase", "")
+        by_phase.setdefault(ph, []).append(r)
+
+    nn_phases = [ph for ph in ["nn", "nn-rl", "nn-rl+exp50"] if ph in by_phase]
+    if not nn_phases:
+        return
+    n = len(nn_phases)
+
+    fig, axes = plt.subplots(1, n, figsize=(5 * n + 2, 5), squeeze=False)
+
+    components = [
+        ("stats_ms",    "#3498db", "Stats kernels"),
+        ("nn_ms",       "#2ecc71", "NN inference"),
+        ("preproc_ms",  "#9b59b6", "Preprocessing"),
+        ("comp_ms",     "#e74c3c", "Compression"),
+        ("explore_ms",  "#f39c12", "Exploration"),
+        ("sgd_ms",      "#1abc9c", "SGD update"),
+    ]
+
+    phase_labels = {"nn": "NN Inference", "nn-rl": "NN + SGD",
+                    "nn-rl+exp50": "NN + SGD + Explore"}
+
+    for col, ph in enumerate(nn_phases):
+        ax = axes[0, col]
+        rows = sorted(by_phase[ph], key=lambda r: int(g(r, "timestep")))
+        ts = [int(g(r, "timestep")) for r in rows]
+        bottom = np.zeros(len(rows))
+
+        for key, color, label in components:
+            vals = np.array([g(r, key) for r in rows])
+            if np.sum(vals) > 0:  # skip empty components
+                ax.bar(ts, vals, bottom=bottom, color=color,
+                       label=label, width=0.8, edgecolor="white", linewidth=0.3)
+                bottom += vals
+
+        ax.set_xlabel("Timestep")
+        if col == 0:
+            ax.set_ylabel("Time (ms, sum across chunks)")
+        ax.set_title(phase_labels.get(ph, ph), fontweight="bold")
+        if col == n - 1:
+            ax.legend(loc="upper right", fontsize=7, framealpha=0.9)
+        ax.grid(axis="y", alpha=0.2)
+
+    fig.suptitle("GPU Component Breakdown Over Timesteps\n"
+                 "(stats + NN + preprocessing + compression + exploration + SGD)",
+                 fontsize=13, fontweight="bold")
+    _sc_finalize(fig, pad=1.5, rect=[0, 0, 1, 0.93])
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved: {output_path}")

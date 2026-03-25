@@ -116,13 +116,13 @@ def generate_figures(dataset, policy, out_dir):
             count += 1
 
     # ── 3. Algorithm evolution heatmap (all policies) ──
-    if csv_base:
-        tc_csv = os.path.join(data_dir, f"{csv_base}_timestep_chunks.csv")
-        ch_csv = os.path.join(data_dir, f"{csv_base}_chunks.csv")
-    elif dataset in DATASETS:
+    # Try derived name from csv_base first, then config registry, then generic
+    tc_csv = os.path.join(data_dir, f"{csv_base}_timestep_chunks.csv") if csv_base else ""
+    ch_csv = os.path.join(data_dir, f"{csv_base}_chunks.csv") if csv_base else ""
+    if not os.path.exists(tc_csv) and dataset in DATASETS:
         tc_csv = os.path.join(data_dir, DATASETS[dataset]["timestep_chunks_csv"])
         ch_csv = os.path.join(data_dir, DATASETS[dataset]["chunks_csv"])
-    else:
+    if not os.path.exists(tc_csv):
         tc_csv = os.path.join(data_dir, f"benchmark_{dataset}_timestep_chunks.csv")
         ch_csv = os.path.join(data_dir, f"benchmark_{dataset}_chunks.csv")
 
@@ -139,11 +139,10 @@ def generate_figures(dataset, policy, out_dir):
         count += 1
 
     # ── 5. Learning dynamics: MAPE + firing rates ──
-    if csv_base:
-        ts_csv = os.path.join(data_dir, f"{csv_base}_timesteps.csv")
-    elif dataset in DATASETS:
+    ts_csv = os.path.join(data_dir, f"{csv_base}_timesteps.csv") if csv_base else ""
+    if not os.path.exists(ts_csv) and dataset in DATASETS:
         ts_csv = os.path.join(data_dir, DATASETS[dataset]["timesteps_csv"])
-    else:
+    if not os.path.exists(ts_csv):
         ts_csv = os.path.join(data_dir, f"benchmark_{dataset}_timesteps.csv")
 
     if os.path.exists(ts_csv):
@@ -166,15 +165,32 @@ def generate_figures(dataset, policy, out_dir):
     # ── 5e. Ranking quality (Kendall tau) ──
     if csv_base:
         ranking_csv = os.path.join(data_dir, f"{csv_base}_ranking.csv")
-    elif dataset in DATASETS:
+    if not os.path.exists(ranking_csv) and dataset in DATASETS:
         ranking_csv = os.path.join(data_dir,
             DATASETS[dataset].get("agg_csv", "").replace(".csv", "_ranking.csv"))
-    else:
-        ranking_csv = os.path.join(data_dir, f"benchmark_{dataset}_ranking.csv")
+    if not os.path.exists(ranking_csv):
+        # Try without the vol infix (phase-major GS naming)
+        ranking_csv = os.path.join(data_dir, f"benchmark_{dataset.replace('_', '')}_ranking.csv")
+    if not os.path.exists(ranking_csv):
+        ranking_csv = os.path.join(data_dir, f"benchmark_grayscott_ranking.csv")
 
     if os.path.exists(ranking_csv):
         out_ranking = os.path.join(out_dir, "5e_ranking_quality.png")
         viz.make_ranking_quality_figure(ranking_csv, out_ranking)
+        count += 1
+
+    # ── 6. Write path decomposition + pipeline waterfall ──
+    if os.path.exists(ts_csv):
+        out_wp = os.path.join(out_dir, "6a_write_path_decomposition.png")
+        viz.make_write_path_decomposition(ts_csv, out_wp)
+        count += 1
+
+        out_wf = os.path.join(out_dir, "6b_pipeline_waterfall.png")
+        viz.make_pipeline_waterfall(ts_csv, out_wf)
+        count += 1
+
+        out_gpu = os.path.join(out_dir, "6c_gpu_breakdown_over_time.png")
+        viz.make_gpu_breakdown_over_time(ts_csv, out_gpu)
         count += 1
 
     return count
