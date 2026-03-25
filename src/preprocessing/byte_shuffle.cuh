@@ -45,6 +45,22 @@ uint8_t* byte_shuffle_simple(
 );
 
 /**
+ * @brief P1 overload: shuffle into a pre-allocated output buffer.
+ * If d_output_buf is non-null and large enough, uses it (returns d_output_buf).
+ * Otherwise falls back to cudaMalloc (caller must cudaFree the returned ptr).
+ * Sets *owns_output = true if the caller must free the returned pointer.
+ */
+uint8_t* byte_shuffle_simple(
+    void* device_input,
+    size_t total_bytes,
+    unsigned element_size,
+    size_t chunk_bytes,
+    cudaStream_t stream,
+    void* d_output_buf, size_t output_buf_cap,
+    bool* owns_output
+);
+
+/**
  * @brief Unshuffle a device buffer (reverse of byte_shuffle_simple)
  *
  * @param device_input   Pointer to shuffled data on device

@@ -65,6 +65,10 @@ static void destroyCompContextSlot(CompContext& ctx) {
     if (ctx.d_sgd_samples)       { cudaFree(ctx.d_sgd_samples); ctx.d_sgd_samples = nullptr; }
     if (ctx.d_range_min)         { cudaFree(ctx.d_range_min); ctx.d_range_min = nullptr; }
     if (ctx.d_range_max)         { cudaFree(ctx.d_range_max); ctx.d_range_max = nullptr; }
+    /* P1: preprocessing buffers */
+    if (ctx.d_preproc_quant)     { cudaFree(ctx.d_preproc_quant); ctx.d_preproc_quant = nullptr; ctx.preproc_quant_cap = 0; }
+    if (ctx.d_preproc_shuffle)   { cudaFree(ctx.d_preproc_shuffle); ctx.d_preproc_shuffle = nullptr; ctx.preproc_shuffle_cap = 0; }
+    if (ctx.d_cub_temp)          { cudaFree(ctx.d_cub_temp); ctx.d_cub_temp = nullptr; ctx.cub_temp_cap = 0; }
 }
 
 int initCompContextPool() {
@@ -107,6 +111,21 @@ int initCompContextPool() {
 
         if (cudaMalloc(&ctx.d_range_min, sizeof(double)) != cudaSuccess) goto fail;
         if (cudaMalloc(&ctx.d_range_max, sizeof(double)) != cudaSuccess) goto fail;
+
+        /* P1: Pre-allocate preprocessing buffers.
+         * 16MB covers the typical max chunk size. Quantized output may be
+         * smaller (int8/int16) but we allocate for worst case (1:1).
+         * CUB temp is typically a few KB — 64KB is generous. */
+        {
+            static constexpr size_t kPreallocChunk = 16UL << 20;  /* 16 MB */
+            static constexpr size_t kCubTemp       = 64UL << 10;  /* 64 KB */
+            if (cudaMalloc(&ctx.d_preproc_quant, kPreallocChunk) != cudaSuccess) goto fail;
+            ctx.preproc_quant_cap = kPreallocChunk;
+            if (cudaMalloc(&ctx.d_preproc_shuffle, kPreallocChunk) != cudaSuccess) goto fail;
+            ctx.preproc_shuffle_cap = kPreallocChunk;
+            if (cudaMalloc(&ctx.d_cub_temp, kCubTemp) != cudaSuccess) goto fail;
+            ctx.cub_temp_cap = kCubTemp;
+        }
 
         g_pool_slot_free[i] = true;
         g_pool_free_count++;

@@ -58,6 +58,17 @@ struct CompContext {
     void* d_range_min;
     void* d_range_max;
 
+    /* P1: Pre-allocated preprocessing buffers.
+     * Eliminates per-chunk cudaMalloc/cudaFree in quantize + shuffle.
+     * Sized to max chunk at init; if a chunk exceeds capacity, falls back
+     * to cudaMalloc (should be rare with typical 4-16MB chunks). */
+    void*   d_preproc_quant;       /* quantization output buffer */
+    size_t  preproc_quant_cap;     /* allocated capacity in bytes */
+    void*   d_preproc_shuffle;     /* shuffle output buffer */
+    size_t  preproc_shuffle_cap;   /* allocated capacity in bytes */
+    void*   d_cub_temp;            /* CUB temp storage for min/max reduction */
+    size_t  cub_temp_cap;          /* allocated capacity in bytes */
+
     static constexpr int N_COMP_ALGOS = 8;
 
     /* LRU-3 nvcomp manager cache — up to 3 managers per slot.
@@ -239,6 +250,11 @@ struct ChunkDiagInput {
     float predicted_ratio, predicted_comp_time, predicted_decomp_time, predicted_psnr;
     double error_bound;
     const AutoStatsGPU* d_stats_ptr;
+    /* P4 fix: host-side copy of stats features, pre-copied before mutex */
+    float h_feat_entropy;
+    float h_feat_mad;
+    float h_feat_deriv;
+    bool  h_stats_valid;
     /* Cost model */
     float cost_model_error_pct, actual_cost, predicted_cost;
     /* Original config metrics (before exploration swap) */

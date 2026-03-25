@@ -194,6 +194,9 @@ DeviceChunkArrays createDeviceChunkArrays(
     err = cudaMalloc(&result.d_sizes, num_chunks * sizeof(size_t));
     if (err != cudaSuccess)
         throw std::runtime_error("Failed to allocate d_sizes");
+    /* Note: on partial alloc failure, the throw propagates to the caller
+     * whose catch block returns nullptr. The DeviceChunkArrays destructor
+     * will cudaFree any successfully allocated members (nullptr-safe). */
 
     const int threads_per_block = 256;
     const int num_blocks = (num_chunks + threads_per_block - 1) / threads_per_block;
@@ -313,13 +316,16 @@ uint8_t* byte_shuffle_simple(
         arrays.d_output_ptrs, arrays.d_sizes,
         arrays.num_chunks, element_size, stream);
 
+    /* W1+P0: sync stream before scope exit so populateChunkArraysKernel
+     * (and shuffle kernel on success) complete before ~DeviceChunkArrays
+     * frees d_input_ptrs/d_output_ptrs/d_sizes. */
+    cudaStreamSynchronize(stream);
+
     if (err != cudaSuccess) {
         cudaFree(device_output);
         return nullptr;
     }
 
-    /* S4 fix: sync removed — next operation on same stream (compression)
-     * implicitly waits for shuffle to complete via GPU ordering. */
     return device_output;
 }
 
@@ -357,12 +363,68 @@ uint8_t* byte_unshuffle_simple(
         arrays.d_output_ptrs, arrays.d_sizes,
         arrays.num_chunks, element_size, stream);
 
+    /* W1+P0: sync before scope exit (same as shuffle path). */
+    cudaStreamSynchronize(stream);
+
     if (err != cudaSuccess) {
         cudaFree(device_output);
         return nullptr;
     }
 
-    /* S4 fix: sync removed — next operation on same stream
-     * implicitly waits via GPU ordering. */
+    return device_output;
+}
+
+
+/* P1 overload: uses pre-allocated output buffer when possible. */
+uint8_t* byte_shuffle_simple(
+    void* device_input,
+    size_t total_bytes,
+    unsigned element_size,
+    size_t chunk_bytes,
+    cudaStream_t stream,
+    void* d_output_buf, size_t output_buf_cap,
+    bool* owns_output
+) {
+    if (!device_input || total_bytes == 0) return nullptr;
+
+    uint8_t* device_output;
+    bool allocated;
+    if (d_output_buf && output_buf_cap >= total_bytes) {
+        device_output = static_cast<uint8_t*>(d_output_buf);
+        allocated = false;
+    } else {
+        cudaError_t err = cudaMalloc(&device_output, total_bytes);
+        if (err != cudaSuccess) return nullptr;
+        allocated = true;
+    }
+
+    DeviceChunkArrays arrays;
+    try {
+        arrays = createDeviceChunkArrays(device_input, device_output,
+                                         total_bytes, chunk_bytes, stream);
+    } catch (const std::exception&) {
+        if (allocated) cudaFree(device_output);
+        return nullptr;
+    }
+
+    if (arrays.num_chunks == 0) {
+        if (allocated) cudaFree(device_output);
+        return nullptr;
+    }
+
+    cudaError_t err = launch_byte_shuffle(
+        const_cast<const uint8_t**>(arrays.d_input_ptrs),
+        arrays.d_output_ptrs, arrays.d_sizes,
+        arrays.num_chunks, element_size, stream);
+
+    /* W1+P0: sync before scope exit (same as other overloads). */
+    cudaStreamSynchronize(stream);
+
+    if (err != cudaSuccess) {
+        if (allocated) cudaFree(device_output);
+        return nullptr;
+    }
+
+    if (owns_output) *owns_output = allocated;
     return device_output;
 }

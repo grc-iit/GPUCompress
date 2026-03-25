@@ -117,6 +117,7 @@ struct QuantizationResult {
     QuantizationType type;          // Quantization method used
     size_t num_elements;            // Number of elements
     size_t original_element_size;   // Original element size (4 or 8)
+    bool   owns_output;             // P1: true = caller must cudaFree d_quantized
 
     /**
      * @brief Default constructor
@@ -132,6 +133,7 @@ struct QuantizationResult {
         , type(QuantizationType::NONE)
         , num_elements(0)
         , original_element_size(0)
+        , owns_output(true)
     {}
 
     /**
@@ -273,6 +275,26 @@ QuantizationResult quantize_simple(
     QuantizationConfig config,
     void* d_range_min_buf,
     void* d_range_max_buf,
+    cudaStream_t stream = 0
+);
+
+/**
+ * @brief Thread-safe quantization with pre-allocated output + CUB temp (P1).
+ *
+ * If d_output_buf is non-null and output_buf_cap >= required size, uses
+ * the pre-allocated buffer (result.owns_output = false, caller must NOT free).
+ * Otherwise falls back to cudaMalloc (result.owns_output = true).
+ * Same logic applies to d_cub_temp_buf.
+ */
+QuantizationResult quantize_simple(
+    void* d_input,
+    size_t num_elements,
+    size_t element_size,
+    QuantizationConfig config,
+    void* d_range_min_buf,
+    void* d_range_max_buf,
+    void* d_output_buf, size_t output_buf_cap,
+    void* d_cub_temp_buf, size_t cub_temp_cap,
     cudaStream_t stream = 0
 );
 

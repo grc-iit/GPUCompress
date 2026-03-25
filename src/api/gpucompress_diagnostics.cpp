@@ -173,12 +173,13 @@ void recordChunkDiagnostic(const ChunkDiagInput& d)
         h->feat_action   = d.nn_original_action;
         h->feat_eb_enc   = static_cast<float>(log10(fmax(d.error_bound, 1e-7)));
         h->feat_ds_enc   = static_cast<float>(log2(fmax((double)d.input_size, 1.0)));
-        if (d.d_stats_ptr) {
-            AutoStatsGPU h_stats;
-            cudaMemcpy(&h_stats, d.d_stats_ptr, sizeof(AutoStatsGPU), cudaMemcpyDeviceToHost);
-            h->feat_entropy = static_cast<float>(h_stats.entropy);
-            h->feat_mad     = static_cast<float>(h_stats.mad_normalized);
-            h->feat_deriv   = static_cast<float>(h_stats.deriv_normalized);
+        /* P4 fix: use pre-copied host-side stats instead of synchronous
+         * cudaMemcpy D->H under mutex.  The caller copies stats to host
+         * before entering this function, eliminating GPU stalls under lock. */
+        if (d.h_stats_valid) {
+            h->feat_entropy = d.h_feat_entropy;
+            h->feat_mad     = d.h_feat_mad;
+            h->feat_deriv   = d.h_feat_deriv;
         }
 
         /* Debug: print per-chunk predicted vs actual summary.

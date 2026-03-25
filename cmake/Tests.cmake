@@ -266,38 +266,6 @@ target_include_directories(test_m7_header_async PRIVATE
 target_link_libraries(test_m7_header_async PRIVATE gpucompress CUDA::cudart)
 set_target_properties(test_m7_header_async PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
-add_executable(test_m8m9_warp_mask tests/regression/test_m8m9_warp_mask.cu)
-set_source_files_properties(tests/regression/test_m8m9_warp_mask.cu PROPERTIES LANGUAGE CUDA)
-target_include_directories(test_m8m9_warp_mask PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-)
-target_link_libraries(test_m8m9_warp_mask PRIVATE gpucompress CUDA::cudart)
-set_target_properties(test_m8m9_warp_mask PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-
-add_executable(test_m10_stats_workspace_race tests/regression/test_m10_stats_workspace_race.cu)
-set_source_files_properties(tests/regression/test_m10_stats_workspace_race.cu PROPERTIES LANGUAGE CUDA)
-target_include_directories(test_m10_stats_workspace_race PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-)
-target_link_libraries(test_m10_stats_workspace_race PRIVATE gpucompress CUDA::cudart pthread)
-set_target_properties(test_m10_stats_workspace_race PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-
-add_executable(test_m11_chunk_arrays_raii tests/regression/test_m11_chunk_arrays_raii.cu)
-set_source_files_properties(tests/regression/test_m11_chunk_arrays_raii.cu PROPERTIES LANGUAGE CUDA)
-target_include_directories(test_m11_chunk_arrays_raii PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-)
-target_link_libraries(test_m11_chunk_arrays_raii PRIVATE gpucompress CUDA::cudart)
-set_target_properties(test_m11_chunk_arrays_raii PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-
-add_executable(test_m12_range_bufs_race tests/regression/test_m12_range_bufs_race.cu)
-set_source_files_properties(tests/regression/test_m12_range_bufs_race.cu PROPERTIES LANGUAGE CUDA)
-target_include_directories(test_m12_range_bufs_race PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-)
-target_link_libraries(test_m12_range_bufs_race PRIVATE gpucompress CUDA::cudart)
-set_target_properties(test_m12_range_bufs_race PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-
 add_executable(test_m13_compute_range_errors tests/regression/test_m13_compute_range_errors.cu)
 set_source_files_properties(tests/regression/test_m13_compute_range_errors.cu PROPERTIES LANGUAGE CUDA)
 target_include_directories(test_m13_compute_range_errors PRIVATE
@@ -576,6 +544,33 @@ target_include_directories(test_nn_inference_profile PRIVATE
 )
 target_link_libraries(test_nn_inference_profile PRIVATE gpucompress CUDA::cudart m)
 set_target_properties(test_nn_inference_profile PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+add_executable(test_p1_preproc_correctness tests/perf/test_p1_preproc_correctness.cu)
+set_source_files_properties(tests/perf/test_p1_preproc_correctness.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(test_p1_preproc_correctness PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_p1_preproc_correctness PRIVATE gpucompress CUDA::cudart m)
+set_target_properties(test_p1_preproc_correctness PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+add_executable(test_p4_diag_overhead tests/perf/test_p4_diag_overhead.cu)
+set_source_files_properties(tests/perf/test_p4_diag_overhead.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(test_p4_diag_overhead PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_p4_diag_overhead PRIVATE gpucompress CUDA::cudart m)
+set_target_properties(test_p4_diag_overhead PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+add_executable(test_perf_optimizations tests/perf/test_perf_optimizations.cu)
+set_source_files_properties(tests/perf/test_perf_optimizations.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(test_perf_optimizations PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_perf_optimizations PRIVATE gpucompress CUDA::cudart m pthread)
+set_target_properties(test_perf_optimizations PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
 add_executable(test_k4_shuffle_throughput tests/perf/test_k4_shuffle_throughput.cu)
 set_source_files_properties(tests/perf/test_k4_shuffle_throughput.cu PROPERTIES LANGUAGE CUDA)

@@ -232,6 +232,55 @@ static int compute_data_range_typed(
     return 0;
 }
 
+/* P1 overload: uses pre-allocated CUB temp buffer if large enough. */
+template<typename T>
+static int compute_data_range_typed(
+    T* d_input, size_t num_elements,
+    double& data_min, double& data_max,
+    T* d_buf_min, T* d_buf_max,
+    void* d_cub_temp, size_t cub_temp_cap,
+    cudaStream_t stream
+) {
+    if (num_elements > (size_t)INT_MAX) return -1;
+
+    size_t temp_bytes = 0;
+    cudaError_t err = cub::DeviceReduce::Min(nullptr, temp_bytes, d_input, d_buf_min,
+                                              (int)num_elements, stream);
+    if (err != cudaSuccess) return -1;
+
+    void* d_temp = nullptr;
+    bool owns_temp = false;
+    if (d_cub_temp && cub_temp_cap >= temp_bytes) {
+        d_temp = d_cub_temp;
+    } else {
+        err = cudaMalloc(&d_temp, temp_bytes);
+        if (err != cudaSuccess) return -1;
+        owns_temp = true;
+    }
+
+    err = cub::DeviceReduce::Min(d_temp, temp_bytes, d_input, d_buf_min,
+                                  (int)num_elements, stream);
+    if (err != cudaSuccess) { if (owns_temp) cudaFree(d_temp); return -1; }
+
+    err = cub::DeviceReduce::Max(d_temp, temp_bytes, d_input, d_buf_max,
+                                  (int)num_elements, stream);
+    if (err != cudaSuccess) { if (owns_temp) cudaFree(d_temp); return -1; }
+
+    T h_min, h_max;
+    err = cudaMemcpyAsync(&h_min, d_buf_min, sizeof(T), cudaMemcpyDeviceToHost, stream);
+    if (err != cudaSuccess) { if (owns_temp) cudaFree(d_temp); return -1; }
+    err = cudaMemcpyAsync(&h_max, d_buf_max, sizeof(T), cudaMemcpyDeviceToHost, stream);
+    if (err != cudaSuccess) { if (owns_temp) cudaFree(d_temp); return -1; }
+    err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) { if (owns_temp) cudaFree(d_temp); return -1; }
+
+    if (owns_temp) cudaFree(d_temp);
+
+    data_min = static_cast<double>(h_min);
+    data_max = static_cast<double>(h_max);
+    return 0;
+}
+
 static int compute_data_range(
     void* d_input,
     size_t num_elements,
@@ -250,6 +299,27 @@ static int compute_data_range(
         return compute_data_range_typed<double>(
             static_cast<double*>(d_input), num_elements, data_min, data_max,
             static_cast<double*>(d_buf_min), static_cast<double*>(d_buf_max), stream);
+    }
+}
+
+/* P1 overload with pre-allocated CUB temp. */
+static int compute_data_range(
+    void* d_input, size_t num_elements, size_t element_size,
+    double& data_min, double& data_max,
+    void* d_buf_min, void* d_buf_max,
+    void* d_cub_temp, size_t cub_temp_cap,
+    cudaStream_t stream
+) {
+    if (element_size == 4) {
+        return compute_data_range_typed<float>(
+            static_cast<float*>(d_input), num_elements, data_min, data_max,
+            static_cast<float*>(d_buf_min), static_cast<float*>(d_buf_max),
+            d_cub_temp, cub_temp_cap, stream);
+    } else {
+        return compute_data_range_typed<double>(
+            static_cast<double*>(d_input), num_elements, data_min, data_max,
+            static_cast<double*>(d_buf_min), static_cast<double*>(d_buf_max),
+            d_cub_temp, cub_temp_cap, stream);
     }
 }
 
@@ -608,6 +678,119 @@ QuantizationResult quantize_simple(
     result.type                 = config.type;
     result.num_elements         = num_elements;
     result.original_element_size = element_size;
+
+    return result;
+}
+
+/**
+ * P1 overload: uses pre-allocated output + CUB temp buffers when possible.
+ * Falls back to cudaMalloc if pre-allocated buffers are too small.
+ */
+QuantizationResult quantize_simple(
+    void* d_input, size_t num_elements, size_t element_size,
+    QuantizationConfig config,
+    void* d_range_min_buf, void* d_range_max_buf,
+    void* d_output_buf, size_t output_buf_cap,
+    void* d_cub_temp_buf, size_t cub_temp_cap,
+    cudaStream_t stream
+) {
+    QuantizationResult result;
+
+    if (d_input == nullptr || num_elements == 0) return result;
+    if (element_size != 4 && element_size != 8) return result;
+    if (config.error_bound <= 0.0) return result;
+    if (d_range_min_buf == nullptr || d_range_max_buf == nullptr) return result;
+
+    double data_min, data_max;
+    if (compute_data_range(d_input, num_elements, element_size, data_min, data_max,
+                           d_range_min_buf, d_range_max_buf,
+                           d_cub_temp_buf, cub_temp_cap, stream) != 0) {
+        return result;
+    }
+
+    double data_range = data_max - data_min;
+    if (data_range <= 0.0) data_range = 1.0;
+
+    double max_abs_value    = fmax(fabs(data_min), fabs(data_max));
+    double float_repr_error = max_abs_value * 2.4e-7;
+    double available_for_quant = config.error_bound - float_repr_error;
+    double safety_margin    = config.error_bound * 0.05;
+    available_for_quant    -= safety_margin;
+    double min_eb_for_int32 = data_range / 4.0e9;
+
+    double effective_eb;
+    if (available_for_quant <= 0) {
+        effective_eb = fmax(min_eb_for_int32, float_repr_error * 0.1);
+    } else {
+        effective_eb = available_for_quant;
+    }
+    effective_eb = fmax(effective_eb, min_eb_for_int32);
+
+    int precision;
+    if (config.precision == QuantizationPrecision::AUTO) {
+        precision = compute_required_precision(data_range, effective_eb);
+    } else {
+        switch (config.precision) {
+            case QuantizationPrecision::INT8:  precision = 8;  break;
+            case QuantizationPrecision::INT16: precision = 16; break;
+            case QuantizationPrecision::INT32: precision = 32; break;
+            default: precision = 32;
+        }
+    }
+
+    double scale = 1.0 / (2.0 * effective_eb);
+
+    /* P1: use pre-allocated output buffer if large enough */
+    size_t output_bytes = num_elements * precision_to_bytes(precision);
+    void* d_output;
+    bool owns_output;
+    if (d_output_buf && output_buf_cap >= output_bytes) {
+        d_output = d_output_buf;
+        owns_output = false;
+    } else {
+        if (cudaMalloc(&d_output, output_bytes) != cudaSuccess) return result;
+        owns_output = true;
+    }
+
+    if (element_size == 4) {
+        if (precision == 8)
+            launch_quantize_kernel<float, int8_t>(
+                static_cast<float*>(d_input), static_cast<int8_t*>(d_output),
+                num_elements, scale, data_min, stream);
+        else if (precision == 16)
+            launch_quantize_kernel<float, int16_t>(
+                static_cast<float*>(d_input), static_cast<int16_t*>(d_output),
+                num_elements, scale, data_min, stream);
+        else
+            launch_quantize_kernel<float, int32_t>(
+                static_cast<float*>(d_input), static_cast<int32_t*>(d_output),
+                num_elements, scale, data_min, stream);
+    } else {
+        if (precision == 8)
+            launch_quantize_kernel<double, int8_t>(
+                static_cast<double*>(d_input), static_cast<int8_t*>(d_output),
+                num_elements, scale, data_min, stream);
+        else if (precision == 16)
+            launch_quantize_kernel<double, int16_t>(
+                static_cast<double*>(d_input), static_cast<int16_t*>(d_output),
+                num_elements, scale, data_min, stream);
+        else
+            launch_quantize_kernel<double, int32_t>(
+                static_cast<double*>(d_input), static_cast<int32_t*>(d_output),
+                num_elements, scale, data_min, stream);
+    }
+
+    result.d_quantized          = d_output;
+    result.quantized_bytes      = output_bytes;
+    result.actual_precision     = precision;
+    result.data_min             = data_min;
+    result.data_max             = data_max;
+    result.scale_factor         = scale;
+    result.error_bound          = effective_eb;
+    result.type                 = config.type;
+    result.num_elements         = num_elements;
+    result.original_element_size = element_size;
+    result.owns_output          = owns_output;
 
     return result;
 }

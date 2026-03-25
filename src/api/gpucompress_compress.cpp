@@ -267,11 +267,12 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
 
     g_last_nn_action.store(action);
 
-    /* ---- Preprocessing (same as gpucompress_compress_gpu) ---- */
+    /* ---- Preprocessing (P1: uses pre-allocated buffers from CompContext) ---- */
     const uint8_t* d_compress_input = static_cast<const uint8_t*>(d_input);
     size_t compress_input_size = input_size;
     uint8_t* d_quantized = nullptr;
     uint8_t* d_shuffled  = nullptr;
+    bool owns_quantized = true, owns_shuffled = true;
     QuantizationResult quant_result;
 
     auto t_preproc_start = std::chrono::steady_clock::now();
@@ -284,9 +285,13 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
                 num_elements, sizeof(float));
             quant_result = quantize_simple(
                 const_cast<uint8_t*>(d_compress_input), num_elements, sizeof(float), quant_cfg,
-                ctx->d_range_min, ctx->d_range_max, stream);
+                ctx->d_range_min, ctx->d_range_max,
+                ctx->d_preproc_quant, ctx->preproc_quant_cap,
+                ctx->d_cub_temp, ctx->cub_temp_cap,
+                stream);
             if (quant_result.isValid()) {
                 d_quantized = static_cast<uint8_t*>(quant_result.d_quantized);
+                owns_quantized = quant_result.owns_output;
                 d_compress_input = d_quantized;
                 compress_input_size = quant_result.quantized_bytes;
             } else {
@@ -299,11 +304,13 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     if (shuffle_size > 0) {
         d_shuffled = byte_shuffle_simple(
             const_cast<uint8_t*>(d_compress_input), compress_input_size,
-            shuffle_size, gpucompress::SHUFFLE_CHUNK_SIZE, stream);
+            shuffle_size, gpucompress::SHUFFLE_CHUNK_SIZE, stream,
+            ctx->d_preproc_shuffle, ctx->preproc_shuffle_cap,
+            &owns_shuffled);
         if (d_shuffled) {
             d_compress_input = d_shuffled;
         } else {
-            if (d_quantized) cudaFree(d_quantized);
+            if (d_quantized && owns_quantized) cudaFree(d_quantized);
             return GPUCOMPRESS_ERROR_COMPRESSION;
         }
     }
@@ -320,8 +327,8 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     CompressionAlgorithm internal_algo = gpucompress::toInternalAlgorithm(algo_to_use);
     auto* compressor = gpucompress::getOrCreateCompManager(ctx, internal_algo);
     if (!compressor) {
-        if (d_quantized) cudaFree(d_quantized);
-        if (d_shuffled)  cudaFree(d_shuffled);
+        if (d_quantized && owns_quantized) cudaFree(d_quantized);
+        if (d_shuffled && owns_shuffled)  cudaFree(d_shuffled);
         return GPUCOMPRESS_ERROR_COMPRESSION;
     }
 
@@ -329,16 +336,16 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     size_t max_compressed_size = comp_config.max_compressed_buffer_size;
 
     if (max_compressed_size == 0) {
-        if (d_quantized) cudaFree(d_quantized);
-        if (d_shuffled)  cudaFree(d_shuffled);
+        if (d_quantized && owns_quantized) cudaFree(d_quantized);
+        if (d_shuffled && owns_shuffled)  cudaFree(d_shuffled);
         return GPUCOMPRESS_ERROR_COMPRESSION;
     }
 
     size_t header_size = GPUCOMPRESS_HEADER_SIZE;
     size_t total_max_needed = header_size + max_compressed_size;
     if (total_max_needed < header_size) {
-        if (d_quantized) cudaFree(d_quantized);
-        if (d_shuffled)  cudaFree(d_shuffled);
+        if (d_quantized && owns_quantized) cudaFree(d_quantized);
+        if (d_shuffled && owns_shuffled)  cudaFree(d_shuffled);
         return GPUCOMPRESS_ERROR_INVALID_INPUT;
     }
 
@@ -348,8 +355,8 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
 
     if (total_max_needed > *output_size) {
         if (cudaMalloc(&d_temp_out, total_max_needed) != cudaSuccess) {
-            if (d_quantized) cudaFree(d_quantized);
-            if (d_shuffled)  cudaFree(d_shuffled);
+            if (d_quantized && owns_quantized) cudaFree(d_quantized);
+            if (d_shuffled && owns_shuffled)   cudaFree(d_shuffled);
             return GPUCOMPRESS_ERROR_OUT_OF_MEMORY;
         }
         d_comp_target = d_temp_out + header_size;
@@ -365,13 +372,13 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
         compressor->compress(d_compress_input, d_comp_target, comp_config);
     } catch (const std::exception& e) {
         if (d_temp_out)  cudaFree(d_temp_out);
-        if (d_quantized) cudaFree(d_quantized);
-        if (d_shuffled)  cudaFree(d_shuffled);
+        if (d_quantized && owns_quantized) cudaFree(d_quantized);
+        if (d_shuffled && owns_shuffled)  cudaFree(d_shuffled);
         return GPUCOMPRESS_ERROR_COMPRESSION;
     } catch (...) {
         if (d_temp_out)  cudaFree(d_temp_out);
-        if (d_quantized) cudaFree(d_quantized);
-        if (d_shuffled)  cudaFree(d_shuffled);
+        if (d_quantized && owns_quantized) cudaFree(d_quantized);
+        if (d_shuffled && owns_shuffled)  cudaFree(d_shuffled);
         return GPUCOMPRESS_ERROR_COMPRESSION;
     }
 
@@ -435,8 +442,9 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
                                    cudaMemcpyHostToDevice, stream);
     }
 
-    if (d_quantized) { cudaFree(d_quantized); d_quantized = nullptr; }
-    if (d_shuffled)  { cudaFree(d_shuffled);  d_shuffled  = nullptr; }
+    /* P1: only free if we allocated (not pre-allocated from CompContext) */
+    if (d_quantized && owns_quantized) { cudaFree(d_quantized); d_quantized = nullptr; }
+    if (d_shuffled && owns_shuffled)   { cudaFree(d_shuffled);  d_shuffled  = nullptr; }
 
     if (cuda_err != cudaSuccess) return GPUCOMPRESS_ERROR_CUDA_FAILED;
 
@@ -864,6 +872,19 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
         di.predicted_psnr = predicted_psnr;
         di.error_bound = cfg.error_bound;
         di.d_stats_ptr = d_stats_ptr;
+        /* P4 fix: copy stats features to host BEFORE entering the diagnostic
+         * mutex.  The stream is already synced (line 814), so d_stats_ptr is
+         * stable.  This eliminates a synchronous cudaMemcpy under lock. */
+        if (d_stats_ptr) {
+            AutoStatsGPU h_stats;
+            if (cudaMemcpy(&h_stats, d_stats_ptr, sizeof(AutoStatsGPU),
+                           cudaMemcpyDeviceToHost) == cudaSuccess) {
+                di.h_feat_entropy = static_cast<float>(h_stats.entropy);
+                di.h_feat_mad     = static_cast<float>(h_stats.mad_normalized);
+                di.h_feat_deriv   = static_cast<float>(h_stats.deriv_normalized);
+                di.h_stats_valid  = true;
+            }
+        }
         /* Cost model diagnostics (only valid when online learning enabled) */
         if (g_online_learning_enabled) {
             di.cost_model_error_pct = static_cast<float>(error_pct);

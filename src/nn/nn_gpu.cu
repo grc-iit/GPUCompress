@@ -1935,23 +1935,22 @@ int runNNSGDCtx(
     }
     if (err != cudaSuccess) return -1;
 
-    /* Record completion event so future inference calls can wait */
-    cudaEventRecord(g_sgd_done, g_sgd_stream);
+    /* Record completion event so future inference calls can wait.
+     * Inference inserts cudaStreamWaitEvent(g_sgd_done) before reading
+     * weights — this GPU-side dependency is the correctness mechanism. */
+    /* W2: only set flag if event record succeeds — prevents inference
+     * from waiting on a stale/unrecorded event. */
+    if (cudaEventRecord(g_sgd_done, g_sgd_stream) == cudaSuccess)
+        g_sgd_ever_fired.store(true, std::memory_order_release);
 
-    /* D→H: copy SGDOutput (12B) */
-    SGDOutput h_result;
-    err = cudaMemcpyAsync(&h_result, ctx->d_sgd_output, sizeof(SGDOutput),
-                           cudaMemcpyDeviceToHost, g_sgd_stream);
-    if (err != cudaSuccess) return -1;
-
-    err = cudaStreamSynchronize(g_sgd_stream);
-    if (err != cudaSuccess) return -1;
-
-    g_sgd_ever_fired.store(true, std::memory_order_release);
-
-    if (out_grad_norm) *out_grad_norm = h_result.grad_norm;
-    if (out_clipped)   *out_clipped   = h_result.was_clipped;
-    if (out_count)     *out_count     = h_result.sample_count;
+    /* P6: fire-and-forget — no D→H readback or stream sync needed.
+     * SGDOutput (grad_norm, was_clipped, sample_count) is dead code:
+     * both callers pass &gn/&gc/&gs but never read them after the call.
+     * Removing the sync drops g_sgd_mutex hold time from 0.1-0.5ms
+     * to ~10μs, eliminating serialization across concurrent workers. */
+    if (out_grad_norm) *out_grad_norm = 0.0f;
+    if (out_clipped)   *out_clipped   = 0;
+    if (out_count)     *out_count     = num_samples;
 
     return 0;
 }
@@ -2199,8 +2198,10 @@ int runBatchedDecompSGD(
     }
     if (err != cudaSuccess) return -1;
 
-    cudaEventRecord(g_sgd_done, g_sgd_stream);
-    g_sgd_ever_fired.store(true, std::memory_order_release);
+    /* W2: only set flag if event record succeeds — prevents inference
+     * from waiting on a stale/unrecorded event. */
+    if (cudaEventRecord(g_sgd_done, g_sgd_stream) == cudaSuccess)
+        g_sgd_ever_fired.store(true, std::memory_order_release);
 
     SGDOutput h_result;
     err = cudaMemcpyAsync(&h_result, d_decomp_sgd_output, sizeof(SGDOutput),
