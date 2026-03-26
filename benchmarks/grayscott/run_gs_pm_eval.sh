@@ -31,6 +31,7 @@ SGD_LR=${SGD_LR:-0.2}
 SGD_MAPE=${SGD_MAPE:-0.10}
 EXPLORE_K=${EXPLORE_K:-4}
 EXPLORE_THRESH=${EXPLORE_THRESH:-0.20}
+VERIFY=${VERIFY:-1}
 
 # ── Paths ──
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -151,6 +152,7 @@ for policy in "${POLICY_LIST[@]}"; do
             --w0 $W0 --w1 $W1 --w2 $W2 \
             --lr $SGD_LR --mape $SGD_MAPE \
             --explore-k $EXPLORE_K --explore-thresh $EXPLORE_THRESH \
+            ${VERIFY:+$([ "$VERIFY" = "0" ] && echo "--no-verify")} \
             --out-dir "$PHASE_DIR" \
             > "$PHASE_DIR/gs_benchmark.log" 2>&1
 

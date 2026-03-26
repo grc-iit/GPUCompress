@@ -1014,6 +1014,7 @@ int main(int argc, char **argv)
     float  rank_w0 = 1.0f, rank_w1 = 1.0f, rank_w2 = 1.0f;  /* cost model weights */
     double error_bound = 0.0;  /* 0 = lossless, >0 = lossy quantization */
     const char *out_dir_override = NULL;  /* overridable via --out-dir */
+    int do_verify = 1;       /* --no-verify: skip read-back + bitwise verification */
     int verbose_chunks = 0;  /* --verbose-chunks: print per-chunk detail at milestones */
     int inject_patterns = 0; /* --inject-patterns: overwrite middle chunks with contrasting data */
 
@@ -1083,6 +1084,8 @@ int main(int argc, char **argv)
                            "         fixed-gdeflate, fixed-zstd, fixed-ans, fixed-cascaded,\n"
                            "         fixed-bitcomp, nn, nn-rl, nn-rl+exp50\n", p);
                    return 1; }
+        } else if (strcmp(argv[i], "--no-verify") == 0) {
+            do_verify = 0;
         } else if (strcmp(argv[i], "--verbose-chunks") == 0) {
             verbose_chunks = 1;
         } else if (strcmp(argv[i], "--inject-patterns") == 0) {
@@ -1398,26 +1401,30 @@ int main(int argc, char **argv)
 
             if (wret < 0) { printf("  %-4d  H5Dwrite failed\n", t); continue; }
 
-            drop_pagecache(all_phases[pi].tmp_file);
+            double read_ms_t = 0;
+            unsigned long long mm = 0;
+            if (do_verify) {
+                drop_pagecache(all_phases[pi].tmp_file);
 
-            /* Read back + verify */
-            fapl = make_vol_fapl();
-            file = H5Fopen(all_phases[pi].tmp_file, H5F_ACC_RDONLY, fapl);
-            H5Pclose(fapl);
-            dset = H5Dopen2(file, "V", H5P_DEFAULT);
-            double tr0  = now_ms();
-            H5Dread(dset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, d_read);
-            cudaDeviceSynchronize();
-            H5Dclose(dset); H5Fclose(file);
-            double tr1  = now_ms();
-            double read_ms_t = tr1 - tr0;
+                /* Read back + verify */
+                fapl = make_vol_fapl();
+                file = H5Fopen(all_phases[pi].tmp_file, H5F_ACC_RDONLY, fapl);
+                H5Pclose(fapl);
+                dset = H5Dopen2(file, "V", H5P_DEFAULT);
+                double tr0  = now_ms();
+                H5Dread(dset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, d_read);
+                cudaDeviceSynchronize();
+                H5Dclose(dset); H5Fclose(file);
+                double tr1  = now_ms();
+                read_ms_t = tr1 - tr0;
+
+                mm = gpu_compare(d_v, d_read, n_floats, d_count);
+            }
 
             /* Accumulate */
             sum_write_ms += write_ms_t;
             sum_read_ms  += read_ms_t;
             n_steady++;
-
-            unsigned long long mm = gpu_compare(d_v, d_read, n_floats, d_count);
             size_t file_sz = file_size(all_phases[pi].tmp_file);
             last_file_sz = file_sz;
             double ratio_t = (file_sz > 0) ? (double)total_bytes / (double)file_sz : 1.0;

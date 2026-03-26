@@ -30,6 +30,7 @@ SGD_LR=${SGD_LR:-0.2}
 SGD_MAPE=${SGD_MAPE:-0.10}
 EXPLORE_K=${EXPLORE_K:-4}
 EXPLORE_THRESH=${EXPLORE_THRESH:-0.20}
+VERIFY=${VERIFY:-1}
 
 # ── Paths ──
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -154,6 +155,7 @@ for policy in "${POLICY_LIST[@]}"; do
         VPIC_RESULTS_DIR="$PHASE_DIR" \
         VPIC_LR=$SGD_LR VPIC_MAPE_THRESHOLD=$SGD_MAPE \
         VPIC_EXPLORE_K=$EXPLORE_K VPIC_EXPLORE_THRESH=$EXPLORE_THRESH \
+        VPIC_VERIFY=$VERIFY \
         "$VPIC_BIN" "$VPIC_DECK" > "$PHASE_DIR/vpic_benchmark.log" 2>&1
 
         RUN_END=$(date +%s)

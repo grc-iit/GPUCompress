@@ -154,7 +154,7 @@ begin_globals {
     float              reinforce_mape;    // MAPE threshold for SGD (env VPIC_MAPE_THRESHOLD)
     int                explore_k;         // Exploration K alternatives (env VPIC_EXPLORE_K)
     float              explore_thresh;    // Exploration error threshold (env VPIC_EXPLORE_THRESH)
-    /* n_runs removed — phase-major doesn't use single-shot repetitions */
+    int                do_verify;         // Read-back + bitwise verify (env VPIC_VERIFY, default 1)
 
     // Ranking quality profiler
     FILE*              ranking_csv;       // Kendall tau ranking CSV
@@ -765,7 +765,8 @@ begin_initialization {
     global->reinforce_mape  = reinforce_mape;
     global->explore_k       = explore_k;
     global->explore_thresh  = explore_thresh;
-    /* n_runs removed */
+    const char* env_verify = getenv("VPIC_VERIFY");
+    global->do_verify       = env_verify ? atoi(env_verify) : 1;
 
     // Grid setup
     define_units(c, eps0);
@@ -1317,27 +1318,31 @@ begin_diagnostics {
                 continue;
             }
 
-            /* Drop page cache so read-back measures real I/O, not cached data */
-            drop_pagecache(phases[pi].tmp_file);
+            double read_ms_t = 0;
+            unsigned long long mm = 0;
+            if (global->do_verify) {
+                /* Drop page cache so read-back measures real I/O, not cached data */
+                drop_pagecache(phases[pi].tmp_file);
 
-            /* Read back + verify */
-            fapl = H5Pcreate(H5P_FILE_ACCESS);
-            nid = H5VLget_connector_id_by_name("native");
-            H5Pset_fapl_gpucompress(fapl, nid, NULL);
-            H5VLclose(nid);
-            file = H5Fopen(phases[pi].tmp_file, H5F_ACC_RDONLY, fapl);
-            H5Pclose(fapl);
-            dset = H5Dopen2(file, "fields", H5P_DEFAULT);
+                /* Read back + verify */
+                fapl = H5Pcreate(H5P_FILE_ACCESS);
+                nid = H5VLget_connector_id_by_name("native");
+                H5Pset_fapl_gpucompress(fapl, nid, NULL);
+                H5VLclose(nid);
+                file = H5Fopen(phases[pi].tmp_file, H5F_ACC_RDONLY, fapl);
+                H5Pclose(fapl);
+                dset = H5Dopen2(file, "fields", H5P_DEFAULT);
 
-            double tr0 = now_ms();
-            H5Dread(dset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, global->d_read);
-            cudaDeviceSynchronize();
-            H5Dclose(dset); H5Fclose(file);
-            double tr1 = now_ms();
-            double read_ms_t = tr1 - tr0;
+                double tr0 = now_ms();
+                H5Dread(dset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, global->d_read);
+                cudaDeviceSynchronize();
+                H5Dclose(dset); H5Fclose(file);
+                double tr1 = now_ms();
+                read_ms_t = tr1 - tr0;
 
-            unsigned long long mm = host_compare(d_fields, global->d_read,
-                                                  global->h_orig, global->h_read, n_floats);
+                mm = host_compare(d_fields, global->d_read,
+                                  global->h_orig, global->h_read, n_floats);
+            }
 
             /* File size for ratio */
             size_t file_sz = get_file_size(phases[pi].tmp_file);
