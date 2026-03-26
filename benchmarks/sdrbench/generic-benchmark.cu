@@ -69,7 +69,7 @@
 #define DEFAULT_CHUNK_MB    4
 #define DEFAULT_EXT         ".f32"
 
-#define REINFORCE_LR        0.1f
+#define REINFORCE_LR        0.2f
 #define REINFORCE_MAPE      0.10f
 
 #define TMP_NOCOMP      "/tmp/bm_generic_nocomp.h5"
@@ -991,6 +991,10 @@ int main(int argc, char **argv)
     unsigned int phase_mask = 0;
     float rank_w0 = 1.0f, rank_w1 = 1.0f, rank_w2 = 1.0f;
     float sgd_lr = REINFORCE_LR;
+    float sgd_mape = REINFORCE_MAPE;
+    int   explore_k = 4;
+    float explore_thresh = 0.20f;
+    int   do_verify = 1;
     double error_bound = 0.0;
 
     for (int i = 1; i < argc; i++) {
@@ -1015,14 +1019,14 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "--phase") == 0 && i + 1 < argc) {
             i++;
             if (strcmp(argv[i], "no-comp") == 0) phase_mask |= P_NOCOMP;
-            else if (strcmp(argv[i], "fixed-lz4") == 0) phase_mask |= P_FIX_LZ4;
-            else if (strcmp(argv[i], "fixed-snappy") == 0) phase_mask |= P_FIX_SNAPPY;
-            else if (strcmp(argv[i], "fixed-deflate") == 0) phase_mask |= P_FIX_DEFL;
-            else if (strcmp(argv[i], "fixed-gdeflate") == 0) phase_mask |= P_FIX_GDEFL;
-            else if (strcmp(argv[i], "fixed-zstd") == 0) phase_mask |= P_FIX_ZSTD;
-            else if (strcmp(argv[i], "fixed-ans") == 0) phase_mask |= P_FIX_ANS;
-            else if (strcmp(argv[i], "fixed-cascaded") == 0) phase_mask |= P_FIX_CASC;
-            else if (strcmp(argv[i], "fixed-bitcomp") == 0) phase_mask |= P_FIX_BITCOMP;
+            else if (strcmp(argv[i], "lz4") == 0 || strcmp(argv[i], "fixed-lz4") == 0) phase_mask |= P_FIX_LZ4;
+            else if (strcmp(argv[i], "snappy") == 0 || strcmp(argv[i], "fixed-snappy") == 0) phase_mask |= P_FIX_SNAPPY;
+            else if (strcmp(argv[i], "deflate") == 0 || strcmp(argv[i], "fixed-deflate") == 0) phase_mask |= P_FIX_DEFL;
+            else if (strcmp(argv[i], "gdeflate") == 0 || strcmp(argv[i], "fixed-gdeflate") == 0) phase_mask |= P_FIX_GDEFL;
+            else if (strcmp(argv[i], "zstd") == 0 || strcmp(argv[i], "fixed-zstd") == 0) phase_mask |= P_FIX_ZSTD;
+            else if (strcmp(argv[i], "ans") == 0 || strcmp(argv[i], "fixed-ans") == 0) phase_mask |= P_FIX_ANS;
+            else if (strcmp(argv[i], "cascaded") == 0 || strcmp(argv[i], "fixed-cascaded") == 0) phase_mask |= P_FIX_CASC;
+            else if (strcmp(argv[i], "bitcomp") == 0 || strcmp(argv[i], "fixed-bitcomp") == 0) phase_mask |= P_FIX_BITCOMP;
             else if (strcmp(argv[i], "nn") == 0) phase_mask |= P_NN;
             else if (strcmp(argv[i], "nn-rl") == 0) phase_mask |= P_NNRL;
             else if (strcmp(argv[i], "nn-rl+exp50") == 0) phase_mask |= P_NNRLEXP;
@@ -1036,6 +1040,14 @@ int main(int argc, char **argv)
             rank_w2 = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--lr") == 0 && i + 1 < argc) {
             sgd_lr = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--mape") == 0 && i + 1 < argc) {
+            sgd_mape = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--explore-k") == 0 && i + 1 < argc) {
+            explore_k = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--explore-thresh") == 0 && i + 1 < argc) {
+            explore_thresh = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--no-verify") == 0) {
+            do_verify = 0;
         } else if (strcmp(argv[i], "--error-bound") == 0 && i + 1 < argc) {
             error_bound = atof(argv[++i]);
         } else if (strcmp(argv[i], "--name") == 0 && i + 1 < argc) {
@@ -1415,7 +1427,10 @@ int main(int argc, char **argv)
                     "write_mbps,read_mbps,"
                     "file_bytes,"
                     "stats_ms,nn_ms,preproc_ms,comp_ms,decomp_ms,explore_ms,sgd_ms,"
-                    "mae_ratio,mae_comp_ms,mae_decomp_ms,r2_ratio\n");
+                    "mae_ratio,mae_comp_ms,mae_decomp_ms,r2_ratio,"
+                    "vol_stage1_ms,vol_stage2_ms,vol_stage3_ms,"
+                    "h5dwrite_ms,cuda_sync_ms,h5dclose_ms,h5fclose_ms,"
+                    "vol_setup_ms,vol_pipeline_ms,vol_join_ms\n");
         }
 
         /* Open timestep-chunks CSV for milestone fields */
@@ -1458,14 +1473,14 @@ int main(int argc, char **argv)
 
             if (ts_all[pi].sgd) {
                 gpucompress_enable_online_learning();
-                gpucompress_set_reinforcement(1, sgd_lr, REINFORCE_MAPE, REINFORCE_MAPE);
+                gpucompress_set_reinforcement(1, sgd_lr, sgd_mape, sgd_mape);
             } else {
                 gpucompress_disable_online_learning();
             }
             gpucompress_set_exploration(ts_all[pi].explore);
             if (ts_all[pi].explore) {
-                gpucompress_set_exploration_threshold(0.20);
-                gpucompress_set_exploration_k(31);
+                gpucompress_set_exploration_threshold(explore_thresh);
+                gpucompress_set_exploration_k(explore_k);
             }
 
             printf("  %-4s  %-30s  %-7s  %-7s  %-7s  %-8s  %-4s  %-4s\n",
@@ -1513,29 +1528,49 @@ int main(int argc, char **argv)
                 double tw0 = now_ms();
                 H5Dwrite(dset, H5T_NATIVE_FLOAT,
                          H5S_ALL, H5S_ALL, H5P_DEFAULT, d_data);
+                double tw_after_write = now_ms();
                 cudaDeviceSynchronize();
-                H5Dclose(dset); H5Fclose(file);
+                double tw_after_sync = now_ms();
+                H5Dclose(dset);
+                double tw_after_dclose = now_ms();
+                H5Fclose(file);
                 double tw1 = now_ms();
 
-                drop_pagecache(TMP_NN_RL);
+                /* Fine-grained write path breakdown */
+                double h5dwrite_ms_t  = tw_after_write - tw0;
+                double cuda_sync_ms_t = tw_after_sync - tw_after_write;
+                double h5dclose_ms_t  = tw_after_dclose - tw_after_sync;
+                double h5fclose_ms_t  = tw1 - tw_after_dclose;
 
-                /* Read back */
-                fapl = make_vol_fapl();
-                file = H5Fopen(TMP_NN_RL, H5F_ACC_RDONLY, fapl);
-                H5Pclose(fapl);
-                dset = H5Dopen2(file, "field", H5P_DEFAULT);
+                /* VOL pipeline stage timing */
+                double vol_s1 = 0, vol_s2 = 0, vol_s3 = 0, vol_total = 0;
+                H5VL_gpucompress_get_stage_timing(&vol_s1, &vol_s2, &vol_s3, &vol_total);
+                double vol_setup = 0, vol_func = 0, vol_join = 0;
+                H5VL_gpucompress_get_vol_func_timing(&vol_setup, &vol_func, &vol_join);
 
-                double tr0 = now_ms();
-                H5Dread(dset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, d_read);
-                cudaDeviceSynchronize();
-                H5Dclose(dset); H5Fclose(file);
-                double tr1 = now_ms();
+                double read_ms_t = 0;
+                unsigned long long mm = 0;
+                if (do_verify) {
+                    drop_pagecache(TMP_NN_RL);
 
-                unsigned long long mm = gpu_compare(d_data, d_read, n_floats, d_count);
+                    /* Read back + verify */
+                    fapl = make_vol_fapl();
+                    file = H5Fopen(TMP_NN_RL, H5F_ACC_RDONLY, fapl);
+                    H5Pclose(fapl);
+                    dset = H5Dopen2(file, "field", H5P_DEFAULT);
+
+                    double tr0 = now_ms();
+                    H5Dread(dset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, d_read);
+                    cudaDeviceSynchronize();
+                    H5Dclose(dset); H5Fclose(file);
+                    double tr1 = now_ms();
+                    read_ms_t = tr1 - tr0;
+
+                    mm = gpu_compare(d_data, d_read, n_floats, d_count);
+                }
                 size_t file_sz = get_file_size(TMP_NN_RL);
                 double ratio_t = (file_sz > 0) ? (double)total_bytes / (double)file_sz : 1.0;
                 double write_ms_t = tw1 - tw0;
-                double read_ms_t = tr1 - tr0;
 
                 /* Collect MAPE for this field */
                 PhaseResult field_r;
@@ -1588,23 +1623,28 @@ int main(int argc, char **argv)
 
                 /* Write to timestep CSV */
                 if (ts_csv) {
+                    double wr_mbps = (write_ms_t > 0) ? (double)total_bytes / (1 << 20) / (write_ms_t / 1000.0) : 0;
+                    double rd_mbps = (read_ms_t > 0) ? (double)total_bytes / (1 << 20) / (read_ms_t / 1000.0) : 0;
                     fprintf(ts_csv, "%s,%d,%s,%.2f,%.2f,%.4f,"
                             "%.2f,%.2f,%.2f,"
                             "%d,%d,%d,%llu,%.1f,%.1f,%zu,"
                             "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
-                            "%.4f,%.4f,%.4f,%.4f\n",
+                            "%.4f,%.4f,%.4f,%.4f,"
+                            "%.3f,%.3f,%.3f,"
+                            "%.3f,%.3f,%.3f,%.3f,"
+                            "%.3f,%.3f,%.3f\n",
                             phase_name, fi, fname,
                             write_ms_t, read_ms_t, ratio_t,
                             field_r.mape_ratio_pct, field_r.mape_comp_pct,
                             field_r.mape_decomp_pct,
                             field_r.sgd_fires, field_r.explorations,
-                            n_chunks, mm,
-                            (double)total_bytes / (1 << 20) / (write_ms_t / 1000.0),
-                            (double)total_bytes / (1 << 20) / (read_ms_t / 1000.0),
-                            file_sz,
+                            n_chunks, mm, wr_mbps, rd_mbps, file_sz,
                             field_r.stats_ms, field_r.nn_ms, field_r.preproc_ms,
                             field_r.comp_ms, field_r.decomp_ms, field_r.explore_ms, field_r.sgd_ms,
-                            field_r.mae_ratio, field_r.mae_comp_ms, field_r.mae_decomp_ms, field_r.r2_ratio);
+                            field_r.mae_ratio, field_r.mae_comp_ms, field_r.mae_decomp_ms, field_r.r2_ratio,
+                            vol_s1, vol_s2, vol_s3,
+                            h5dwrite_ms_t, cuda_sync_ms_t, h5dclose_ms_t, h5fclose_ms_t,
+                            vol_setup, vol_total, vol_join);
                 }
 
                 /* Write per-chunk detail at milestone fields */

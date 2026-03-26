@@ -35,7 +35,8 @@
 #
 #   Variable        Default     Description
 #   --------------- ----------- -----------------------------------------
-#   BENCHMARKS      grayscott,vpic   Which to run (comma-separated)
+#   BENCHMARKS      grayscott,vpic,sdrbench  Which to run (comma-separated)
+#   SDR_DATASET     nyx              SDRBench dataset (hurricane_isabel, nyx, cesm_atm)
 #   DATA_MB         512         Target dataset size in MB (auto-computes grid)
 #   CHUNK_MB        16          Chunk size in MB
 #   TIMESTEPS       50          Number of write/read/verify cycles
@@ -59,7 +60,7 @@ set +e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # ── Shared defaults ──
-BENCHMARKS=${BENCHMARKS:-"grayscott,vpic"}
+BENCHMARKS=${BENCHMARKS:-"grayscott,vpic,sdrbench"}
 DATA_MB=${DATA_MB:-512}
 CHUNK_MB=${CHUNK_MB:-16}
 TIMESTEPS=${TIMESTEPS:-50}
@@ -83,12 +84,13 @@ if [ -z "$GS_L" ]; then
     GS_L=$(python3 -c "import math; print(int(round(math.pow($DATA_MB * 1024 * 1024 / 4, 1/3))))")
 fi
 if [ -z "$VPIC_NX" ]; then
-    # NX = cube_root(DATA_MB * 1024 * 1024 / 24)
-    VPIC_NX=$(python3 -c "import math; print(int(round(math.pow($DATA_MB * 1024 * 1024 / 24, 1/3))))")
+    # VPIC writes (NX+2)^3 * 16 fields * 4 bytes = (NX+2)^3 * 64
+    # NX = cube_root(DATA_MB * 1024 * 1024 / 64) - 2
+    VPIC_NX=$(python3 -c "import math; print(int(round(math.pow($DATA_MB * 1024 * 1024 / 64, 1/3))) - 2)")
 fi
 
 GS_DATA=$(( GS_L * GS_L * GS_L * 4 / 1024 / 1024 ))
-VPIC_DATA=$(( (VPIC_NX+2) * (VPIC_NX+2) * (VPIC_NX+2) * 24 / 1024 / 1024 ))
+VPIC_DATA=$(( (VPIC_NX+2) * (VPIC_NX+2) * (VPIC_NX+2) * 64 / 1024 / 1024 ))
 
 echo "============================================================"
 echo "  GPUCompress Benchmark Suite"
@@ -148,8 +150,24 @@ for bench in "${BENCH_LIST[@]}"; do
             DEBUG_NN=$DEBUG_NN \
             bash "$SCRIPT_DIR/vpic-kokkos/run_vpic_pm_eval.sh"
             ;;
+        sdrbench)
+            echo ""
+            echo ">>> Running SDRBench benchmark..."
+            echo ""
+            DATASET=${SDR_DATASET:-nyx} \
+            CHUNK_MB=$CHUNK_MB \
+            PHASES=$PHASES \
+            POLICIES=$POLICIES \
+            SGD_LR=$SGD_LR \
+            SGD_MAPE=$SGD_MAPE \
+            EXPLORE_K=$EXPLORE_K \
+            EXPLORE_THRESH=$EXPLORE_THRESH \
+            VERIFY=$VERIFY \
+            DEBUG_NN=$DEBUG_NN \
+            bash "$SCRIPT_DIR/sdrbench/run_sdr_pm_eval.sh"
+            ;;
         *)
-            echo "ERROR: Unknown benchmark '$bench'. Use: grayscott, vpic"
+            echo "ERROR: Unknown benchmark '$bench'. Use: grayscott, vpic, sdrbench"
             ;;
     esac
 done
