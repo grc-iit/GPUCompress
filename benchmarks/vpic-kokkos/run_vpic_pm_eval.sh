@@ -36,8 +36,8 @@ VERIFY=${VERIFY:-1}
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 GPU_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 WEIGHTS="$GPU_DIR/neural_net/weights/model.nnwt"
-VPIC_BIN="$SCRIPT_DIR/vpic_benchmark_deck_pm.Linux"
-VPIC_DECK="$SCRIPT_DIR/vpic_benchmark_deck_phase_major.cxx"
+VPIC_BIN="$SCRIPT_DIR/vpic_benchmark_deck.Linux"
+VPIC_DECK="$SCRIPT_DIR/vpic_benchmark_deck.cxx"
 VPIC_LD_PATH="/tmp/hdf5-install/lib:$GPU_DIR/build:/tmp/lib"
 
 # ── Policy configs ──
@@ -77,7 +77,7 @@ PARAMS_EOF
 # ── Verify binary ──
 if [ ! -f "$VPIC_BIN" ]; then
     echo "ERROR: Phase-major binary not found: $VPIC_BIN"
-    echo "Build it: bash benchmarks/vpic-kokkos/build_vpic_pm.sh && mv vpic_benchmark_deck_pm.Linux benchmarks/vpic-kokkos/"
+    echo "Build it: bash benchmarks/vpic-kokkos/build_vpic_pm.sh && mv vpic_benchmark_deck.Linux benchmarks/vpic-kokkos/"
     exit 1
 fi
 

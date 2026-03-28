@@ -1548,6 +1548,34 @@ extern "C" gpucompress_error_t gpucompress_nn_restore_snapshot(const void* src) 
 }
 
 /**
+ * Save a snapshot of the current NN weights to a device buffer (GPU → GPU).
+ *
+ * @param d_dst  Device buffer of at least gpucompress_nn_weights_size() bytes
+ */
+extern "C" gpucompress_error_t gpucompress_nn_save_snapshot_device(void* d_dst) {
+    if (!d_dst) return GPUCOMPRESS_ERROR_INVALID_INPUT;
+    std::lock_guard<std::mutex> lock(g_nn_ptr_mutex);
+    if (!d_nn_weights) return GPUCOMPRESS_ERROR_INVALID_INPUT;
+    cudaError_t err = cudaMemcpy(d_dst, d_nn_weights, sizeof(NNWeightsGPU),
+                                  cudaMemcpyDeviceToDevice);
+    return (err == cudaSuccess) ? GPUCOMPRESS_SUCCESS : GPUCOMPRESS_ERROR_CUDA_FAILED;
+}
+
+/**
+ * Restore NN weights from a device snapshot buffer (GPU → GPU).
+ *
+ * @param d_src  Device buffer previously filled by gpucompress_nn_save_snapshot_device()
+ */
+extern "C" gpucompress_error_t gpucompress_nn_restore_snapshot_device(const void* d_src) {
+    if (!d_src) return GPUCOMPRESS_ERROR_INVALID_INPUT;
+    std::lock_guard<std::mutex> lock(g_nn_ptr_mutex);
+    if (!d_nn_weights) return GPUCOMPRESS_ERROR_INVALID_INPUT;
+    cudaError_t err = cudaMemcpy(d_nn_weights, d_src, sizeof(NNWeightsGPU),
+                                  cudaMemcpyDeviceToDevice);
+    return (err == cudaSuccess) ? GPUCOMPRESS_SUCCESS : GPUCOMPRESS_ERROR_CUDA_FAILED;
+}
+
+/**
  * Run neural network inference to find best compression config.
  *
  * Launches 32 threads (one per config), each runs a full forward pass

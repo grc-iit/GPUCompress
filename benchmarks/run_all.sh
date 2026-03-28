@@ -135,20 +135,80 @@ for bench in "${BENCH_LIST[@]}"; do
             ;;
         vpic)
             echo ""
-            echo ">>> Running VPIC benchmark..."
+            echo ">>> Running VPIC benchmark (single invocation, GPU weight isolation)..."
             echo ""
-            NX=$VPIC_NX \
-            CHUNK_MB=$CHUNK_MB \
-            TIMESTEPS=$TIMESTEPS \
-            PHASES=$PHASES \
-            POLICIES=$POLICIES \
-            SGD_LR=$SGD_LR \
-            SGD_MAPE=$SGD_MAPE \
-            EXPLORE_K=$EXPLORE_K \
-            EXPLORE_THRESH=$EXPLORE_THRESH \
-            VERIFY=$VERIFY \
-            DEBUG_NN=$DEBUG_NN \
-            bash "$SCRIPT_DIR/vpic-kokkos/run_vpic_pm_eval.sh"
+
+            VPIC_BIN="$SCRIPT_DIR/vpic-kokkos/vpic_benchmark_deck.Linux"
+            VPIC_DECK="$SCRIPT_DIR/vpic-kokkos/vpic_benchmark_deck.cxx"
+            VPIC_WEIGHTS="$SCRIPT_DIR/../neural_net/weights/model.nnwt"
+            VPIC_LD_PATH="/tmp/hdf5-install/lib:$SCRIPT_DIR/../build:/tmp/lib"
+
+            # VPIC physics: faster reconnection for data variety
+            VPIC_MI_ME=${VPIC_MI_ME:-5}
+            VPIC_WPE_WCE=${VPIC_WPE_WCE:-2}
+            VPIC_TI_TE=${VPIC_TI_TE:-3}
+            VPIC_NPPC=${VPIC_NPPC:-2}
+            VPIC_WARMUP=${VPIC_WARMUP_STEPS:-1000}
+            VPIC_SIM_INT=${VPIC_SIM_INTERVAL:-50}
+
+            # Convert PHASES to VPIC_EXCLUDE (invert the selection)
+            # VPIC binary runs all 12 phases by default; VPIC_EXCLUDE skips unwanted ones
+            ALL_VPIC_PHASES="no-comp,lz4,snappy,deflate,gdeflate,zstd,ans,cascaded,bitcomp,nn,nn-rl,nn-rl+exp50"
+            VPIC_EXCLUDE_LIST=""
+            IFS=',' read -ra _ALL <<< "$ALL_VPIC_PHASES"
+            for ap in "${_ALL[@]}"; do
+                if ! echo ",$PHASES," | grep -q ",$ap,"; then
+                    VPIC_EXCLUDE_LIST="${VPIC_EXCLUDE_LIST:+$VPIC_EXCLUDE_LIST,}$ap"
+                fi
+            done
+
+            # Run per policy (different cost model weights)
+            IFS=',' read -ra _POLICIES <<< "$POLICIES"
+            for pol in "${_POLICIES[@]}"; do
+                case "$pol" in
+                    balanced) W0=1.0; W1=1.0; W2=1.0; LABEL="balanced_w1-1-1" ;;
+                    ratio)    W0=0.0; W1=0.0; W2=1.0; LABEL="ratio_only_w0-0-1" ;;
+                    speed)    W0=1.0; W1=1.0; W2=0.0; LABEL="speed_only_w1-1-0" ;;
+                    *)        W0=1.0; W1=1.0; W2=1.0; LABEL="$pol" ;;
+                esac
+
+                VPIC_RESULTS="$SCRIPT_DIR/vpic-kokkos/results/eval_NX${VPIC_NX}_chunk${CHUNK_MB}mb_ts${TIMESTEPS}/$LABEL"
+                mkdir -p "$VPIC_RESULTS"
+
+                echo "  VPIC: NX=$VPIC_NX (~${VPIC_DATA} MB), chunk=${CHUNK_MB}MB, ts=${TIMESTEPS}, policy=$LABEL"
+                echo "    warmup=$VPIC_WARMUP, sim_interval=$VPIC_SIM_INT, physics: mi_me=$VPIC_MI_ME wpe_wce=$VPIC_WPE_WCE Ti_Te=$VPIC_TI_TE"
+
+                LD_LIBRARY_PATH="$VPIC_LD_PATH" \
+                GPUCOMPRESS_DETAILED_TIMING=1 \
+                GPUCOMPRESS_WEIGHTS="$VPIC_WEIGHTS" \
+                GPUCOMPRESS_DEBUG_NN=$DEBUG_NN \
+                VPIC_NX=$VPIC_NX \
+                VPIC_NPPC=$VPIC_NPPC \
+                VPIC_MI_ME=$VPIC_MI_ME \
+                VPIC_WPE_WCE=$VPIC_WPE_WCE \
+                VPIC_TI_TE=$VPIC_TI_TE \
+                VPIC_WARMUP_STEPS=$VPIC_WARMUP \
+                VPIC_TIMESTEPS=$TIMESTEPS \
+                VPIC_SIM_INTERVAL=$VPIC_SIM_INT \
+                VPIC_CHUNK_MB=$CHUNK_MB \
+                VPIC_VERIFY=$VERIFY \
+                VPIC_EXCLUDE="$VPIC_EXCLUDE_LIST" \
+                VPIC_RESULTS_DIR="$VPIC_RESULTS" \
+                VPIC_W0=$W0 VPIC_W1=$W1 VPIC_W2=$W2 \
+                VPIC_LR=$SGD_LR \
+                VPIC_MAPE_THRESHOLD=$SGD_MAPE \
+                VPIC_EXPLORE_K=$EXPLORE_K \
+                VPIC_EXPLORE_THRESH=$EXPLORE_THRESH \
+                "$VPIC_BIN" "$VPIC_DECK" \
+                > "$VPIC_RESULTS/vpic_benchmark.log" 2>&1
+
+                echo "    Done. Log: $VPIC_RESULTS/vpic_benchmark.log"
+
+                # Generate plots
+                VPIC_DIR="$VPIC_RESULTS" \
+                python3 "$SCRIPT_DIR/plots/generate_dataset_figures.py" \
+                    --dataset vpic --policy "$LABEL" 2>&1 | grep -E "Generated"
+            done
             ;;
         sdrbench)
             echo ""

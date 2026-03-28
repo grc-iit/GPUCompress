@@ -527,6 +527,22 @@ gpucompress_error_t gpucompress_nn_save_snapshot(void* dst);
  */
 gpucompress_error_t gpucompress_nn_restore_snapshot(const void* src);
 
+/**
+ * Save a snapshot of the current NN weights to a device buffer (GPU → GPU).
+ *
+ * @param d_dst  Device buffer of at least gpucompress_nn_weights_size() bytes
+ * @return GPUCOMPRESS_SUCCESS or error code
+ */
+gpucompress_error_t gpucompress_nn_save_snapshot_device(void* d_dst);
+
+/**
+ * Restore NN weights from a device snapshot buffer (GPU → GPU).
+ *
+ * @param d_src  Device buffer previously filled by gpucompress_nn_save_snapshot_device()
+ * @return GPUCOMPRESS_SUCCESS or error code
+ */
+gpucompress_error_t gpucompress_nn_restore_snapshot_device(const void* d_src);
+
 /* ============================================================
  * Utility Functions
  * ============================================================ */

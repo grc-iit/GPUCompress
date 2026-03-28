@@ -6,30 +6,26 @@
  * field data compression through the GPUCompress VOL connector.
  * Matches the benchmark_grayscott_vol structure.
  *
- * Pipeline per phase:
+ * Pipeline per timestep:
  *   VPIC simulation (GPU) → field_array->k_f_d → H5Dwrite(d_ptr) → VOL →
  *   GPU compress → HDF5 file → H5Dread(d_ptr) → GPU decompress → bitwise verify
  *
- * Single-shot phases (run once at timestep 0):
- *   1. no-comp      : H5Dwrite via VOL (no compression, baseline)
- *   2. fixed-*      : H5Dwrite via VOL (fixed algorithm baselines)
+ * All phases run on the same field data each timestep:
+ *   - no-comp       : baseline (no compression)
+ *   - fixed-*       : fixed algorithm baselines (lz4, zstd, etc.)
+ *   - nn            : ALGO_AUTO, inference-only (frozen weights)
+ *   - nn-rl         : ALGO_AUTO + online SGD (learning curve over N writes)
+ *   - nn-rl+exp50   : ALGO_AUTO + online SGD + exploration
  *
- * Multi-timestep phases (run across all timesteps for fair comparison):
- *   3. nn           : ALGO_AUTO, inference-only (frozen weights)
- *   4. nn-rl        : ALGO_AUTO + online SGD (learning curve over N writes)
- *   5. nn-rl+exp50  : ALGO_AUTO + online SGD + exploration
+ * Per-NN-phase GPU weight isolation ensures SGD updates in nn-rl don't
+ * leak into nn or nn-rl+exp50. Each NN phase maintains its own weight
+ * snapshot on the GPU, swapped via device-to-device memcpy (~75 KB).
  *
  * BUILD:
- *   See benchmarks/vpic-kokkos/build_vpic_benchmark.sh
+ *   bash benchmarks/vpic-kokkos/build_vpic_pm.sh
  *
  * RUN:
- *   export LD_LIBRARY_PATH=$GPU_DIR/build:/tmp/lib:/tmp/hdf5-install/lib:$LD_LIBRARY_PATH
- *   export GPUCOMPRESS_WEIGHTS=$GPU_DIR/neural_net/weights/model.nnwt
- *   mpirun -np 1 ./vpic_benchmark_deck.Linux
- *
- * OUTPUT:
- *   Console: per-phase ratio, write/read MB/s, verification, SGD/exploration stats
- *   Files:   /tmp/bm_vpic_*.h5 (temporary, removed after each phase)
+ *   See benchmarks/vpic-kokkos/runBEnchCombo.sh for full usage.
  */
 
 // ============================================================
@@ -82,8 +78,6 @@ extern "C" float gpucompress_get_bandwidth_bytes_per_ms(void);
 #define H5Z_FILTER_GPUCOMPRESS    305
 #define H5Z_GPUCOMPRESS_CD_NELMTS 5
 
-#define N_PHASES 10  /* no-comp, 6 fixed (3+3 shuf), nn, nn-rl, nn-rl+exp50 */
-
 #define TMP_NOCOMP    "/tmp/bm_vpic_nocomp.h5"
 #define TMP_FIX_LZ4   "/tmp/bm_vpic_fix_lz4.h5"
 #define TMP_FIX_SNAPPY "/tmp/bm_vpic_fix_snappy.h5"
@@ -131,7 +125,7 @@ static void init_csv_paths() {
 // ============================================================
 begin_globals {
     int                sim_steps;         // Warmup steps before benchmarking
-    int                timesteps;         // Number of multi-timestep writes (0 = single-shot)
+    int                timesteps;         // Number of benchmark write cycles
     int                ts_count;          // Current timestep counter
     size_t             chunk_bytes;       // HDF5 chunk size in bytes
     gpucompress_vpic_t vpic_fields_h;     // Adapter handle for fields
@@ -139,7 +133,6 @@ begin_globals {
     hid_t              vol_id;            // VOL connector ID
     int                gpucompress_ready; // 1 if init succeeded
     int                benchmark_done;    // 1 after all benchmark steps complete
-    /* single_shot_done removed — phase-major always uses multi-timestep loop */
     double             diag_error_bound;  // Error bound for diagnostics
     FILE*              ts_csv;            // Timestep CSV file handle
     FILE*              tc_csv;            // Timestep per-chunk CSV file handle
@@ -170,6 +163,20 @@ begin_globals {
     // Field dump: VPIC_DUMP_FIELDS=1 dumps raw field binary each timestep
     int                dump_fields;       // 0 = off, 1 = dump to RESULTS_DIR/fields_t<N>.raw
     int                grid_n;            // NX (grid size without ghost cells)
+
+    // Simulation interval: run N physics steps between each benchmark write
+    // VPIC_SIM_INTERVAL=10 means 10 sim steps per write (data evolves more between snapshots)
+    int                sim_interval;      // default 1 (every step)
+    int                sim_steps_pending; // countdown for next benchmark write
+
+    // Per-NN-phase weight snapshots for SGD isolation (GPU-resident).
+    // Each NN phase (nn=0, nn-rl=1, nn-rl+exp50=2) maintains its own copy
+    // of NN weights on the GPU so SGD updates in one phase don't leak into
+    // others. Swaps are device-to-device (~75 KB, <0.01ms).
+    // Indexed by TsPhase::nn_weight_idx.
+    static const int   NN_PHASE_COUNT = 3;
+    void*              nn_weight_snapshots_gpu[3]; // device buffers, allocated at t==0
+    size_t             nn_weight_bytes;            // size of each snapshot
 };
 
 // ============================================================
@@ -278,9 +285,6 @@ static void action_to_str(int action, char *buf, size_t bufsz)
              shuf ? "+shuf" : "", quant ? "+quant" : "");
 }
 
-// (PhaseResult struct removed — phase-major mode uses CSV directly)
-
-// (Statistics helpers removed — only used by single-shot run_phase)
 // ============================================================
 // VOL FAPL
 // ============================================================
@@ -359,294 +363,6 @@ static unsigned long long host_compare(const float* d_a, const float* d_b,
     return mm;
 }
 
-// (run_phase removed — phase-major mode runs all timesteps in the multi-ts loop)
-
-#if 0  /* Dead code: run_phase — single-shot benchmark path */
-static int run_phase_REMOVED(const char* phase_name, const char* tmp_file,
-                     float* d_data, float* d_read,
-                     float* h_a, float* h_b,
-                     size_t n_floats, int n_chunks, hid_t dcpl,
-                     PhaseResult* r)
-{
-    size_t total_bytes = n_floats * sizeof(float);
-    hsize_t dims[1] = { (hsize_t)n_floats };
-
-    // Warmup write: primes VOL write context, nvCOMP manager cache,
-    // and NN inference JIT.  Results discarded — only the timed run counts.
-    {
-        const char *warmup_file = "/tmp/bm_vpic_warmup.h5";
-        gpucompress_disable_online_learning();
-
-        remove(warmup_file);
-        hid_t wfapl = make_vol_fapl();
-        hid_t wfile = H5Fcreate(warmup_file, H5F_ACC_TRUNC, H5P_DEFAULT, wfapl);
-        H5Pclose(wfapl);
-        if (wfile >= 0) {
-            hid_t wfsp  = H5Screate_simple(1, dims, NULL);
-            hid_t wdset = H5Dcreate2(wfile, "fields", H5T_NATIVE_FLOAT,
-                                      wfsp, H5P_DEFAULT, dcpl, H5P_DEFAULT);
-            H5Sclose(wfsp);
-            if (wdset >= 0) {
-                H5Dwrite(wdset, H5T_NATIVE_FLOAT,
-                         H5S_ALL, H5S_ALL, H5P_DEFAULT, d_data);
-                cudaDeviceSynchronize();
-                H5Dclose(wdset);
-            }
-            H5Fclose(wfile);
-            remove(warmup_file);
-        }
-        gpucompress_flush_manager_cache();  /* cold-start the timed run */
-    }
-
-    // VOL write
-    printf("  [%s] H5Dwrite (GPU ptr, VOL)... ", phase_name); fflush(stdout);
-    remove(tmp_file);
-
-    gpucompress_reset_chunk_history();
-    gpucompress_set_debug_context(phase_name, -1);
-    H5VL_gpucompress_reset_stats();
-
-    hid_t fapl = make_vol_fapl();
-    hid_t file = H5Fcreate(tmp_file, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
-    H5Pclose(fapl);
-    if (file < 0) { fprintf(stderr, "H5Fcreate failed for %s\n", tmp_file); return 1; }
-
-    hid_t fsp  = H5Screate_simple(1, dims, NULL);
-    hid_t dset = H5Dcreate2(file, "fields", H5T_NATIVE_FLOAT,
-                             fsp, H5P_DEFAULT, dcpl, H5P_DEFAULT);
-    H5Sclose(fsp);
-
-    double t0   = now_ms();
-    herr_t wret = H5Dwrite(dset, H5T_NATIVE_FLOAT,
-                           H5S_ALL, H5S_ALL, H5P_DEFAULT, d_data);
-    cudaDeviceSynchronize();
-    H5Dclose(dset);
-    H5Fclose(file);
-    double t1   = now_ms();
-    printf("%.0f ms\n", t1 - t0);
-
-    if (wret < 0) { fprintf(stderr, "  [%s] H5Dwrite failed\n", phase_name); return 1; }
-
-    drop_pagecache(tmp_file);
-
-    // VOL read
-    printf("  [%s] H5Dread (GPU ptr, VOL)... ", phase_name); fflush(stdout);
-    fapl = make_vol_fapl();
-    file = H5Fopen(tmp_file, H5F_ACC_RDONLY, fapl);
-    H5Pclose(fapl);
-    dset = H5Dopen2(file, "fields", H5P_DEFAULT);
-
-    double t2   = now_ms();
-    herr_t rret = H5Dread(dset, H5T_NATIVE_FLOAT,
-                          H5S_ALL, H5S_ALL, H5P_DEFAULT, d_read);
-    cudaDeviceSynchronize();
-    H5Dclose(dset);
-    H5Fclose(file);
-    double t3   = now_ms();
-    printf("%.0f ms\n", t3 - t2);
-
-    if (rret < 0) { fprintf(stderr, "  [%s] H5Dread failed\n", phase_name); return 1; }
-
-    // Bitwise verify (D→H then CPU compare; VPIC .cxx can't use __global__)
-    unsigned long long mm = host_compare(d_data, d_read, h_a, h_b, n_floats);
-
-    // Collect per-chunk diagnostics and write to CSV
-    int sgd_fires    = 0;
-    int explorations = 0;
-    double mape_ratio_sum = 0.0, mape_comp_sum = 0.0, mape_decomp_sum = 0.0;
-    int    mape_ratio_cnt = 0,   mape_comp_cnt = 0,   mape_decomp_cnt = 0;
-    double mae_r_sum = 0.0, mae_c_sum = 0.0, mae_d_sum = 0.0;
-    int    r2_cnt = 0;
-    double total_stats_ms   = 0.0;
-    double total_nn_ms      = 0.0;
-    double total_preproc_ms = 0.0;
-    double total_comp_ms    = 0.0;
-    double total_decomp_ms  = 0.0;
-    double total_explore_ms = 0.0;
-    double total_sgd_ms     = 0.0;
-    int n_hist       = gpucompress_get_chunk_history_count();
-    FILE *chunk_csv  = NULL;
-    if (n_hist > 0) {
-        printf("    chunk | action (final)       | action (orig)        | ratio  | pred   | MAPE   | sgd | expl\n");
-        printf("    ------+----------------------+----------------------+--------+--------+--------+-----+-----\n");
-        // Open chunks CSV: create with header on first phase, append on subsequent
-        struct stat st;
-        bool need_header = (stat(CHUNKS_CSV, &st) != 0 || st.st_size == 0);
-        chunk_csv = fopen(CHUNKS_CSV, "a");
-        if (chunk_csv && need_header) {
-            fprintf(chunk_csv, "phase,chunk,action_final,action_orig,"
-                               "actual_ratio,predicted_ratio,mape_ratio,"
-                               "actual_comp_ms_raw,predicted_comp_ms,mape_comp,"
-                               "actual_decomp_ms_raw,predicted_decomp_ms,mape_decomp,"
-                               "sgd_fired,exploration_triggered,"
-                               "cost_model_error_pct,actual_cost,predicted_cost,"
-                               "explore_n_alt");
-            for (int ei = 0; ei < 31; ei++)
-                fprintf(chunk_csv, ",explore_alt_%d,explore_ratio_%d,explore_comp_ms_%d,explore_cost_%d",
-                        ei, ei, ei, ei);
-            fprintf(chunk_csv, ","
-                               "stats_ms,nn_inference_ms,preprocessing_ms,compression_ms_raw,"
-                               "exploration_ms,sgd_update_ms,"
-                               "feat_entropy,feat_mad,feat_deriv,feat_eb_enc,feat_ds_enc\n");
-        }
-    }
-    for (int i = 0; i < n_hist; i++) {
-        gpucompress_chunk_diag_t d;
-        if (gpucompress_get_chunk_diag(i, &d) == 0) {
-            sgd_fires    += d.sgd_fired;
-            explorations += d.exploration_triggered;
-            total_stats_ms   += d.stats_ms;
-            total_nn_ms      += d.nn_inference_ms;
-            total_preproc_ms += d.preprocessing_ms;
-            total_comp_ms    += d.compression_ms_raw;   /* unclamped for breakdown */
-            total_decomp_ms  += d.decompression_ms_raw; /* unclamped for breakdown */
-            total_explore_ms += d.exploration_ms;
-            total_sgd_ms     += d.sgd_update_ms;
-            /* MAPE: |pred - actual| / |actual| */
-            if (d.actual_ratio > 0) {
-                mape_ratio_sum += fabs(d.predicted_ratio - d.actual_ratio) / fabs(d.actual_ratio) * 100.0;
-                mape_ratio_cnt++;
-            }
-            if (d.compression_ms > 0) {
-                mape_comp_sum += fabs(d.predicted_comp_time - d.compression_ms) / fabs(d.compression_ms) * 100.0;
-                mape_comp_cnt++;
-            }
-            if (d.decompression_ms > 0) {
-                mape_decomp_sum += fabs(d.predicted_decomp_time - d.decompression_ms) / fabs(d.decompression_ms) * 100.0;
-                mape_decomp_cnt++;
-            }
-            /* MAE accumulators */
-            if (d.actual_ratio > 0 && d.predicted_ratio > 0) {
-                mae_r_sum += fabs(d.predicted_ratio - d.actual_ratio);
-                r2_cnt++;
-            }
-            if (d.compression_ms_raw > 0)
-                mae_c_sum += fabs(d.predicted_comp_time - d.compression_ms);
-            if (d.decompression_ms > 0)
-                mae_d_sum += fabs(d.predicted_decomp_time - d.decompression_ms);
-            char final_str[40], orig_str[40];
-            action_to_str(d.nn_action, final_str, sizeof(final_str));
-            action_to_str(d.nn_original_action, orig_str, sizeof(orig_str));
-            double chunk_mape = (d.actual_ratio > 0)
-                ? fmin(200.0, fabs((double)d.predicted_ratio - (double)d.actual_ratio) / fabs((double)d.actual_ratio) * 100.0)
-                : 0.0;
-            printf("    %5d | %-20s | %-20s | %5.2fx | %5.2fx | %5.1f%% | %s | %s\n",
-                   i + 1, final_str, orig_str,
-                   (double)d.actual_ratio, (double)d.predicted_ratio,
-                   chunk_mape,
-                   d.sgd_fired ? "yes" : "  -",
-                   d.exploration_triggered ? "yes" : "  -");
-            if (chunk_csv) {
-                /* Per-chunk MAPE */
-                double mr = fmin(200.0, (d.actual_ratio > 0) ? fabs((double)d.predicted_ratio - (double)d.actual_ratio) / fabs((double)d.actual_ratio) * 100.0 : 0.0);
-                double mc = fmin(200.0, (d.compression_ms > 0) ? fabs((double)d.predicted_comp_time - (double)d.compression_ms) / fabs((double)d.compression_ms) * 100.0 : 0.0);
-                double md = fmin(200.0, (d.decompression_ms > 0) ? fabs((double)d.predicted_decomp_time - (double)d.decompression_ms) / fabs((double)d.decompression_ms) * 100.0 : 0.0);
-
-                fprintf(chunk_csv, "%s,%d,%s,%s,"
-                                   "%.4f,%.4f,%.1f,"
-                                   "%.3f,%.3f,%.1f,%.3f,%.3f,%.1f,"
-                                   "%d,%d,"
-                                   "%.4f,%.4f,%.4f,%d",
-                        phase_name, i + 1, final_str, orig_str,
-                        (double)d.actual_ratio, (double)d.predicted_ratio, mr,
-                        (double)d.compression_ms_raw, (double)d.predicted_comp_time, mc,
-                        (double)d.decompression_ms_raw, (double)d.predicted_decomp_time, md,
-                        d.sgd_fired, d.exploration_triggered,
-                        (double)d.cost_model_error_pct,
-                        (double)d.actual_cost, (double)d.predicted_cost,
-                        d.explore_n_alternatives);
-                /* Exploration alternatives (31 slots) */
-                for (int ei = 0; ei < 31; ei++) {
-                    if (ei < d.explore_n_alternatives) {
-                        char alt_str[40];
-                        action_to_str(d.explore_alternatives[ei], alt_str, sizeof(alt_str));
-                        fprintf(chunk_csv, ",%s,%.4f,%.4f,%.4f",
-                                alt_str,
-                                (double)d.explore_ratios[ei],
-                                (double)d.explore_comp_ms[ei],
-                                (double)d.explore_costs[ei]);
-                    } else {
-                        fprintf(chunk_csv, ",,,,");
-                    }
-                }
-                fprintf(chunk_csv, ",%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
-                                   "%.4f,%.6f,%.6f,%.4f,%.4f\n",
-                        (double)d.stats_ms, (double)d.nn_inference_ms, (double)d.preprocessing_ms,
-                        (double)d.compression_ms_raw, (double)d.exploration_ms,
-                        (double)d.sgd_update_ms,
-                        (double)d.feat_entropy, (double)d.feat_mad, (double)d.feat_deriv,
-                        (double)d.feat_eb_enc, (double)d.feat_ds_enc);
-            }
-        }
-    }
-    if (chunk_csv) fclose(chunk_csv);
-
-    size_t fbytes = get_file_size(tmp_file);
-
-    r->write_ms     = t1 - t0;
-    r->read_ms      = t3 - t2;
-    r->file_bytes   = fbytes;
-    r->orig_bytes   = total_bytes;
-    r->ratio        = (double)total_bytes / (double)(fbytes ? fbytes : 1);
-    r->write_mbps   = (double)total_bytes / (1 << 20) / ((t1 - t0) / 1000.0);
-    r->read_mbps    = (double)total_bytes / (1 << 20) / ((t3 - t2) / 1000.0);
-    r->mismatches   = mm;
-    r->sgd_fires    = sgd_fires;
-    r->explorations = explorations;
-    r->n_chunks     = n_chunks;
-    r->mape_ratio_pct  = fmin(200.0, (mape_ratio_cnt > 0) ? mape_ratio_sum / mape_ratio_cnt : 0.0);
-    r->mape_comp_pct   = fmin(200.0, (mape_comp_cnt > 0) ? mape_comp_sum / mape_comp_cnt : 0.0);
-    r->mape_decomp_pct = fmin(200.0, (mape_decomp_cnt > 0) ? mape_decomp_sum / mape_decomp_cnt : 0.0);
-    r->mae_ratio     = r2_cnt ? mae_r_sum / r2_cnt : 0.0;
-    r->mae_comp_ms   = mape_comp_cnt  ? mae_c_sum / mape_comp_cnt  : 0.0;
-    r->mae_decomp_ms = mape_decomp_cnt ? mae_d_sum / mape_decomp_cnt : 0.0;
-    r->stats_ms     = total_stats_ms;
-    r->nn_ms        = total_nn_ms;
-    r->preproc_ms   = total_preproc_ms;
-    r->comp_ms      = total_comp_ms;
-    r->decomp_ms    = total_decomp_ms;
-    r->explore_ms   = total_explore_ms;
-    r->sgd_ms       = total_sgd_ms;
-    r->comp_gbps    = (total_comp_ms > 0)
-        ? (double)total_bytes / 1e9 / (total_comp_ms / 1000.0) : 0.0;
-    r->decomp_gbps  = (total_decomp_ms > 0)
-        ? (double)total_bytes / 1e9 / (total_decomp_ms / 1000.0) : 0.0;
-    r->write_ms_std = 0;
-    r->read_ms_std  = 0;
-    r->comp_gbps_std  = 0;
-    r->decomp_gbps_std = 0;
-    r->n_runs       = 1;
-    snprintf(r->phase, sizeof(r->phase), "%s", phase_name);
-
-    printf("  [%s] ratio=%.2fx  write=%.0f MiB/s  read=%.0f MiB/s  "
-           "file=%.0f MiB  sgd=%d expl=%d/%d  mismatches=%llu\n",
-           phase_name, r->ratio, r->write_mbps, r->read_mbps,
-           (double)fbytes / (1 << 20), sgd_fires, explorations, n_hist, mm);
-
-    double total_tracked = total_stats_ms + total_nn_ms + total_preproc_ms
-                         + total_comp_ms + total_explore_ms + total_sgd_ms;
-    double write_ms = t1 - t0;
-    printf("  [%s] Overhead breakdown (%d chunks, write=%.1f ms, total GPU-time=%.1f ms):\n",
-           phase_name, n_hist, write_ms, total_tracked);
-    printf("    Stats compute: %8.1f ms  (%4.1f%% of GPU-time)\n",
-           total_stats_ms, total_tracked > 0 ? 100.0 * total_stats_ms / total_tracked : 0.0);
-    printf("    NN inference : %8.1f ms  (%4.1f%% of GPU-time)\n",
-           total_nn_ms, total_tracked > 0 ? 100.0 * total_nn_ms / total_tracked : 0.0);
-    printf("    Preprocessing: %8.1f ms  (%4.1f%% of GPU-time)\n",
-           total_preproc_ms, total_tracked > 0 ? 100.0 * total_preproc_ms / total_tracked : 0.0);
-    printf("    Compression  : %8.1f ms  (%4.1f%% of GPU-time)\n",
-           total_comp_ms, total_tracked > 0 ? 100.0 * total_comp_ms / total_tracked : 0.0);
-    printf("    Exploration  : %8.1f ms  (%4.1f%% of GPU-time)\n",
-           total_explore_ms, total_tracked > 0 ? 100.0 * total_explore_ms / total_tracked : 0.0);
-    printf("    SGD update   : %8.1f ms  (%4.1f%% of GPU-time)\n",
-           total_sgd_ms, total_tracked > 0 ? 100.0 * total_sgd_ms / total_tracked : 0.0);
-
-    remove(tmp_file);
-    return (mm == 0) ? 0 : 1;
-}
-#endif /* Dead code: run_phase */
-
-// ============================================================
 // Initialization: Harris sheet + GPUCompress + VOL setup
 // ============================================================
 begin_initialization {
@@ -657,10 +373,18 @@ begin_initialization {
     double c    = 1;
     double eps0 = 1;
 
-    double mi_me   = 25;
+    // Physics params configurable via env vars for data variety tuning.
+    // Lower mi_me + wpe_wce = faster reconnection → richer 2D/3D structure.
+    // Higher Ti_Te = more free energy → stronger instabilities.
+    //   Defaults (mi_me=25, wpe_wce=3, Ti_Te=1): slow reconnection, ~20k steps for structure
+    //   Fast recon (mi_me=1,  wpe_wce=1, Ti_Te=5): visible structure in ~500 steps
+    const char* env_mime   = getenv("VPIC_MI_ME");
+    const char* env_wpewce = getenv("VPIC_WPE_WCE");
+    const char* env_tite   = getenv("VPIC_TI_TE");
+    double mi_me   = env_mime   ? atof(env_mime)   : 25;
     double rhoi_L  = 1;
-    double Ti_Te   = 1;
-    double wpe_wce = 3;
+    double Ti_Te   = env_tite   ? atof(env_tite)   : 1;
+    double wpe_wce = env_wpewce ? atof(env_wpewce) : 3;
 
     // Grid size configurable via VPIC_NX env var (default 200 ≈ 512 MB)
     // Field data = (nx+2)^3 * 16 * 4 bytes
@@ -740,20 +464,30 @@ begin_initialization {
     int   explore_k      = env_ek   ? atoi(env_ek)          : 4;
     float explore_thresh = env_et   ? (float)atof(env_et)   : 0.20f;
 
-    // Run warmup steps, then single-shot phases (1 step), then multi-timestep writes
-    num_step        = warmup + 1 + timesteps;
+    // Simulation interval: N physics steps between each benchmark write
+    const char* env_sim_int = getenv("VPIC_SIM_INTERVAL");
+    int sim_interval = env_sim_int ? atoi(env_sim_int) : 1;
+    if (sim_interval < 1) sim_interval = 1;
+
+    // Total VPIC steps: warmup + 1 + timesteps * sim_interval
+    // With sim_interval=10 and timesteps=50: 500 additional sim steps between writes
+    num_step        = warmup + 1 + timesteps * sim_interval;
     status_interval = 50;
-    clean_div_e_interval = 10;
-    clean_div_b_interval = 10;
+    // Divergence cleaning disabled: saves ~46 kernel launches on cleaning steps.
+    // For compression benchmarking, divergence error is irrelevant.
+    clean_div_e_interval = 0;
+    clean_div_b_interval = 0;
+    // Single-process needs only 1 comm round (default 3 in vpic.cc).
+    // Saves 2/3 of boundary_p CPU-serial processing per step.
+    num_comm_round = 1;
 
     global->sim_steps       = warmup;
     global->timesteps       = timesteps;
     global->ts_count        = 0;
+    global->sim_interval    = sim_interval;
+    global->sim_steps_pending = 0;
     global->chunk_bytes     = (size_t)chunk_mb * 1024 * 1024;
     global->benchmark_done  = 0;
-    /* Always run single-shot phases first (summary + aggregate CSV),
-     * then multi-timestep loop if requested.  Matches Gray-Scott behavior. */
-    /* single_shot_done removed */
     global->diag_error_bound = 0.0;
 
     /* Phase exclusion: VPIC_EXCLUDE="lz4,no-comp,zstd" */
@@ -802,8 +536,10 @@ begin_initialization {
     define_material("vacuum", 1);
     define_field_array(NULL, damp);
 
-    species_t* ion      = define_species("ion",       ec, mi, 1.5*Ni/nproc(), -1, 5, 1);
-    species_t* electron = define_species("electron", -ec, me, 1.5*Ne/nproc(), -1, 5, 1);
+    // sort_interval: disabled for benchmark (saves ~20ms on sort steps).
+    // Cache degradation is negligible for short runs (<500 steps).
+    species_t* ion      = define_species("ion",       ec, mi, 1.5*Ni/nproc(), -1, 0, 1);
+    species_t* electron = define_species("electron", -ec, me, 1.5*Ne/nproc(), -1, 0, 1);
 
     // Load fields (Harris current sheet)
     set_region_field(everywhere,
@@ -883,9 +619,12 @@ begin_initialization {
             << grid->nv << " cells)");
     sim_log("  Chunks   : " << global->chunk_bytes / (1024*1024) << " MB each");
     sim_log("  Particles: " << nppc << " per cell");
+    sim_log("  Physics  : mi_me=" << mi_me << " wpe_wce=" << wpe_wce << " Ti_Te=" << Ti_Te);
     sim_log("  Warmup   : " << global->sim_steps << " steps");
+    if (sim_interval > 1)
+        sim_log("  Sim interval: " << sim_interval << " steps between writes");
     if (timesteps > 0)
-        sim_log("  Timesteps: " << timesteps << " (multi-timestep nn-rl writes after single-shot)");
+        sim_log("  Timesteps: " << timesteps << " (all phases per timestep, GPU weight isolation)");
     sim_log("  Env vars : VPIC_NX=" << grid_n << " VPIC_CHUNK_MB=" << chunk_mb
             << " VPIC_WARMUP_STEPS=" << warmup
             << " VPIC_TIMESTEPS=" << timesteps);
@@ -934,6 +673,13 @@ begin_diagnostics {
     // Multi-timestep mode: all phases per timestep (apple-to-apple on same data)
     // ============================================================
     if (step() >= global->sim_steps) {  /* physics warmup complete → run benchmark */
+        // Skip intermediate steps when sim_interval > 1
+        // (run N physics steps between each benchmark write for data variety)
+        if (global->sim_interval > 1 && global->sim_steps_pending > 0) {
+            global->sim_steps_pending--;
+            return;  // let VPIC advance without benchmarking
+        }
+
         if (global->timesteps <= 0 || global->ts_count >= global->timesteps) {
             // All timesteps done — close CSV and cleanup
             if (global->ts_csv) {
@@ -1132,6 +878,14 @@ begin_diagnostics {
             global->d_read = NULL;
             global->h_orig = NULL;
             global->h_read = NULL;
+            /* Free weight snapshots before VOL/gpucompress cleanup to avoid
+             * conflicts with Kokkos CUDA memory pool finalization. */
+            for (int wi = 0; wi < global->NN_PHASE_COUNT; wi++) {
+                if (global->nn_weight_snapshots_gpu[wi]) {
+                    cudaFree(global->nn_weight_snapshots_gpu[wi]);
+                    global->nn_weight_snapshots_gpu[wi] = NULL;
+                }
+            }
             gpucompress_vpic_destroy(global->vpic_fields_h);
             H5Pclose(global->vol_fapl);
             H5VLclose(global->vol_id);
@@ -1195,11 +949,22 @@ begin_diagnostics {
             if (global->ranking_costs_csv)
                 vpic_write_ranking_costs_csv_header(global->ranking_costs_csv);
 
-            /* Phase-major: each process runs exactly one phase, so reload
-             * NN weights from disk to ensure every phase starts from
-             * identical pretrained weights (no SGD leakage). */
+            /* Reload pretrained weights and create per-NN-phase GPU snapshots.
+             * Each NN phase (nn, nn-rl, nn-rl+exp50) gets an independent copy
+             * on the GPU so SGD updates in one phase don't leak into others.
+             * Swaps are device-to-device memcpy (~75 KB, <0.01ms). */
             const char* wpath = getenv("GPUCOMPRESS_WEIGHTS");
             if (wpath) gpucompress_reload_nn(wpath);
+
+            global->nn_weight_bytes = gpucompress_nn_weights_size();
+            for (int wi = 0; wi < global->NN_PHASE_COUNT; wi++) {
+                cudaMalloc(&global->nn_weight_snapshots_gpu[wi], global->nn_weight_bytes);
+                /* Initialize all 3 snapshots from the same pretrained weights */
+                gpucompress_nn_save_snapshot_device(global->nn_weight_snapshots_gpu[wi]);
+            }
+            printf("  NN weight isolation: %d GPU snapshots x %zu bytes (%.1f KB each)\n",
+                   global->NN_PHASE_COUNT, global->nn_weight_bytes,
+                   global->nn_weight_bytes / 1024.0);
 
         }
 
@@ -1268,8 +1033,30 @@ begin_diagnostics {
             /* Flush nvCOMP manager cache so each phase starts cold (no cache bias) */
             gpucompress_flush_manager_cache();
 
-            /* Phase-major: weights were reloaded at t==0; SGD evolves them
-             * naturally across timesteps within this single-phase process. */
+            /* Restore this NN phase's isolated weight snapshot before running.
+             * This ensures nn-rl's SGD updates don't leak into nn or nn-rl+exp50.
+             * Device-to-device copy (~75 KB, <0.01ms — not part of timed section). */
+            int weight_idx = phases[pi].nn_weight_idx;
+            if (weight_idx >= 0 && weight_idx < global->NN_PHASE_COUNT
+                && global->nn_weight_snapshots_gpu[weight_idx]) {
+                gpucompress_nn_restore_snapshot_device(
+                    global->nn_weight_snapshots_gpu[weight_idx]);
+
+                /* Debug: sample 3 weights from snapshot to verify restore.
+                 * On next timestep, RESTORED values should match SAVED values from previous T. */
+                if (getenv("VPIC_DEBUG_WEIGHTS")) {
+                    float samples[3];
+                    size_t n_floats_w = global->nn_weight_bytes / sizeof(float);
+                    size_t offsets[3] = {n_floats_w / 4, n_floats_w / 2, n_floats_w * 3 / 4};
+                    for (int si = 0; si < 3; si++)
+                        cudaMemcpy(&samples[si],
+                                   (float*)global->nn_weight_snapshots_gpu[weight_idx] + offsets[si],
+                                   sizeof(float), cudaMemcpyDeviceToHost);
+                    printf("    [T=%d][%s] RESTORED  w[%zu]=%.8e w[%zu]=%.8e w[%zu]=%.8e\n",
+                           t, phase_name, offsets[0], samples[0], offsets[1], samples[1],
+                           offsets[2], samples[2]);
+                }
+            }
 
             if (do_sgd) {
                 gpucompress_enable_online_learning();
@@ -1547,9 +1334,34 @@ begin_diagnostics {
 
             H5Pclose(dcpl);
             remove(phases[pi].tmp_file);
+
+            /* Save this NN phase's weights back to its GPU snapshot.
+             * SGD may have updated them during compression — preserve
+             * the updated state for the next timestep. */
+            if (weight_idx >= 0 && weight_idx < global->NN_PHASE_COUNT
+                && global->nn_weight_snapshots_gpu[weight_idx]) {
+                gpucompress_nn_save_snapshot_device(
+                    global->nn_weight_snapshots_gpu[weight_idx]);
+
+                /* Debug: sample 3 weights after save to compare with restore on next timestep */
+                if (getenv("VPIC_DEBUG_WEIGHTS")) {
+                    float samples[3];
+                    size_t n_floats_w = global->nn_weight_bytes / sizeof(float);
+                    size_t offsets[3] = {n_floats_w / 4, n_floats_w / 2, n_floats_w * 3 / 4};
+                    for (int si = 0; si < 3; si++)
+                        cudaMemcpy(&samples[si],
+                                   (float*)global->nn_weight_snapshots_gpu[weight_idx] + offsets[si],
+                                   sizeof(float), cudaMemcpyDeviceToHost);
+                    printf("    [T=%d][%s] SAVED     w[%zu]=%.8e w[%zu]=%.8e w[%zu]=%.8e\n",
+                           t, phase_name, offsets[0], samples[0], offsets[1], samples[1],
+                           offsets[2], samples[2]);
+                }
+            }
         } /* end phase loop */
 
         global->ts_count++;
+        // Schedule next sim_interval-1 steps to skip (run sim without benchmarking)
+        global->sim_steps_pending = global->sim_interval - 1;
         return;
     }
 
@@ -1557,10 +1369,6 @@ begin_diagnostics {
     // All phases run in the multi-timestep loop above.
     // The aggregate CSV is generated from the timestep CSV at completion.
     // ============================================================
-
-    // Summary and aggregate CSV are generated from the timestep CSV
-    // at the end of the multi-timestep loop (see PhaseAccum above).
-    /* (single_shot_done removed — entry controlled by step() >= sim_steps) */
 
     // If no multi-timestep requested, we're done — cleanup now
     if (global->timesteps <= 0) {
@@ -1571,6 +1379,12 @@ begin_diagnostics {
         global->d_read = NULL;
         global->h_orig = NULL;
         global->h_read = NULL;
+        for (int wi = 0; wi < global->NN_PHASE_COUNT; wi++) {
+            if (global->nn_weight_snapshots_gpu[wi]) {
+                cudaFree(global->nn_weight_snapshots_gpu[wi]);
+                global->nn_weight_snapshots_gpu[wi] = NULL;
+            }
+        }
         gpucompress_vpic_destroy(global->vpic_fields_h);
         H5Pclose(global->vol_fapl);
         H5VLclose(global->vol_id);

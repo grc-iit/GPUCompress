@@ -10,7 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 export NVCC_WRAPPER_DEFAULT_COMPILER=${CXX:-g++}
 
-DECK_PATH="${GPU_DIR}/benchmarks/vpic-kokkos/vpic_benchmark_deck_phase_major.cxx"
+DECK_PATH="${GPU_DIR}/benchmarks/vpic-kokkos/vpic_benchmark_deck.cxx"
 
 # Compile ranking profiler (CUDA) as a separate object
 echo "Compiling vpic_ranking_profiler.cu ..."
@@ -44,7 +44,7 @@ echo "Compiling vpic_benchmark_deck ..."
   "${VPIC_DIR}/deck/main.cc" \
   "${VPIC_DIR}/deck/wrapper.cc" \
   "${SCRIPT_DIR}/vpic_ranking_profiler.o" \
-  -o vpic_benchmark_deck_pm.Linux \
+  -o vpic_benchmark_deck.Linux \
   -Wl,-rpath,"${VPIC_BUILD}" \
   -L"${VPIC_BUILD}" -lvpic \
   -lpthread -ldl \
@@ -61,4 +61,4 @@ echo "Compiling vpic_benchmark_deck ..."
   -L/usr/lib/x86_64-linux-gnu/openmpi/lib -lmpi -lgomp \
   -x cu -expt-extended-lambda -Wext-lambda-captures-this -arch=sm_80
 
-echo "Built: vpic_benchmark_deck_pm.Linux"
+echo "Built: vpic_benchmark_deck.Linux"
