@@ -147,7 +147,8 @@ begin_globals {
     float              reinforce_mape;    // MAPE threshold for SGD (env VPIC_MAPE_THRESHOLD)
     int                explore_k;         // Exploration K alternatives (env VPIC_EXPLORE_K)
     float              explore_thresh;    // Exploration error threshold (env VPIC_EXPLORE_THRESH)
-    int                do_verify;         // Bitwise validation (env VPIC_VERIFY, default 1; read-back always runs)
+    int                do_verify;         // Bitwise validation (env VPIC_VERIFY, default 1)
+    int                verify_weights;    // Cross-timestep weight verification (env VPIC_VERIFY_WEIGHTS, default 0)
 
     // Ranking quality profiler
     FILE*              ranking_csv;       // Kendall tau ranking CSV
@@ -169,14 +170,19 @@ begin_globals {
     int                sim_interval;      // default 1 (every step)
     int                sim_steps_pending; // countdown for next benchmark write
 
-    // Per-NN-phase weight snapshots for SGD isolation (GPU-resident).
-    // Each NN phase (nn=0, nn-rl=1, nn-rl+exp50=2) maintains its own copy
-    // of NN weights on the GPU so SGD updates in one phase don't leak into
-    // others. Swaps are device-to-device (~75 KB, <0.01ms).
-    // Indexed by TsPhase::nn_weight_idx.
-    static const int   NN_PHASE_COUNT = 3;
-    void*              nn_weight_snapshots_gpu[3]; // device buffers, allocated at t==0
-    size_t             nn_weight_bytes;            // size of each snapshot
+    // Multi-policy support: VPIC_POLICIES="balanced,ratio,speed"
+    // Each policy sets different cost model weights for NN algorithm selection.
+    // Fixed phases run once; NN phases run once per policy with isolated weights.
+    // Snapshot index: policy_idx * 3 + nn_base_idx (nn=0, nn-rl=1, nn-rl+exp50=2)
+    static const int   NN_BASE_PHASES = 3;
+    static const int   MAX_POLICIES = 3;  // balanced, ratio, speed
+    int                n_policies;
+    float              policy_w0[MAX_POLICIES];
+    float              policy_w1[MAX_POLICIES];
+    float              policy_w2[MAX_POLICIES];
+    char               policy_labels[MAX_POLICIES][32];
+    void*              nn_weight_snapshots_gpu[MAX_POLICIES * 3];
+    size_t             nn_weight_bytes;
 };
 
 // ============================================================
@@ -448,12 +454,53 @@ begin_initialization {
     int timesteps = env_ts ? atoi(env_ts) : 0;
     if (timesteps < 0) timesteps = 0;
 
+    // Parse policies: VPIC_POLICIES="balanced,ratio,speed" (default: balanced)
+    // Falls back to VPIC_W0/W1/W2 for backward compatibility (single policy).
+    const char* env_policies = getenv("VPIC_POLICIES");
     const char* env_w0 = getenv("VPIC_W0");
-    const char* env_w1 = getenv("VPIC_W1");
-    const char* env_w2 = getenv("VPIC_W2");
-    float rank_w0 = env_w0 ? (float)atof(env_w0) : 1.0f;
-    float rank_w1 = env_w1 ? (float)atof(env_w1) : 1.0f;
-    float rank_w2 = env_w2 ? (float)atof(env_w2) : 1.0f;
+    int n_policies = 0;
+    float all_w0[3], all_w1[3], all_w2[3];
+    char  all_labels[3][32];
+
+    if (env_policies && env_policies[0]) {
+        char buf[256];
+        strncpy(buf, env_policies, sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
+        char* tok = strtok(buf, ",");
+        while (tok && n_policies < 3) {
+            while (*tok == ' ') tok++;
+            if (strcmp(tok, "balanced") == 0) {
+                all_w0[n_policies] = 1.0f; all_w1[n_policies] = 1.0f; all_w2[n_policies] = 1.0f;
+                snprintf(all_labels[n_policies], 32, "balanced");
+            } else if (strcmp(tok, "ratio") == 0) {
+                all_w0[n_policies] = 0.0f; all_w1[n_policies] = 0.0f; all_w2[n_policies] = 1.0f;
+                snprintf(all_labels[n_policies], 32, "ratio");
+            } else if (strcmp(tok, "speed") == 0) {
+                all_w0[n_policies] = 1.0f; all_w1[n_policies] = 1.0f; all_w2[n_policies] = 0.0f;
+                snprintf(all_labels[n_policies], 32, "speed");
+            } else {
+                fprintf(stderr, "Unknown policy: %s (use balanced, ratio, speed)\n", tok);
+                tok = strtok(NULL, ",");
+                continue;
+            }
+            n_policies++;
+            tok = strtok(NULL, ",");
+        }
+    }
+    if (n_policies == 0) {
+        // Fallback: single policy from VPIC_W0/W1/W2 or default balanced
+        const char* env_w1_fb = getenv("VPIC_W1");
+        const char* env_w2_fb = getenv("VPIC_W2");
+        all_w0[0] = env_w0       ? (float)atof(env_w0)    : 1.0f;
+        all_w1[0] = env_w1_fb    ? (float)atof(env_w1_fb)  : 1.0f;
+        all_w2[0] = env_w2_fb    ? (float)atof(env_w2_fb)  : 1.0f;
+        snprintf(all_labels[0], 32, "balanced");
+        n_policies = 1;
+    }
+    // Use first policy as the default ranking weights
+    float rank_w0 = all_w0[0];
+    float rank_w1 = all_w1[0];
+    float rank_w2 = all_w2[0];
 
     const char* env_lr = getenv("VPIC_LR");
     const char* env_mape = getenv("VPIC_MAPE_THRESHOLD");
@@ -514,7 +561,9 @@ begin_initialization {
     global->explore_k       = explore_k;
     global->explore_thresh  = explore_thresh;
     const char* env_verify = getenv("VPIC_VERIFY");
+    const char* env_verify_wt = getenv("VPIC_VERIFY_WEIGHTS");
     global->do_verify       = env_verify ? atoi(env_verify) : 1;
+    global->verify_weights  = env_verify_wt ? atoi(env_verify_wt) : 0;
 
     const char* env_dump = getenv("VPIC_DUMP_FIELDS");
     global->dump_fields     = env_dump ? atoi(env_dump) : 0;
@@ -619,6 +668,13 @@ begin_initialization {
     global->rank_w0 = rank_w0;
     global->rank_w1 = rank_w1;
     global->rank_w2 = rank_w2;
+    global->n_policies = n_policies;
+    for (int pi = 0; pi < n_policies; pi++) {
+        global->policy_w0[pi] = all_w0[pi];
+        global->policy_w1[pi] = all_w1[pi];
+        global->policy_w2[pi] = all_w2[pi];
+        strncpy(global->policy_labels[pi], all_labels[pi], 31);
+    }
     global->gpucompress_ready = 1;
 
     // Create VPIC adapter handle for fields
@@ -647,7 +703,10 @@ begin_initialization {
             << " VPIC_TIMESTEPS=" << timesteps);
     sim_log("  Weights  : " << (weights_path ? weights_path : "(none, fallback to LZ4)"));
     sim_log("  NN loaded: " << (gpucompress_nn_is_loaded() ? "yes" : "no"));
-    sim_log("  Cost w0/w1/w2: " << rank_w0 << " / " << rank_w1 << " / " << rank_w2);
+    sim_log("  Policies : " << n_policies);
+    for (int pi = 0; pi < n_policies; pi++)
+        sim_log("    [" << pi << "] " << all_labels[pi]
+                << " (w0=" << all_w0[pi] << " w1=" << all_w1[pi] << " w2=" << all_w2[pi] << ")");
     sim_log("  SGD LR: " << reinforce_lr << "  MAPE threshold: " << reinforce_mape);
     if (global->exclude_list[0])
         sim_log("  Exclude: " << global->exclude_list);
@@ -667,12 +726,38 @@ begin_initialization {
 // ============================================================
 begin_diagnostics {
     if (global->benchmark_done) return;
-    if (step() < global->sim_steps) return;
     if (!global->gpucompress_ready) return;
+
+    /* Weight fingerprints for cross-timestep verification (VPIC_VERIFY_WEIGHTS=1) */
+    static float wt_fingerprints[3 * 3][3]; /* 3 policies × 3 NN base phases */
+
+    /* ── Warmup progress ── */
+    static double warmup_start_ms = 0;
+    if (step() < global->sim_steps) {
+        if (step() == 0) warmup_start_ms = now_ms();
+        if (step() % 50 == 0 || step() == global->sim_steps - 1) {
+            double elapsed_s = (now_ms() - warmup_start_ms) / 1000.0;
+            int pct = (global->sim_steps > 0) ? (int)step() * 100 / global->sim_steps : 0;
+            int bar_w = 20;
+            int filled = (int)step() * bar_w / (global->sim_steps > 0 ? global->sim_steps : 1);
+            fprintf(stderr, "\r  Warmup %d/%d [", (int)step(), global->sim_steps);
+            for (int b = 0; b < bar_w; b++)
+                fputc(b < filled ? '#' : '.', stderr);
+            fprintf(stderr, "] %3d%%  (%.1fs)", pct, elapsed_s);
+            fflush(stderr);
+        }
+        return;
+    }
 
     /* Initialize CSV paths on first invocation */
     static bool csv_paths_init = false;
-    if (!csv_paths_init) { init_csv_paths(); csv_paths_init = true; }
+    if (!csv_paths_init) {
+        double warmup_elapsed_s = (now_ms() - warmup_start_ms) / 1000.0;
+        fprintf(stderr, "\r  Warmup %d/%d [####################] 100%%  done (%.1fs)               \n",
+                global->sim_steps, global->sim_steps, warmup_elapsed_s);
+        init_csv_paths();
+        csv_paths_init = true;
+    }
 
     // Attach GPU-resident field data (fresh pointer each step — fields evolve)
     vpic_attach_fields(global->vpic_fields_h, field_array->k_f_d);
@@ -692,7 +777,21 @@ begin_diagnostics {
     if (step() >= global->sim_steps) {  /* physics warmup complete → run benchmark */
         // Skip intermediate steps when sim_interval > 1
         // (run N physics steps between each benchmark write for data variety)
+        static double evolve_start_ms = 0;
         if (global->sim_interval > 1 && global->sim_steps_pending > 0) {
+            int done = global->sim_interval - global->sim_steps_pending;
+            if (done == 1) evolve_start_ms = now_ms();  // start timer on first skip step
+            if (done % 50 == 0 || global->sim_steps_pending == 1) {
+                double elapsed_s = (now_ms() - evolve_start_ms) / 1000.0;
+                int pct = done * 100 / global->sim_interval;
+                int bar_w = 20;
+                int filled = done * bar_w / global->sim_interval;
+                fprintf(stderr, "\r  Sim evolve %d→%d [", global->ts_count, global->ts_count + 1);
+                for (int b = 0; b < bar_w; b++)
+                    fputc(b < filled ? '#' : '.', stderr);
+                fprintf(stderr, "] %3d%%  (%d/%d steps, %.1fs)          ", pct, done, global->sim_interval, elapsed_s);
+                fflush(stderr);
+            }
             global->sim_steps_pending--;
             return;  // let VPIC advance without benchmarking
         }
@@ -719,7 +818,9 @@ begin_diagnostics {
                 global->ranking_costs_csv = NULL;
                 printf("  Ranking costs CSV: %s\n", RANKING_COSTS_CSV);
             }
-            printf("\n=== VPIC Multi-Timestep complete (%d timesteps x 12 phases) ===\n",
+            fprintf(stderr, "\r  T=%d/%d [##############################] 100%%  Done.                    \n",
+                    global->ts_count, global->ts_count);
+            printf("\n=== VPIC Multi-Timestep complete (%d timesteps) ===\n",
                    global->ts_count);
 
             /* Append nn-rl and nn-rl+exp50 steady-state averages to aggregate CSV.
@@ -788,7 +889,10 @@ begin_diagnostics {
                                        &t_vs2_busy, &t_vs3_busy);
                             if (nf >= 12 && ts_idx >= WARMUP) {
                                 for (int pi = 0; pi < N_AGG_PHASES; pi++) {
-                                    if (strcmp(ph, pnames[pi]) == 0) {
+                                    /* Match "nn-rl" against both "nn-rl" and "nn-rl/balanced" etc. */
+                                    size_t plen = strlen(pnames[pi]);
+                                    if (strncmp(ph, pnames[pi], plen) == 0
+                                        && (ph[plen] == '\0' || ph[plen] == '/')) {
                                         pa[pi].sum_write += wr;
                                         pa[pi].sum_read  += rd;
                                         pa[pi].sum_ratio += rat;
@@ -897,7 +1001,7 @@ begin_diagnostics {
             global->h_read = NULL;
             /* Free weight snapshots before VOL/gpucompress cleanup to avoid
              * conflicts with Kokkos CUDA memory pool finalization. */
-            for (int wi = 0; wi < global->NN_PHASE_COUNT; wi++) {
+            for (int wi = 0; wi < global->n_policies * global->NN_BASE_PHASES; wi++) {
                 if (global->nn_weight_snapshots_gpu[wi]) {
                     cudaFree(global->nn_weight_snapshots_gpu[wi]);
                     global->nn_weight_snapshots_gpu[wi] = NULL;
@@ -966,21 +1070,20 @@ begin_diagnostics {
             if (global->ranking_costs_csv)
                 vpic_write_ranking_costs_csv_header(global->ranking_costs_csv);
 
-            /* Reload pretrained weights and create per-NN-phase GPU snapshots.
-             * Each NN phase (nn, nn-rl, nn-rl+exp50) gets an independent copy
-             * on the GPU so SGD updates in one phase don't leak into others.
-             * Swaps are device-to-device memcpy (~75 KB, <0.01ms). */
+            /* Reload pretrained weights and create per-(NN-phase × policy) GPU snapshots.
+             * With N policies and 3 NN base phases, we allocate N*3 snapshots.
+             * Each gets independent SGD state — no leakage across phases or policies. */
             const char* wpath = getenv("GPUCOMPRESS_WEIGHTS");
             if (wpath) gpucompress_reload_nn(wpath);
 
             global->nn_weight_bytes = gpucompress_nn_weights_size();
-            for (int wi = 0; wi < global->NN_PHASE_COUNT; wi++) {
+            int total_snapshots = global->n_policies * global->NN_BASE_PHASES;
+            for (int wi = 0; wi < total_snapshots; wi++) {
                 cudaMalloc(&global->nn_weight_snapshots_gpu[wi], global->nn_weight_bytes);
-                /* Initialize all 3 snapshots from the same pretrained weights */
                 gpucompress_nn_save_snapshot_device(global->nn_weight_snapshots_gpu[wi]);
             }
-            printf("  NN weight isolation: %d GPU snapshots x %zu bytes (%.1f KB each)\n",
-                   global->NN_PHASE_COUNT, global->nn_weight_bytes,
+            printf("  NN weight isolation: %d policies x %d NN phases = %d GPU snapshots (%.1f KB each)\n",
+                   global->n_policies, global->NN_BASE_PHASES, total_snapshots,
                    global->nn_weight_bytes / 1024.0);
 
         }
@@ -1018,14 +1121,16 @@ begin_diagnostics {
 
         hsize_t dims[1] = { (hsize_t)n_floats };
 
-        /* Progress to stderr (visible even when stdout is redirected to log) */
-        if (t % 5 == 0 || t == global->timesteps - 1)
-            fprintf(stderr, "\r  [VPIC] Timestep %d/%d (%d%%)  ",
-                    t, global->timesteps, t * 100 / global->timesteps);
-
         /* Dump raw field binary for visualization (gated by VPIC_DUMP_FIELDS=1) */
         if (global->dump_fields)
             dump_fields_raw(d_fields, n_floats, t, global->grid_n);
+
+        /* Clear sim progress line, show evolution time */
+        if (global->sim_interval > 1 && t > 0) {
+            double evolve_elapsed_s = (now_ms() - evolve_start_ms) / 1000.0;
+            fprintf(stderr, "\r  Sim evolve %d→%d: %d steps (%.1fs)                                        \n",
+                    t - 1, t, global->sim_interval, evolve_elapsed_s);
+        }
 
         for (int pi = 0; pi < n_phases_ts; pi++) {
             const char* phase_name = phases[pi].name;
@@ -1045,33 +1150,63 @@ begin_diagnostics {
 
             int do_sgd  = phases[pi].sgd;
             int do_expl = phases[pi].explore;
-            bool is_nn  = (phases[pi].algo == GPUCOMPRESS_ALGO_AUTO && strcmp(phase_name, "no-comp") != 0);
+            int nn_base_idx = phases[pi].nn_weight_idx; // -1 for fixed, 0/1/2 for nn/nn-rl/nn-rl+exp50
+            bool is_nn  = (nn_base_idx >= 0);
+
+            // For NN phases, loop over all policies. For fixed phases, run once.
+            int pol_start = 0, pol_end = 1;  // fixed: single iteration
+            if (is_nn) {
+                pol_start = 0;
+                pol_end = global->n_policies;
+            }
+
+          for (int pol_idx = pol_start; pol_idx < pol_end; pol_idx++) {
+
+            // Build display name: "nn-rl" for single policy, "nn-rl/ratio" for multi
+            char display_name[80];
+            if (is_nn && global->n_policies > 1)
+                snprintf(display_name, sizeof(display_name), "%s/%s", phase_name, global->policy_labels[pol_idx]);
+            else
+                snprintf(display_name, sizeof(display_name), "%s", phase_name);
 
             /* Flush nvCOMP manager cache so each phase starts cold (no cache bias) */
             gpucompress_flush_manager_cache();
 
-            /* Restore this NN phase's isolated weight snapshot before running.
-             * This ensures nn-rl's SGD updates don't leak into nn or nn-rl+exp50.
-             * Device-to-device copy (~75 KB, <0.01ms — not part of timed section). */
-            int weight_idx = phases[pi].nn_weight_idx;
-            if (weight_idx >= 0 && weight_idx < global->NN_PHASE_COUNT
-                && global->nn_weight_snapshots_gpu[weight_idx]) {
+            /* For NN phases: set this policy's cost weights and restore weight snapshot */
+            int weight_idx = -1;
+            if (is_nn) {
+                gpucompress_set_ranking_weights(
+                    global->policy_w0[pol_idx], global->policy_w1[pol_idx], global->policy_w2[pol_idx]);
+                weight_idx = pol_idx * global->NN_BASE_PHASES + nn_base_idx;
                 gpucompress_nn_restore_snapshot_device(
                     global->nn_weight_snapshots_gpu[weight_idx]);
 
-                /* Debug: sample 3 weights from snapshot to verify restore.
-                 * On next timestep, RESTORED values should match SAVED values from previous T. */
-                if (getenv("VPIC_DEBUG_WEIGHTS")) {
-                    float samples[3];
-                    size_t n_floats_w = global->nn_weight_bytes / sizeof(float);
-                    size_t offsets[3] = {n_floats_w / 4, n_floats_w / 2, n_floats_w * 3 / 4};
+                /* Verify weight snapshot continuity across timesteps.
+                 * After restore, sample 3 weights and compare to what was saved
+                 * at the end of the previous timestep. Mismatch = snapshot corruption. */
+                if (global->verify_weights && t > 0) {
+                    float restored[3];
+                    size_t nw = global->nn_weight_bytes / sizeof(float);
+                    size_t offs[3] = {nw / 4, nw / 2, nw * 3 / 4};
                     for (int si = 0; si < 3; si++)
-                        cudaMemcpy(&samples[si],
-                                   (float*)global->nn_weight_snapshots_gpu[weight_idx] + offsets[si],
+                        cudaMemcpy(&restored[si],
+                                   (float*)global->nn_weight_snapshots_gpu[weight_idx] + offs[si],
                                    sizeof(float), cudaMemcpyDeviceToHost);
-                    printf("    [T=%d][%s] RESTORED  w[%zu]=%.8e w[%zu]=%.8e w[%zu]=%.8e\n",
-                           t, phase_name, offsets[0], samples[0], offsets[1], samples[1],
-                           offsets[2], samples[2]);
+                    bool match = (restored[0] == wt_fingerprints[weight_idx][0] &&
+                                  restored[1] == wt_fingerprints[weight_idx][1] &&
+                                  restored[2] == wt_fingerprints[weight_idx][2]);
+                    if (!match) {
+                        fprintf(stderr, "  *** WEIGHT MISMATCH T=%d %s (idx=%d): "
+                                "restored=[%.8e,%.8e,%.8e] expected=[%.8e,%.8e,%.8e]\n",
+                                t, display_name, weight_idx,
+                                restored[0], restored[1], restored[2],
+                                wt_fingerprints[weight_idx][0],
+                                wt_fingerprints[weight_idx][1],
+                                wt_fingerprints[weight_idx][2]);
+                    } else if (t == 1) {
+                        fprintf(stderr, "  [verify] T=%d %s: weights match previous save ✓\n",
+                                t, display_name);
+                    }
                 }
             }
 
@@ -1098,15 +1233,24 @@ begin_diagnostics {
                 dcpl = make_dcpl_auto((hsize_t)chunk_floats, global->diag_error_bound);
             }
 
-            /* Print header on first timestep for each phase */
+            /* Print phase header on first timestep */
             if (t == 0) {
                 printf("\n── [%s] (SGD=%s, Explore=%s) ──\n",
-                       phase_name, do_sgd ? "on" : "off", do_expl ? "on" : "off");
+                       display_name, do_sgd ? "on" : "off", do_expl ? "on" : "off");
                 printf("  %-4s  %-8s  %-7s  %-7s  %-7s  %-8s  %-8s  %-8s  %-4s\n",
                        "T", "SimStep", "WrMs", "RdMs", "Ratio",
                        "MAPE_R", "MAPE_C", "MAPE_D", "SGD");
                 printf("  ----  --------  -------  -------  -------  "
                        "--------  --------  --------  ----\n");
+            }
+
+            /* Suppress VOL warnings for no-comp (they are expected and noisy) */
+            int saved_stderr = -1;
+            if (strcmp(phase_name, "no-comp") == 0) {
+                fflush(stderr);
+                saved_stderr = dup(STDERR_FILENO);
+                int devnull = open("/dev/null", O_WRONLY);
+                if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
             }
 
             /* Write via VOL */
@@ -1241,12 +1385,31 @@ begin_diagnostics {
             double wr_mbps = (write_ms_t > 0) ? orig_mib / (write_ms_t / 1000.0) : 0;
             double rd_mbps = (read_ms_t > 0)  ? orig_mib / (read_ms_t  / 1000.0) : 0;
 
-            /* Print every 5th timestep */
+            /* Print every 5th timestep to stdout (log) */
             bool print_row = (t % 5 == 0 || t == global->timesteps - 1);
             if (print_row) {
                 printf("  %-4d  %-8d  %6.0f  %6.0f   %5.2fx  %7.1f%%  %7.1f%%  %7.1f%%  %3d\n",
                        t, (int)step(), write_ms_t, read_ms_t,
                        ratio_t, real_mape_r, real_mape_c, real_mape_d, sgd_t);
+            }
+
+            /* Restore stderr if we suppressed VOL warnings for no-comp */
+            if (saved_stderr >= 0) {
+                fflush(stderr);
+                dup2(saved_stderr, STDERR_FILENO);
+                close(saved_stderr);
+            }
+
+            /* Per-phase progress on stderr (visible during run) */
+            {
+                double phase_total_ms = write_ms_t + read_ms_t;
+                fprintf(stderr, "\r  T=%-3d %-20s  ratio=%5.2fx  wr=%5.0f MiB/s  rd=%5.0f MiB/s  (%.1fs)",
+                        t + 1, display_name, ratio_t, wr_mbps, rd_mbps, phase_total_ms / 1000.0);
+                if (do_sgd)
+                    fprintf(stderr, "  SGD=%d", sgd_t);
+                /* Pad to overwrite any leftover chars from previous longer line */
+                fprintf(stderr, "                    \n");
+                fflush(stderr);
             }
 
             if (global->ts_csv) {
@@ -1259,7 +1422,7 @@ begin_diagnostics {
                         "%.2f,%.2f,"
                         "%.2f,%.2f,%.2f,%.2f,"
                         "%.2f,%.2f\n",
-                        phase_name, t, (int)step(), write_ms_t, read_ms_t, ratio_t,
+                        display_name, t, (int)step(), write_ms_t, read_ms_t, ratio_t,
                         real_mape_r, real_mape_c, real_mape_d,
                         sgd_t, expl_t, n_hist,
                         (unsigned long long)mm, wr_mbps, rd_mbps,
@@ -1302,7 +1465,7 @@ begin_diagnostics {
                                 "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
                                 "%.2f,%.2f,%.2f,%d,%d,"
                                 "%.4f,%.4f,%.4f,%d",
-                                phase_name, t, ci, action_str, orig_str,
+                                display_name, t, ci, action_str, orig_str,
                                 (double)dd.predicted_ratio, (double)dd.actual_ratio,
                                 (double)dd.predicted_comp_time, (double)dd.compression_ms_raw,
                                 (double)dd.predicted_decomp_time, (double)dd.decompression_ms_raw,
@@ -1336,13 +1499,17 @@ begin_diagnostics {
             /* Kendall τ ranking quality at milestones */
             if (is_nn && global->ranking_csv && vpic_is_ranking_milestone(t, global->timesteps)) {
                 float bw = gpucompress_get_bandwidth_bytes_per_ms();
+                /* Use this policy's cost weights for ranking, not the default */
+                float prof_w0 = global->policy_w0[pol_idx];
+                float prof_w1 = global->policy_w1[pol_idx];
+                float prof_w2 = global->policy_w2[pol_idx];
                 RankingMilestoneResult tau_result = {};
                 vpic_run_ranking_profiler(
                     d_fields, n_floats * sizeof(float), global->chunk_bytes,
                     global->diag_error_bound,
-                    global->rank_w0, global->rank_w1, global->rank_w2, bw,
+                    prof_w0, prof_w1, prof_w2, bw,
                     3, global->ranking_csv, global->ranking_costs_csv,
-                    phase_name, t, &tau_result);
+                    display_name, t, &tau_result);
                 printf("    [τ] T=%d: τ=%.3f  regret=%.3fx  (%.0fms)\n",
                        t, tau_result.mean_tau,
                        tau_result.mean_regret,
@@ -1355,25 +1522,22 @@ begin_diagnostics {
             /* Save this NN phase's weights back to its GPU snapshot.
              * SGD may have updated them during compression — preserve
              * the updated state for the next timestep. */
-            if (weight_idx >= 0 && weight_idx < global->NN_PHASE_COUNT
-                && global->nn_weight_snapshots_gpu[weight_idx]) {
+            if (weight_idx >= 0 && global->nn_weight_snapshots_gpu[weight_idx]) {
                 gpucompress_nn_save_snapshot_device(
                     global->nn_weight_snapshots_gpu[weight_idx]);
 
-                /* Debug: sample 3 weights after save to compare with restore on next timestep */
-                if (getenv("VPIC_DEBUG_WEIGHTS")) {
-                    float samples[3];
-                    size_t n_floats_w = global->nn_weight_bytes / sizeof(float);
-                    size_t offsets[3] = {n_floats_w / 4, n_floats_w / 2, n_floats_w * 3 / 4};
+                /* Record fingerprint for next-timestep verification */
+                if (global->verify_weights) {
+                    size_t nw = global->nn_weight_bytes / sizeof(float);
+                    size_t offs[3] = {nw / 4, nw / 2, nw * 3 / 4};
                     for (int si = 0; si < 3; si++)
-                        cudaMemcpy(&samples[si],
-                                   (float*)global->nn_weight_snapshots_gpu[weight_idx] + offsets[si],
+                        cudaMemcpy(&wt_fingerprints[weight_idx][si],
+                                   (float*)global->nn_weight_snapshots_gpu[weight_idx] + offs[si],
                                    sizeof(float), cudaMemcpyDeviceToHost);
-                    printf("    [T=%d][%s] SAVED     w[%zu]=%.8e w[%zu]=%.8e w[%zu]=%.8e\n",
-                           t, phase_name, offsets[0], samples[0], offsets[1], samples[1],
-                           offsets[2], samples[2]);
                 }
             }
+
+          } /* end policy loop (for NN phases) */
         } /* end phase loop */
 
         global->ts_count++;
@@ -1396,7 +1560,7 @@ begin_diagnostics {
         global->d_read = NULL;
         global->h_orig = NULL;
         global->h_read = NULL;
-        for (int wi = 0; wi < global->NN_PHASE_COUNT; wi++) {
+        for (int wi = 0; wi < global->n_policies * global->NN_BASE_PHASES; wi++) {
             if (global->nn_weight_snapshots_gpu[wi]) {
                 cudaFree(global->nn_weight_snapshots_gpu[wi]);
                 global->nn_weight_snapshots_gpu[wi] = NULL;

@@ -1,82 +1,91 @@
 #!/bin/bash
 # ============================================================
-# Run All Benchmarks (Gray-Scott + VPIC + SDRBench)
+# GPUCompress Benchmark Suite
 #
-# Single entry point for all benchmarks with shared configuration.
+# Single entry point for all benchmarks: Gray-Scott, VPIC, SDRBench.
+# Fixed phases run once; NN phases run per policy with GPU weight isolation.
 #
-# Examples:
-#
-#   # Run everything with defaults (512MB, 16MB chunks, 50 timesteps)
-#   bash benchmarks/run_all.sh
-#
-#   # 1GB data, 32MB chunks, all benchmarks
-#   DATA_MB=1024 CHUNK_MB=32 bash benchmarks/run_all.sh
-#
-#   # VPIC only, 1GB, 50 timesteps, balanced policy
-#   BENCHMARKS=vpic DATA_MB=1024 CHUNK_MB=32 TIMESTEPS=50 \
-#     POLICIES=balanced VERIFY=0 bash benchmarks/run_all.sh
-#
-#   # Gray-Scott only, quick test
-#   BENCHMARKS=grayscott DATA_MB=128 CHUNK_MB=16 TIMESTEPS=5 \
-#     PHASES="no-comp,lz4,nn,nn-rl" VERIFY=0 bash benchmarks/run_all.sh
-#
-#   # SDRBench only, NYX dataset
-#   BENCHMARKS=sdrbench SDR_DATASETS=nyx CHUNK_MB=8 \
-#     POLICIES=balanced VERIFY=0 bash benchmarks/run_all.sh
-#
-#   # All SDR datasets with specific phases
-#   BENCHMARKS=sdrbench CHUNK_MB=64 \
-#     PHASES="no-comp,lz4,zstd,nn,nn-rl,nn-rl+exp50" bash benchmarks/run_all.sh
-#
-#   # VPIC with custom physics (faster reconnection, more data variety)
-#   BENCHMARKS=vpic DATA_MB=1024 VPIC_MI_ME=1 VPIC_TI_TE=5 \
-#     VPIC_WARMUP_STEPS=500 VPIC_SIM_INTERVAL=20 bash benchmarks/run_all.sh
-#
-#   # All benchmarks, speed policy only, NN phases only
-#   PHASES="nn,nn-rl,nn-rl+exp50" POLICIES=speed \
-#     DATA_MB=512 CHUNK_MB=16 TIMESTEPS=50 bash benchmarks/run_all.sh
-#
-#   # Override grid sizes directly (ignore DATA_MB)
-#   GS_L=640 VPIC_NX=254 CHUNK_MB=64 TIMESTEPS=100 bash benchmarks/run_all.sh
-#
-# ── Environment Variables ──────────────────────────────────
-#
-#   Variable            Default                 Description
-#   ------------------- ----------------------- -----------------------------------
-#   BENCHMARKS          grayscott,vpic,sdrbench Which to run (comma-separated)
-#   DATA_MB             512                     Target per-snapshot size in MB
-#   CHUNK_MB            16                      Chunk size in MB
-#   TIMESTEPS           50                      Number of benchmark write cycles
-#   POLICIES            balanced,ratio,speed    Cost model policies
-#   PHASES              (all 12)                Compression phases to run
-#   VERIFY              1                       Bitwise verify (0=skip)
-#   DEBUG_NN            0                       NN debug output
-#
-#   NN hyperparameters:
-#   SGD_LR              0.2                     SGD learning rate
-#   SGD_MAPE            0.10                    MAPE threshold for SGD
-#   EXPLORE_K           4                       Exploration alternatives
-#   EXPLORE_THRESH      0.20                    Exploration error threshold
-#
-#   Gray-Scott specific:
-#   GS_L                (auto from DATA_MB)     Grid size (L^3 * 4 bytes)
-#   GS_STEPS            500                     PDE sim steps per timestep
-#
-#   VPIC specific:
-#   VPIC_NX             (auto from DATA_MB)     Grid size ((NX+2)^3 * 64 bytes)
-#   VPIC_NPPC           2                       Particles per cell
-#   VPIC_WARMUP_STEPS   500                     Sim steps before benchmarking
-#   VPIC_PERTURBATION   0.1                     Bx tearing mode seed (fraction of b0)
-#   VPIC_GUIDE_FIELD    0.0                     By guide field (fraction of b0, 0.2 for 3D)
-#   VPIC_SIM_INTERVAL   190                     Sim steps between benchmark writes
-#   VPIC_MI_ME          5                       Ion/electron mass ratio (lower=faster reconnection)
-#   VPIC_WPE_WCE        1                       Plasma/cyclotron freq ratio (lower=stronger B field)
-#   VPIC_TI_TE          5                       Ion/electron temp ratio (higher=more free energy)
-#
-#   SDRBench specific:
-#   SDR_DATASETS        nyx,hurricane_isabel,cesm_atm  Datasets to run
+# Usage:
+#   bash benchmarks/benchmark.sh [--help]
 #
 # ============================================================
+
+show_help() {
+cat << 'HELP'
+GPUCompress Benchmark Suite
+===========================
+
+Usage: bash benchmarks/benchmark.sh
+
+All configuration is via environment variables. Defaults shown in [brackets].
+
+GENERAL
+  BENCHMARKS          [grayscott,vpic,sdrbench]  Which benchmarks to run
+  DATA_MB             [512]                      Per-snapshot data size in MB
+  CHUNK_MB            [16]                       HDF5 chunk size in MB
+  TIMESTEPS           [50]                       Number of benchmark write cycles
+  POLICIES            [balanced,ratio,speed]      Cost model policies (NN phases only)
+  PHASES              [all 12]                   Compression phases to run
+                        Fixed: no-comp,lz4,snappy,deflate,gdeflate,zstd,ans,cascaded,bitcomp
+                        NN:    nn,nn-rl,nn-rl+exp50
+  VERIFY              [1]                        Bitwise verify (0=skip for speed)
+  DEBUG_NN            [0]                        NN debug output
+
+NN HYPERPARAMETERS
+  SGD_LR              [0.2]                      SGD learning rate
+  SGD_MAPE            [0.10]                     MAPE threshold for SGD updates
+  EXPLORE_K           [4]                        Number of exploration alternatives
+  EXPLORE_THRESH      [0.20]                     Cost error threshold for exploration
+
+GRAY-SCOTT (GPU reaction-diffusion simulation)
+  GS_L                [auto]                     Grid size L (L^3 voxels, 4 bytes each)
+  GS_STEPS            [500]                      PDE simulation steps per timestep
+
+VPIC (GPU plasma particle-in-cell simulation)
+  VPIC_NX             [auto]                     Grid size NX ((NX+2)^3 * 64 bytes)
+  VPIC_NPPC           [2]                        Particles per cell
+  VPIC_WARMUP_STEPS   [500]                      Simulation steps before benchmarking
+  VPIC_SIM_INTERVAL   [190]                      Simulation steps between benchmark writes
+  VPIC_MI_ME          [5]                        Ion/electron mass ratio (lower=faster)
+  VPIC_WPE_WCE        [1]                        Plasma/cyclotron freq ratio (lower=stronger B)
+  VPIC_TI_TE          [5]                        Ion/electron temp ratio (higher=more energy)
+  VPIC_PERTURBATION   [0.1]                      Bx tearing mode seed (0=none, 0.1=10% of B0)
+  VPIC_GUIDE_FIELD    [0.0]                      By guide field (0.2-0.5 for 3D structure)
+  VPIC_DUMP_FIELDS    [0]                        Dump raw field binary per timestep
+
+SDRBENCH (static scientific datasets)
+  SDR_DATASETS        [nyx,hurricane_isabel,cesm_atm]  Datasets to run
+
+EXAMPLES
+  # Quick smoke test
+  BENCHMARKS=vpic DATA_MB=128 CHUNK_MB=16 TIMESTEPS=3 VERIFY=0 bash benchmarks/benchmark.sh
+
+  # VPIC 1GB, all phases, balanced policy
+  BENCHMARKS=vpic DATA_MB=1024 CHUNK_MB=32 TIMESTEPS=10 POLICIES=balanced VERIFY=0 bash benchmarks/benchmark.sh
+
+  # Gray-Scott 512MB with selected phases
+  BENCHMARKS=grayscott DATA_MB=512 PHASES="no-comp,lz4,zstd,nn,nn-rl" bash benchmarks/benchmark.sh
+
+  # SDRBench NYX only
+  BENCHMARKS=sdrbench SDR_DATASETS=nyx CHUNK_MB=8 VERIFY=0 bash benchmarks/benchmark.sh
+
+  # All benchmarks, all policies, 1GB
+  DATA_MB=1024 CHUNK_MB=32 TIMESTEPS=50 bash benchmarks/benchmark.sh
+
+  # VPIC with custom physics
+  BENCHMARKS=vpic DATA_MB=1024 VPIC_MI_ME=1 VPIC_TI_TE=5 VPIC_WARMUP_STEPS=200 bash benchmarks/benchmark.sh
+
+OUTPUT
+  CSVs:   benchmarks/<benchmark>/results/eval_<params>/<policy>/
+  Plots:  benchmarks/results/per_dataset/<dataset>/eval_<params>/<policy>/
+  Logs:   benchmarks/<benchmark>/results/eval_<params>/<policy>/*_benchmark.log
+HELP
+exit 0
+}
+
+# Show help if --help is passed
+[[ "$1" == "--help" || "$1" == "-h" ]] && show_help
+
 set +e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -191,7 +200,7 @@ for bench in "${BENCH_LIST[@]}"; do
                     --explore-k $EXPLORE_K --explore-thresh $EXPLORE_THRESH \
                     $VERIFY_ARG \
                     --out-dir "$GS_FIXED_DIR" \
-                    > "$GS_FIXED_DIR/gs_benchmark.log" 2>&1
+                    > "$GS_FIXED_DIR/gs_benchmark.log" 2> >(tee -a "$GS_FIXED_DIR/gs_benchmark.log" >&2)
 
                 echo "      Done. Log: $GS_FIXED_DIR/gs_benchmark.log"
                 echo ""
@@ -227,7 +236,7 @@ for bench in "${BENCH_LIST[@]}"; do
                         --explore-k $EXPLORE_K --explore-thresh $EXPLORE_THRESH \
                         $VERIFY_ARG \
                         --out-dir "$GS_NN_DIR" \
-                        > "$GS_NN_DIR/gs_benchmark.log" 2>&1
+                        > "$GS_NN_DIR/gs_benchmark.log" 2> >(tee -a "$GS_NN_DIR/gs_benchmark.log" >&2)
 
                     echo "      Done. Log: $GS_NN_DIR/gs_benchmark.log"
 
@@ -301,20 +310,11 @@ for bench in "${BENCH_LIST[@]}"; do
                 echo "$EXCL"
             }
 
-            echo "  NX=$VPIC_NX (~${VPIC_DATA} MB), chunk=${CHUNK_MB}MB, ts=${TIMESTEPS}"
-            echo "  warmup=$VPIC_WARMUP, sim_interval=$VPIC_SIM_INT"
-            echo "  physics: mi_me=$VPIC_MI_ME wpe_wce=$VPIC_WPE_WCE Ti_Te=$VPIC_TI_TE pert=${VPIC_PERTURBATION:-0.1}"
-            echo "  fixed phases: ${VPIC_FIXED_PHASES:-none}"
-            echo "  NN phases:    ${VPIC_NN_PHASES:-none}"
-            echo ""
-
-            # ── Step 1: Fixed phases (run ONCE, policy-independent) ──
-            if [ -n "$VPIC_FIXED_PHASES" ]; then
-                FIXED_DIR="$VPIC_EVAL_DIR/fixed_phases"
-                mkdir -p "$FIXED_DIR"
-                FIXED_EXCLUDE=$(vpic_exclude_from "$VPIC_FIXED_PHASES")
-
-                echo "  >>> Fixed phases (run once): $VPIC_FIXED_PHASES"
+            # Helper: run VPIC binary
+            vpic_run() {
+                local RESULTS_DIR="$1" INCLUDE_PHASES="$2"
+                local EXCL=$(vpic_exclude_from "$INCLUDE_PHASES")
+                mkdir -p "$RESULTS_DIR"
 
                 LD_LIBRARY_PATH="$VPIC_LD_PATH" \
                 GPUCOMPRESS_DETAILED_TIMING=1 \
@@ -325,84 +325,38 @@ for bench in "${BENCH_LIST[@]}"; do
                 VPIC_PERTURBATION=${VPIC_PERTURBATION:-0.1} VPIC_GUIDE_FIELD=${VPIC_GUIDE_FIELD:-0.0} \
                 VPIC_WARMUP_STEPS=$VPIC_WARMUP VPIC_TIMESTEPS=$TIMESTEPS VPIC_SIM_INTERVAL=$VPIC_SIM_INT \
                 VPIC_CHUNK_MB=$CHUNK_MB VPIC_VERIFY=$VERIFY \
-                VPIC_EXCLUDE="$FIXED_EXCLUDE" \
-                VPIC_RESULTS_DIR="$FIXED_DIR" \
-                VPIC_W0=1.0 VPIC_W1=1.0 VPIC_W2=1.0 \
+                VPIC_EXCLUDE="$EXCL" \
+                VPIC_RESULTS_DIR="$RESULTS_DIR" \
+                VPIC_POLICIES="$POLICIES" \
                 VPIC_LR=$SGD_LR VPIC_MAPE_THRESHOLD=$SGD_MAPE \
                 VPIC_EXPLORE_K=$EXPLORE_K VPIC_EXPLORE_THRESH=$EXPLORE_THRESH \
                 "$VPIC_BIN" "$VPIC_DECK" \
-                > "$FIXED_DIR/vpic_benchmark.log" 2>&1
+                > "$RESULTS_DIR/vpic_benchmark.log" 2> >(tee -a "$RESULTS_DIR/vpic_benchmark.log" >&2)
+            }
 
-                echo "      Done. Log: $FIXED_DIR/vpic_benchmark.log"
-                echo ""
-            fi
+            echo "  NX=$VPIC_NX (~${VPIC_DATA} MB), chunk=${CHUNK_MB}MB, ts=${TIMESTEPS}"
+            echo "  warmup=$VPIC_WARMUP, sim_interval=$VPIC_SIM_INT"
+            echo "  physics: mi_me=$VPIC_MI_ME wpe_wce=$VPIC_WPE_WCE Ti_Te=$VPIC_TI_TE pert=${VPIC_PERTURBATION:-0.1}"
+            echo "  policies: $POLICIES"
+            echo ""
 
-            # ── Step 2: NN phases (run per policy) ──
-            if [ -n "$VPIC_NN_PHASES" ]; then
-                NN_EXCLUDE=$(vpic_exclude_from "$VPIC_NN_PHASES")
+            # ── Single invocation: all phases + all policies ──
+            # Fixed phases run once. NN phases run once per policy.
+            # The VPIC binary handles multi-policy internally via VPIC_POLICIES.
+            VPIC_RESULTS="$VPIC_EVAL_DIR"
+            mkdir -p "$VPIC_RESULTS"
 
-                IFS=',' read -ra _POLICIES <<< "$POLICIES"
-                POL_IDX=0
-                POL_TOTAL=${#_POLICIES[@]}
+            echo "  >>> All phases, all policies in single invocation"
 
-                for pol in "${_POLICIES[@]}"; do
-                    POL_IDX=$((POL_IDX + 1))
-                    case "$pol" in
-                        balanced) W0=1.0; W1=1.0; W2=1.0; LABEL="balanced_w1-1-1" ;;
-                        ratio)    W0=0.0; W1=0.0; W2=1.0; LABEL="ratio_only_w0-0-1" ;;
-                        speed)    W0=1.0; W1=1.0; W2=0.0; LABEL="speed_only_w1-1-0" ;;
-                        *)        W0=1.0; W1=1.0; W2=1.0; LABEL="$pol" ;;
-                    esac
+            vpic_run "$VPIC_RESULTS" "$PHASES"
 
-                    NN_DIR="$VPIC_EVAL_DIR/$LABEL"
-                    mkdir -p "$NN_DIR"
+            echo "      Done. Log: $VPIC_RESULTS/vpic_benchmark.log"
 
-                    echo "  >>> NN phases [$LABEL] ($POL_IDX/$POL_TOTAL): $VPIC_NN_PHASES"
-
-                    LD_LIBRARY_PATH="$VPIC_LD_PATH" \
-                    GPUCOMPRESS_DETAILED_TIMING=1 \
-                    GPUCOMPRESS_WEIGHTS="$VPIC_WEIGHTS" \
-                    GPUCOMPRESS_DEBUG_NN=$DEBUG_NN \
-                    VPIC_NX=$VPIC_NX VPIC_NPPC=$VPIC_NPPC \
-                    VPIC_MI_ME=$VPIC_MI_ME VPIC_WPE_WCE=$VPIC_WPE_WCE VPIC_TI_TE=$VPIC_TI_TE \
-                    VPIC_PERTURBATION=${VPIC_PERTURBATION:-0.1} VPIC_GUIDE_FIELD=${VPIC_GUIDE_FIELD:-0.0} \
-                    VPIC_WARMUP_STEPS=$VPIC_WARMUP VPIC_TIMESTEPS=$TIMESTEPS VPIC_SIM_INTERVAL=$VPIC_SIM_INT \
-                    VPIC_CHUNK_MB=$CHUNK_MB VPIC_VERIFY=$VERIFY \
-                    VPIC_EXCLUDE="$NN_EXCLUDE" \
-                    VPIC_RESULTS_DIR="$NN_DIR" \
-                    VPIC_W0=$W0 VPIC_W1=$W1 VPIC_W2=$W2 \
-                    VPIC_LR=$SGD_LR VPIC_MAPE_THRESHOLD=$SGD_MAPE \
-                    VPIC_EXPLORE_K=$EXPLORE_K VPIC_EXPLORE_THRESH=$EXPLORE_THRESH \
-                    "$VPIC_BIN" "$VPIC_DECK" \
-                    > "$NN_DIR/vpic_benchmark.log" 2>&1
-
-                    echo "      Done. Log: $NN_DIR/vpic_benchmark.log"
-
-                    # Merge fixed + NN CSVs for this policy.
-                    # Strategy: build merged file in temp, then overwrite the NN dir copy
-                    # so the plot generator finds all phases in one file.
-                    if [ -n "$VPIC_FIXED_PHASES" ] && [ -d "$FIXED_DIR" ]; then
-                        for csv_name in benchmark_vpic_deck.csv benchmark_vpic_deck_timesteps.csv benchmark_vpic_deck_timestep_chunks.csv benchmark_vpic_deck_ranking.csv benchmark_vpic_deck_ranking_costs.csv; do
-                            FIXED_SRC="$FIXED_DIR/$csv_name"
-                            NN_SRC="$NN_DIR/$csv_name"
-                            if [ -f "$FIXED_SRC" ] && [ -f "$NN_SRC" ]; then
-                                # Merge: fixed header+data, then NN data (skip header)
-                                TMP_MERGED=$(mktemp)
-                                cp "$FIXED_SRC" "$TMP_MERGED"
-                                tail -n+2 "$NN_SRC" >> "$TMP_MERGED"
-                                mv "$TMP_MERGED" "$NN_SRC"
-                            elif [ -f "$FIXED_SRC" ] && [ ! -f "$NN_SRC" ]; then
-                                cp "$FIXED_SRC" "$NN_SRC"
-                            fi
-                        done
-                    fi
-
-                    VPIC_DIR="$NN_DIR" \
-                    python3 "$SCRIPT_DIR/plots/generate_dataset_figures.py" \
-                        --dataset vpic --policy "$LABEL" 2>&1 | grep -E "Generated"
-                    echo ""
-                done
-            fi
+            # Generate plots
+            VPIC_DIR="$VPIC_RESULTS" \
+            python3 "$SCRIPT_DIR/plots/generate_dataset_figures.py" \
+                --dataset vpic --policy "balanced_w1-1-1" 2>&1 | grep -E "Generated"
+            echo ""
             ;;
         sdrbench)
             echo ""
