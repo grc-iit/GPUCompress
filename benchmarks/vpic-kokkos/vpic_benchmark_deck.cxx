@@ -78,6 +78,9 @@ extern "C" float gpucompress_get_bandwidth_bytes_per_ms(void);
 #define H5Z_FILTER_GPUCOMPRESS    305
 #define H5Z_GPUCOMPRESS_CD_NELMTS 5
 
+/* Temporary HDF5 files written to /tmp (typically tmpfs / RAM-backed).
+ * This isolates GPU compression pipeline overhead from disk I/O variability.
+ * Note: drop_pagecache() is a no-op on tmpfs, so reads may hit warm cache. */
 #define TMP_NOCOMP    "/tmp/bm_vpic_nocomp.h5"
 #define TMP_FIX_LZ4   "/tmp/bm_vpic_fix_lz4.h5"
 #define TMP_FIX_SNAPPY "/tmp/bm_vpic_fix_snappy.h5"
@@ -235,8 +238,8 @@ static bool is_phase_excluded(const char* phase_name, const char* exclude_list) 
     while (tok) {
         /* Trim leading spaces */
         while (*tok == ' ') tok++;
-        /* Match: phase "lz4" excluded by "lz4" */
-        if (strstr(phase_name, tok)) return true;
+        /* Exact match: "deflate" excludes "deflate" but not "gdeflate" */
+        if (strcmp(phase_name, tok) == 0) return true;
         tok = strtok(NULL, ",");
     }
     return false;
@@ -535,7 +538,8 @@ begin_initialization {
     global->sim_steps_pending = 0;
     global->chunk_bytes     = (size_t)chunk_mb * 1024 * 1024;
     global->benchmark_done  = 0;
-    global->diag_error_bound = 0.0;
+    const char* env_eb = getenv("VPIC_ERROR_BOUND");
+    global->diag_error_bound = env_eb ? atof(env_eb) : 0.0;
 
     /* Phase exclusion: VPIC_EXCLUDE="lz4,no-comp,zstd" */
     const char* env_exclude = getenv("VPIC_EXCLUDE");
@@ -708,6 +712,8 @@ begin_initialization {
         sim_log("    [" << pi << "] " << all_labels[pi]
                 << " (w0=" << all_w0[pi] << " w1=" << all_w1[pi] << " w2=" << all_w2[pi] << ")");
     sim_log("  SGD LR: " << reinforce_lr << "  MAPE threshold: " << reinforce_mape);
+    if (global->diag_error_bound > 0.0)
+        sim_log("  Error bound: " << global->diag_error_bound << " (lossy quantization enabled)");
     if (global->exclude_list[0])
         sim_log("  Exclude: " << global->exclude_list);
     if (global->single_phase[0])
@@ -824,7 +830,7 @@ begin_diagnostics {
                    global->ts_count);
 
             /* Append nn-rl and nn-rl+exp50 steady-state averages to aggregate CSV.
-             * Read from timestep CSV, skip warmup (first 5 timesteps), average the rest. */
+             * Read from timestep CSV and compute per-phase averages across all timesteps. */
             {
                 FILE* agg = fopen(AGG_CSV, "w");
                 if (agg && global->ts_csv == NULL) {
@@ -967,7 +973,7 @@ begin_diagnostics {
                                 ? orig_bytes / 1e9 / (avg_decomp_ms / 1000.0) : 0.0;
                             fprintf(agg, "vpic,%s,%d,%.2f,0.00,%.2f,0.00,"
                                          "%.2f,%.2f,%.4f,"
-                                         "%.1f,%.1f,0,%d,%d,%d,"
+                                         "%.1f,%.1f,0,%.0f,%.0f,%d,"
                                          "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,"
                                          "%.4f,%.4f,"
                                          "%.2f,%.2f,%.2f,"
@@ -977,7 +983,7 @@ begin_diagnostics {
                                     pnames[pi], n, avg_wr, avg_rd,
                                     avg_file_mib, orig_mib, avg_ratio,
                                     wmbps, rmbps,
-                                    pa[pi].sum_sgd, pa[pi].sum_expl, pa[pi].n_chunks_last,
+                                    (double)pa[pi].sum_sgd / n, (double)pa[pi].sum_expl / n, pa[pi].n_chunks_last,
                                     pa[pi].sum_nn_ms / n, pa[pi].sum_stats_ms / n, pa[pi].sum_preproc_ms / n,
                                     avg_comp_ms, avg_decomp_ms,
                                     pa[pi].sum_explore_ms / n, pa[pi].sum_sgd_ms / n,
@@ -1039,7 +1045,7 @@ begin_diagnostics {
                 fprintf(global->ts_csv, "phase,timestep,sim_step,write_ms,read_ms,ratio,"
                         "mape_ratio,mape_comp,mape_decomp,"
                         "sgd_fires,explorations,n_chunks,mismatches,"
-                        "write_mbps,read_mbps,"
+                        "write_mibps,read_mibps,"
                         "file_bytes,"
                         "stats_ms,nn_ms,preproc_ms,comp_ms,decomp_ms,explore_ms,sgd_ms,"
                         "mae_ratio,mae_comp_ms,mae_decomp_ms,"
@@ -1169,8 +1175,11 @@ begin_diagnostics {
             else
                 snprintf(display_name, sizeof(display_name), "%s", phase_name);
 
-            /* Flush nvCOMP manager cache so each phase starts cold (no cache bias) */
-            gpucompress_flush_manager_cache();
+            /* Flush nvCOMP manager cache for NN phases (prevents cache bias between
+             * different NN algorithm selections). Fixed phases use hardcoded algorithms
+             * so cache state doesn't affect their results. */
+            if (is_nn)
+                gpucompress_flush_manager_cache();
 
             /* For NN phases: set this policy's cost weights and restore weight snapshot */
             int weight_idx = -1;
@@ -1298,7 +1307,15 @@ begin_diagnostics {
             H5VL_gpucompress_get_vol_func_timing(&vol_setup, NULL);
 
             if (wret < 0) {
-                printf("  %-4d  [%s] H5Dwrite failed\n", t, phase_name);
+                printf("  %-4d  [%s] H5Dwrite failed\n", t, display_name);
+                H5Pclose(dcpl);
+                /* Restore stderr if suppressed for no-comp */
+                if (saved_stderr >= 0) {
+                    fflush(stderr);
+                    dup2(saved_stderr, STDERR_FILENO);
+                    close(saved_stderr);
+                    saved_stderr = -1;
+                }
                 continue;
             }
 

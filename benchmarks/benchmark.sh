@@ -323,6 +323,7 @@ for bench in "${BENCH_LIST[@]}"; do
                 VPIC_NX=$VPIC_NX VPIC_NPPC=$VPIC_NPPC \
                 VPIC_MI_ME=$VPIC_MI_ME VPIC_WPE_WCE=$VPIC_WPE_WCE VPIC_TI_TE=$VPIC_TI_TE \
                 VPIC_PERTURBATION=${VPIC_PERTURBATION:-0.1} VPIC_GUIDE_FIELD=${VPIC_GUIDE_FIELD:-0.0} \
+                VPIC_ERROR_BOUND=${VPIC_ERROR_BOUND:-0.0} \
                 VPIC_WARMUP_STEPS=$VPIC_WARMUP VPIC_TIMESTEPS=$TIMESTEPS VPIC_SIM_INTERVAL=$VPIC_SIM_INT \
                 VPIC_CHUNK_MB=$CHUNK_MB VPIC_VERIFY=$VERIFY \
                 VPIC_EXCLUDE="$EXCL" \
@@ -352,10 +353,81 @@ for bench in "${BENCH_LIST[@]}"; do
 
             echo "      Done. Log: $VPIC_RESULTS/vpic_benchmark.log"
 
-            # Generate plots
-            VPIC_DIR="$VPIC_RESULTS" \
-            python3 "$SCRIPT_DIR/plots/generate_dataset_figures.py" \
-                --dataset vpic --policy "balanced_w1-1-1" 2>&1 | grep -E "Generated"
+            # ── Split results into per-policy directories ──
+            # Each policy dir gets: fixed phase rows + that policy's NN rows
+            IFS=',' read -ra _POLICIES <<< "$POLICIES"
+            for pol in "${_POLICIES[@]}"; do
+                case "$pol" in
+                    balanced) LABEL="balanced_w1-1-1" ;;
+                    ratio)    LABEL="ratio_only_w0-0-1" ;;
+                    speed)    LABEL="speed_only_w1-1-0" ;;
+                    *)        LABEL="$pol" ;;
+                esac
+
+                POL_DIR="$VPIC_RESULTS/$LABEL"
+                mkdir -p "$POL_DIR"
+
+                # For each CSV: extract fixed rows + this policy's NN rows
+                for csv_name in benchmark_vpic_deck_timesteps.csv benchmark_vpic_deck_timestep_chunks.csv benchmark_vpic_deck_ranking.csv benchmark_vpic_deck_ranking_costs.csv; do
+                    SRC="$VPIC_RESULTS/$csv_name"
+                    [ -f "$SRC" ] || continue
+                    DST="$POL_DIR/$csv_name"
+
+                    # Header + fixed rows (no "/" in phase) + this policy's NN rows (strip suffix)
+                    head -1 "$SRC" > "$DST"
+                    tail -n+2 "$SRC" | awk -F',' -v pol="/$pol" '{
+                        phase=$1;
+                        if (index(phase, "/") == 0) print;
+                        else if (index(phase, pol) > 0) {
+                            sub(pol, "", phase);
+                            $1 = phase;
+                            print;
+                        }
+                    }' OFS=',' >> "$DST"
+                done
+
+                # Regenerate aggregate CSV from the per-policy timestep CSV
+                # (the binary's aggregate mixes all policies — we need per-policy)
+                TS_CSV="$POL_DIR/benchmark_vpic_deck_timesteps.csv"
+                AGG_CSV="$POL_DIR/benchmark_vpic_deck.csv"
+                if [ -f "$TS_CSV" ]; then
+                    python3 -c "
+import csv, sys
+rows = list(csv.DictReader(open('$TS_CSV')))
+phases = {}
+for r in rows:
+    p = r['phase']
+    if p not in phases:
+        phases[p] = {'sum_wr':0,'sum_rd':0,'sum_rat':0,'sum_file_bytes':0,'n':0,'n_chunks':0}
+    d = phases[p]
+    d['sum_wr'] += float(r.get('write_ms',0))
+    d['sum_rd'] += float(r.get('read_ms',0))
+    d['sum_rat'] += float(r.get('ratio',0))
+    d['sum_file_bytes'] += int(r.get('file_bytes',0))
+    d['n_chunks'] = int(r.get('n_chunks',0))
+    d['n'] += 1
+with open('$AGG_CSV','w') as f:
+    f.write('source,phase,n_runs,write_ms,write_ms_std,read_ms,read_ms_std,file_mib,orig_mib,ratio,write_mibps,read_mibps,mismatches,sgd_fires,explorations,n_chunks\n')
+    for p,d in phases.items():
+        n = d['n']
+        wr = d['sum_wr']/n if n else 0
+        rd = d['sum_rd']/n if n else 0
+        rat = d['sum_rat']/n if n else 0
+        avg_file_mib = d['sum_file_bytes'] / n / (1024*1024) if n else 0
+        orig_mib = avg_file_mib * rat if rat > 0 else avg_file_mib
+        wr_mibps = orig_mib / (wr/1000.0) if wr > 0 else 0
+        rd_mibps = orig_mib / (rd/1000.0) if rd > 0 else 0
+        f.write(f'vpic,{p},{n},{wr:.2f},0.00,{rd:.2f},0.00,{avg_file_mib:.2f},{orig_mib:.2f},{rat:.4f},{wr_mibps:.1f},{rd_mibps:.1f},0,0,0,{d[\"n_chunks\"]}\n')
+" 2>/dev/null
+                fi
+
+                echo "  [$LABEL] Split CSVs → $POL_DIR/"
+
+                # Generate plots for this policy
+                VPIC_DIR="$POL_DIR" \
+                python3 "$SCRIPT_DIR/plots/generate_dataset_figures.py" \
+                    --dataset vpic --policy "$LABEL" 2>&1 | grep -E "Generated"
+            done
             echo ""
             ;;
         sdrbench)
