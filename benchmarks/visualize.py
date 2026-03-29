@@ -261,6 +261,7 @@ def _merge_timestep_phases(rows, ts_csv_path, orig_mib):
         else:
             ratio_agg = _avg_all(ph_rows, "ratio")  # fallback for old CSVs
             total_file_mib = total_data_mib / max(ratio_agg, 1e-6)
+            print(f"  WARNING: {ph} has no file_bytes column — ratio uses mean(per-timestep) fallback")
         total_sgd = sum(int(g(r, "sgd_fires")) for r in ph_rows)
         total_expl = sum(int(g(r, "explorations")) for r in ph_rows)
         total_chunks = sum(int(g(r, "n_chunks")) for r in ph_rows)

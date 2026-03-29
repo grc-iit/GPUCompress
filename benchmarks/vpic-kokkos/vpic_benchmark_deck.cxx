@@ -857,7 +857,7 @@ begin_diagnostics {
                         fgets(line, sizeof(line), ts);  /* skip header */
 
                         struct PhaseAccum {
-                            double sum_write, sum_read, sum_ratio;
+                            double sum_write, sum_read;
                             double sum_mape_r, sum_mape_c, sum_mape_d;
                             int    sum_sgd, sum_expl, n_chunks_last;
                             size_t last_file_sz;
@@ -916,7 +916,6 @@ begin_diagnostics {
                                         && (ph[plen] == '\0' || ph[plen] == '/')) {
                                         pa[pi].sum_write += wr;
                                         pa[pi].sum_read  += rd;
-                                        pa[pi].sum_ratio += rat;
                                         pa[pi].sum_mape_r += mr;
                                         pa[pi].sum_mape_c += mc;
                                         pa[pi].sum_mape_d += md;
@@ -968,17 +967,13 @@ begin_diagnostics {
                             int n = pa[pi].count;
                             double avg_wr = pa[pi].sum_write / n;
                             double avg_rd = pa[pi].sum_read / n;
-                            double avg_rat = pa[pi].sum_ratio / n;
-                            /* Use actual file sizes when available (avoids Jensen's
-                               inequality bias from orig/mean(ratio) != mean(orig/ratio)).
-                               Fall back to ratio-derived estimate for old CSV files
-                               that lack the file_bytes column. */
-                            double avg_file_mib = (pa[pi].sum_file_sz > 0)
-                                ? pa[pi].sum_file_sz / n / (double)(1 << 20)
-                                : orig_mib / avg_rat;
-                            double avg_ratio = (avg_file_mib > 0)
-                                ? orig_mib / avg_file_mib
-                                : avg_rat;
+                            /* Ratio = total_orig / total_compressed (not mean of
+                               per-timestep ratios, which has Jensen's inequality bias). */
+                            double total_file_mib = pa[pi].sum_file_sz / (double)(1 << 20);
+                            double avg_file_mib = (total_file_mib > 0)
+                                ? total_file_mib / n : 0.0;
+                            double avg_ratio = (total_file_mib > 0)
+                                ? (n * orig_mib) / total_file_mib : 1.0;
                             double wmbps = orig_mib / (avg_wr / 1000.0);
                             double rmbps = orig_mib / (avg_rd / 1000.0);
                             double avg_comp_ms = pa[pi].sum_comp_ms / n;

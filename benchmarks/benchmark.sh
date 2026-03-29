@@ -398,33 +398,81 @@ phases = {}
 for r in rows:
     p = r['phase']
     if p not in phases:
-        phases[p] = {'sum_wr':0,'sum_rd':0,'sum_rat':0,'sum_file_bytes':0,'n':0,'n_chunks':0}
+        phases[p] = {'sum_wr':0,'sum_rd':0,'sum_file_bytes':0,'n':0,'n_chunks':0,
+                     'sum_sgd':0,'sum_expl':0,'sum_mape_r':0,'sum_mape_c':0,'sum_mape_d':0,
+                     'sum_mape_p':0,'sum_mae_r':0,'sum_mae_c':0,'sum_mae_d':0,'sum_mae_p':0,
+                     'sum_stats':0,'sum_nn':0,'sum_pre':0,'sum_comp':0,'sum_dec':0,
+                     'sum_expl_ms':0,'sum_sgd_ms':0}
     d = phases[p]
     d['sum_wr'] += float(r.get('write_ms',0))
     d['sum_rd'] += float(r.get('read_ms',0))
-    d['sum_rat'] += float(r.get('ratio',0))
     d['sum_file_bytes'] += int(r.get('file_bytes',0))
     d['n_chunks'] = int(r.get('n_chunks',0))
+    d['sum_sgd'] += int(r.get('sgd_fires',0))
+    d['sum_expl'] += int(r.get('explorations',0))
+    d['sum_mape_r'] += float(r.get('mape_ratio',0))
+    d['sum_mape_c'] += float(r.get('mape_comp',0))
+    d['sum_mape_d'] += float(r.get('mape_decomp',0))
+    d['sum_mape_p'] += float(r.get('mape_psnr',0))
+    d['sum_mae_r'] += float(r.get('mae_ratio',0))
+    d['sum_mae_c'] += float(r.get('mae_comp_ms',0))
+    d['sum_mae_d'] += float(r.get('mae_decomp_ms',0))
+    d['sum_mae_p'] += float(r.get('mae_psnr_db',0))
+    d['sum_stats'] += float(r.get('stats_ms',0))
+    d['sum_nn'] += float(r.get('nn_ms',0))
+    d['sum_pre'] += float(r.get('preproc_ms',0))
+    d['sum_comp'] += float(r.get('comp_ms',0))
+    d['sum_dec'] += float(r.get('decomp_ms',0))
+    d['sum_expl_ms'] += float(r.get('explore_ms',0))
+    d['sum_sgd_ms'] += float(r.get('sgd_ms',0))
     d['n'] += 1
-with open('$AGG_CSV','w') as f:
-    f.write('source,phase,n_runs,write_ms,write_ms_std,read_ms,read_ms_std,file_mib,orig_mib,ratio,write_mibps,read_mibps,mismatches,sgd_fires,explorations,n_chunks\n')
-    # Get constant orig size from first no-comp row (ratio~1, file_bytes~orig)
-    first_orig = 0
+# Get constant orig size: prefer orig_mib column if present, else from no-comp file_bytes
+first_orig = 0
+if 'orig_mib' in rows[0]:
+    first_orig = float(rows[0].get('orig_mib',0))
+if first_orig <= 0:
     for r in rows:
         if r['phase'] == 'no-comp':
             first_orig = int(r.get('file_bytes',0)) / (1024*1024)
             break
+with open('$AGG_CSV','w') as f:
+    hdr = ('source,phase,n_runs,write_ms,write_ms_std,read_ms,read_ms_std,'
+           'file_mib,orig_mib,ratio,write_mibps,read_mibps,mismatches,'
+           'sgd_fires,explorations,n_chunks,'
+           'nn_ms,stats_ms,preproc_ms,comp_ms,decomp_ms,explore_ms,sgd_ms,'
+           'comp_gbps,decomp_gbps,'
+           'mape_ratio_pct,mape_comp_pct,mape_decomp_pct,mape_psnr_pct,'
+           'mae_ratio,mae_comp_ms,mae_decomp_ms,mae_psnr_db')
+    f.write(hdr + '\n')
     for p,d in phases.items():
         n = d['n']
-        wr = d['sum_wr']/n if n else 0
-        rd = d['sum_rd']/n if n else 0
-        total_file_mib = d['sum_file_bytes'] / (1024*1024) if n else 0
-        avg_file_mib = total_file_mib / n if n else 0
+        if n == 0: continue
+        total_wr = d['sum_wr']
+        total_rd = d['sum_rd']
+        avg_wr = total_wr / n
+        avg_rd = total_rd / n
+        total_file_mib = d['sum_file_bytes'] / (1024*1024)
+        avg_file_mib = total_file_mib / n
         orig_mib = first_orig if first_orig > 0 else avg_file_mib
         rat = (n * orig_mib) / total_file_mib if total_file_mib > 0 else 0
-        wr_mibps = orig_mib / (wr/1000.0) if wr > 0 else 0
-        rd_mibps = orig_mib / (rd/1000.0) if rd > 0 else 0
-        f.write(f'vpic,{p},{n},{wr:.2f},0.00,{rd:.2f},0.00,{avg_file_mib:.2f},{orig_mib:.2f},{rat:.4f},{wr_mibps:.1f},{rd_mibps:.1f},0,0,0,{d[\"n_chunks\"]}\n')
+        # Throughput: total_data / total_time (not orig / mean_time)
+        wr_mibps = (n * orig_mib) / (total_wr / 1000.0) if total_wr > 0 else 0
+        rd_mibps = (n * orig_mib) / (total_rd / 1000.0) if total_rd > 0 else 0
+        avg_comp = d['sum_comp'] / n
+        avg_dec = d['sum_dec'] / n
+        orig_bytes = orig_mib * 1024 * 1024
+        cgbps = orig_bytes / 1e9 / (avg_comp / 1000.0) if avg_comp > 0 else 0
+        dgbps = orig_bytes / 1e9 / (avg_dec / 1000.0) if avg_dec > 0 else 0
+        f.write(f'vpic,{p},{n},{avg_wr:.2f},0.00,{avg_rd:.2f},0.00,'
+                f'{avg_file_mib:.2f},{orig_mib:.2f},{rat:.4f},{wr_mibps:.1f},{rd_mibps:.1f},0,'
+                f'{d["sum_sgd"]/n:.0f},{d["sum_expl"]/n:.0f},{d["n_chunks"]},'
+                f'{d["sum_nn"]/n:.2f},{d["sum_stats"]/n:.2f},{d["sum_pre"]/n:.2f},'
+                f'{avg_comp:.2f},{avg_dec:.2f},{d["sum_expl_ms"]/n:.2f},{d["sum_sgd_ms"]/n:.2f},'
+                f'{cgbps:.4f},{dgbps:.4f},'
+                f'{min(200,d["sum_mape_r"]/n):.2f},{min(200,d["sum_mape_c"]/n):.2f},'
+                f'{min(200,d["sum_mape_d"]/n):.2f},{min(200,d["sum_mape_p"]/n):.2f},'
+                f'{d["sum_mae_r"]/n:.4f},{d["sum_mae_c"]/n:.4f},'
+                f'{d["sum_mae_d"]/n:.4f},{d["sum_mae_p"]/n:.4f}\n')
 " 2>/dev/null
                 fi
 
