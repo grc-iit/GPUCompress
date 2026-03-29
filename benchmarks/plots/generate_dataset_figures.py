@@ -2,14 +2,15 @@
 """
 Generate all figures for a single dataset + policy combination.
 
-Produces up to 9 figures:
+Produces up to 12 figures:
   1_summary.png            - 4-panel: ratio, write, read, Pareto
   3_algorithm_evolution.png - heatmap: algo per chunk over time (nn, nn-rl, nn-rl+exp)
   4_<phase>_predicted_vs_actual.png - per-chunk predicted vs actual (per phase)
   5a_sgd_convergence.png   - MAPE convergence over timesteps
   5b_sgd_exploration_firing.png - SGD/exploration firing rates
   5c_mae_over_time.png     - MAE convergence over timesteps
-  5d_ranking_quality.png   - Kendall tau, selection regret at milestones
+  5d_psnr_quality.png      - PSNR actual vs predicted (lossy mode only)
+  5f_ranking_quality.png   - Kendall tau, selection regret at milestones
 
 Usage:
   python3 generate_dataset_figures.py --dataset hurricane_isabel
@@ -151,7 +152,11 @@ def generate_figures(dataset, policy, out_dir):
         viz.make_mae_figure(ts_csv, out_mae)
         count += 1
 
-    # ── 5d. Ranking quality (Kendall tau) ──
+        out_psnr = os.path.join(out_dir, "5d_psnr_quality.png")
+        viz.make_psnr_figure(ts_csv, out_psnr)
+        count += 1
+
+    # ── 5e. Ranking quality (Kendall tau) ──
     ranking_csv = ""
     if csv_base:
         ranking_csv = os.path.join(data_dir, f"{csv_base}_ranking.csv")
@@ -165,7 +170,7 @@ def generate_figures(dataset, policy, out_dir):
         ranking_csv = os.path.join(data_dir, f"benchmark_grayscott_ranking.csv")
 
     if os.path.exists(ranking_csv):
-        out_ranking = os.path.join(out_dir, "5e_ranking_quality.png")
+        out_ranking = os.path.join(out_dir, "5f_ranking_quality.png")
         viz.make_ranking_quality_figure(ranking_csv, out_ranking)
         count += 1
 

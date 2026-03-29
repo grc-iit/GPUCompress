@@ -58,6 +58,7 @@ extern float g_rank_w0;
 extern float g_rank_w1;
 extern float g_rank_w2;
 extern float g_measured_bw_bytes_per_ms;
+extern float g_min_psnr_db;  /* PSNR quality floor — configs below this are rejected */
 
 /* ---- Algorithm selection mode ---- */
 extern std::atomic<int> g_selection_mode;  /* gpucompress_selection_mode_t */

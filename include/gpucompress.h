@@ -482,6 +482,13 @@ void gpucompress_set_reinforcement(int enable, float learning_rate,
 void gpucompress_set_ranking_weights(float w0, float w1, float w2);
 
 /**
+ * Set minimum PSNR quality floor for NN algorithm selection.
+ * Configs with predicted PSNR below this threshold are rejected.
+ * Set to 0.0 to disable (default).
+ */
+void gpucompress_set_min_psnr(float min_psnr_db);
+
+/**
  * Override the auto-probed storage bandwidth used in cost-based ranking.
  *
  * @param bw_gbps  Bandwidth in GB/s (e.g. 3.0 for NVMe, 0.2 for HDD)
@@ -600,6 +607,7 @@ typedef struct {
     float  predicted_comp_time;  /* NN-predicted compression time ms      */
     float  predicted_decomp_time;/* NN-predicted decompression time ms    */
     float  predicted_psnr;       /* NN-predicted PSNR in dB               */
+    float  actual_psnr;          /* analytical PSNR: 20*log10(range/eb), 120 lossless */
 
     /* Filled during read (decompression) — 0 until VOL read completes   */
     float  decompression_ms;     /* actual decompression time (clamped to 5ms floor for MAPE) */

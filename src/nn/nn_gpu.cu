@@ -42,6 +42,7 @@ extern float g_rank_w0;
 extern float g_rank_w1;
 extern float g_rank_w2;
 extern float g_measured_bw_bytes_per_ms;
+extern float g_min_psnr_db;
 
 /* Debug flag — defined in gpucompress_api.cpp, set via GPUCOMPRESS_DEBUG_NN=1 */
 extern bool g_debug_nn;
@@ -114,6 +115,7 @@ __device__ static void nnForwardPass(
     float mad_f,        // (float)mad_norm                 — precomputed by caller
     float deriv_f,      // (float)deriv_norm               — precomputed by caller
     double error_bound, // kept for quant-mask check only
+    float min_psnr,     // quality floor — reject configs below this PSNR
     float data_size_bytes, float w0, float w1, float w2, float bw,
     float* out_rank_val,
     float* out_ratio,
@@ -190,6 +192,7 @@ __device__ static void nnForwardPass(
     float cost = w0 * comp_time + w1 * decomp_time + w2 * io_cost;
     float rank_val = -cost;
     if (quant == 1 && error_bound <= 0.0) rank_val = -INFINITY;
+    if (min_psnr > 0.0f && psnr < min_psnr) rank_val = -INFINITY;
 
     *out_rank_val   = rank_val;
     *out_ratio      = ratio;
@@ -233,6 +236,7 @@ __global__ void nnInferenceKernel(
     double deriv_norm,
     size_t data_size,
     double error_bound,
+    float min_psnr,
     float w0, float w1, float w2, float bw,
     NNInferenceOutput* __restrict__ out_result,
     int* __restrict__ out_top_actions
@@ -258,7 +262,7 @@ __global__ void nnInferenceKernel(
     float rank_val, ratio, comp_time, decomp_time, psnr;
     nnForwardPass(weights, tid,
                   s_enc[0], s_enc[1], s_enc[2], s_enc[3], s_enc[4],
-                  error_bound,
+                  error_bound, min_psnr,
                   static_cast<float>(data_size), w0, w1, w2, bw,
                   &rank_val, &ratio, &comp_time, &decomp_time, &psnr);
 
@@ -354,6 +358,7 @@ __global__ void nnFusedInferenceKernel(
     const AutoStatsGPU* __restrict__ d_stats,
     size_t data_size,
     double error_bound,
+    float min_psnr,
     float w0, float w1, float w2, float bw,
     NNInferenceOutput* __restrict__ out_result,
     int* __restrict__ out_top_actions,
@@ -382,7 +387,7 @@ __global__ void nnFusedInferenceKernel(
     float rank_val, ratio, comp_time, decomp_time, psnr;
     nnForwardPass(weights, tid,
                   s_enc[0], s_enc[1], s_enc[2], s_enc[3], s_enc[4],
-                  error_bound,
+                  error_bound, min_psnr,
                   static_cast<float>(data_size), w0, w1, w2, bw,
                   &rank_val, &ratio, &comp_time, &decomp_time, &psnr);
 
@@ -1624,7 +1629,7 @@ int runNNInference(
         nnInferenceKernel<<<1, NN_NUM_CONFIGS, 0, stream>>>(
             d_nn_weights,
             entropy, mad_norm, deriv_norm,
-            data_size, error_bound,
+            data_size, error_bound, g_min_psnr_db,
             g_rank_w0, g_rank_w1, g_rank_w2, g_measured_bw_bytes_per_ms,
             d_infer_output,
             out_top_actions ? d_infer_top_actions : nullptr
@@ -1694,7 +1699,7 @@ int runNNFusedInference(
         nnFusedInferenceKernel<<<1, NN_NUM_CONFIGS, 0, stream>>>(
             d_nn_weights,
             d_stats,
-            data_size, error_bound,
+            data_size, error_bound, g_min_psnr_db,
             g_rank_w0, g_rank_w1, g_rank_w2, g_measured_bw_bytes_per_ms,
             d_fused_infer_output,
             out_top_actions ? d_fused_top_actions : nullptr,
@@ -1848,7 +1853,7 @@ int runNNFusedInferenceCtx(
         nnFusedInferenceKernel<<<1, NN_NUM_CONFIGS, 0, stream>>>(
             d_nn_weights,
             d_stats,
-            data_size, error_bound,
+            data_size, error_bound, g_min_psnr_db,
             g_rank_w0, g_rank_w1, g_rank_w2, g_measured_bw_bytes_per_ms,
             ctx->d_fused_infer_output,
             out_top_actions ? ctx->d_fused_top_actions : nullptr,

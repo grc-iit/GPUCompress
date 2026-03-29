@@ -65,6 +65,7 @@ std::atomic<bool> g_sgd_ever_fired{false};
 float g_rank_w0 = 1.0f;                   // weight on compression time
 float g_rank_w1 = 1.0f;                   // weight on decompression time
 float g_rank_w2 = 1.0f;                   // weight on I/O cost (data_size / (ratio * bw))
+float g_min_psnr_db = 0.0f;               // PSNR quality floor (0 = no filtering)
 float g_measured_bw_bytes_per_ms = 5e6f;   // 5 GB/s = 5e6 bytes/ms (representative HPC storage)
 
 

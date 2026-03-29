@@ -790,6 +790,16 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
                         actual_ratio = s.ratio;
                         algo_to_use = static_cast<gpucompress_algorithm_t>(s.algo);
                         preproc_to_use = s.preproc;
+                        /* Update quant state so diagnostics record the winner's PSNR.
+                         * Only quant_result (host struct) matters — d_quantized is
+                         * used purely as a boolean flag, not dereferenced. */
+                        if (s.d_quant && s.quant_result.isValid()) {
+                            d_quantized = s.d_quant;
+                            quant_result = s.quant_result;
+                        } else {
+                            d_quantized = nullptr;
+                            quant_result = {};
+                        }
                     }
                 }
             }
@@ -910,6 +920,13 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
         di.predicted_comp_time = predicted_comp_time;
         di.predicted_decomp_time = predicted_decomp_time;
         di.predicted_psnr = predicted_psnr;
+        di.actual_psnr = 120.0f;  // lossless default
+        if (d_quantized && quant_result.isValid()) {
+            double range = quant_result.data_max - quant_result.data_min;
+            if (range > 0.0 && quant_result.error_bound > 0.0)
+                di.actual_psnr = static_cast<float>(
+                    fmin(20.0 * log10(range / quant_result.error_bound), 120.0));
+        }
         di.error_bound = cfg.error_bound;
         di.d_stats_ptr = d_stats_ptr;
         /* P4 fix: copy stats features to host BEFORE entering the diagnostic

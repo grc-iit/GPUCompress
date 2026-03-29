@@ -22,6 +22,15 @@ echo "Compiling vpic_ranking_profiler.cu ..."
   -o "${SCRIPT_DIR}/vpic_ranking_profiler.o" \
   -x cu -expt-extended-lambda -arch=sm_80
 
+# Compile PSNR kernel (CUDA) as a separate object
+echo "Compiling vpic_psnr.cu ..."
+"${VPIC_DIR}/kokkos/bin/nvcc_wrapper" \
+  -I"${GPU_DIR}/include" \
+  -std=c++17 \
+  -c "${SCRIPT_DIR}/vpic_psnr.cu" \
+  -o "${SCRIPT_DIR}/vpic_psnr.o" \
+  -x cu -expt-extended-lambda -arch=sm_80
+
 # Compile and link the deck
 echo "Compiling vpic_benchmark_deck ..."
 "${VPIC_DIR}/kokkos/bin/nvcc_wrapper" \
@@ -44,6 +53,7 @@ echo "Compiling vpic_benchmark_deck ..."
   "${VPIC_DIR}/deck/main.cc" \
   "${VPIC_DIR}/deck/wrapper.cc" \
   "${SCRIPT_DIR}/vpic_ranking_profiler.o" \
+  "${SCRIPT_DIR}/vpic_psnr.o" \
   -o vpic_benchmark_deck.Linux \
   -Wl,-rpath,"${VPIC_BUILD}" \
   -L"${VPIC_BUILD}" -lvpic \

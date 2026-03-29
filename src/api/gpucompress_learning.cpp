@@ -206,6 +206,10 @@ extern "C" void gpucompress_set_ranking_weights(float w0, float w1, float w2) {
     g_rank_w2 = w2;
 }
 
+extern "C" void gpucompress_set_min_psnr(float min_psnr_db) {
+    g_min_psnr_db = min_psnr_db;
+}
+
 extern "C" void gpucompress_set_bandwidth(float bw_gbps) {
     if (bw_gbps > 0.0f)
         g_measured_bw_bytes_per_ms = bw_gbps * 1e6f;

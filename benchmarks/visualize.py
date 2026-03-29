@@ -219,6 +219,8 @@ def _normalize_rows(rows):
             r["mape_comp"] = r["mape_comp_pct"]
         if "mape_decomp" not in r and "mape_decomp_pct" in r:
             r["mape_decomp"] = r["mape_decomp_pct"]
+        if "mape_psnr" not in r and "mape_psnr_pct" in r:
+            r["mape_psnr"] = r["mape_psnr_pct"]
     return rows
 
 
@@ -269,6 +271,7 @@ def _merge_timestep_phases(rows, ts_csv_path, orig_mib):
             "mape_ratio_pct": _avg_all(ph_rows, "mape_ratio"),
             "mape_comp_pct": _avg_all(ph_rows, "mape_comp"),
             "mape_decomp_pct": _avg_all(ph_rows, "mape_decomp"),
+            "mape_psnr_pct": _avg_all(ph_rows, "mape_psnr"),
         })
         merged.append(ph)
     if merged:
@@ -537,8 +540,15 @@ def make_timestep_figure(ts_csv_path, output_path):
         ("Compression Time",   "mape_comp"),
         ("Decompression Time", "mape_decomp"),
     ]
+    # Add PSNR MAPE panel if lossy data present
+    has_psnr_mape = any(g(r, "mape_psnr") > 0 for r in rows)
+    if has_psnr_mape:
+        metric_keys.append(("PSNR", "mape_psnr"))
 
-    fig, axes = plt.subplots(3, 1, figsize=(14, 10))
+    n_panels = len(metric_keys)
+    fig, axes = plt.subplots(n_panels, 1, figsize=(14, 3.3 * n_panels + 1))
+    if n_panels == 1:
+        axes = [axes]
     title_suffix = "Fields" if is_field_based else "Timesteps"
     fig.suptitle(f"NN Prediction Accuracy Over {title_suffix}\n"
                  "(per-metric MAPE averaged across all chunks)",
@@ -613,8 +623,15 @@ def make_mae_figure(ts_csv_path, output_path):
         ("Compression Time",  "mae_comp_ms", " (ms)"),
         ("Decompression Time", "mae_decomp_ms", " (ms)"),
     ]
+    # Add PSNR MAE panel if lossy data present
+    has_psnr_mae = any(g(r, "mae_psnr_db") > 0 for r in rows)
+    if has_psnr_mae:
+        metric_keys.append(("PSNR", "mae_psnr_db", " (dB)"))
 
-    fig, axes = plt.subplots(3, 1, figsize=(14, 10))
+    n_panels = len(metric_keys)
+    fig, axes = plt.subplots(n_panels, 1, figsize=(14, 3.3 * n_panels + 1))
+    if n_panels == 1:
+        axes = [axes]
     title_suffix = "Fields" if is_field_based else "Timesteps"
     fig.suptitle(f"NN Prediction MAE Over {title_suffix}\n"
                  "(per-metric Mean Absolute Error averaged across all chunks)",
@@ -641,6 +658,92 @@ def make_mae_figure(ts_csv_path, output_path):
     axes[-1].set_xlabel(x_label, fontweight="bold")
 
     _sc_finalize(fig, pad=1.5, rect=[0, 0, 1, 0.96])
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
+def make_psnr_figure(ts_csv_path, output_path):
+    """Plot PSNR (actual and predicted) over timesteps.
+
+    Layout: one row per NN phase, two columns (actual | predicted).
+    Each phase gets its own subplot for easy visual tracking.
+    """
+    rows = parse_csv(ts_csv_path)
+    if not rows:
+        return
+
+    if "psnr_db" not in rows[0]:
+        return
+
+    has_lossy = any(g(r, "psnr_db") < 119.0 for r in rows)
+    has_predicted = any(g(r, "psnr_predicted_db") > 0.0 for r in rows)
+    if not has_lossy and not has_predicted:
+        return
+
+    is_field_based = "field_idx" in rows[0] and "timestep" not in rows[0]
+    x_label = "Field" if is_field_based else "Timestep"
+
+    by_phase = {}
+    for r in rows:
+        ph = r.get("phase", "nn-rl")
+        by_phase.setdefault(ph, []).append(r)
+
+    phase_order = ["nn", "nn-rl", "nn-rl+exp50"]
+    phase_info = {
+        "nn":          {"color": "#e67e22", "label": "NN (Inference)", "marker": "s"},
+        "nn-rl":       {"color": "#8e44ad", "label": "NN+SGD",        "marker": "o"},
+        "nn-rl+exp50": {"color": "#c0392b", "label": "NN+SGD+Explore","marker": "D"},
+    }
+    phases_present = [p for p in phase_order if p in by_phase]
+    n_phases = len(phases_present)
+    if n_phases == 0:
+        return
+
+    fig, axes = plt.subplots(n_phases, 1, figsize=(14, 4 * n_phases),
+                             squeeze=False, sharex=True)
+    fig.suptitle("PSNR Quality Over Timesteps\n"
+                 "(higher = better quality, 120 dB = lossless)",
+                 fontsize=14, fontweight="bold", y=0.98)
+
+    for row, ph in enumerate(phases_present):
+        info = phase_info.get(ph, {"color": "black", "label": ph, "marker": "."})
+        ph_rows = by_phase[ph]
+        ts = np.array([g(r, "timestep", "field_idx") for r in ph_rows])
+        actual = np.array([g(r, "psnr_db") for r in ph_rows])
+        predicted = np.array([g(r, "psnr_predicted_db") for r in ph_rows])
+
+        ax = axes[row, 0]
+
+        # Actual PSNR (solid)
+        ax.plot(ts, actual, color=info["color"], marker=info["marker"],
+                markersize=7, linewidth=2.5, label="Actual PSNR",
+                zorder=4, alpha=0.9)
+
+        # Predicted PSNR (dashed, same color)
+        if np.max(predicted) > 0:
+            ax.plot(ts, predicted, color=info["color"], marker=info["marker"],
+                    markersize=5, linewidth=1.5, linestyle="--",
+                    label="Predicted PSNR", zorder=3, alpha=0.7)
+
+        ax.axhline(y=120, color="#27ae60", linestyle=":", alpha=0.5,
+                   linewidth=1, label="Lossless (120 dB)")
+
+        ax.set_ylabel("PSNR (dB)", fontweight="bold")
+        ax.set_title(info["label"], fontweight="bold", fontsize=12)
+        ax.legend(loc="lower right", fontsize=9)
+        ax.grid(axis="y", alpha=0.2, linestyle="--")
+
+        # Sensible y-axis range
+        all_vals = np.concatenate([actual, predicted[predicted > 0]]) if np.max(predicted) > 0 else actual
+        y_min = max(0, all_vals.min() - 10)
+        y_max = min(130, all_vals.max() + 5)
+        ax.set_ylim(y_min, y_max)
+
+    axes[-1, 0].set_xlabel(x_label, fontweight="bold")
+
+    _sc_finalize(fig, pad=1.5, rect=[0, 0, 1, 0.95])
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
