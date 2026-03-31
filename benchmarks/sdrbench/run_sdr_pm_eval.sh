@@ -82,6 +82,18 @@ DS_EXT[nyx]=".f32"
 DS_SUBDIR[cesm_atm]="cesm_atm/SDRBENCH-CESM-ATM-cleared-1800x3600"
 DS_DIMS[cesm_atm]="1800,3600"
 DS_EXT[cesm_atm]=".dat"
+DS_SUBDIR[ai_checkpoint]="ai_checkpoint"
+DS_DIMS[ai_checkpoint]="256,256,256"
+DS_EXT[ai_checkpoint]=".f32"
+DS_SUBDIR[pytorch_resnet50]="pytorch_resnet50_concat"
+DS_DIMS[pytorch_resnet50]="8,3194629"
+DS_EXT[pytorch_resnet50]=".f32"
+DS_SUBDIR[pytorch_vgg16]="pytorch_vgg16_concat"
+DS_DIMS[pytorch_vgg16]="1976,70019"
+DS_EXT[pytorch_vgg16]=".f32"
+DS_SUBDIR[vit_b_cifar10]="vit_b_cifar10"
+DS_DIMS[vit_b_cifar10]="2,42903173"
+DS_EXT[vit_b_cifar10]=".f32"
 
 # Use env overrides or auto from DATASET
 DATA_DIR=${DATA_DIR:-"$SDR_DATA_DIR/${DS_SUBDIR[$DATASET]}"}

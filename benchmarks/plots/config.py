@@ -40,6 +40,11 @@ VPIC_EVAL  = _resolve("VPIC_DIR", f"benchmarks/vpic-kokkos/results/eval_NX{VPIC_
 SDR_CHUNK = os.environ.get("SDR_CHUNK", "4")
 SDR_EVAL  = _resolve("SDR_DIR", f"benchmarks/sdrbench/results/eval_chunk{SDR_CHUNK}mb")
 
+AI_MODEL   = os.environ.get("AI_MODEL", "vit_b")
+AI_DATASET = os.environ.get("AI_DATASET", "cifar10")
+AI_CHUNK   = os.environ.get("AI_CHUNK", "4")
+AI_EVAL    = _resolve("AI_DIR", f"benchmarks/ai_training/results/eval_{AI_MODEL}_{AI_DATASET}_chunk{AI_CHUNK}mb")
+
 # ── Cost model policies ──
 
 BALANCED   = "balanced_w1-1-1"
@@ -73,6 +78,12 @@ DATASETS = {
     },
 }
 
+# AI Training checkpoint datasets
+AI_DATASETS = {
+    "vit_b_cifar10": {"model": "vit_b_16", "params": "86M"},
+    "vit_l_cifar10": {"model": "vit_l_16", "params": "304M"},
+}
+
 # SDRBench datasets are auto-discovered from the eval directory
 SDR_DATASETS = {
     "hurricane_isabel": {"dims": "100x500x500", "ext": ".bin.f32"},
@@ -86,6 +97,8 @@ def get_data_dir(dataset, policy=BALANCED):
     """Return the result directory for a dataset+policy."""
     if dataset in DATASETS:
         base = DATASETS[dataset]["eval_dir"]
+    elif dataset in AI_DATASETS:
+        base = AI_EVAL
     else:
         base = SDR_EVAL
     sub = os.path.join(base, policy)

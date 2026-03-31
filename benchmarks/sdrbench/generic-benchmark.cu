@@ -1610,6 +1610,7 @@ int main(int argc, char **argv)
                 /* Collect MAPE for this field */
                 PhaseResult field_r;
                 memset(&field_r, 0, sizeof(field_r));
+                field_r.orig_bytes = total_bytes;
                 collect_chunk_metrics(&field_r);
 
                 if (fi >= WARMUP_SKIP) {

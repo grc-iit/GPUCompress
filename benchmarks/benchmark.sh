@@ -21,6 +21,7 @@ All configuration is via environment variables. Defaults shown in [brackets].
 
 GENERAL
   BENCHMARKS          [grayscott,vpic,sdrbench]  Which benchmarks to run
+                        Options: grayscott, vpic, sdrbench, ai_training
   DATA_MB             [512]                      Per-snapshot data size in MB
   CHUNK_MB            [16]                       HDF5 chunk size in MB
   TIMESTEPS           [50]                       Number of benchmark write cycles
@@ -61,28 +62,57 @@ VPIC (GPU plasma particle-in-cell simulation)
 SDRBENCH (static scientific datasets)
   SDR_DATASETS        [nyx,hurricane_isabel,cesm_atm]  Datasets to run
 
+AI_TRAINING (neural network checkpoint compression)
+  AI_MODEL            [vit_b_16]                   Model: vit_b_16 (327MB) or vit_l_16 (1.16GB)
+  AI_DATASET          [cifar10]                    Training dataset
+  AI_CHECKPOINT_DIR   [auto]                       Path to exported .f32 checkpoint files
+                        Generate with: python3 scripts/train_and_export_checkpoints.py
+
+STANDALONE BENCHMARKS
+  # ── 1. Gray-Scott (GPU reaction-diffusion simulation) ──
+  BENCHMARKS=grayscott DATA_MB=512 CHUNK_MB=4 TIMESTEPS=25 VERIFY=0 bash benchmarks/benchmark.sh
+
+  # ── 2. VPIC (GPU plasma particle-in-cell simulation) ──
+  BENCHMARKS=vpic DATA_MB=512 CHUNK_MB=4 TIMESTEPS=25 VERIFY=0 bash benchmarks/benchmark.sh
+
+  # ── 3. SDRBench (static scientific datasets from disk) ──
+  # Available: nyx (512MB/field), hurricane_isabel (100MB/field), cesm_atm (25MB/field)
+  BENCHMARKS=sdrbench SDR_DATASETS=nyx CHUNK_MB=4 VERIFY=0 bash benchmarks/benchmark.sh
+  BENCHMARKS=sdrbench SDR_DATASETS="nyx,hurricane_isabel,cesm_atm" bash benchmarks/benchmark.sh
+
+  # ── 4. AI Training (neural network checkpoint compression) ──
+  # Step 1: Generate checkpoint data (one-time, ~4 min for vit_b, ~45 min for vit_l)
+  python3 scripts/train_and_export_checkpoints.py --model vit_b_16 --epochs 3
+  python3 scripts/train_and_export_checkpoints.py --model vit_l_16 --epochs 20  # 1+ GB/file
+  # Step 2: Run benchmark
+  BENCHMARKS=ai_training AI_MODEL=vit_b_16 CHUNK_MB=4 VERIFY=0 bash benchmarks/benchmark.sh
+  BENCHMARKS=ai_training AI_MODEL=vit_l_16 CHUNK_MB=16 VERIFY=0 bash benchmarks/benchmark.sh
+
 EXAMPLES
-  # Quick smoke test
-  BENCHMARKS=vpic DATA_MB=128 CHUNK_MB=16 TIMESTEPS=3 VERIFY=0 bash benchmarks/benchmark.sh
+  # Quick smoke test (smallest config, ~2 min)
+  BENCHMARKS=grayscott DATA_MB=8 CHUNK_MB=4 TIMESTEPS=3 VERIFY=0 bash benchmarks/benchmark.sh
 
-  # VPIC 1GB, all phases, balanced policy
-  BENCHMARKS=vpic DATA_MB=1024 CHUNK_MB=32 TIMESTEPS=10 POLICIES=balanced VERIFY=0 bash benchmarks/benchmark.sh
+  # All 4 benchmarks, balanced policy
+  BENCHMARKS="grayscott,vpic,sdrbench,ai_training" POLICIES=balanced VERIFY=0 bash benchmarks/benchmark.sh
 
-  # Gray-Scott 512MB with selected phases
-  BENCHMARKS=grayscott DATA_MB=512 PHASES="no-comp,lz4,zstd,nn,nn-rl" bash benchmarks/benchmark.sh
+  # All 3 policies for comparison
+  BENCHMARKS=ai_training POLICIES="balanced,ratio,speed" CHUNK_MB=4 VERIFY=0 bash benchmarks/benchmark.sh
 
-  # SDRBench NYX only
-  BENCHMARKS=sdrbench SDR_DATASETS=nyx CHUNK_MB=8 VERIFY=0 bash benchmarks/benchmark.sh
+  # Selected phases only
+  BENCHMARKS=vpic PHASES="no-comp,lz4,zstd,nn,nn-rl" DATA_MB=1024 bash benchmarks/benchmark.sh
 
-  # All benchmarks, all policies, 1GB
-  DATA_MB=1024 CHUNK_MB=32 TIMESTEPS=50 bash benchmarks/benchmark.sh
+  # Multi-GPU (2 ranks, 2 GPUs per node)
+  MPI_NP=2 GPUS_PER_NODE=2 BENCHMARKS=vpic DATA_MB=512 VERIFY=0 bash benchmarks/benchmark.sh
 
   # VPIC with custom physics
   BENCHMARKS=vpic DATA_MB=1024 VPIC_MI_ME=1 VPIC_TI_TE=5 VPIC_WARMUP_STEPS=200 bash benchmarks/benchmark.sh
 
 OUTPUT
-  CSVs:   benchmarks/<benchmark>/results/eval_<params>/<policy>/
-  Plots:  benchmarks/results/per_dataset/<dataset>/eval_<params>/<policy>/
+  benchmarks/grayscott/results/eval_<params>/<policy>/      Gray-Scott CSVs + plots
+  benchmarks/vpic-kokkos/results/eval_<params>/<policy>/    VPIC CSVs + plots
+  benchmarks/sdrbench/results/eval_<dataset>_<params>/      SDRBench CSVs + plots
+  benchmarks/ai_training/results/eval_<model>_<params>/     AI Training CSVs + plots
+  benchmarks/results/per_dataset/<dataset>/<eval>/<policy>/  Auto-generated plots
   Logs:   benchmarks/<benchmark>/results/eval_<params>/<policy>/*_benchmark.log
 HELP
 exit 0
@@ -162,6 +192,10 @@ mpi_launch() {
 # ── GS-specific defaults ──
 GS_STEPS=${GS_STEPS:-500}
 
+# ── AI Training defaults ──
+AI_MODEL=${AI_MODEL:-"vit_b_16"}
+AI_DATASET=${AI_DATASET:-"cifar10"}
+
 # ── Auto-compute grid sizes from DATA_MB if not explicitly set ──
 # Gray-Scott: L^3 * 4 bytes = DATA_MB * 1024^2
 # VPIC: (NX+2)^3 * 16 fields * 4 bytes = (NX+2)^3 * 64
@@ -198,6 +232,7 @@ echo ""
 echo "  Gray-Scott  : L=${GS_L} (~${GS_DATA} MB), steps=${GS_STEPS}"
 echo "  VPIC        : NX=${VPIC_NX} (~${VPIC_DATA} MB), warmup=${VPIC_WARMUP_STEPS:-500}, interval=${VPIC_SIM_INTERVAL:-190}"
 echo "  SDRBench    : datasets=${SDR_DATASETS:-nyx,hurricane_isabel,cesm_atm}"
+echo "  AI Training : model=${AI_MODEL}, dataset=${AI_DATASET}"
 echo "============================================================"
 echo ""
 
@@ -598,8 +633,163 @@ with open('$AGG_CSV','w') as f:
             LAUNCHER=$LAUNCHER \
             bash "$SCRIPT_DIR/sdrbench/run_all_sdr.sh"
             ;;
+        ai_training)
+            echo ""
+            echo ">>> Running AI Training Checkpoint benchmark..."
+            echo ""
+
+            AI_BIN="$SCRIPT_DIR/../build/generic_benchmark"
+            AI_WEIGHTS="$SCRIPT_DIR/../neural_net/weights/model.nnwt"
+
+            # Resolve checkpoint data directory
+            # Naming convention: vit_b_cifar10, vit_l_cifar10, etc.
+            _AI_SHORT=$(echo "$AI_MODEL" | sed 's/vit_\(.\)_16/vit_\1/')
+            AI_DIR_NAME="${_AI_SHORT}_${AI_DATASET}"
+            AI_DATA_DIR="${AI_CHECKPOINT_DIR:-$SCRIPT_DIR/../data/sdrbench/${AI_DIR_NAME}}"
+
+            if [ ! -d "$AI_DATA_DIR" ]; then
+                echo "ERROR: Checkpoint data not found at $AI_DATA_DIR"
+                echo ""
+                echo "Generate it first:"
+                echo "  python3 scripts/train_and_export_checkpoints.py --model $AI_MODEL --dataset $AI_DATASET"
+                echo ""
+                continue
+            fi
+
+            # Auto-detect dims from first .f32 file
+            _FIRST_FILE=$(ls "$AI_DATA_DIR"/*.f32 2>/dev/null | head -1)
+            if [ -z "$_FIRST_FILE" ]; then
+                echo "ERROR: No .f32 files in $AI_DATA_DIR"
+                continue
+            fi
+            _FILE_BYTES=$(stat --printf="%s" "$_FIRST_FILE")
+            _N_FLOATS=$(( _FILE_BYTES / 4 ))
+            _N_FILES=$(ls "$AI_DATA_DIR"/*.f32 | wc -l)
+            # Use 2D dims: find factor
+            _DIM0=$(python3 -c "
+import math
+n=$_N_FLOATS; s=int(math.isqrt(n))
+while s>1 and n%s!=0: s-=1
+print(s)
+")
+            _DIM1=$(( _N_FLOATS / _DIM0 ))
+            AI_DIMS="${_DIM0},${_DIM1}"
+
+            _FILE_MB=$(( _FILE_BYTES / 1024 / 1024 ))
+            echo "  Model       : ${AI_MODEL}"
+            echo "  Dataset     : ${AI_DATASET}"
+            echo "  Data dir    : ${AI_DATA_DIR}"
+            echo "  Files       : ${_N_FILES} x ${_FILE_MB} MB"
+            echo "  Dims        : ${AI_DIMS}"
+            echo "  Chunk size  : ${CHUNK_MB} MB"
+            echo "  Policies    : ${POLICIES}"
+            echo ""
+
+            # Split phases into fixed and NN
+            AI_FIXED_PHASES=""
+            AI_NN_PHASES=""
+            IFS=',' read -ra _PH <<< "$PHASES"
+            for ph in "${_PH[@]}"; do
+                case "$ph" in
+                    nn|nn-rl|nn-rl+exp50) AI_NN_PHASES="${AI_NN_PHASES:+$AI_NN_PHASES,}$ph" ;;
+                    *) AI_FIXED_PHASES="${AI_FIXED_PHASES:+$AI_FIXED_PHASES,}$ph" ;;
+                esac
+            done
+
+            AI_EVAL_DIR="$SCRIPT_DIR/ai_training/results/eval_${AI_DIR_NAME}_chunk${CHUNK_MB}mb"
+            VERIFY_ARG=""
+            [ "$VERIFY" = "0" ] && VERIFY_ARG="--no-verify"
+
+            COMMON_ARGS="--data-dir $AI_DATA_DIR --dims $AI_DIMS --ext .f32 --chunk-mb $CHUNK_MB --name $AI_DIR_NAME"
+
+            # ── Fixed phases (run once) ──
+            if [ -n "$AI_FIXED_PHASES" ]; then
+                AI_FIXED_DIR="$AI_EVAL_DIR/fixed_phases"
+                mkdir -p "$AI_FIXED_DIR"
+
+                echo "  >>> Fixed phases: $AI_FIXED_PHASES"
+                PHASE_ARGS=""
+                IFS=',' read -ra _FP <<< "$AI_FIXED_PHASES"
+                for fp in "${_FP[@]}"; do PHASE_ARGS="$PHASE_ARGS --phase $fp"; done
+
+                GPUCOMPRESS_DETAILED_TIMING=1 \
+                GPUCOMPRESS_DEBUG_NN=$DEBUG_NN \
+                mpi_launch "$AI_BIN" "$AI_WEIGHTS" \
+                    $COMMON_ARGS $PHASE_ARGS \
+                    --w0 1.0 --w1 1.0 --w2 1.0 \
+                    --lr $SGD_LR --mape $SGD_MAPE \
+                    --explore-k $EXPLORE_K --explore-thresh $EXPLORE_THRESH \
+                    $VERIFY_ARG \
+                    --out-dir "$AI_FIXED_DIR" \
+                    > "$AI_FIXED_DIR/ai_benchmark.log" 2> >(tee -a "$AI_FIXED_DIR/ai_benchmark.log" >&2)
+
+                echo "      Done. Log: $AI_FIXED_DIR/ai_benchmark.log"
+                echo ""
+            fi
+
+            # ── NN phases (run per policy) ──
+            if [ -n "$AI_NN_PHASES" ]; then
+                IFS=',' read -ra _POLICIES <<< "$POLICIES"
+                POL_IDX=0
+                POL_TOTAL=${#_POLICIES[@]}
+
+                for pol in "${_POLICIES[@]}"; do
+                    POL_IDX=$((POL_IDX + 1))
+                    case "$pol" in
+                        balanced) W0=1.0; W1=1.0; W2=1.0; LABEL="balanced_w1-1-1" ;;
+                        ratio)    W0=0.0; W1=0.0; W2=1.0; LABEL="ratio_only_w0-0-1" ;;
+                        speed)    W0=1.0; W1=1.0; W2=0.0; LABEL="speed_only_w1-1-0" ;;
+                        *)        W0=1.0; W1=1.0; W2=1.0; LABEL="$pol" ;;
+                    esac
+
+                    AI_NN_DIR="$AI_EVAL_DIR/$LABEL"
+                    mkdir -p "$AI_NN_DIR"
+
+                    PHASE_ARGS=""
+                    IFS=',' read -ra _NP <<< "$AI_NN_PHASES"
+                    for np in "${_NP[@]}"; do PHASE_ARGS="$PHASE_ARGS --phase $np"; done
+
+                    echo "  >>> NN phases [$LABEL] ($POL_IDX/$POL_TOTAL): $AI_NN_PHASES"
+
+                    GPUCOMPRESS_DETAILED_TIMING=1 \
+                    GPUCOMPRESS_DEBUG_NN=$DEBUG_NN \
+                    mpi_launch "$AI_BIN" "$AI_WEIGHTS" \
+                        $COMMON_ARGS $PHASE_ARGS \
+                        --w0 $W0 --w1 $W1 --w2 $W2 \
+                        --lr $SGD_LR --mape $SGD_MAPE \
+                        --explore-k $EXPLORE_K --explore-thresh $EXPLORE_THRESH \
+                        $VERIFY_ARG \
+                        --out-dir "$AI_NN_DIR" \
+                        > "$AI_NN_DIR/ai_benchmark.log" 2> >(tee -a "$AI_NN_DIR/ai_benchmark.log" >&2)
+
+                    echo "      Done. Log: $AI_NN_DIR/ai_benchmark.log"
+
+                    # Merge fixed + NN CSVs
+                    if [ -n "$AI_FIXED_PHASES" ] && [ -d "$AI_FIXED_DIR" ]; then
+                        for csv_name in benchmark_${AI_DIR_NAME}.csv benchmark_${AI_DIR_NAME}_timesteps.csv benchmark_${AI_DIR_NAME}_timestep_chunks.csv benchmark_${AI_DIR_NAME}_ranking.csv benchmark_${AI_DIR_NAME}_ranking_costs.csv; do
+                            FIXED_SRC="$AI_FIXED_DIR/$csv_name"
+                            NN_SRC="$AI_NN_DIR/$csv_name"
+                            if [ -f "$FIXED_SRC" ] && [ -f "$NN_SRC" ]; then
+                                TMP_MERGED=$(mktemp)
+                                cp "$FIXED_SRC" "$TMP_MERGED"
+                                tail -n+2 "$NN_SRC" >> "$TMP_MERGED"
+                                mv "$TMP_MERGED" "$NN_SRC"
+                            elif [ -f "$FIXED_SRC" ] && [ ! -f "$NN_SRC" ]; then
+                                cp "$FIXED_SRC" "$NN_SRC"
+                            fi
+                        done
+                    fi
+
+                    # Generate plots
+                    AI_DIR="$AI_EVAL_DIR" AI_CHUNK="$CHUNK_MB" \
+                    python3 "$SCRIPT_DIR/plots/generate_dataset_figures.py" \
+                        --dataset "$AI_DIR_NAME" --policy "$LABEL" 2>&1 | grep -E "Generated"
+                    echo ""
+                done
+            fi
+            ;;
         *)
-            echo "ERROR: Unknown benchmark '$bench'. Use: grayscott, vpic, sdrbench"
+            echo "ERROR: Unknown benchmark '$bench'. Use: grayscott, vpic, sdrbench, ai_training"
             ;;
     esac
 done
