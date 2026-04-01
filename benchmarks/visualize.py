@@ -329,18 +329,22 @@ def _sc_finalize(fig, pad=1.5, rect=None):
 # View 1: Aggregate Summary
 # ═══════════════════════════════════════════════════════════════════════
 
-def plot_bars(ax, phases, values, title, ylabel, fmt="%.2f", annotate=True):
+def plot_bars(ax, phases, values, title, ylabel, fmt="%.2f", annotate=True,
+              yerr=None):
     x = np.arange(len(phases))
     colors = [PHASE_COLORS.get(p, "#bdc3c7") for p in phases]
     hatches = [PHASE_HATCHES.get(p, "") for p in phases]
+    err_kw = dict(ecolor="#333", capsize=3, capthick=0.8, elinewidth=0.8) if yerr is not None else {}
     bars = ax.bar(x, values, color=colors, edgecolor="black", linewidth=0.4,
-                  width=0.6, zorder=3)
+                  width=0.6, zorder=3, yerr=yerr, error_kw=err_kw)
     for bar, h in zip(bars, hatches):
         bar.set_hatch(h)
     if annotate:
-        for bar, v in zip(bars, values):
+        for i, (bar, v) in enumerate(zip(bars, values)):
             if v > 0:
-                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                offset = (yerr[i] if yerr is not None and yerr[i] > 0 else 0)
+                ax.text(bar.get_x() + bar.get_width() / 2,
+                        bar.get_height() + offset,
                         fmt % v, ha="center", va="bottom", fontsize=8)
     ax.set_xticks(x)
     ax.set_xticklabels([PHASE_LABELS.get(p, p) for p in phases], rotation=30, ha='right')
@@ -462,12 +466,31 @@ def make_summary_figure(source_name, rows, output_path, meta_text=""):
     ax1 = fig.add_subplot(gs[0, 0])
     plot_bars(ax1, phases, [g(r, "ratio") for r in ordered],
               "Compression Ratio (higher = better)", "Ratio", fmt="%.2fx")
+    # Compute throughput error bars from write_ms_std via error propagation:
+    # throughput = orig / time, so σ_tp ≈ throughput × (σ_time / time)
+    write_tp = [g(r, "write_mibps", "write_mbps") for r in ordered]
+    read_tp  = [g(r, "read_mibps", "read_mbps") for r in ordered]
+    write_tp_err = []
+    read_tp_err  = []
+    for r, wtp, rtp in zip(ordered, write_tp, read_tp):
+        wms = g(r, "write_ms")
+        wstd = g(r, "write_ms_std")
+        rms = g(r, "read_ms")
+        rstd = g(r, "read_ms_std")
+        write_tp_err.append(wtp * (wstd / wms) if wms > 0 and wstd > 0 else 0)
+        read_tp_err.append(rtp * (rstd / rms) if rms > 0 and rstd > 0 else 0)
+    # Only show error bars if any are nonzero
+    w_err = write_tp_err if any(e > 0 for e in write_tp_err) else None
+    r_err = read_tp_err if any(e > 0 for e in read_tp_err) else None
+
     ax2 = fig.add_subplot(gs[0, 1])
-    plot_bars(ax2, phases, [g(r, "write_mibps", "write_mbps") for r in ordered],
-              "End-to-End Write Throughput (full pipeline)", "MiB/s", fmt="%.0f")
+    plot_bars(ax2, phases, write_tp,
+              "End-to-End Write Throughput (full pipeline)", "MiB/s", fmt="%.0f",
+              yerr=w_err)
     ax3 = fig.add_subplot(gs[1, 0])
-    plot_bars(ax3, phases, [g(r, "read_mibps", "read_mbps") for r in ordered],
-              "End-to-End Read Throughput (full pipeline)", "MiB/s", fmt="%.0f")
+    plot_bars(ax3, phases, read_tp,
+              "End-to-End Read Throughput (full pipeline)", "MiB/s", fmt="%.0f",
+              yerr=r_err)
 
     # ── Pareto scatter: Ratio vs Write Throughput ──
     ax4 = fig.add_subplot(gs[1, 1])

@@ -419,15 +419,17 @@ begin_initialization {
     // Physics params configurable via env vars for data variety tuning.
     // Lower mi_me + wpe_wce = faster reconnection → richer 2D/3D structure.
     // Higher Ti_Te = more free energy → stronger instabilities.
-    //   Defaults (mi_me=25, wpe_wce=3, Ti_Te=1): slow reconnection, ~20k steps for structure
-    //   Fast recon (mi_me=1,  wpe_wce=1, Ti_Te=5): visible structure in ~500 steps
+    //   Defaults (mi_me=5, wpe_wce=1, Ti_Te=5): fast reconnection, ~500 steps for structure
+    //   Slow recon (mi_me=25, wpe_wce=3, Ti_Te=1): ~20k steps for structure
     const char* env_mime   = getenv("VPIC_MI_ME");
     const char* env_wpewce = getenv("VPIC_WPE_WCE");
     const char* env_tite   = getenv("VPIC_TI_TE");
-    double mi_me   = env_mime   ? atof(env_mime)   : 25;
+    // Fast reconnection defaults: visible structure in ~500 steps.
+    // Original slow defaults (mi_me=25, wpe_wce=3, Ti_Te=1) need ~20K steps.
+    double mi_me   = env_mime   ? atof(env_mime)   : 5;
     double rhoi_L  = 1;
-    double Ti_Te   = env_tite   ? atof(env_tite)   : 1;
-    double wpe_wce = env_wpewce ? atof(env_wpewce) : 3;
+    double Ti_Te   = env_tite   ? atof(env_tite)   : 5;
+    double wpe_wce = env_wpewce ? atof(env_wpewce) : 1;
 
     // Grid size configurable via VPIC_NX env var (default 200 ≈ 512 MB)
     // Field data = (nx+2)^3 * 16 * 4 bytes

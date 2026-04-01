@@ -76,15 +76,25 @@ for run in $(seq 1 "$N_RUNS"); do
     RUN_DIR="$OUT_DIR/run_${run}"
     mkdir -p "$RUN_DIR"
 
-    # Run the benchmark
+    # Create a timestamp marker before the run
+    MARKER=$(mktemp)
+
+    # Run the benchmark with a per-run suffix so each run gets its own
+    # results directory (e.g., eval_NX159_chunk4mb_ts10_run1/).
+    # VPIC uses VPIC_EVAL_SUFFIX, GS/SDR/AI use the eval dir directly.
     RUN_START=$(date +%s)
-    env "${BENCH_ARGS[@]}" bash "$SCRIPT_DIR/benchmark.sh" \
+    # Append _runN to any existing VPIC_EVAL_SUFFIX (e.g., _lossless_run1)
+    _EXISTING_SUFFIX=""
+    for arg in "${BENCH_ARGS[@]}"; do
+        case "$arg" in VPIC_EVAL_SUFFIX=*) _EXISTING_SUFFIX="${arg#VPIC_EVAL_SUFFIX=}" ;; esac
+    done
+    env "${BENCH_ARGS[@]}" VPIC_EVAL_SUFFIX="${_EXISTING_SUFFIX}_run${run}" \
+        bash "$SCRIPT_DIR/benchmark.sh" \
         > "$RUN_DIR/benchmark.log" 2>&1 || true
     RUN_END=$(date +%s)
     ELAPSED=$((RUN_END - RUN_START))
 
-    # Copy result CSVs to run directory
-    # Find all aggregate CSVs (not timesteps, not chunks, not ranking)
+    # Copy result CSVs that were modified AFTER the marker (this run's output only)
     for results_dir in \
         "$SCRIPT_DIR/grayscott/results" \
         "$SCRIPT_DIR/vpic-kokkos/results" \
@@ -93,9 +103,11 @@ for run in $(seq 1 "$N_RUNS"); do
         if [ -d "$results_dir" ]; then
             find "$results_dir" -name "benchmark_*.csv" \
                 ! -name "*timesteps*" ! -name "*chunks*" ! -name "*ranking*" \
+                -newer "$MARKER" \
                 -exec cp {} "$RUN_DIR/" \; 2>/dev/null || true
         fi
     done
+    rm -f "$MARKER"
 
     N_CSVS=$(ls "$RUN_DIR"/*.csv 2>/dev/null | wc -l)
     echo "    Done (${ELAPSED}s, ${N_CSVS} CSVs collected)"
@@ -191,9 +203,12 @@ for agg_template in agg_csvs:
                     if vals:
                         out_row[col] = f'{sum(vals)/len(vals):.4f}'
 
-            # Compute experimental std for write_ms and read_ms
-            for metric, std_col in [('write_ms', 'write_ms_exp_std'),
-                                     ('read_ms', 'read_ms_exp_std')]:
+            # Compute experimental std for write_ms and read_ms.
+            # Write into BOTH the _exp_std column AND the standard write_ms_std/read_ms_std
+            # columns so the plot script picks them up as error bars.
+            for metric, std_col, main_std_col in [
+                    ('write_ms', 'write_ms_exp_std', 'write_ms_std'),
+                    ('read_ms', 'read_ms_exp_std', 'read_ms_std')]:
                 vals = []
                 for r in phase_rows:
                     try:
@@ -203,7 +218,9 @@ for agg_template in agg_csvs:
                 if len(vals) >= 2:
                     mean = sum(vals) / len(vals)
                     var = sum((v - mean)**2 for v in vals) / (len(vals) - 1)
-                    out_row[std_col] = f'{math.sqrt(var):.4f}'
+                    std_val = f'{math.sqrt(var):.4f}'
+                    out_row[std_col] = std_val
+                    out_row[main_std_col] = std_val  # for plot script
                 else:
                     out_row[std_col] = '0.0000'
 
@@ -221,6 +238,35 @@ print(f'Results in: {out_dir}/')
 print(f'  run_1/ ... run_{n_runs}/     ← per-run CSVs')
 print(f'  mean_std_*.csv               ← mean ± experimental std across {n_runs} runs')
 " 2>&1
+
+# ── Generate summary plot from averaged CSV with experimental error bars ──
+echo "Generating summary plot from averaged results..."
+for mean_csv in "$OUT_DIR"/mean_std_benchmark_*.csv; do
+    [ -f "$mean_csv" ] || continue
+    PLOT_DIR="$OUT_DIR/plots"
+    mkdir -p "$PLOT_DIR"
+
+    python3 -c "
+import sys, os
+sys.path.insert(0, os.path.join('$SCRIPT_DIR', 'plots'))
+sys.path.insert(0, '$SCRIPT_DIR')
+import visualize as viz
+
+csv_path = '$mean_csv'
+plot_dir = '$PLOT_DIR'
+rows = viz.parse_csv(csv_path)
+if rows:
+    source = rows[0].get('source', 'benchmark')
+    # Build meta text
+    n_runs = rows[0].get('n_exp_runs', '?')
+    meta = f'Averaged across {n_runs} independent runs | Policy: {rows[0].get(\"policy\", \"balanced\")}'
+    out = os.path.join(plot_dir, '1_summary_averaged.png')
+    viz.make_summary_figure(source.replace('_', ' ').title(), rows, out, meta)
+    print(f'  Saved: {out}')
+else:
+    print(f'  No data in {csv_path}')
+" 2>&1
+done
 
 echo ""
 echo "============================================================"

@@ -249,7 +249,7 @@ for bench in "${BENCH_LIST[@]}"; do
 
             GS_BIN="$SCRIPT_DIR/../build/grayscott_benchmark_pm"
             GS_WEIGHTS="$SCRIPT_DIR/../neural_net/weights/model.nnwt"
-            GS_EVAL_DIR="$SCRIPT_DIR/grayscott/results/eval_L${GS_L}_chunk${CHUNK_MB}mb_ts${TIMESTEPS}"
+            GS_EVAL_DIR="$SCRIPT_DIR/grayscott/results/eval_L${GS_L}_chunk${CHUNK_MB}mb_ts${TIMESTEPS}${VPIC_EVAL_SUFFIX:-}"
 
             VERIFY_ARG=""
             [ "$VERIFY" = "0" ] && VERIFY_ARG="--no-verify"
@@ -529,14 +529,19 @@ phases = {}
 for r in rows:
     p = r['phase']
     if p not in phases:
-        phases[p] = {'sum_wr':0,'sum_rd':0,'sum_file_bytes':0,'n':0,'n_chunks':0,
+        phases[p] = {'sum_wr':0,'sum_rd':0,'sum_wr_sq':0,'sum_rd_sq':0,
+                     'sum_file_bytes':0,'n':0,'n_chunks':0,
                      'sum_sgd':0,'sum_expl':0,'sum_mape_r':0,'sum_mape_c':0,'sum_mape_d':0,
                      'sum_mape_p':0,'sum_mae_r':0,'sum_mae_c':0,'sum_mae_d':0,'sum_mae_p':0,
                      'sum_stats':0,'sum_nn':0,'sum_pre':0,'sum_comp':0,'sum_dec':0,
                      'sum_expl_ms':0,'sum_sgd_ms':0}
     d = phases[p]
-    d['sum_wr'] += float(r.get('write_ms',0))
-    d['sum_rd'] += float(r.get('read_ms',0))
+    wr_val = float(r.get('write_ms',0))
+    rd_val = float(r.get('read_ms',0))
+    d['sum_wr'] += wr_val
+    d['sum_rd'] += rd_val
+    d['sum_wr_sq'] += wr_val * wr_val
+    d['sum_rd_sq'] += rd_val * rd_val
     d['sum_file_bytes'] += int(r.get('file_bytes',0))
     d['n_chunks'] = int(r.get('n_chunks',0))
     d['sum_sgd'] += int(r.get('sgd_fires',0))
@@ -582,6 +587,11 @@ with open('$AGG_CSV','w') as f:
         total_rd = d['sum_rd']
         avg_wr = total_wr / n
         avg_rd = total_rd / n
+        import math
+        wr_var = (d['sum_wr_sq']/n - avg_wr**2) * n/(n-1) if n > 1 else 0
+        rd_var = (d['sum_rd_sq']/n - avg_rd**2) * n/(n-1) if n > 1 else 0
+        wr_std = math.sqrt(wr_var) if wr_var > 0 else 0
+        rd_std = math.sqrt(rd_var) if rd_var > 0 else 0
         total_file_mib = d['sum_file_bytes'] / (1024*1024)
         avg_file_mib = total_file_mib / n
         orig_mib = first_orig if first_orig > 0 else avg_file_mib
@@ -594,16 +604,21 @@ with open('$AGG_CSV','w') as f:
         orig_bytes = orig_mib * 1024 * 1024
         cgbps = orig_bytes / 1e9 / (avg_comp / 1000.0) if avg_comp > 0 else 0
         dgbps = orig_bytes / 1e9 / (avg_dec / 1000.0) if avg_dec > 0 else 0
-        f.write(f'-1,vpic,{p},{n},{avg_wr:.2f},0.00,{avg_rd:.2f},0.00,'
+        sgd=d['sum_sgd']/n; expl=d['sum_expl']/n; nch=d['n_chunks']
+        nn=d['sum_nn']/n; st=d['sum_stats']/n; pre=d['sum_pre']/n
+        exms=d['sum_expl_ms']/n; sgms=d['sum_sgd_ms']/n
+        mr=min(200,d['sum_mape_r']/n); mc=min(200,d['sum_mape_c']/n)
+        md=min(200,d['sum_mape_d']/n); mp=min(200,d['sum_mape_p']/n)
+        ar=d['sum_mae_r']/n; ac=d['sum_mae_c']/n
+        ad=d['sum_mae_d']/n; ap=d['sum_mae_p']/n
+        f.write(f'-1,vpic,{p},{n},{avg_wr:.2f},{wr_std:.2f},{avg_rd:.2f},{rd_std:.2f},'
                 f'{avg_file_mib:.2f},{orig_mib:.2f},{rat:.4f},{wr_mibps:.1f},{rd_mibps:.1f},0,'
-                f'{d["sum_sgd"]/n:.0f},{d["sum_expl"]/n:.0f},{d["n_chunks"]},'
-                f'{d["sum_nn"]/n:.2f},{d["sum_stats"]/n:.2f},{d["sum_pre"]/n:.2f},'
-                f'{avg_comp:.2f},{avg_dec:.2f},{d["sum_expl_ms"]/n:.2f},{d["sum_sgd_ms"]/n:.2f},'
+                f'{sgd:.0f},{expl:.0f},{nch},'
+                f'{nn:.2f},{st:.2f},{pre:.2f},'
+                f'{avg_comp:.2f},{avg_dec:.2f},{exms:.2f},{sgms:.2f},'
                 f'{cgbps:.4f},{dgbps:.4f},'
-                f'{min(200,d["sum_mape_r"]/n):.2f},{min(200,d["sum_mape_c"]/n):.2f},'
-                f'{min(200,d["sum_mape_d"]/n):.2f},{min(200,d["sum_mape_p"]/n):.2f},'
-                f'{d["sum_mae_r"]/n:.4f},{d["sum_mae_c"]/n:.4f},'
-                f'{d["sum_mae_d"]/n:.4f},{d["sum_mae_p"]/n:.4f}\n')
+                f'{mr:.2f},{mc:.2f},{md:.2f},{mp:.2f},'
+                f'{ar:.4f},{ac:.4f},{ad:.4f},{ap:.4f}\n')
 " 2>/dev/null
                 fi
 
@@ -706,7 +721,7 @@ print(s)
                 esac
             done
 
-            AI_EVAL_DIR="$SCRIPT_DIR/ai_training/results/eval_${AI_DIR_NAME}_chunk${CHUNK_MB}mb"
+            AI_EVAL_DIR="$SCRIPT_DIR/ai_training/results/eval_${AI_DIR_NAME}_chunk${CHUNK_MB}mb${VPIC_EVAL_SUFFIX:-}"
             VERIFY_ARG=""
             [ "$VERIFY" = "0" ] && VERIFY_ARG="--no-verify"
 
