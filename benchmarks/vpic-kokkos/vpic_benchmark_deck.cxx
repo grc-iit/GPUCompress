@@ -69,6 +69,9 @@ extern "C" void vpic_write_ranking_csv_header(FILE* csv);
 extern "C" void vpic_write_ranking_costs_csv_header(FILE* csv);
 extern "C" double vpic_compute_psnr_gpu(
     const float* d_original, const float* d_decompressed, size_t n_floats);
+extern "C" double vpic_compute_quality_gpu(
+    const float* d_original, const float* d_decompressed, size_t n_floats,
+    double* out_rmse, double* out_max_err);
 extern "C" float gpucompress_get_bandwidth_bytes_per_ms(void);
 
 // ============================================================
@@ -948,8 +951,8 @@ begin_diagnostics {
                             {
                                 const char* p = line;
                                 int commas = 0;
-                                while (*p && commas < 42) { if (*p == ',') commas++; p++; }
-                                if (commas >= 42) t_mape_p = atof(p);
+                                while (*p && commas < 45) { if (*p == ',') commas++; p++; }
+                                if (commas >= 45) t_mape_p = atof(p);
                             }
                             if (nf >= 12 && ts_idx >= WARMUP) {
                                 for (int pi = 0; pi < N_AGG_PHASES; pi++) {
@@ -1118,7 +1121,7 @@ begin_diagnostics {
                         "vol_s2_busy_ms,vol_s3_busy_ms,"
                         "h5dwrite_ms,cuda_sync_ms,h5dclose_ms,h5fclose_ms,"
                         "vol_setup_ms,vol_pipeline_ms,"
-                        "psnr_db,psnr_predicted_db,"
+                        "psnr_db,psnr_predicted_db,rmse,max_abs_err,bit_rate,"
                         "mape_psnr\n");
             }
             global->tc_csv = fopen(TSTEP_CHUNKS_CSV, "w");
@@ -1456,12 +1459,15 @@ begin_diagnostics {
                                   global->h_orig, global->h_read, n_floats);
             }
 
-            /* PSNR: computed on GPU, outside timed section */
-            double psnr_db = vpic_compute_psnr_gpu(d_fields, global->d_read, n_floats);
+            /* Quality metrics: PSNR, RMSE, max error — computed on GPU, outside timed section */
+            double rmse = 0.0, max_abs_err = 0.0;
+            double psnr_db = vpic_compute_quality_gpu(d_fields, global->d_read, n_floats,
+                                                       &rmse, &max_abs_err);
 
-            /* File size for ratio */
+            /* File size for ratio + derived metrics */
             size_t file_sz = get_file_size(phases[pi].tmp_file);
             double ratio_t = (file_sz > 0) ? (double)nbytes_f / (double)file_sz : 1.0;
+            double bit_rate = (ratio_t > 0) ? 32.0 / ratio_t : 32.0;  /* bits per float32 value */
 
             /* Collect per-chunk MAPE, timing breakdown, MAE/R² */
             int n_hist = gpucompress_get_chunk_history_count();
@@ -1570,7 +1576,7 @@ begin_diagnostics {
                         "%.2f,%.2f,"
                         "%.2f,%.2f,%.2f,%.2f,"
                         "%.2f,%.2f,"
-                        "%.2f,%.2f,"
+                        "%.2f,%.2f,%.6e,%.6e,%.4f,"
                         "%.2f\n",
                         rank(), display_name, t, (int)step(), write_ms_t, read_ms_t, ratio_t,
                         real_mape_r, real_mape_c, real_mape_d,
@@ -1585,6 +1591,7 @@ begin_diagnostics {
                         h5dwrite_ms, cuda_sync_ms, h5dclose_ms, h5fclose_ms,
                         vol_setup, vol_total,
                         psnr_db, psnr_predicted,
+                        rmse, max_abs_err, bit_rate,
                         real_mape_p);
                 fflush(global->ts_csv);
             }

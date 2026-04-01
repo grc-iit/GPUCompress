@@ -781,6 +781,86 @@ def make_psnr_figure(ts_csv_path, output_path):
     print(f"  Saved: {output_path}")
 
 
+def make_lossy_quality_figure(ts_csv_path, output_path):
+    """Plot lossy compression quality metrics: PSNR, RMSE, Max Error, Bit Rate.
+
+    4-panel figure showing all standard lossy metrics across timesteps,
+    one line per phase. Only generated when lossy data is present
+    (RMSE > 0 for at least one row).
+    """
+    rows = parse_csv(ts_csv_path)
+    if not rows:
+        return
+
+    # Check if lossy metrics exist and have nonzero values
+    has_rmse = "rmse" in rows[0]
+    has_max_err = "max_abs_err" in rows[0]
+    has_bit_rate = "bit_rate" in rows[0]
+    if not has_rmse:
+        return
+
+    has_lossy_data = any(g(r, "rmse") > 0 for r in rows)
+    if not has_lossy_data:
+        return
+
+    is_field_based = "field_idx" in rows[0] and "timestep" not in rows[0]
+    x_key = "field_idx" if is_field_based else "timestep"
+    x_label = "Field" if is_field_based else "Timestep"
+
+    by_phase = {}
+    for r in rows:
+        ph = r.get("phase", "unknown")
+        by_phase.setdefault(ph, []).append(r)
+
+    phase_order = ["no-comp", "lz4", "snappy", "deflate", "gdeflate", "zstd",
+                   "ans", "cascaded", "bitcomp", "nn", "nn-rl", "nn-rl+exp50"]
+    phases_present = [p for p in phase_order if p in by_phase]
+    if not phases_present:
+        return
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10), facecolor="white")
+    fig.suptitle("Lossy Compression Quality Metrics\n"
+                 "(lower RMSE/Max Error = better quality, higher PSNR = better)",
+                 fontsize=14, fontweight="bold", y=0.98)
+
+    panels = [
+        (axes[0, 0], "psnr_db",      "PSNR (dB)",           "higher = better", False),
+        (axes[0, 1], "rmse",          "RMSE",                "lower = better",  True),
+        (axes[1, 0], "max_abs_err",   "Max Absolute Error",  "lower = better",  True),
+        (axes[1, 1], "bit_rate",      "Bit Rate (bits/value)","lower = better", False),
+    ]
+
+    for ax, col, ylabel, subtitle, use_log in panels:
+        for ph in phases_present:
+            ph_rows = by_phase[ph]
+            ts = [g(r, x_key) for r in ph_rows]
+            vals = [g(r, col) for r in ph_rows]
+
+            # Skip phases with all zeros for this metric
+            if all(v == 0 for v in vals):
+                continue
+
+            color = PHASE_COLORS.get(ph, "#bdc3c7")
+            label = PHASE_LABELS.get(ph, ph).replace("\n", " ")
+            marker = {'nn': 'D', 'nn-rl': 's', 'nn-rl+exp50': '^'}.get(ph, 'o')
+            ax.plot(ts, vals, color=color, marker=marker, markersize=5,
+                    linewidth=1.5, label=label, alpha=0.8)
+
+        ax.set_xlabel(x_label)
+        ax.set_ylabel(ylabel)
+        ax.set_title(f"{ylabel}  ({subtitle})", fontweight="bold")
+        ax.legend(fontsize=7, loc="best", ncol=2)
+        ax.grid(alpha=0.2, linestyle="--")
+        if use_log:
+            ax.set_yscale("log")
+
+    _sc_finalize(fig, pad=1.5, rect=[0, 0, 1, 0.93])
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
 def make_ranking_quality_figure(ranking_csv_path, output_path):
     """Plot Kendall tau-b and selection regret over milestone timesteps."""
     rows = parse_csv(ranking_csv_path)

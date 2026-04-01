@@ -179,7 +179,12 @@ def generate_figures(dataset, policy, out_dir):
         viz.make_psnr_figure(ts_csv, out_psnr)
         count += 1
 
-    # ── 5e. Ranking quality (Kendall tau) ──
+        # ── 5e. Lossy quality metrics (RMSE, Max Error, Bit Rate, PSNR) ──
+        out_lossy = os.path.join(out_dir, "5e_lossy_quality_metrics.png")
+        viz.make_lossy_quality_figure(ts_csv, out_lossy)
+        count += 1
+
+    # ── 5f. Ranking quality (Kendall tau) ──
     ranking_csv = ""
     if csv_base:
         ranking_csv = os.path.join(data_dir, f"{csv_base}_ranking.csv")
