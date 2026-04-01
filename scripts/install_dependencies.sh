@@ -7,11 +7,14 @@
 #   2. HDF5 2.0.0         -> /tmp/hdf5-install  (for VOL connector)
 #   3. Builds the project -> build/
 #   4. SDRBench datasets  -> data/sdrbench/  (for SC benchmarks)
+#   5. (optional) AI training checkpoint data  --with-ai-training
 #
-# Run with: ./scripts/install_dependencies.sh
+# Run with:
+#   ./scripts/install_dependencies.sh                    # standard install
+#   ./scripts/install_dependencies.sh --with-ai-training # + AI checkpoint data
 #
 # Requirements:
-#   - Linux x86_64 (Ubuntu 20.04+, RHEL 9+)
+#   - Linux (Ubuntu 20.04+, RHEL 9+)
 #   - NVIDIA GPU with compute capability >= 7.0
 #   - CUDA Toolkit >= 12.0 installed
 #   - NVIDIA driver >= 525.60.13
@@ -19,6 +22,17 @@
 #
 
 set -e  # Exit on error
+
+# ── Parse arguments ──
+WITH_AI_TRAINING=0
+AI_MODEL="${AI_MODEL:-vit_b_16}"
+AI_EPOCHS="${AI_EPOCHS:-20}"
+AI_CHECKPOINT_EPOCHS="${AI_CHECKPOINT_EPOCHS:-1,2,3,5,8,10,15,20}"
+for arg in "$@"; do
+    case "$arg" in
+        --with-ai-training) WITH_AI_TRAINING=1 ;;
+    esac
+done
 
 # Resolve project root early, before any cd changes the working directory.
 _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -290,6 +304,56 @@ done
 echo_info "SDRBench datasets installed at ${SDRBENCH_DIR}"
 
 # ============================================================================
+# (Optional) AI Training Checkpoint Data
+# ============================================================================
+
+if [[ "$WITH_AI_TRAINING" -eq 1 ]]; then
+    echo_info "=== Step 5/5: Generating AI training checkpoint data ==="
+
+    # Check if data already exists
+    _AI_SHORT=$(echo "$AI_MODEL" | sed 's/vit_\(.\)_16/vit_\1/')
+    _AI_DIR="${_PROJECT_DIR}/data/ai_training/${_AI_SHORT}_cifar10"
+    _AI_N_FILES=$(ls "$_AI_DIR"/*.f32 2>/dev/null | wc -l)
+
+    if [[ "$_AI_N_FILES" -gt 0 ]]; then
+        echo_info "  AI checkpoint data already exists at ${_AI_DIR} (${_AI_N_FILES} files), skipping"
+    else
+        # Install PyTorch if not available
+        if ! python3 -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
+            echo_info "  Installing PyTorch with CUDA support..."
+            pip3 install --break-system-packages torch torchvision \
+                --index-url https://download.pytorch.org/whl/cu124 2>/dev/null \
+            || pip3 install torch torchvision \
+                --index-url https://download.pytorch.org/whl/cu124 2>/dev/null \
+            || {
+                echo_warn "  PyTorch installation failed. Install manually:"
+                echo_warn "    pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu124"
+                echo_warn "  Then run: python3 scripts/train_and_export_checkpoints.py --model ${AI_MODEL}"
+            }
+        fi
+
+        # Generate checkpoint data
+        if python3 -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
+            echo_info "  Training ${AI_MODEL} on CIFAR-10 for ${AI_EPOCHS} epochs..."
+            echo_info "  Checkpoint epochs: ${AI_CHECKPOINT_EPOCHS}"
+            python3 "${_PROJECT_DIR}/scripts/train_and_export_checkpoints.py" \
+                --model "$AI_MODEL" \
+                --epochs "$AI_EPOCHS" \
+                --checkpoint-epochs "$AI_CHECKPOINT_EPOCHS" \
+                --batch-size 64 --amp
+            echo_info "  AI checkpoint data generated at ${_AI_DIR}"
+        else
+            echo_warn "  PyTorch CUDA not available — skipping AI checkpoint generation"
+            echo_warn "  To generate later: python3 scripts/train_and_export_checkpoints.py --model ${AI_MODEL}"
+        fi
+    fi
+else
+    echo_info ""
+    echo_info "Tip: To also generate AI training checkpoint data, re-run with:"
+    echo_info "  ./scripts/install_dependencies.sh --with-ai-training"
+fi
+
+# ============================================================================
 # Verify build
 # ============================================================================
 
@@ -323,6 +387,9 @@ if [[ "$FAIL" -eq 0 ]]; then
     echo "  - nvcomp ${NVCOMP_VERSION}       -> /tmp/include, /tmp/lib"
     echo "  - HDF5 ${HDF5_VERSION}           -> ${HDF5_INSTALL_DIR}"
     echo "  - SDRBench datasets    -> ${SDRBENCH_DIR}"
+    if [[ "$WITH_AI_TRAINING" -eq 1 ]] && [[ -d "${_AI_DIR:-/nonexistent}" ]]; then
+    echo "  - AI checkpoints       -> ${_AI_DIR}"
+    fi
     echo ""
     echo "Built targets:"
     echo "  - build/gpu_compress             (CLI compression)"
@@ -334,9 +401,11 @@ if [[ "$FAIL" -eq 0 ]]; then
     echo "Before running, set up the environment:"
     echo "  source scripts/setup_env.sh"
     echo ""
-    echo "Example usage:"
-    echo "  ./build/gpu_compress input.bin output.lz4 lz4"
-    echo "  ./build/gpu_decompress output.lz4 restored.bin"
+    echo "Run benchmarks:"
+    echo "  BENCHMARKS=grayscott bash benchmarks/benchmark.sh    # HPC: reaction-diffusion"
+    echo "  BENCHMARKS=vpic bash benchmarks/benchmark.sh         # HPC: plasma physics"
+    echo "  BENCHMARKS=sdrbench bash benchmarks/benchmark.sh     # Scientific datasets"
+    echo "  BENCHMARKS=ai_training bash benchmarks/benchmark.sh  # AI checkpoints"
     echo ""
 else
     echo_error "Build verification failed"

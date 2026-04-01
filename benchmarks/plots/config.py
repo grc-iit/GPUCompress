@@ -45,6 +45,8 @@ AI_DATASET = os.environ.get("AI_DATASET", "cifar10")
 AI_CHUNK   = os.environ.get("AI_CHUNK", "4")
 AI_EVAL    = _resolve("AI_DIR", f"benchmarks/ai_training/results/eval_{AI_MODEL}_{AI_DATASET}_chunk{AI_CHUNK}mb")
 
+# Data lives in data/ai_training/, not data/sdrbench/
+
 # ── Cost model policies ──
 
 BALANCED   = "balanced_w1-1-1"

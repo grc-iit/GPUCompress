@@ -113,7 +113,7 @@ def main():
     if args.outdir:
         outdir = args.outdir
     else:
-        outdir = os.path.join(project_dir, "data", "sdrbench",
+        outdir = os.path.join(project_dir, "data", "ai_training",
                               f"vit_{args.model.split('_')[1]}_{args.dataset}")
     os.makedirs(outdir, exist_ok=True)
 

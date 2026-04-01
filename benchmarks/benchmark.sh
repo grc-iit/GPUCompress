@@ -645,7 +645,7 @@ with open('$AGG_CSV','w') as f:
             # Naming convention: vit_b_cifar10, vit_l_cifar10, etc.
             _AI_SHORT=$(echo "$AI_MODEL" | sed 's/vit_\(.\)_16/vit_\1/')
             AI_DIR_NAME="${_AI_SHORT}_${AI_DATASET}"
-            AI_DATA_DIR="${AI_CHECKPOINT_DIR:-$SCRIPT_DIR/../data/sdrbench/${AI_DIR_NAME}}"
+            AI_DATA_DIR="${AI_CHECKPOINT_DIR:-$SCRIPT_DIR/../data/ai_training/${AI_DIR_NAME}}"
 
             if [ ! -d "$AI_DATA_DIR" ]; then
                 echo "ERROR: Checkpoint data not found at $AI_DATA_DIR"
