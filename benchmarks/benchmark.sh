@@ -147,14 +147,27 @@ DEBUG_NN=${DEBUG_NN:-0}
 # MPI_NP: total number of MPI ranks (default 1 = single-process, no mpirun)
 # GPUS_PER_NODE: GPUs per node (used for CUDA_VISIBLE_DEVICES mapping)
 # LAUNCHER: auto (detect SLURM vs mpirun), srun, or mpirun
-MPI_NP=${MPI_NP:-1}
-GPUS_PER_NODE=${GPUS_PER_NODE:-1}
-LAUNCHER=${LAUNCHER:-auto}
+#
+# Auto-detection: if this script is already running inside an srun step
+# (SLURM_STEP_ID is set), we are one of N ranks launched by the user's srun.
+# In that case, mpi_launch() runs the binary directly — srun already created
+# the MPI ranks. MPI_NP is inferred from SLURM_NTASKS so that the CSV merge
+# logic knows how many rank-suffixed files to expect.
+if [ -n "$SLURM_STEP_ID" ] && [ "${SLURM_NTASKS:-1}" -gt 1 ]; then
+    # Already inside srun with multiple tasks — don't nest srun
+    MPI_NP=${MPI_NP:-${SLURM_NTASKS}}
+    GPUS_PER_NODE=${GPUS_PER_NODE:-${SLURM_GPUS_ON_NODE:-1}}
+    LAUNCHER=${LAUNCHER:-none}
+else
+    MPI_NP=${MPI_NP:-1}
+    GPUS_PER_NODE=${GPUS_PER_NODE:-1}
+    LAUNCHER=${LAUNCHER:-auto}
+fi
 
 # Helper: wrap binary with srun or mpirun for multi-GPU, setting per-rank GPU binding.
-# - SLURM (srun): uses --gpus-per-task=1 for automatic GPU binding (no manual
-#   CUDA_VISIBLE_DEVICES needed). Detects SLURM via SLURM_JOB_ID env var.
-# - mpirun: sets CUDA_VISIBLE_DEVICES=$((LOCAL_RANK % GPUS_PER_NODE)) per rank.
+# - none: already inside srun — run binary directly (MPI is pre-initialized)
+# - srun: SLURM launches ranks with --gpus-per-task=1 (use from salloc or sbatch)
+# - mpirun: manual CUDA_VISIBLE_DEVICES mapping per rank (non-SLURM systems)
 # - Single-rank (MPI_NP=1): runs binary directly, no launcher.
 mpi_launch() {
     if [ "$MPI_NP" -le 1 ]; then
@@ -173,6 +186,10 @@ mpi_launch() {
     fi
 
     case "$use_launcher" in
+        none)
+            # Already inside srun — binary runs directly, MPI is pre-initialized
+            "$@"
+            ;;
         srun)
             # SLURM: srun handles rank-to-GPU binding natively with --gpus-per-task
             srun --ntasks="$MPI_NP" \
@@ -187,7 +204,7 @@ mpi_launch() {
                 _ "$@"
             ;;
         *)
-            echo "ERROR: Unknown LAUNCHER=$use_launcher (use: auto, srun, mpirun)" >&2
+            echo "ERROR: Unknown LAUNCHER=$use_launcher (use: auto, srun, mpirun, none)" >&2
             return 1
             ;;
     esac
@@ -216,6 +233,12 @@ fi
 GS_DATA=$(( GS_L * GS_L * GS_L * 4 / 1024 / 1024 ))
 VPIC_DATA=$(( (VPIC_NX+2) * (VPIC_NX+2) * (VPIC_NX+2) * 64 / 1024 / 1024 ))
 
+# Determine local MPI rank for rank-0 only output.
+# SLURM_PROCID is set by srun; PMI_RANK by Cray PMI; fall back to 0.
+MY_RANK=${SLURM_PROCID:-${PMI_RANK:-${OMPI_COMM_WORLD_RANK:-0}}}
+
+# Only rank 0 prints the banner and post-processing output
+if [ "$MY_RANK" -eq 0 ]; then
 echo "============================================================"
 echo "  GPUCompress Benchmark Suite"
 echo "============================================================"
@@ -225,6 +248,11 @@ echo "  Chunk size  : ${CHUNK_MB} MB"
 echo "  Timesteps   : ${TIMESTEPS}"
 echo "  Policies    : ${POLICIES}"
 echo "  Phases      : ${PHASES}"
+if [ "${VPIC_ERROR_BOUND:-0}" != "0" ] && [ "${VPIC_ERROR_BOUND:-0}" != "0.0" ]; then
+echo "  Mode        : LOSSY (error_bound=${VPIC_ERROR_BOUND})"
+else
+echo "  Mode        : LOSSLESS"
+fi
 if [ "$MPI_NP" -gt 1 ]; then
 echo "  MPI ranks   : ${MPI_NP} (GPUs/node: ${GPUS_PER_NODE})"
 fi
@@ -239,6 +267,7 @@ echo "  SDRBench    : datasets=${SDR_DATASETS:-nyx,hurricane_isabel,cesm_atm}"
 echo "  AI Training : model=${AI_MODEL}, dataset=${AI_DATASET}"
 echo "============================================================"
 echo ""
+fi  # end rank-0 banner
 
 IFS=',' read -ra BENCH_LIST <<< "$BENCHMARKS"
 
@@ -275,17 +304,21 @@ for bench in "${BENCH_LIST[@]}"; do
                 esac
             done
 
+            if [ "$MY_RANK" -eq 0 ]; then
             echo "  L=$GS_L (~${GS_DATA} MB), chunk=${CHUNK_MB}MB, ts=${TIMESTEPS}, steps=${GS_STEPS}"
             echo "  fixed phases: ${GS_FIXED_LIST:-none}"
             echo "  NN phases:    ${GS_NN_LIST:-none}"
             echo ""
+            fi
 
             # ── Fixed phases (run once, policy-independent) ──
             if [ -n "$GS_FIXED_ARGS" ]; then
                 GS_FIXED_DIR="$GS_EVAL_DIR/fixed_phases"
                 mkdir -p "$GS_FIXED_DIR"
 
+                if [ "$MY_RANK" -eq 0 ]; then
                 echo "  >>> Fixed phases (run once): $GS_FIXED_LIST"
+                fi
 
                 GPUCOMPRESS_DETAILED_TIMING=1 \
                 GPUCOMPRESS_DEBUG_NN=$DEBUG_NN \
@@ -299,8 +332,10 @@ for bench in "${BENCH_LIST[@]}"; do
                     --out-dir "$GS_FIXED_DIR" \
                     > "$GS_FIXED_DIR/gs_benchmark.log" 2> >(tee -a "$GS_FIXED_DIR/gs_benchmark.log" >&2)
 
+                if [ "$MY_RANK" -eq 0 ]; then
                 echo "      Done. Log: $GS_FIXED_DIR/gs_benchmark.log"
                 echo ""
+                fi
             fi
 
             # ── NN phases (run per policy) ──
@@ -321,7 +356,9 @@ for bench in "${BENCH_LIST[@]}"; do
                     GS_NN_DIR="$GS_EVAL_DIR/$LABEL"
                     mkdir -p "$GS_NN_DIR"
 
+                    if [ "$MY_RANK" -eq 0 ]; then
                     echo "  >>> NN phases [$LABEL] ($POL_IDX/$POL_TOTAL): $GS_NN_LIST"
+                    fi
 
                     GPUCOMPRESS_DETAILED_TIMING=1 \
                     GPUCOMPRESS_DEBUG_NN=$DEBUG_NN \
@@ -335,6 +372,7 @@ for bench in "${BENCH_LIST[@]}"; do
                         --out-dir "$GS_NN_DIR" \
                         > "$GS_NN_DIR/gs_benchmark.log" 2> >(tee -a "$GS_NN_DIR/gs_benchmark.log" >&2)
 
+                    if [ "$MY_RANK" -eq 0 ]; then
                     echo "      Done. Log: $GS_NN_DIR/gs_benchmark.log"
 
                     # Merge fixed + NN CSVs.
@@ -378,6 +416,7 @@ for bench in "${BENCH_LIST[@]}"; do
                     python3 "$SCRIPT_DIR/plots/generate_dataset_figures.py" \
                         --dataset gray_scott --policy "$LABEL" 2>&1 | grep -E "Generated"
                     echo ""
+                    fi  # end rank-0 GS post-processing
                 done
             fi
             ;;
@@ -389,7 +428,7 @@ for bench in "${BENCH_LIST[@]}"; do
             VPIC_BIN="$SCRIPT_DIR/vpic-kokkos/vpic_benchmark_deck.Linux"
             VPIC_DECK="$SCRIPT_DIR/vpic-kokkos/vpic_benchmark_deck.cxx"
             VPIC_WEIGHTS="$SCRIPT_DIR/../neural_net/weights/model.nnwt"
-            VPIC_LD_PATH="/tmp/hdf5-install/lib:$SCRIPT_DIR/../build:/tmp/lib"
+            VPIC_LD_PATH="/tmp/hdf5-install/lib:$SCRIPT_DIR/../build:/tmp/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
             # VPIC physics: wpe_wce=1 + Ti_Te=5 gives best compression diversity
             # (2x field range, highest throughput, same runtime as default)
@@ -433,6 +472,17 @@ for bench in "${BENCH_LIST[@]}"; do
                 local EXCL=$(vpic_exclude_from "$INCLUDE_PHASES")
                 mkdir -p "$RESULTS_DIR"
 
+                # Log destination: in LAUNCHER=none mode (interactive srun),
+                # each rank runs its own copy of benchmark.sh, so use
+                # rank-suffixed logs to avoid file corruption. In srun/mpirun
+                # mode, only one benchmark.sh runs, so use a single log.
+                local LOG_FILE
+                if [ "$LAUNCHER" = "none" ]; then
+                    LOG_FILE="$RESULTS_DIR/vpic_benchmark_rank${MY_RANK}.log"
+                else
+                    LOG_FILE="$RESULTS_DIR/vpic_benchmark.log"
+                fi
+
                 LD_LIBRARY_PATH="$VPIC_LD_PATH" \
                 GPUCOMPRESS_DETAILED_TIMING=1 \
                 GPUCOMPRESS_WEIGHTS="$VPIC_WEIGHTS" \
@@ -449,14 +499,17 @@ for bench in "${BENCH_LIST[@]}"; do
                 VPIC_LR=$SGD_LR VPIC_MAPE_THRESHOLD=$SGD_MAPE \
                 VPIC_EXPLORE_K=$EXPLORE_K VPIC_EXPLORE_THRESH=$EXPLORE_THRESH \
                 mpi_launch "$VPIC_BIN" "$VPIC_DECK" \
-                > "$RESULTS_DIR/vpic_benchmark.log" 2> >(tee -a "$RESULTS_DIR/vpic_benchmark.log" >&2)
+                > "$LOG_FILE" 2> >(tee -a "$LOG_FILE" >&2)
             }
 
+            if [ "$MY_RANK" -eq 0 ]; then
             echo "  NX=$VPIC_NX (~${VPIC_DATA} MB), chunk=${CHUNK_MB}MB, ts=${TIMESTEPS}"
             echo "  warmup=$VPIC_WARMUP, sim_interval=$VPIC_SIM_INT"
             echo "  physics: mi_me=$VPIC_MI_ME wpe_wce=$VPIC_WPE_WCE Ti_Te=$VPIC_TI_TE pert=${VPIC_PERTURBATION:-0.1}"
             echo "  policies: $POLICIES"
             echo ""
+            echo "  >>> All phases, all policies in single invocation"
+            fi
 
             # ── Single invocation: all phases + all policies ──
             # Fixed phases run once. NN phases run once per policy.
@@ -464,11 +517,14 @@ for bench in "${BENCH_LIST[@]}"; do
             VPIC_RESULTS="$VPIC_EVAL_DIR"
             mkdir -p "$VPIC_RESULTS"
 
-            echo "  >>> All phases, all policies in single invocation"
-
             vpic_run "$VPIC_RESULTS" "$PHASES"
 
-            echo "      Done. Log: $VPIC_RESULTS/vpic_benchmark.log"
+            if [ "$MY_RANK" -eq 0 ]; then
+            if [ "$LAUNCHER" = "none" ]; then
+                echo "      Done. Logs: $VPIC_RESULTS/vpic_benchmark_rank*.log"
+            else
+                echo "      Done. Log: $VPIC_RESULTS/vpic_benchmark.log"
+            fi
 
             # ── Split results into per-policy directories ──
             # Each policy dir gets: fixed phase rows + that policy's NN rows
@@ -490,8 +546,8 @@ for bench in "${BENCH_LIST[@]}"; do
                     csv_name="${csv_base}.csv"
                     SRC="$VPIC_RESULTS/$csv_name"
 
-                    # If rank-suffixed files exist (MPI mode), merge them
-                    if [ ! -f "$SRC" ] && [ "$MPI_NP" -gt 1 ]; then
+                    # If rank-suffixed files exist (MPI mode), merge them (overwrite stale single-rank files)
+                    if [ "$MPI_NP" -gt 1 ]; then
                         RANK0="$VPIC_RESULTS/${csv_base}_rank0.csv"
                         if [ -f "$RANK0" ]; then
                             cp "$RANK0" "$SRC"
@@ -631,7 +687,108 @@ with open('$AGG_CSV','w') as f:
                 python3 "$SCRIPT_DIR/plots/generate_dataset_figures.py" \
                     --dataset vpic --policy "$LABEL" 2>&1 | grep -E "Generated"
             done
+
+            # ── Multi-rank aggregate throughput summary ──
+            if [ "$MPI_NP" -gt 1 ]; then
+                MERGED_TS="$VPIC_RESULTS/benchmark_vpic_deck_timesteps.csv"
+                AGG_MULTI="$VPIC_RESULTS/benchmark_vpic_deck_aggregate_multi_rank.csv"
+                if [ -f "$MERGED_TS" ]; then
+                    echo "  Generating multi-rank aggregate throughput ..."
+                    python3 -c "
+import csv, math
+
+rows = list(csv.DictReader(open('$MERGED_TS')))
+if not rows:
+    exit()
+
+n_ranks = len(set(r['rank'] for r in rows))
+
+# Group by (phase, timestep): for each group, compute aggregate throughput
+# across all ranks running in parallel.
+#   aggregate_write_throughput = sum(orig_mib) / (max(write_ms) / 1000)
+#   aggregate_read_throughput  = sum(orig_mib) / (max(read_ms) / 1000)
+groups = {}
+for r in rows:
+    key = (r['phase'], r['timestep'])
+    if key not in groups:
+        groups[key] = []
+    groups[key].append(r)
+
+# Aggregate per phase (average across timesteps)
+phases = {}
+for (phase, ts), ranks in groups.items():
+    if phase not in phases:
+        phases[phase] = {'n_ts': 0,
+                         'sum_agg_wr_mibps': 0, 'sum_agg_rd_mibps': 0,
+                         'sum_agg_wr_sq': 0, 'sum_agg_rd_sq': 0,
+                         'sum_orig_mib': 0, 'sum_file_mib': 0,
+                         'sum_max_wr_ms': 0, 'sum_max_rd_ms': 0,
+                         'avg_per_rank_wr': 0, 'avg_per_rank_rd': 0,
+                         'n_per_rank': 0}
+    d = phases[phase]
+
+    total_orig = sum(float(r.get('orig_mib', 0)) for r in ranks)
+    total_file = sum(int(r.get('file_bytes', 0)) for r in ranks) / (1024*1024)
+    max_wr = max(float(r.get('write_ms', 0)) for r in ranks)
+    max_rd = max(float(r.get('read_ms', 0)) for r in ranks)
+
+    agg_wr = total_orig / (max_wr / 1000.0) if max_wr > 0 else 0
+    agg_rd = total_orig / (max_rd / 1000.0) if max_rd > 0 else 0
+
+    d['n_ts'] += 1
+    d['sum_agg_wr_mibps'] += agg_wr
+    d['sum_agg_rd_mibps'] += agg_rd
+    d['sum_agg_wr_sq'] += agg_wr * agg_wr
+    d['sum_agg_rd_sq'] += agg_rd * agg_rd
+    d['sum_orig_mib'] += total_orig
+    d['sum_file_mib'] += total_file
+    d['sum_max_wr_ms'] += max_wr
+    d['sum_max_rd_ms'] += max_rd
+
+    for r in ranks:
+        d['avg_per_rank_wr'] += float(r.get('write_mibps', 0))
+        d['avg_per_rank_rd'] += float(r.get('read_mibps', 0))
+        d['n_per_rank'] += 1
+
+with open('$AGG_MULTI', 'w') as f:
+    f.write('n_ranks,phase,n_timesteps,'
+            'avg_agg_write_mibps,avg_agg_read_mibps,'
+            'agg_write_mibps_std,agg_read_mibps_std,'
+            'avg_per_rank_write_mibps,avg_per_rank_read_mibps,'
+            'avg_ratio,total_orig_mib,total_file_mib,'
+            'avg_max_write_ms,avg_max_read_ms\n')
+    for phase in phases:
+        d = phases[phase]
+        n = d['n_ts']
+        if n == 0:
+            continue
+        avg_wr = d['sum_agg_wr_mibps'] / n
+        avg_rd = d['sum_agg_rd_mibps'] / n
+        wr_var = (d['sum_agg_wr_sq']/n - avg_wr**2) * n/(n-1) if n > 1 else 0
+        rd_var = (d['sum_agg_rd_sq']/n - avg_rd**2) * n/(n-1) if n > 1 else 0
+        wr_std = math.sqrt(wr_var) if wr_var > 0 else 0
+        rd_std = math.sqrt(rd_var) if rd_var > 0 else 0
+        orig = d['sum_orig_mib'] / n
+        fmib = d['sum_file_mib'] / n
+        ratio = orig / fmib if fmib > 0 else 0
+        pr_wr = d['avg_per_rank_wr'] / d['n_per_rank'] if d['n_per_rank'] > 0 else 0
+        pr_rd = d['avg_per_rank_rd'] / d['n_per_rank'] if d['n_per_rank'] > 0 else 0
+        avg_mwr = d['sum_max_wr_ms'] / n
+        avg_mrd = d['sum_max_rd_ms'] / n
+        f.write(f'{n_ranks},{phase},{n},'
+                f'{avg_wr:.1f},{avg_rd:.1f},'
+                f'{wr_std:.1f},{rd_std:.1f},'
+                f'{pr_wr:.1f},{pr_rd:.1f},'
+                f'{ratio:.4f},{orig:.2f},{fmib:.2f},'
+                f'{avg_mwr:.2f},{avg_mrd:.2f}\n')
+
+print(f'  Aggregate: {n_ranks} ranks, {len(phases)} phases -> $AGG_MULTI')
+" 2>/dev/null
+                fi
+            fi
+
             echo ""
+            fi  # end rank-0 post-processing
             ;;
         sdrbench)
             echo ""
@@ -653,9 +810,11 @@ with open('$AGG_CSV','w') as f:
             bash "$SCRIPT_DIR/sdrbench/run_all_sdr.sh"
             ;;
         ai_training)
+            if [ "$MY_RANK" -eq 0 ]; then
             echo ""
             echo ">>> Running AI Training Checkpoint benchmark..."
             echo ""
+            fi
 
             AI_BIN="$SCRIPT_DIR/../build/generic_benchmark"
             AI_WEIGHTS="$SCRIPT_DIR/../neural_net/weights/model.nnwt"
@@ -670,6 +829,7 @@ with open('$AGG_CSV','w') as f:
             AI_DATA_DIR="${AI_CHECKPOINT_DIR:-$SCRIPT_DIR/../data/ai_training/${AI_DIR_NAME}}"
 
             if [ ! -d "$AI_DATA_DIR" ]; then
+                if [ "$MY_RANK" -eq 0 ]; then
                 echo "ERROR: Checkpoint data not found at $AI_DATA_DIR"
                 echo ""
                 echo "Generate it first:"
@@ -679,13 +839,16 @@ with open('$AGG_CSV','w') as f:
                     *)     echo "  Generate .f32 files in data/ai_training/${AI_DIR_NAME}/" ;;
                 esac
                 echo ""
+                fi
                 continue
             fi
 
             # Auto-detect dims from first .f32 file
             _FIRST_FILE=$(ls "$AI_DATA_DIR"/*.f32 2>/dev/null | head -1)
             if [ -z "$_FIRST_FILE" ]; then
+                if [ "$MY_RANK" -eq 0 ]; then
                 echo "ERROR: No .f32 files in $AI_DATA_DIR"
+                fi
                 continue
             fi
             _FILE_BYTES=$(stat --printf="%s" "$_FIRST_FILE")
@@ -702,6 +865,7 @@ print(s)
             AI_DIMS="${_DIM0},${_DIM1}"
 
             _FILE_MB=$(( _FILE_BYTES / 1024 / 1024 ))
+            if [ "$MY_RANK" -eq 0 ]; then
             echo "  Model       : ${AI_MODEL}"
             echo "  Dataset     : ${AI_DATASET}"
             echo "  Data dir    : ${AI_DATA_DIR}"
@@ -710,6 +874,7 @@ print(s)
             echo "  Chunk size  : ${CHUNK_MB} MB"
             echo "  Policies    : ${POLICIES}"
             echo ""
+            fi
 
             # Split phases into fixed and NN
             AI_FIXED_PHASES=""
@@ -733,7 +898,9 @@ print(s)
                 AI_FIXED_DIR="$AI_EVAL_DIR/fixed_phases"
                 mkdir -p "$AI_FIXED_DIR"
 
+                if [ "$MY_RANK" -eq 0 ]; then
                 echo "  >>> Fixed phases: $AI_FIXED_PHASES"
+                fi
                 PHASE_ARGS=""
                 IFS=',' read -ra _FP <<< "$AI_FIXED_PHASES"
                 for fp in "${_FP[@]}"; do PHASE_ARGS="$PHASE_ARGS --phase $fp"; done
@@ -749,8 +916,10 @@ print(s)
                     --out-dir "$AI_FIXED_DIR" \
                     > "$AI_FIXED_DIR/ai_benchmark.log" 2> >(tee -a "$AI_FIXED_DIR/ai_benchmark.log" >&2)
 
+                if [ "$MY_RANK" -eq 0 ]; then
                 echo "      Done. Log: $AI_FIXED_DIR/ai_benchmark.log"
                 echo ""
+                fi
             fi
 
             # ── NN phases (run per policy) ──
@@ -775,7 +944,9 @@ print(s)
                     IFS=',' read -ra _NP <<< "$AI_NN_PHASES"
                     for np in "${_NP[@]}"; do PHASE_ARGS="$PHASE_ARGS --phase $np"; done
 
+                    if [ "$MY_RANK" -eq 0 ]; then
                     echo "  >>> NN phases [$LABEL] ($POL_IDX/$POL_TOTAL): $AI_NN_PHASES"
+                    fi
 
                     GPUCOMPRESS_DETAILED_TIMING=1 \
                     GPUCOMPRESS_DEBUG_NN=$DEBUG_NN \
@@ -788,6 +959,7 @@ print(s)
                         --out-dir "$AI_NN_DIR" \
                         > "$AI_NN_DIR/ai_benchmark.log" 2> >(tee -a "$AI_NN_DIR/ai_benchmark.log" >&2)
 
+                    if [ "$MY_RANK" -eq 0 ]; then
                     echo "      Done. Log: $AI_NN_DIR/ai_benchmark.log"
 
                     # Merge fixed + NN CSVs
@@ -812,6 +984,7 @@ print(s)
                     python3 "$SCRIPT_DIR/plots/generate_dataset_figures.py" \
                         --dataset "$AI_DIR_NAME" --policy "$LABEL" 2>&1 | grep -E "Generated"
                     echo ""
+                    fi  # end rank-0 AI post-processing
                 done
             fi
             ;;
@@ -821,7 +994,9 @@ print(s)
     esac
 done
 
+if [ "$MY_RANK" -eq 0 ]; then
 echo ""
 echo "============================================================"
 echo "  All benchmarks complete."
 echo "============================================================"
+fi

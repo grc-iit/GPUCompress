@@ -25,12 +25,14 @@ set -e  # Exit on error
 
 # ── Parse arguments ──
 WITH_AI_TRAINING=0
+NODE_LOCAL_ONLY=0
 AI_MODEL="${AI_MODEL:-vit_b_16}"
 AI_EPOCHS="${AI_EPOCHS:-20}"
 AI_CHECKPOINT_EPOCHS="${AI_CHECKPOINT_EPOCHS:-1,2,3,5,8,10,15,20}"
 for arg in "$@"; do
     case "$arg" in
         --with-ai-training) WITH_AI_TRAINING=1 ;;
+        --node-local-only)  NODE_LOCAL_ONLY=1 ;;
     esac
 done
 
@@ -56,14 +58,22 @@ echo_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
-# Configuration
+# Architecture detection (x86_64 or aarch64/sbsa for GH200)
+ARCH=$(uname -m)
+case "$ARCH" in
+    x86_64)  NVCOMP_ARCH="x86_64" ;;
+    aarch64) NVCOMP_ARCH="sbsa" ;;
+    *)       echo_error "Unsupported architecture: $ARCH"; exit 1 ;;
+esac
+
+# Configuration (all overridable via env vars)
 NVCOMP_VERSION="5.1.0.21"
 NVCOMP_CUDA_VERSION="cuda12"
-NVCOMP_INSTALL_DIR="/tmp"
-NVCOMP_URL="https://developer.download.nvidia.com/compute/nvcomp/redist/nvcomp/linux-x86_64/nvcomp-linux-x86_64-${NVCOMP_VERSION}_${NVCOMP_CUDA_VERSION}-archive.tar.xz"
+NVCOMP_INSTALL_DIR="${NVCOMP_INSTALL_DIR:-/tmp}"
+NVCOMP_URL="https://developer.download.nvidia.com/compute/nvcomp/redist/nvcomp/linux-${NVCOMP_ARCH}/nvcomp-linux-${NVCOMP_ARCH}-${NVCOMP_VERSION}_${NVCOMP_CUDA_VERSION}-archive.tar.xz"
 
 HDF5_VERSION="2.0.0"
-HDF5_INSTALL_DIR="/tmp/hdf5-install"
+HDF5_INSTALL_DIR="${HDF5_INSTALL_DIR:-/tmp/hdf5-install}"
 HDF5_URL="https://github.com/HDFGroup/hdf5/releases/download/${HDF5_VERSION}/hdf5-${HDF5_VERSION}.tar.gz"
 
 # SDRBench datasets for SC benchmark evaluation
@@ -80,14 +90,21 @@ declare -A SDRBENCH_DATASETS=(
 CUDA_ARCH="${CUDA_ARCH:-80}"
 
 # ============================================================================
-# Pre-flight checks
+# Pre-flight checks (skipped for --node-local-only)
 # ============================================================================
+
+if [[ "$NODE_LOCAL_ONLY" -eq 1 ]]; then
+    echo_info "Mode: --node-local-only (nvcomp + HDF5 only)"
+    echo_info "Architecture: $ARCH, install to: NVCOMP=$NVCOMP_INSTALL_DIR HDF5=$HDF5_INSTALL_DIR"
+fi
+
+if [[ "$NODE_LOCAL_ONLY" -eq 0 ]]; then
 
 echo_info "Running pre-flight checks..."
 
-# Check if running on Linux x86_64
-if [[ "$(uname -s)" != "Linux" ]] || [[ "$(uname -m)" != "x86_64" ]]; then
-    echo_error "This script only supports Linux x86_64"
+# Check if running on supported Linux
+if [[ "$(uname -s)" != "Linux" ]]; then
+    echo_error "This script only supports Linux"
     exit 1
 fi
 
@@ -117,10 +134,12 @@ fi
 
 # Check for cuFile (GDS support) - search multiple possible locations
 CUFILE_LIB=""
+CUDA_TARGET="${ARCH}-linux"
+[[ "$ARCH" == "aarch64" ]] && CUDA_TARGET="sbsa-linux"
 for candidate in \
     "/usr/local/cuda/lib64/libcufile.so" \
-    "/usr/local/cuda/targets/x86_64-linux/lib/libcufile.so" \
-    "/opt/nvidia/cuda-${CUDA_VERSION}/targets/x86_64-linux/lib/libcufile.so"; do
+    "/usr/local/cuda/targets/${CUDA_TARGET}/lib/libcufile.so" \
+    "/opt/nvidia/cuda-${CUDA_VERSION}/targets/${CUDA_TARGET}/lib/libcufile.so"; do
     if [[ -f "$candidate" ]]; then
         CUFILE_LIB="$(dirname "$candidate")"
         break
@@ -141,6 +160,8 @@ else
     echo_warn "cuFile not found - GPUDirect Storage may not work"
 fi
 
+fi  # end pre-flight checks
+
 echo_info "cmake version: $(cmake --version | head -1)"
 echo_info "Target CUDA architecture: sm_${CUDA_ARCH}"
 
@@ -148,7 +169,9 @@ echo_info "Target CUDA architecture: sm_${CUDA_ARCH}"
 # Download and install nvcomp
 # ============================================================================
 
+_t_start=$(date +%s)
 echo_info "=== Step 1/4: Installing nvcomp ${NVCOMP_VERSION} ==="
+echo_info "  Install dir: ${NVCOMP_INSTALL_DIR}"
 
 # Create install directories
 mkdir -p "${NVCOMP_INSTALL_DIR}/include"
@@ -157,31 +180,32 @@ mkdir -p "${NVCOMP_INSTALL_DIR}/lib"
 # Download nvcomp
 NVCOMP_ARCHIVE="/tmp/nvcomp-${NVCOMP_VERSION}.tar.xz"
 if [[ ! -f "${NVCOMP_ARCHIVE}" ]]; then
-    echo_info "Downloading nvcomp from NVIDIA..."
+    echo_info "  [1/3] Downloading nvcomp from NVIDIA..."
     curl -L -o "${NVCOMP_ARCHIVE}" "${NVCOMP_URL}"
 else
-    echo_info "Using cached nvcomp archive"
+    echo_info "  [1/3] Using cached nvcomp archive"
 fi
 
 # Extract nvcomp
-NVCOMP_EXTRACT_DIR="/tmp/nvcomp-linux-x86_64-${NVCOMP_VERSION}_${NVCOMP_CUDA_VERSION}-archive"
+NVCOMP_EXTRACT_DIR="/tmp/nvcomp-linux-${NVCOMP_ARCH}-${NVCOMP_VERSION}_${NVCOMP_CUDA_VERSION}-archive"
 if [[ -d "${NVCOMP_EXTRACT_DIR}" ]]; then
     rm -rf "${NVCOMP_EXTRACT_DIR}"
 fi
 
-echo_info "Extracting nvcomp..."
+echo_info "  [2/3] Extracting nvcomp..."
 cd /tmp
 tar -xf "${NVCOMP_ARCHIVE}"
 
 # Copy files to install location
-echo_info "Installing nvcomp headers and libraries..."
+echo_info "  [3/3] Copying headers and libraries to ${NVCOMP_INSTALL_DIR} ..."
 cp -r "${NVCOMP_EXTRACT_DIR}/include/"* "${NVCOMP_INSTALL_DIR}/include/"
 cp -r "${NVCOMP_EXTRACT_DIR}/lib/"* "${NVCOMP_INSTALL_DIR}/lib/"
 
 # Verify installation
 if [[ -f "${NVCOMP_INSTALL_DIR}/include/nvcomp.hpp" ]] && \
    [[ -f "${NVCOMP_INSTALL_DIR}/lib/libnvcomp.so" ]]; then
-    echo_info "nvcomp installed successfully"
+    _t_now=$(date +%s)
+    echo_info "  nvcomp installed successfully ($((_t_now - _t_start))s)"
 else
     echo_error "nvcomp installation failed"
     exit 1
@@ -192,6 +216,7 @@ fi
 # ============================================================================
 
 echo_info "=== Step 2/4: Building HDF5 ${HDF5_VERSION} (for VOL connector) ==="
+echo_info "  Install dir: ${HDF5_INSTALL_DIR}"
 
 HDF5_ARCHIVE="/tmp/hdf5-${HDF5_VERSION}.tar.gz"
 HDF5_SRC_DIR="/tmp/hdf5-${HDF5_VERSION}"
@@ -199,25 +224,27 @@ HDF5_BUILD_DIR="/tmp/hdf5-build"
 
 if [[ -f "${HDF5_INSTALL_DIR}/lib/libhdf5.so" ]] && \
    [[ -f "${HDF5_INSTALL_DIR}/include/hdf5.h" ]]; then
-    echo_info "HDF5 ${HDF5_VERSION} already installed at ${HDF5_INSTALL_DIR}, skipping build"
+    echo_info "  HDF5 ${HDF5_VERSION} already installed, skipping build"
 else
     # Download
     if [[ ! -f "${HDF5_ARCHIVE}" ]]; then
-        echo_info "Downloading HDF5 ${HDF5_VERSION} source..."
+        echo_info "  [1/4] Downloading HDF5 ${HDF5_VERSION} source..."
         curl -L -o "${HDF5_ARCHIVE}" "${HDF5_URL}"
     else
-        echo_info "Using cached HDF5 source archive"
+        echo_info "  [1/4] Using cached HDF5 source archive"
     fi
 
     # Extract
     if [[ ! -d "${HDF5_SRC_DIR}" ]]; then
-        echo_info "Extracting HDF5 source..."
+        echo_info "  [2/4] Extracting HDF5 source..."
         cd /tmp
         tar xzf "${HDF5_ARCHIVE}"
+    else
+        echo_info "  [2/4] HDF5 source already extracted"
     fi
 
     # Build (C library only, minimal config for speed)
-    echo_info "Configuring HDF5 build..."
+    echo_info "  [3/4] Configuring HDF5 build..."
     rm -rf "${HDF5_BUILD_DIR}"
     mkdir -p "${HDF5_BUILD_DIR}"
     cd "${HDF5_BUILD_DIR}"
@@ -233,18 +260,26 @@ else
         -DHDF5_BUILD_JAVA=OFF \
         -DHDF5_BUILD_HL_LIB=ON
 
-    echo_info "Building HDF5 (this may take a few minutes)..."
+    echo_info "  [4/4] Building + installing HDF5 (this may take a few minutes)..."
     make -j$(nproc)
     make install
 
     # Verify
     if [[ -f "${HDF5_INSTALL_DIR}/lib/libhdf5.so" ]] && \
        [[ -f "${HDF5_INSTALL_DIR}/include/hdf5.h" ]]; then
-        echo_info "HDF5 ${HDF5_VERSION} installed successfully at ${HDF5_INSTALL_DIR}"
+        _t_now=$(date +%s)
+        echo_info "  HDF5 installed successfully ($((_t_now - _t_start))s total)"
     else
         echo_error "HDF5 installation failed"
         exit 1
     fi
+fi
+
+# ── Early exit for --node-local-only ──
+if [ "$NODE_LOCAL_ONLY" -eq 1 ]; then
+    _t_now=$(date +%s)
+    echo_info "Node-local dependencies installed in $((_t_now - _t_start))s. Skipping project build and datasets."
+    exit 0
 fi
 
 # ============================================================================

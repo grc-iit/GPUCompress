@@ -6,9 +6,25 @@ GPU_DIR="${GPU_DIR:-$HOME/GPUCompress}"
 VPIC_BUILD="${VPIC_BUILD:-${VPIC_DIR}/build-compress}"
 HDF5_PREFIX="${HDF5_PREFIX:-/tmp/hdf5-install}"
 NVCOMP_LIB="${NVCOMP_LIB:-/tmp/lib}"
+CUDA_ARCH="${CUDA_ARCH:-80}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 export NVCC_WRAPPER_DEFAULT_COMPILER=${CXX:-g++}
+
+# Auto-detect MPI library path
+if [ -n "$CRAY_MPICH_DIR" ]; then
+    MPI_LIB_FLAGS="-L${CRAY_MPICH_DIR}/lib -lmpi"
+    MPI_INC_FLAGS="-I${CRAY_MPICH_DIR}/include"
+    echo "Using Cray MPICH: $CRAY_MPICH_DIR"
+elif command -v mpicc &>/dev/null; then
+    MPI_LIB_FLAGS="$(mpicc --showme:link 2>/dev/null || pkg-config --libs mpi 2>/dev/null || echo '-lmpi')"
+    MPI_INC_FLAGS="$(mpicc --showme:compile 2>/dev/null || pkg-config --cflags mpi 2>/dev/null || echo '')"
+    echo "Using system MPI: $(which mpicc)"
+else
+    MPI_LIB_FLAGS="-L/usr/lib/x86_64-linux-gnu/openmpi/lib -lmpi"
+    MPI_INC_FLAGS=""
+    echo "WARNING: No MPI detected, falling back to default OpenMPI path"
+fi
 
 DECK_PATH="${GPU_DIR}/benchmarks/vpic-kokkos/vpic_benchmark_deck.cxx"
 
@@ -20,7 +36,7 @@ echo "Compiling vpic_ranking_profiler.cu ..."
   -std=c++17 \
   -c "${SCRIPT_DIR}/vpic_ranking_profiler.cu" \
   -o "${SCRIPT_DIR}/vpic_ranking_profiler.o" \
-  -x cu -expt-extended-lambda -arch=sm_80
+  -x cu -expt-extended-lambda -arch=sm_${CUDA_ARCH}
 
 # Compile PSNR kernel (CUDA) as a separate object
 echo "Compiling vpic_psnr.cu ..."
@@ -29,7 +45,7 @@ echo "Compiling vpic_psnr.cu ..."
   -std=c++17 \
   -c "${SCRIPT_DIR}/vpic_psnr.cu" \
   -o "${SCRIPT_DIR}/vpic_psnr.o" \
-  -x cu -expt-extended-lambda -arch=sm_80
+  -x cu -expt-extended-lambda -arch=sm_${CUDA_ARCH}
 
 # Compile and link the deck
 echo "Compiling vpic_benchmark_deck ..."
@@ -37,6 +53,7 @@ echo "Compiling vpic_benchmark_deck ..."
   -I"${GPU_DIR}/include" \
   -I"${GPU_DIR}/examples" \
   -I"${HDF5_PREFIX}/include" \
+  $MPI_INC_FLAGS \
   -I. \
   -I"${VPIC_DIR}/src" \
   -I"${VPIC_BUILD}/kokkos" \
@@ -68,7 +85,7 @@ echo "Compiling vpic_benchmark_deck ..."
   -L"${HDF5_PREFIX}/lib" -lhdf5 \
   -Wl,-rpath,"${NVCOMP_LIB}" \
   -L"${NVCOMP_LIB}" -lnvcomp \
-  -L/usr/lib/x86_64-linux-gnu/openmpi/lib -lmpi -lgomp \
-  -x cu -expt-extended-lambda -Wext-lambda-captures-this -arch=sm_80
+  $MPI_LIB_FLAGS -lgomp \
+  -x cu -expt-extended-lambda -Wext-lambda-captures-this -arch=sm_${CUDA_ARCH} -Xcompiler -fopenmp
 
 echo "Built: vpic_benchmark_deck.Linux"
