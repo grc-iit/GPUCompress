@@ -381,12 +381,14 @@ def main():
                          "write_ms,read_ms,write_mbps,read_mbps,"
                          "file_bytes,orig_bytes,mismatches,"
                          "n_chunks,sgd_fires,explorations,"
-                         "mape_ratio_pct,mape_comp_pct,mape_decomp_pct,"
-                         "mae_ratio,mae_comp_ms,mae_decomp_ms,"
+                         "mape_ratio_pct,mape_comp_pct,mape_decomp_pct,mape_psnr_pct,"
+                         "mae_ratio,mae_comp_ms,mae_decomp_ms,mae_psnr_db,"
+                         "r2_ratio,r2_comp,r2_decomp,r2_psnr,"
                          "nn_ms,stats_ms,preproc_ms,comp_ms,decomp_ms,"
                          "explore_ms,sgd_ms,"
                          "stage1_ms,drain_ms,io_drain_ms,pipeline_ms,"
-                         "s2_busy_ms,s3_busy_ms\n")
+                         "s2_busy_ms,s3_busy_ms,"
+                         "psnr_db,rmse,max_abs_err,bit_rate\n")
             CHUNK_CSV_HEADER = ("epoch,tensor,algorithm,policy,mode,"
                                 "chunk_idx,action,actual_ratio,predicted_ratio,"
                                 "comp_ms,predicted_comp_time,"

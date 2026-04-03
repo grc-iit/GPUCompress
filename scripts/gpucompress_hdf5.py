@@ -309,6 +309,14 @@ class GPUCompressHDF5Writer:
         mape_r_sum = 0.0; mape_c_sum = 0.0; mape_d_sum = 0.0
         mae_r_sum = 0.0; mae_c_sum = 0.0; mae_d_sum = 0.0
         cnt_r = 0; cnt_c = 0; cnt_d = 0
+        # R² accumulators: Σactual, Σactual², Σ(actual-predicted)²
+        r2_r_sum = 0.0; r2_r_sum2 = 0.0; r2_r_ss = 0.0; r2_r_n = 0
+        r2_c_sum = 0.0; r2_c_sum2 = 0.0; r2_c_ss = 0.0; r2_c_n = 0
+        r2_d_sum = 0.0; r2_d_sum2 = 0.0; r2_d_ss = 0.0; r2_d_n = 0
+        # PSNR metrics
+        mape_p_sum = 0.0; mae_p_sum = 0.0; cnt_p = 0
+        r2_p_sum = 0.0; r2_p_sum2 = 0.0; r2_p_ss = 0.0; r2_p_n = 0
+        psnr_pred_sum = 0.0; psnr_pred_cnt = 0
         total_nn = 0.0; total_stats = 0.0; total_preproc = 0.0
         total_comp = 0.0; total_decomp = 0.0
         total_explore = 0.0; total_sgd = 0.0
@@ -329,24 +337,42 @@ class GPUCompressHDF5Writer:
             if sgd_fired: sgd_fires += 1
             if expl_triggered: explorations += 1
 
-            # Ratio MAPE/MAE
+            # Ratio MAPE/MAE/R²
             if actual_ratio > 0 and predicted_ratio > 0:
                 diff = abs(predicted_ratio - actual_ratio)
                 mape_r_sum += diff / abs(actual_ratio)
                 mae_r_sum += diff
+                r2_r_sum += actual_ratio; r2_r_sum2 += actual_ratio**2
+                r2_r_ss += (actual_ratio - predicted_ratio)**2; r2_r_n += 1
                 cnt_r += 1
 
-            # Compression time MAPE/MAE
+            # Compression time MAPE/MAE/R²
             if comp_ms > 0:
                 mape_c_sum += abs(predicted_comp - comp_ms) / abs(comp_ms)
                 mae_c_sum += abs(predicted_comp - comp_ms)
+                r2_c_sum += comp_ms; r2_c_sum2 += comp_ms**2
+                r2_c_ss += (comp_ms - predicted_comp)**2; r2_c_n += 1
                 cnt_c += 1
 
-            # Decompression time MAPE/MAE
+            # Decompression time MAPE/MAE/R²
             if decomp_ms > 0:
                 mape_d_sum += abs(predicted_decomp - decomp_ms) / abs(decomp_ms)
                 mae_d_sum += abs(predicted_decomp - decomp_ms)
+                r2_d_sum += decomp_ms; r2_d_sum2 += decomp_ms**2
+                r2_d_ss += (decomp_ms - predicted_decomp)**2; r2_d_n += 1
                 cnt_d += 1
+
+            # PSNR MAPE/MAE/R² (skip lossless: actual_psnr=120, no variance)
+            if predicted_psnr > 0 and 0 < actual_psnr < 120:
+                a, p = actual_psnr, predicted_psnr
+                mape_p_sum += abs(p - a) / abs(a)
+                mae_p_sum += abs(p - a)
+                cnt_p += 1
+                r2_p_sum += a; r2_p_sum2 += a * a
+                r2_p_ss += (a - p) ** 2; r2_p_n += 1
+            if predicted_psnr > 0:
+                psnr_pred_sum += predicted_psnr
+                psnr_pred_cnt += 1
 
             # Component timing (unclamped)
             total_nn += nn_ms
@@ -359,6 +385,12 @@ class GPUCompressHDF5Writer:
 
         orig_bytes = n_hist * 4 * 1024 * 1024  # approximate (chunk_size * n_chunks)
 
+        # R² = 1 - SS_res / SS_tot, where SS_tot = Σx² - (Σx)²/n
+        def _r2(s, s2, ss_res, n):
+            if n < 2: return 0.0
+            ss_tot = s2 - (s * s) / n
+            return 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else 0.0
+
         return {
             "n_chunks": n_hist,
             "sgd_fires": sgd_fires,
@@ -369,6 +401,12 @@ class GPUCompressHDF5Writer:
             "mae_ratio": mae_r_sum / cnt_r if cnt_r else 0,
             "mae_comp_ms": mae_c_sum / cnt_c if cnt_c else 0,
             "mae_decomp_ms": mae_d_sum / cnt_d if cnt_d else 0,
+            "r2_ratio": _r2(r2_r_sum, r2_r_sum2, r2_r_ss, r2_r_n),
+            "r2_comp": _r2(r2_c_sum, r2_c_sum2, r2_c_ss, r2_c_n),
+            "r2_decomp": _r2(r2_d_sum, r2_d_sum2, r2_d_ss, r2_d_n),
+            "mape_psnr_pct": min(200.0, (mape_p_sum / cnt_p * 100) if cnt_p else 0),
+            "mae_psnr_db": mae_p_sum / cnt_p if cnt_p else 0,
+            "r2_psnr": _r2(r2_p_sum, r2_p_sum2, r2_p_ss, r2_p_n),
             "nn_ms": total_nn,
             "stats_ms": total_stats,
             "preproc_ms": total_preproc,
@@ -776,9 +814,13 @@ class GPUCompressHDF5Writer:
         except (OSError, AttributeError):
             pass
 
-        # 6. Timed read + verify
+        # 6. Timed read + verify + quality metrics
         read_ms = 0.0
         mismatches = -1
+        psnr_db = 0.0
+        rmse = 0.0
+        max_abs_err = 0.0
+        bit_rate = 0.0
         if d_read is not None:
             d_read.zero_()
             torch.cuda.synchronize()
@@ -788,6 +830,22 @@ class GPUCompressHDF5Writer:
             read_ms = (t3 - t2) * 1000.0
             mismatches = int(d_original.view(torch.int32).ne(
                              d_read.view(torch.int32)).sum().item())
+
+            # Quality metrics (meaningful for lossy, trivial for lossless)
+            if mismatches > 0:
+                diff = (d_original.float() - d_read.float())
+                mse = (diff ** 2).mean().item()
+                rmse = mse ** 0.5
+                max_abs_err = diff.abs().max().item()
+                data_range = d_original.float().max().item() - d_original.float().min().item()
+                if mse > 0 and data_range > 0:
+                    psnr_db = 10.0 * torch.log10(
+                        torch.tensor(data_range ** 2 / mse)).item()
+                else:
+                    psnr_db = 120.0
+                bit_rate = (file_bytes * 8.0) / n_elements if n_elements > 0 else 0.0
+            else:
+                psnr_db = 120.0  # lossless = perfect
 
         # 7. Collect diagnostics (chunk metrics + VOL timing + per-chunk details)
         diag = self.collect_chunk_metrics()
@@ -810,6 +868,10 @@ class GPUCompressHDF5Writer:
             "file_bytes": file_bytes,
             "orig_bytes": orig_bytes,
             "mismatches": mismatches,
+            "psnr_db": psnr_db,
+            "rmse": rmse,
+            "max_abs_err": max_abs_err,
+            "bit_rate": bit_rate,
         }
         result.update(diag)
         result.update(vol_timing)
@@ -1189,16 +1251,20 @@ class InlineFullBenchmark:
                 f"{r['file_bytes']},{r['orig_bytes']},{r['mismatches']},"
                 f"{r.get('n_chunks',0)},{r.get('sgd_fires',0)},{r.get('explorations',0)},"
                 f"{r.get('mape_ratio_pct',0):.2f},{r.get('mape_comp_pct',0):.2f},"
-                f"{r.get('mape_decomp_pct',0):.2f},"
+                f"{r.get('mape_decomp_pct',0):.2f},{r.get('mape_psnr_pct',0):.2f},"
                 f"{r.get('mae_ratio',0):.4f},{r.get('mae_comp_ms',0):.4f},"
-                f"{r.get('mae_decomp_ms',0):.4f},"
+                f"{r.get('mae_decomp_ms',0):.4f},{r.get('mae_psnr_db',0):.4f},"
+                f"{r.get('r2_ratio',0):.4f},{r.get('r2_comp',0):.4f},"
+                f"{r.get('r2_decomp',0):.4f},{r.get('r2_psnr',0):.4f},"
                 f"{r.get('nn_ms',0):.3f},{r.get('stats_ms',0):.3f},"
                 f"{r.get('preproc_ms',0):.3f},{r.get('comp_ms',0):.3f},"
                 f"{r.get('decomp_ms',0):.3f},{r.get('explore_ms',0):.3f},"
                 f"{r.get('sgd_ms',0):.3f},"
                 f"{r.get('stage1_ms',0):.3f},{r.get('drain_ms',0):.3f},"
                 f"{r.get('io_drain_ms',0):.3f},{r.get('pipeline_ms',0):.3f},"
-                f"{r.get('s2_busy_ms',0):.3f},{r.get('s3_busy_ms',0):.3f}\n")
+                f"{r.get('s2_busy_ms',0):.3f},{r.get('s3_busy_ms',0):.3f},"
+                f"{r.get('psnr_db',0):.2f},{r.get('rmse',0):.6f},"
+                f"{r.get('max_abs_err',0):.6f},{r.get('bit_rate',0):.4f}\n")
             # Write per-chunk details
             if chunk_csv_file and "chunk_details" in r:
                 for c in r["chunk_details"]:

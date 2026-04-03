@@ -122,11 +122,15 @@ def load_csv(path):
                        "sgd_fires", "explorations"]:
                 r[k] = int(float(r.get(k, 0)))
             for k in ["mape_ratio_pct", "mape_comp_pct", "mape_decomp_pct",
+                       "mape_psnr_pct",
                        "mae_ratio", "mae_comp_ms", "mae_decomp_ms",
+                       "mae_psnr_db",
+                       "r2_ratio", "r2_comp", "r2_decomp", "r2_psnr",
                        "nn_ms", "stats_ms", "preproc_ms", "comp_ms", "decomp_ms",
                        "explore_ms", "sgd_ms",
                        "stage1_ms", "drain_ms", "io_drain_ms", "pipeline_ms",
-                       "s2_busy_ms", "s3_busy_ms"]:
+                       "s2_busy_ms", "s3_busy_ms",
+                       "psnr_db", "rmse", "max_abs_err", "bit_rate"]:
                 r[k] = float(r.get(k, 0))
             rows.append(r)
     return rows
@@ -649,6 +653,95 @@ def fig5c_mae_over_time(rows, outdir, subtitle=""):
     print(f"  Saved {path}")
 
 
+def fig5d_r2_over_time(rows, outdir, subtitle=""):
+    """R² over epochs for NN configs, grid layout: rows=phases, cols=metrics."""
+    epochs = sorted(set(r["epoch"] for r in rows))
+    if len(epochs) < 2:
+        print("  Skipping 5d_r2 (need >= 2 epochs)")
+        return
+
+    nn_rows = [r for r in rows if r.get("policy", "-") != "-"]
+    if not nn_rows:
+        print("  Skipping 5d_r2 (no NN configs)")
+        return
+
+    # Check R² columns exist
+    if "r2_ratio" not in nn_rows[0]:
+        print("  Skipping 5d_r2 (no R² columns)")
+        return
+
+    # Group by base phase name
+    phase_map = {"nn": [], "nn-rl": [], "nn-rl+exp50": []}
+    for algo in NN_ALGOS:
+        arows = [r for r in nn_rows if r["algorithm"] == algo]
+        if not arows:
+            continue
+        mode = arows[0].get("mode", "-")
+        if mode in phase_map:
+            phase_map[mode].extend(arows)
+
+    phases_present = [p for p in ["nn", "nn-rl", "nn-rl+exp50"] if phase_map[p]]
+    if not phases_present:
+        return
+
+    metrics = [("r2_ratio", "Compression Ratio"),
+               ("r2_comp", "Compression Time"),
+               ("r2_decomp", "Decompression Time")]
+    # Add PSNR R² panel if lossy data present
+    has_psnr_r2 = any(r.get("r2_psnr", 0) != 0 for r in nn_rows)
+    if has_psnr_r2:
+        metrics.append(("r2_psnr", "PSNR"))
+
+    n_phases = len(phases_present)
+    n_metrics = len(metrics)
+    phase_colors = {"nn": "#7f8c8d", "nn-rl": "#8e44ad", "nn-rl+exp50": "#c0392b"}
+    phase_labels = {"nn": "NN Inference", "nn-rl": "NN + SGD", "nn-rl+exp50": "NN + SGD + Explore"}
+
+    fig, axes = plt.subplots(n_phases, n_metrics,
+                              figsize=(4.5 * n_metrics, 3.5 * n_phases + 1),
+                              squeeze=False)
+    _t = "NN Prediction R² Over Epochs"
+    if subtitle:
+        _t += f"\n{subtitle}"
+    fig.suptitle(_t, fontsize=14, fontweight="bold", y=0.98)
+
+    for ri, phase in enumerate(phases_present):
+        prows = phase_map[phase]
+        color = phase_colors.get(phase, "gray")
+
+        for ci, (r2_key, metric_label) in enumerate(metrics):
+            ax = axes[ri][ci]
+            # Average R² across algorithms in this phase per epoch
+            ep_vals = defaultdict(list)
+            for r in prows:
+                ep_vals[r["epoch"]].append(r[r2_key])
+            xs = sorted(ep_vals.keys())
+            ys = [np.mean(ep_vals[e]) for e in xs]
+
+            ax.plot(xs, ys, "o-", color=color, markersize=6, linewidth=2)
+            ax.fill_between(xs, 0, ys, where=[v >= 0 for v in ys],
+                            alpha=0.15, color=color)
+
+            ax.axhline(y=1.0, color="#2ecc71", linestyle="--", alpha=0.4, linewidth=1)
+            ax.axhline(y=0.0, color="#e74c3c", linestyle="--", alpha=0.4, linewidth=1)
+            ax.grid(axis="y", alpha=0.2, linestyle="--")
+            ax.set_xticks(epochs)
+
+            if ri == 0:
+                ax.set_title(metric_label, fontsize=12, fontweight="bold")
+            if ci == 0:
+                ax.set_ylabel(f"{phase_labels.get(phase, phase)}\nR²",
+                              fontsize=10, fontweight="bold")
+            if ri == n_phases - 1:
+                ax.set_xlabel("Epoch", fontsize=10)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    path = os.path.join(outdir, "5d_r2_over_time.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved {path}")
+
+
 def fig6b_pipeline_waterfall(rows, outdir, epoch=None, subtitle=""):
     """Pipeline stage timing breakdown: stage1, drain, io_drain."""
     if epoch is None:
@@ -834,6 +927,130 @@ def fig7_epoch_evolution(rows, outdir):
     print(f"  Saved {path}")
 
 
+def fig0_tensor_characterization(rows, outdir, subtitle=""):
+    """Cross-tensor comparison: ratio, throughput, file size, compressibility.
+
+    Uses the last epoch's data. Shows how different tensor types (weights,
+    adam_m, adam_v, gradients) compress differently across algorithms.
+    """
+    epochs = sorted(set(r["epoch"] for r in rows))
+    tensors_in_data = [t for t in TENSOR_ORDER if any(r["tensor"] == t for r in rows)]
+    if len(tensors_in_data) < 2:
+        print("  Skipping tensor_characterization (need >= 2 tensor types)")
+        return
+
+    for epoch in epochs:
+        erows = [r for r in rows if r["epoch"] == epoch]
+        _make_tensor_char_figure(erows, tensors_in_data, epoch, outdir, subtitle)
+
+
+def _make_tensor_char_figure(erows, tensors_in_data, epoch, outdir, subtitle=""):
+    """Generate one tensor characterization figure for a single epoch."""
+
+    tensor_labels = {"weights": "Weights", "adam_m": "Adam M\n(momentum)",
+                     "adam_v": "Adam V\n(variance)", "gradients": "Gradients"}
+    # Key algorithms to compare
+    show_algos = [a for a in ["no-comp", "lz4", "zstd", "ans", "bitcomp",
+                               "bal_nn", "rat_nn"] if any(r["algorithm"] == a for r in erows)]
+    algo_labels_map = {"no-comp": "No Comp", "lz4": "LZ4", "zstd": "Zstd",
+                       "ans": "ANS", "bitcomp": "Bitcomp",
+                       "bal_nn": "NN\nBalanced", "rat_nn": "NN\nRatio"}
+
+    def get_val(tensor, algo, key):
+        r = [row[key] for row in erows if row["tensor"] == tensor and row["algorithm"] == algo]
+        return r[0] if r else 0
+
+    n_tensors = len(tensors_in_data)
+    n_algos = len(show_algos)
+    x = np.arange(n_algos)
+    width = 0.8 / n_tensors
+    t_colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"]
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10), facecolor="white")
+    _title = f"AI Checkpoint Tensor Characterization — Epoch {epoch}"
+    if subtitle:
+        _title += f"\n{subtitle}"
+    fig.suptitle(_title, fontsize=14, fontweight="bold")
+
+    # Panel 1: Compression ratio
+    ax = axes[0, 0]
+    for ti, tensor in enumerate(tensors_in_data):
+        ratios = [get_val(tensor, a, "ratio") for a in show_algos]
+        offset = (ti - n_tensors / 2 + 0.5) * width
+        ax.bar(x + offset, ratios, width * 0.9, label=tensor_labels.get(tensor, tensor),
+               color=t_colors[ti % len(t_colors)], edgecolor="black", linewidth=0.4, alpha=0.85)
+    ax.set_xticks(x)
+    ax.set_xticklabels([algo_labels_map.get(a, a) for a in show_algos], fontsize=9)
+    ax.set_ylabel("Compression Ratio", fontweight="bold")
+    ax.set_title("Compression Ratio by Tensor Type", fontweight="bold")
+    ax.legend(fontsize=8, loc="upper left")
+    ax.axhline(y=1.0, color="gray", linestyle="--", alpha=0.3)
+    ax.grid(axis="y", alpha=0.2, linestyle="--")
+
+    # Panel 2: Write throughput
+    ax = axes[0, 1]
+    for ti, tensor in enumerate(tensors_in_data):
+        thrpts = [get_val(tensor, a, "write_mbps") for a in show_algos]
+        offset = (ti - n_tensors / 2 + 0.5) * width
+        ax.bar(x + offset, thrpts, width * 0.9, label=tensor_labels.get(tensor, tensor),
+               color=t_colors[ti % len(t_colors)], edgecolor="black", linewidth=0.4, alpha=0.85)
+    ax.set_xticks(x)
+    ax.set_xticklabels([algo_labels_map.get(a, a) for a in show_algos], fontsize=9)
+    ax.set_ylabel("Write Throughput (MiB/s)", fontweight="bold")
+    ax.set_title("Write Throughput by Tensor Type", fontweight="bold")
+    ax.legend(fontsize=8, loc="upper left")
+    ax.grid(axis="y", alpha=0.2, linestyle="--")
+
+    # Panel 3: Compressed file size
+    ax = axes[1, 0]
+    orig_mb = get_val(tensors_in_data[0], "no-comp", "orig_bytes") / (1024 * 1024)
+    for ti, tensor in enumerate(tensors_in_data):
+        sizes = [get_val(tensor, a, "file_bytes") / (1024 * 1024) for a in show_algos]
+        offset = (ti - n_tensors / 2 + 0.5) * width
+        ax.bar(x + offset, sizes, width * 0.9, label=tensor_labels.get(tensor, tensor),
+               color=t_colors[ti % len(t_colors)], edgecolor="black", linewidth=0.4, alpha=0.85)
+    if orig_mb > 0:
+        ax.axhline(y=orig_mb, color="red", linestyle="--", alpha=0.5,
+                    label=f"Original ({orig_mb:.0f} MB)")
+    ax.set_xticks(x)
+    ax.set_xticklabels([algo_labels_map.get(a, a) for a in show_algos], fontsize=9)
+    ax.set_ylabel("File Size (MiB)", fontweight="bold")
+    ax.set_title("Compressed File Size by Tensor Type", fontweight="bold")
+    ax.legend(fontsize=8, loc="upper right")
+    ax.grid(axis="y", alpha=0.2, linestyle="--")
+
+    # Panel 4: Compressibility ranking (horizontal bars, key algos per tensor)
+    ax = axes[1, 1]
+    key_algos = [a for a in ["lz4", "zstd", "bal_nn", "rat_nn"]
+                 if any(r["algorithm"] == a for r in erows)]
+    key_colors = {"lz4": "#3498db", "zstd": "#1a5276", "bal_nn": "#e67e22", "rat_nn": "#f39c12"}
+    y = np.arange(len(tensors_in_data))
+    bar_h = 0.8 / max(len(key_algos), 1)
+    for ai, algo in enumerate(key_algos):
+        ratios = [get_val(t, algo, "ratio") for t in tensors_in_data]
+        offset = (ai - len(key_algos) / 2 + 0.5) * bar_h
+        bars = ax.barh(y + offset, ratios, bar_h * 0.9,
+                        label=algo_labels_map.get(algo, algo).replace("\n", " "),
+                        color=key_colors.get(algo, "#bdc3c7"),
+                        edgecolor="black", linewidth=0.4, alpha=0.85)
+        for bar, val in zip(bars, ratios):
+            ax.text(bar.get_width() + 0.005, bar.get_y() + bar.get_height() / 2,
+                    f"{val:.2f}x", va="center", fontsize=7)
+    ax.set_yticks(y)
+    ax.set_yticklabels([tensor_labels.get(t, t) for t in tensors_in_data], fontsize=10)
+    ax.set_xlabel("Compression Ratio", fontweight="bold")
+    ax.set_title("Compressibility by Tensor Type", fontweight="bold")
+    ax.axvline(x=1.0, color="gray", linestyle="--", alpha=0.3)
+    ax.legend(fontsize=8, loc="lower right")
+    ax.grid(axis="x", alpha=0.2, linestyle="--")
+
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    path = os.path.join(outdir, f"0_tensor_characterization_epoch{epoch:02d}.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved {path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Plot inline benchmark results")
     parser.add_argument("csv_path", help="Path to inline_benchmark.csv")
@@ -862,16 +1079,25 @@ def main():
     if all_chunk_rows:
         print(f"Loaded {len(all_chunk_rows)} chunk rows from {chunk_csv_path}")
 
-    # Derive chunk size from data (n_chunks > 0 rows)
+    # Derive chunk size from data: use max chunk size (first N-1 chunks are full-sized,
+    # only the last chunk may be smaller)
     _chunk_rows_with = [r for r in all_rows if r["n_chunks"] > 0]
     if _chunk_rows_with:
         _orig = _chunk_rows_with[0]["orig_bytes"]
         _nchunks = _chunk_rows_with[0]["n_chunks"]
-        chunk_mb = int(round(_orig / _nchunks / (1024 * 1024)))
+        if _nchunks > 1:
+            # Full chunk size = ceil(orig / n_chunks), rounded to nearest standard MB
+            _full_chunk = _orig / (_nchunks - 1) if _nchunks > 1 else _orig
+            chunk_mb = int(round(_full_chunk / (1024 * 1024)))
+        else:
+            chunk_mb = int(round(_orig / (1024 * 1024)))
+        # Snap to nearest standard chunk size (4, 8, 16, 32, 64)
+        standard_sizes = [4, 8, 16, 32, 64, 128]
+        chunk_mb = min(standard_sizes, key=lambda s: abs(s - chunk_mb))
     else:
         chunk_mb = 0
-    # Detect lossless vs lossy from directory name or data
-    _has_lossy = any("lossy" in str(r.get("mode", "")) for r in all_rows)
+    # Detect lossless vs lossy from mismatches or directory name
+    _has_lossy = any(r["mismatches"] > 0 for r in all_rows) or "lossy" in outdir.lower()
     _mode_tag = "lossy" if _has_lossy else "lossless"
 
     def generate_set(rows, chunk_rows, out, label):
@@ -886,10 +1112,15 @@ def main():
         fig5a_sgd_convergence(rows, out, subtitle=ctx)
         fig5b_sgd_exploration_firing(rows, out, subtitle=ctx)
         fig5c_mae_over_time(rows, out, subtitle=ctx)
+        fig5d_r2_over_time(rows, out, subtitle=ctx)
         fig6b_pipeline_waterfall(rows, out, args.epoch, subtitle=ctx)
         fig6c_gpu_breakdown(rows, out, args.epoch, subtitle=ctx)
         fig6d_pipeline_overhead(rows, out, args.epoch, subtitle=ctx)
         # fig7_epoch_evolution removed
+
+    # ── Top-level: cross-tensor characterization ──
+    _ctx = f"{chunk_mb}MB chunks | {_mode_tag}" if chunk_mb else ""
+    fig0_tensor_characterization(all_rows, outdir, subtitle=_ctx)
 
     # ── Per-tensor × per-policy split ──
     tensors_present = [t for t in TENSOR_ORDER if any(r["tensor"] == t for r in all_rows)]
