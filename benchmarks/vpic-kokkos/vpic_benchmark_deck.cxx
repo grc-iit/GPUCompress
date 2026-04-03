@@ -1484,7 +1484,10 @@ begin_diagnostics {
             /* File size for ratio + derived metrics */
             size_t file_sz = get_file_size(phases[pi].tmp_file);
             double ratio_t = (file_sz > 0) ? (double)nbytes_f / (double)file_sz : 1.0;
-            double bit_rate = (ratio_t > 0) ? 32.0 / ratio_t : 32.0;  /* bits per float32 value */
+            /* Bit rate: compressed bits per value (standard lossy metric).
+             * Computed directly as file_bits / n_values rather than 32/ratio
+             * to avoid HDF5 metadata skewing the ratio-derived value. */
+            double bit_rate = (n_floats > 0) ? (double)file_sz * 8.0 / (double)n_floats : 32.0;
 
             /* Collect per-chunk MAPE, timing breakdown, MAE/R² */
             int n_hist = gpucompress_get_chunk_history_count();

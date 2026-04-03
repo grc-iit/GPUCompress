@@ -167,6 +167,10 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/diagnostic/nn-diagnostic-bench
 endif()
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/sdrbench/generic-benchmark.cu")
     add_vol_demo(generic_benchmark       benchmarks/sdrbench/generic-benchmark.cu)
+    if(TARGET generic_benchmark AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/vpic-kokkos/vpic_psnr.cu")
+        target_sources(generic_benchmark PRIVATE benchmarks/vpic-kokkos/vpic_psnr.cu)
+        set_source_files_properties(benchmarks/vpic-kokkos/vpic_psnr.cu PROPERTIES LANGUAGE CUDA)
+    endif()
 endif()
 
 # ── Optional MPI linking for multi-GPU benchmark support ──

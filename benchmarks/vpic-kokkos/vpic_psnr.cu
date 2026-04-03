@@ -212,5 +212,8 @@ extern "C" double vpic_compute_quality_gpu(
     if (mse == 0.0 || data_range == 0.0)
         return 120.0;  // Perfect reconstruction or constant data
 
+    /* PSNR using R = data_range = max(original) - min(original).
+     * This is the HPC/scientific data convention (used by SZ, ZFP, etc.)
+     * For image data, R would be 255 (8-bit) or 65535 (16-bit). */
     return 10.0 * log10((data_range * data_range) / mse);
 }

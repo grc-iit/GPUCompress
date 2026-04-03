@@ -410,7 +410,7 @@ extern "C" gpucompress_algorithm_t gpucompress_algorithm_from_string(const char*
 
 extern "C" const char* gpucompress_error_string(gpucompress_error_t error) {
     int idx = -static_cast<int>(error);
-    if (idx >= 0 && idx <= 9) {
+    if (idx >= 0 && idx <= 8) {
         return ERROR_MESSAGES[idx];
     }
     return "Unknown error";

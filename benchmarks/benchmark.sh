@@ -282,6 +282,70 @@ echo "============================================================"
 echo ""
 fi  # end rank-0 banner
 
+# Write params.txt to a given eval directory
+write_parameters_txt() {
+    local DIR="$1"
+    local BENCH_TYPE="$2"
+    mkdir -p "$DIR"
+    cat > "$DIR/params.txt" <<PARAMS
+GPUCompress Benchmark Parameters
+================================
+Date:               $(date '+%Y-%m-%d %H:%M:%S')
+Benchmark:          ${BENCH_TYPE}
+Chunk size (MB):    ${CHUNK_MB}
+Timesteps:          ${TIMESTEPS}
+Phases:             ${PHASES}
+Policies:           ${POLICIES}
+Verify:             ${VERIFY}
+MPI ranks:          ${MPI_NP}
+GPUs per node:      ${GPUS_PER_NODE}
+
+NN Hyperparameters:
+  SGD_LR:           ${SGD_LR}
+  SGD_MAPE:         ${SGD_MAPE}
+  EXPLORE_K:        ${EXPLORE_K}
+  EXPLORE_THRESH:   ${EXPLORE_THRESH}
+PARAMS
+
+    case "$BENCH_TYPE" in
+        grayscott)
+            cat >> "$DIR/params.txt" <<PARAMS
+
+Gray-Scott:
+  L:                ${GS_L}
+  Data (MB):        ${GS_DATA}
+  Steps:            ${GS_STEPS}
+PARAMS
+            ;;
+        vpic)
+            cat >> "$DIR/params.txt" <<PARAMS
+
+VPIC:
+  NX:               ${VPIC_NX}
+  Data (MB):        ${VPIC_DATA}
+  NPPC:             ${VPIC_NPPC:-2}
+  MI_ME:            ${VPIC_MI_ME:-5}
+  WPE_WCE:          ${VPIC_WPE_WCE:-1}
+  TI_TE:            ${VPIC_TI_TE:-5}
+  Warmup steps:     ${VPIC_WARMUP_STEPS:-500}
+  Sim interval:     ${VPIC_SIM_INTERVAL:-190}
+  Perturbation:     ${VPIC_PERTURBATION:-0.1}
+  Guide field:      ${VPIC_GUIDE_FIELD:-0.0}
+PARAMS
+            ;;
+        ai_training)
+            cat >> "$DIR/params.txt" <<PARAMS
+
+AI Training:
+  Model:            ${AI_MODEL}
+  Dataset:          ${AI_DATASET}
+  Data dir:         ${AI_DATA_DIR}
+  Error bound:      ${AI_EB:-0.0}
+PARAMS
+            ;;
+    esac
+}
+
 IFS=',' read -ra BENCH_LIST <<< "$BENCHMARKS"
 
 for bench in "${BENCH_LIST[@]}"; do
@@ -294,6 +358,7 @@ for bench in "${BENCH_LIST[@]}"; do
             GS_BIN="$SCRIPT_DIR/../build/grayscott_benchmark_pm"
             GS_WEIGHTS="$SCRIPT_DIR/../neural_net/weights/model.nnwt"
             GS_EVAL_DIR="$SCRIPT_DIR/grayscott/results/eval_L${GS_L}_chunk${CHUNK_MB}mb_ts${TIMESTEPS}${_VERIFY_TAG}${_LOSSY_TAG}${VPIC_EVAL_SUFFIX:-}"
+            write_parameters_txt "$GS_EVAL_DIR" "grayscott"
 
             VERIFY_ARG=""
             [ "$VERIFY" = "0" ] && VERIFY_ARG="--no-verify"
@@ -465,6 +530,7 @@ for bench in "${BENCH_LIST[@]}"; do
             done
 
             VPIC_EVAL_DIR="$SCRIPT_DIR/vpic-kokkos/results/eval_NX${VPIC_NX}_chunk${CHUNK_MB}mb_ts${TIMESTEPS}${_VERIFY_TAG}${_LOSSY_TAG}${VPIC_EVAL_SUFFIX:-}"
+            write_parameters_txt "$VPIC_EVAL_DIR" "vpic"
 
             # Helper: build VPIC_EXCLUDE from a comma-separated list of phases to INCLUDE
             vpic_exclude_from() {
@@ -822,6 +888,7 @@ print(f'  Aggregate: {n_ranks} ranks, {len(phases)} phases -> $AGG_MULTI')
             EXPLORE_K=$EXPLORE_K \
             EXPLORE_THRESH=$EXPLORE_THRESH \
             VERIFY=$VERIFY \
+            ERROR_BOUND=${ERROR_BOUND:-0.0} \
             DEBUG_NN=$DEBUG_NN \
             MPI_NP=$MPI_NP \
             GPUS_PER_NODE=$GPUS_PER_NODE \
@@ -862,17 +929,35 @@ print(f'  Aggregate: {n_ranks} ranks, {len(phases)} phases -> $AGG_MULTI')
                 continue
             fi
 
-            # Auto-detect dims from first .f32 file
+            # Auto-detect file format (.f32 or .h5) and dims
             _FIRST_FILE=$(ls "$AI_DATA_DIR"/*.f32 2>/dev/null | head -1)
+            _AI_EXT=".f32"
             if [ -z "$_FIRST_FILE" ]; then
-                if [ "$MY_RANK" -eq 0 ]; then
-                echo "ERROR: No .f32 files in $AI_DATA_DIR"
-                fi
+                _FIRST_FILE=$(ls "$AI_DATA_DIR"/*.h5 2>/dev/null | head -1)
+                _AI_EXT=".h5"
+            fi
+            if [ -z "$_FIRST_FILE" ]; then
+                echo "ERROR: No .f32 or .h5 files in $AI_DATA_DIR"
                 continue
             fi
-            _FILE_BYTES=$(stat --printf="%s" "$_FIRST_FILE")
-            _N_FLOATS=$(( _FILE_BYTES / 4 ))
-            _N_FILES=$(ls "$AI_DATA_DIR"/*.f32 | wc -l)
+            if [ "$_AI_EXT" = ".h5" ]; then
+                # For .h5 files, get element count from HDF5 dataset
+                _N_FLOATS=$(python3 -c "
+import h5py, sys
+try:
+    f=h5py.File('$_FIRST_FILE','r'); print(f['data'].size); f.close()
+except: sys.exit(1)
+" 2>/dev/null)
+                if [ -z "$_N_FLOATS" ]; then
+                    echo "ERROR: Cannot read .h5 file (h5py required): $_FIRST_FILE"
+                    continue
+                fi
+                _FILE_BYTES=$(( _N_FLOATS * 4 ))
+            else
+                _FILE_BYTES=$(stat --printf="%s" "$_FIRST_FILE")
+                _N_FLOATS=$(( _FILE_BYTES / 4 ))
+            fi
+            _N_FILES=$(ls "$AI_DATA_DIR"/*${_AI_EXT} | wc -l)
             # Use 2D dims: find factor
             _DIM0=$(python3 -c "
 import math
@@ -910,7 +995,12 @@ print(s)
             VERIFY_ARG=""
             [ "$VERIFY" = "0" ] && VERIFY_ARG="--no-verify"
 
-            COMMON_ARGS="--data-dir $AI_DATA_DIR --dims $AI_DIMS --ext .f32 --chunk-mb $CHUNK_MB --name $AI_DIR_NAME"
+            # AI_ERROR_BOUND: error bound for lossy compression (default 0.0 = lossless)
+            AI_EB=${AI_ERROR_BOUND:-0.0}
+            EB_ARG=""
+            [ "$AI_EB" != "0.0" ] && [ "$AI_EB" != "0" ] && EB_ARG="--error-bound $AI_EB"
+            COMMON_ARGS="--data-dir $AI_DATA_DIR --dims $AI_DIMS --ext $_AI_EXT --chunk-mb $CHUNK_MB --name $AI_DIR_NAME $EB_ARG"
+            write_parameters_txt "$AI_EVAL_DIR" "ai_training"
 
             # ── Fixed phases (run once) ──
             if [ -n "$AI_FIXED_PHASES" ]; then

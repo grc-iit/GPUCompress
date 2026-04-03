@@ -180,6 +180,11 @@ typedef struct {
     /* Overlapping busy times (NOT additive with above) */
     double s2_busy_ms;    /* bottleneck worker wall time */
     double s3_busy_ms;    /* I/O write time (serial, accumulated) */
+    /* Quality metrics (lossy only — populated when error_bound > 0) */
+    double psnr_db;
+    double rmse;
+    double max_abs_err;
+    double bit_rate;
     /* Standard deviations (populated when --runs N > 1) */
     double write_ms_std;
     double read_ms_std;
@@ -187,6 +192,12 @@ typedef struct {
     double decomp_gbps_std;
     int    n_runs;
 } PhaseResult;
+
+/* Global error bound — set from main(), used by run_phase_* for PSNR */
+static double g_error_bound = 0.0;
+
+/* Global file extension — set from main(), used by load_field() */
+static const char *g_ext = ".f32";
 
 /* ============================================================
  * Timing
@@ -230,6 +241,13 @@ static void mkdirs(const char *path)
     }
     mkdir(tmp, 0755);
 }
+
+/* ============================================================
+ * PSNR / quality metrics (implemented in vpic_psnr.cu)
+ * ============================================================ */
+extern "C" double vpic_compute_quality_gpu(
+    const float* d_original, const float* d_decompressed, size_t n_floats,
+    double* out_rmse, double* out_max_err);
 
 /* ============================================================
  * GPU comparison kernel
@@ -292,6 +310,53 @@ static int load_field_to_gpu(const char *filepath, float *d_buf,
     cudaMemcpy(d_buf, h_buf, expected_bytes, cudaMemcpyHostToDevice);
     free(h_buf);
     return 0;
+}
+
+/* Forward declaration */
+static hid_t make_vol_fapl(void);
+
+/* ============================================================
+ * Load field from HDF5 file (VOL decompresses directly to GPU)
+ * ============================================================ */
+
+static int load_field_from_hdf5(const char *filepath, float *d_buf,
+                                 size_t expected_bytes)
+{
+    hid_t fapl = make_vol_fapl();
+    hid_t file = H5Fopen(filepath, H5F_ACC_RDONLY, fapl);
+    H5Pclose(fapl);
+    if (file < 0) {
+        fprintf(stderr, "ERROR: H5Fopen failed: %s\n", filepath);
+        return 1;
+    }
+    /* Try "data" first (from --hdf5-direct training), then "field" (from benchmark) */
+    hid_t dset = H5Dopen2(file, "data", H5P_DEFAULT);
+    if (dset < 0)
+        dset = H5Dopen2(file, "field", H5P_DEFAULT);
+    if (dset < 0) {
+        fprintf(stderr, "ERROR: H5Dopen2 failed (tried 'data' and 'field'): %s\n", filepath);
+        H5Fclose(file);
+        return 1;
+    }
+    herr_t rc = H5Dread(dset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL,
+                         H5P_DEFAULT, d_buf);
+    cudaDeviceSynchronize();
+    H5Dclose(dset);
+    H5Fclose(file);
+    if (rc < 0) {
+        fprintf(stderr, "ERROR: H5Dread failed: %s\n", filepath);
+        return 1;
+    }
+    return 0;
+}
+
+/* Dispatch: load from .f32 (raw) or .h5 (HDF5 VOL) based on extension */
+static int load_field(const char *filepath, float *d_buf,
+                      size_t expected_bytes, const char *ext)
+{
+    if (strcmp(ext, ".h5") == 0)
+        return load_field_from_hdf5(filepath, d_buf, expected_bytes);
+    return load_field_to_gpu(filepath, d_buf, expected_bytes);
 }
 
 /* ============================================================
@@ -564,6 +629,12 @@ static int run_phase_nocomp(float *d_data, float *d_read,
     r->n_runs     = 1;
     snprintf(r->phase, sizeof(r->phase), "no-comp");
 
+    if (g_error_bound > 0.0) {
+        r->psnr_db = vpic_compute_quality_gpu(d_data, d_read, n_floats,
+                                              &r->rmse, &r->max_abs_err);
+        r->bit_rate = (fbytes > 0) ? (double)(fbytes * 8) / (double)n_floats : 0.0;
+    }
+
     printf("[no-comp] ratio=%.2fx  write=%.0f MiB/s  read=%.0f MiB/s  mismatches=%llu\n",
            r->ratio, r->write_mbps, r->read_mbps, mm);
     return (mm == 0) ? 0 : 1;
@@ -677,6 +748,12 @@ static int run_phase_vol(float *d_data, float *d_read,
     r->n_runs     = 1;
     snprintf(r->phase, sizeof(r->phase), "%s", phase_name);
 
+    if (g_error_bound > 0.0) {
+        r->psnr_db = vpic_compute_quality_gpu(d_data, d_read, n_floats,
+                                              &r->rmse, &r->max_abs_err);
+        r->bit_rate = (fbytes > 0) ? (double)(fbytes * 8) / (double)n_floats : 0.0;
+    }
+
     collect_chunk_metrics(r);
 
     printf("[%s] ratio=%.2fx  write=%.0f MiB/s  read=%.0f MiB/s  "
@@ -771,11 +848,12 @@ static void run_phase_all_fields(
     int sum_sgd_fires = 0, sum_explorations = 0;
     double sum_mae_r = 0, sum_mae_c = 0, sum_mae_d = 0;
     double sum_mape_r = 0, sum_mape_c = 0, sum_mape_d = 0;
+    double agg_psnr = 0, agg_rmse = 0, agg_maxerr = 0, agg_bitrate = 0;
     int count = 0;
     int first_n_chunks = 0;
 
     for (int fi = 0; fi < n_fields; fi++) {
-        if (load_field_to_gpu(fields[fi], d_data, total_bytes)) {
+        if (load_field(fields[fi], d_data, total_bytes, g_ext)) {
             printf("  field %d: SKIP (load failed)\n", fi);
             continue;
         }
@@ -825,6 +903,10 @@ static void run_phase_all_fields(
         sum_mae_r        += fr.mae_ratio;
         sum_mae_c        += fr.mae_comp_ms;
         sum_mae_d        += fr.mae_decomp_ms;
+        agg_psnr         += fr.psnr_db;
+        agg_rmse         += fr.rmse;
+        agg_maxerr        = (fr.max_abs_err > agg_maxerr) ? fr.max_abs_err : agg_maxerr;
+        agg_bitrate      += fr.bit_rate;
         count++;
     }
 
@@ -863,6 +945,12 @@ static void run_phase_all_fields(
         out->mae_decomp_ms = sum_mae_d / count;
         out->n_runs       = count;
         out->n_chunks     = first_n_chunks;
+        if (g_error_bound > 0.0) {
+            out->psnr_db     = agg_psnr / count;
+            out->rmse        = agg_rmse / count;
+            out->max_abs_err = agg_maxerr;
+            out->bit_rate    = agg_bitrate / count;
+        }
 
         /* Compute std across fields (sample std, n-1) */
         int n = (count < MAX_F) ? count : MAX_F;
@@ -903,7 +991,8 @@ static void write_summary_csv(const char *dataset_name,
             "mae_ratio,mae_comp_ms,mae_decomp_ms,"
             "comp_gbps_std,decomp_gbps_std,"
             "vol_stage1_ms,vol_drain_ms,vol_io_drain_ms,"
-            "vol_s2_busy_ms,vol_s3_busy_ms\n");
+            "vol_s2_busy_ms,vol_s3_busy_ms,"
+            "psnr_db,rmse,max_abs_err,bit_rate\n");
 
     for (int i = 0; i < n_phases; i++) {
         PhaseResult *r = &results[i];
@@ -916,7 +1005,8 @@ static void write_summary_csv(const char *dataset_name,
                 "%.4f,%.4f,%.4f,"
                 "%.4f,%.4f,"
                 "%.2f,%.2f,%.2f,"
-                "%.2f,%.2f\n",
+                "%.2f,%.2f,"
+                "%.2f,%.6f,%.6f,%.4f\n",
                 g_mpi_rank, dataset_name, r->phase, r->n_runs,
                 r->write_ms, r->write_ms_std, r->read_ms, r->read_ms_std,
                 (double)r->file_bytes / (1 << 20),
@@ -930,7 +1020,8 @@ static void write_summary_csv(const char *dataset_name,
                 r->mae_ratio, r->mae_comp_ms, r->mae_decomp_ms,
                 r->comp_gbps_std, r->decomp_gbps_std,
                 r->stage1_ms, r->drain_ms, r->io_drain_ms,
-                r->s2_busy_ms, r->s3_busy_ms);
+                r->s2_busy_ms, r->s3_busy_ms,
+                r->psnr_db, r->rmse, r->max_abs_err, r->bit_rate);
     }
     fclose(f);
     printf("\nSummary CSV: %s\n", OUT_CSV);
@@ -1034,6 +1125,7 @@ int main(int argc, char **argv)
             }
         } else if (strcmp(argv[i], "--ext") == 0 && i + 1 < argc) {
             ext = argv[++i];
+            g_ext = ext;
         } else if (strcmp(argv[i], "--chunk-mb") == 0 && i + 1 < argc) {
             chunk_mb = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--runs") == 0 && i + 1 < argc) {
@@ -1072,6 +1164,7 @@ int main(int argc, char **argv)
             do_verify = 0;
         } else if (strcmp(argv[i], "--error-bound") == 0 && i + 1 < argc) {
             error_bound = atof(argv[++i]);
+            g_error_bound = error_bound;
         } else if (strcmp(argv[i], "--name") == 0 && i + 1 < argc) {
             name_override = argv[++i];
         }
@@ -1126,15 +1219,17 @@ int main(int argc, char **argv)
     size_t total_bytes = n_floats * sizeof(float);
     size_t expected_file_size = total_bytes;
 
-    /* Verify first file matches expected size */
-    size_t first_size = get_file_size(fields[0]);
-    if (first_size != expected_file_size) {
-        fprintf(stderr, "ERROR: %s is %zu bytes, expected %zu (dims=",
-                fields[0], first_size, expected_file_size);
-        for (int i = 0; i < ndims; i++)
-            fprintf(stderr, "%s%d", i ? "x" : "", dims[i]);
-        fprintf(stderr, " * 4 bytes)\n");
-        return 1;
+    /* Verify first file matches expected size (skip for .h5 — compressed on disk) */
+    if (strcmp(g_ext, ".h5") != 0) {
+        size_t first_size = get_file_size(fields[0]);
+        if (first_size != expected_file_size) {
+            fprintf(stderr, "ERROR: %s is %zu bytes, expected %zu (dims=",
+                    fields[0], first_size, expected_file_size);
+            for (int i = 0; i < ndims; i++)
+                fprintf(stderr, "%s%d", i ? "x" : "", dims[i]);
+            fprintf(stderr, " * 4 bytes)\n");
+            return 1;
+        }
     }
 
     /* ── Set up HDF5 dimensions and chunking ── */
@@ -1266,7 +1361,7 @@ int main(int argc, char **argv)
 
     /* ── Load first field ── */
     printf("Loading %s... ", fields[0]); fflush(stdout);
-    if (load_field_to_gpu(fields[0], d_data, total_bytes)) {
+    if (load_field(fields[0], d_data, total_bytes, g_ext)) {
         fprintf(stderr, "FATAL: cannot load first field\n");
         cudaFree(d_data); cudaFree(d_read); cudaFree(d_count);
         gpucompress_cleanup(); return 1;
@@ -1291,7 +1386,7 @@ int main(int argc, char **argv)
             size_t sum_fb = 0;
             int count = 0;
             for (int fi = 0; fi < n_fields; fi++) {
-                if (load_field_to_gpu(fields[fi], d_data, total_bytes)) continue;
+                if (load_field(fields[fi], d_data, total_bytes, g_ext)) continue;
                 PhaseResult fr;
                 run_phase_nocomp(d_data, d_read, d_count,
                                  n_floats, ndims, h5_dims, chunk_dims, &fr);
@@ -1465,7 +1560,8 @@ int main(int argc, char **argv)
                     "vol_stage1_ms,vol_drain_ms,vol_io_drain_ms,"
                     "vol_s2_busy_ms,vol_s3_busy_ms,"
                     "h5dwrite_ms,cuda_sync_ms,h5dclose_ms,h5fclose_ms,"
-                    "vol_setup_ms,vol_pipeline_ms\n");
+                    "vol_setup_ms,vol_pipeline_ms,"
+                    "psnr_db,rmse,max_abs_err,bit_rate\n");
         }
 
         /* Open timestep-chunks CSV for milestone fields */
@@ -1535,13 +1631,14 @@ int main(int argc, char **argv)
             double sum_nn_ms = 0, sum_stats_ms = 0, sum_preproc_ms = 0;
             double sum_comp_ms = 0, sum_decomp_ms = 0, sum_explore_ms = 0, sum_sgd_ms = 0;
             double sum_comp_gbps = 0, sum_decomp_gbps = 0;
+            double sum_psnr = 0, sum_rmse = 0, sum_maxerr = 0, sum_bitrate = 0;
             int    sum_sgd = 0, sum_expl = 0;
             size_t last_file_sz = 0;
             int n_steady = 0;
 
             for (int fi = 0; fi < n_fields; fi++) {
                 /* Load field to GPU */
-                if (load_field_to_gpu(fields[fi], d_data, total_bytes)) {
+                if (load_field(fields[fi], d_data, total_bytes, g_ext)) {
                     printf("  %-4d  SKIP (load failed)\n", fi);
                     continue;
                 }
@@ -1603,9 +1700,15 @@ int main(int argc, char **argv)
                 if (do_verify) {
                     mm = gpu_compare(d_data, d_read, n_floats, d_count);
                 }
+                double field_psnr = 0.0, field_rmse = 0.0, field_maxerr = 0.0;
+                if (g_error_bound > 0.0) {
+                    field_psnr = vpic_compute_quality_gpu(d_data, d_read, n_floats,
+                                                         &field_rmse, &field_maxerr);
+                }
                 size_t file_sz = get_file_size(TMP_NN_RL);
                 double ratio_t = (file_sz > 0) ? (double)total_bytes / (double)file_sz : 1.0;
                 double write_ms_t = tw1 - tw0;
+                double field_bitrate = (file_sz > 0) ? (double)(file_sz * 8) / (double)n_floats : 0.0;
 
                 /* Collect MAPE for this field */
                 PhaseResult field_r;
@@ -1643,6 +1746,10 @@ int main(int argc, char **argv)
                     sum_decomp_gbps += field_r.decomp_gbps;
                     sum_sgd    += field_r.sgd_fires;
                     sum_expl   += field_r.explorations;
+                    sum_psnr   += field_psnr;
+                    sum_rmse   += field_rmse;
+                    sum_maxerr  = (field_maxerr > sum_maxerr) ? field_maxerr : sum_maxerr;
+                    sum_bitrate += field_bitrate;
                 }
 
                 /* Extract just the filename */
@@ -1668,7 +1775,8 @@ int main(int argc, char **argv)
                             "%.3f,%.3f,%.3f,"
                             "%.3f,%.3f,"
                             "%.3f,%.3f,%.3f,%.3f,"
-                            "%.3f,%.3f\n",
+                            "%.3f,%.3f,"
+                            "%.2f,%.6f,%.6f,%.4f\n",
                             g_mpi_rank, phase_name, fi, fname,
                             write_ms_t, read_ms_t, ratio_t,
                             field_r.mape_ratio_pct, field_r.mape_comp_pct,
@@ -1681,7 +1789,8 @@ int main(int argc, char **argv)
                             vol_s1, vol_drain, vol_io_drain,
                             vol_s2_busy, vol_s3_busy,
                             h5dwrite_ms_t, cuda_sync_ms_t, h5dclose_ms_t, h5fclose_ms_t,
-                            vol_setup, vol_total);
+                            vol_setup, vol_total,
+                            field_psnr, field_rmse, field_maxerr, field_bitrate);
                 }
 
                 /* Write per-chunk detail at milestone fields */
@@ -1763,6 +1872,12 @@ int main(int argc, char **argv)
                 pr->decomp_gbps = sum_decomp_gbps / n_steady;
                 pr->sgd_fires   = sum_sgd;
                 pr->explorations = sum_expl;
+                if (g_error_bound > 0.0) {
+                    pr->psnr_db     = sum_psnr / n_steady;
+                    pr->rmse        = sum_rmse / n_steady;
+                    pr->max_abs_err = sum_maxerr;  /* max across fields, not average */
+                    pr->bit_rate    = sum_bitrate / n_steady;
+                }
 
                 /* Compute std across steady-state fields */
                 int ns = (n_steady < MAX_F) ? n_steady : MAX_F;

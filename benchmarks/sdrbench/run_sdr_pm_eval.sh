@@ -62,6 +62,7 @@ SGD_MAPE=${SGD_MAPE:-0.10}
 EXPLORE_K=${EXPLORE_K:-4}
 EXPLORE_THRESH=${EXPLORE_THRESH:-0.20}
 VERIFY=${VERIFY:-1}
+ERROR_BOUND=${ERROR_BOUND:-0.0}
 DATASET=${DATASET:-"nyx"}
 
 # ── Paths ──
@@ -103,7 +104,9 @@ POLICY_LABELS[speed]="speed_only_w1-1-0"
 # ── Eval directory ──
 _VERIFY_TAG=""
 [ "${VERIFY:-1}" = "0" ] && _VERIFY_TAG="_noverify"
-EVAL_NAME="eval_${DATASET}_chunk${CHUNK_MB}mb${_VERIFY_TAG}${VPIC_EVAL_SUFFIX:-}"
+_LOSSY_TAG=""
+[ "$ERROR_BOUND" != "0.0" ] && [ "$ERROR_BOUND" != "0" ] && _LOSSY_TAG="_lossy"
+EVAL_NAME="eval_${DATASET}_chunk${CHUNK_MB}mb${_VERIFY_TAG}${_LOSSY_TAG}${VPIC_EVAL_SUFFIX:-}"
 EVAL_DIR="$SCRIPT_DIR/results/$EVAL_NAME"
 
 # ── Write params.txt so we know how this eval was invoked ──
@@ -125,6 +128,7 @@ SGD_MAPE=$SGD_MAPE
 EXPLORE_K=$EXPLORE_K
 EXPLORE_THRESH=$EXPLORE_THRESH
 VERIFY=$VERIFY
+ERROR_BOUND=$ERROR_BOUND
 DEBUG_NN=$DEBUG_NN
 WEIGHTS=$WEIGHTS
 PARAMS_EOF
@@ -174,7 +178,9 @@ TOTAL=$(( ${#FIXED_PHASES[@]} + ${#NN_PHASES[@]} * ${#POLICY_LIST[@]} ))
 RUN_NUM=0
 
 # ── Common args ──
-COMMON_ARGS="--data-dir $DATA_DIR --dims $DIMS --ext $EXT --chunk-mb $CHUNK_MB"
+EB_ARG=""
+[ "$ERROR_BOUND" != "0.0" ] && [ "$ERROR_BOUND" != "0" ] && EB_ARG="--error-bound $ERROR_BOUND"
+COMMON_ARGS="--data-dir $DATA_DIR --dims $DIMS --ext $EXT --chunk-mb $CHUNK_MB $EB_ARG"
 VERIFY_ARG=""
 [ "$VERIFY" = "0" ] && VERIFY_ARG="--no-verify"
 

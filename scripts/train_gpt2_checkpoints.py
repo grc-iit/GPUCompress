@@ -95,6 +95,27 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gradient-accumulation", type=int, default=8,
                         help="Gradient accumulation steps (default: 8)")
+    parser.add_argument("--hdf5-direct", action="store_true",
+                        help="Write checkpoints directly from GPU via HDF5 VOL (no CPU roundtrip)")
+    parser.add_argument("--chunk-mb", type=int, default=4,
+                        help="HDF5 chunk size in MB for --hdf5-direct (default: 4)")
+    parser.add_argument("--error-bound", type=float, default=0.0,
+                        help="Lossy error bound for --hdf5-direct (default: 0.0 = lossless)")
+    parser.add_argument("--policy", type=str, default="balanced",
+                        choices=["balanced", "ratio", "speed"],
+                        help="NN cost model policy for --hdf5-direct (default: balanced)")
+    parser.add_argument("--benchmark", action="store_true",
+                        help="Benchmark all compression algorithms at each checkpoint (requires --hdf5-direct)")
+    parser.add_argument("--benchmark-configs", type=str, default=None,
+                        help="Multi-config benchmark: 'chunk_mb:error_bound:outdir,...'")
+    parser.add_argument("--sgd-lr", type=float, default=0.2,
+                        help="SGD learning rate for online NN updates (default: 0.2)")
+    parser.add_argument("--sgd-mape", type=float, default=0.10,
+                        help="MAPE threshold to trigger SGD update (default: 0.10)")
+    parser.add_argument("--explore-k", type=int, default=4,
+                        help="Number of exploration alternatives (default: 4)")
+    parser.add_argument("--explore-thresh", type=float, default=0.20,
+                        help="Cost error threshold for exploration (default: 0.20)")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -113,6 +134,21 @@ def main():
     os.makedirs(outdir, exist_ok=True)
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+
+    # ── HDF5 direct writer (optional) ──
+    hdf5_writer = None
+    if args.hdf5_direct:
+        from gpucompress_hdf5 import GPUCompressHDF5Writer, concat_and_pad_gpu
+        weights_path = os.path.join(project_dir, "neural_net", "weights", "model.nnwt")
+        if not os.path.exists(weights_path):
+            weights_path = None
+        hdf5_writer = GPUCompressHDF5Writer(
+            lib_dir=os.path.join(project_dir, "build"),
+            weights_path=weights_path,
+        )
+        hdf5_writer.init()
+        hdf5_writer.set_policy(args.policy)
+        print(f"  HDF5 direct write enabled (chunk={args.chunk_mb}MB, eb={args.error_bound}, policy={args.policy})")
 
     # ── Load model + tokenizer ──
     print("Loading GPT-2 Small...")
@@ -140,6 +176,36 @@ def main():
     print(f"  Block size  : {args.block_size}")
     print(f"  Output      : {outdir}")
     print()
+
+    # ── Inline full benchmark (optional) ──
+    inline_bench = None
+    bench_configs = []
+    if hdf5_writer is not None and (args.benchmark or args.benchmark_configs):
+        from gpucompress_hdf5 import InlineFullBenchmark
+        nn_weights = os.path.join(project_dir, "neural_net", "weights", "model.nnwt")
+
+        if args.benchmark_configs:
+            for cfg_str in args.benchmark_configs.split(","):
+                parts = cfg_str.strip().split(":")
+                if len(parts) != 3:
+                    continue
+                c_mb, c_eb, c_outdir = int(parts[0]), float(parts[1]), parts[2]
+                os.makedirs(c_outdir, exist_ok=True)
+                bench = InlineFullBenchmark(hdf5_writer, nn_weights, target_elements,
+                                           sgd_lr=args.sgd_lr, sgd_mape=args.sgd_mape,
+                                           explore_k=args.explore_k, explore_thresh=args.explore_thresh)
+                bench_configs.append({
+                    "chunk_mb": c_mb, "error_bound": c_eb, "outdir": c_outdir,
+                    "bench": bench, "bench_csv": None, "chunk_csv": None,
+                })
+            print(f"  Multi-config benchmark: {len(bench_configs)} configs × 15 algorithms")
+            print(f"  SGD: lr={args.sgd_lr}, mape={args.sgd_mape} | Explore: k={args.explore_k}, thresh={args.explore_thresh}")
+        else:
+            inline_bench = InlineFullBenchmark(hdf5_writer, nn_weights, target_elements,
+                                               sgd_lr=args.sgd_lr, sgd_mape=args.sgd_mape,
+                                               explore_k=args.explore_k, explore_thresh=args.explore_thresh)
+            print(f"  Inline benchmark: 15 configs (9 fixed + 6 NN)")
+            print(f"  SGD: lr={args.sgd_lr}, mape={args.sgd_mape} | Explore: k={args.explore_k}, thresh={args.explore_thresh}")
 
     # ── Load WikiText-2 ──
     print("Loading WikiText-2...")
@@ -184,6 +250,8 @@ def main():
     print("=" * 60)
 
     total_start = time.time()
+    bench_csv = None
+    chunk_csv = None
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -241,52 +309,118 @@ def main():
             print(f"\n  >>> Exporting checkpoint at epoch {epoch}...")
             export_start = time.time()
 
-            # 1. Weights
-            path = os.path.join(outdir, f"epoch{epoch:02d}_weights.f32")
-            sz = export_tensor_padded(list(model.parameters()), path, target_elements)
-            print(f"      epoch{epoch:02d}_weights.f32     {sz/1024/1024:.1f} MB")
+            # Helper: collect Adam state tensors
+            def _adam_tensors(key):
+                tensors = []
+                for group in optimizer.param_groups:
+                    for p in group["params"]:
+                        if p in optimizer.state and key in optimizer.state[p]:
+                            tensors.append(optimizer.state[p][key])
+                        else:
+                            tensors.append(torch.zeros_like(p))
+                return tensors
 
-            # 2. Adam first moment
-            m_tensors = []
-            for group in optimizer.param_groups:
-                for p in group["params"]:
-                    if p in optimizer.state and "exp_avg" in optimizer.state[p]:
-                        m_tensors.append(optimizer.state[p]["exp_avg"])
-                    else:
-                        m_tensors.append(torch.zeros_like(p))
-            path = os.path.join(outdir, f"epoch{epoch:02d}_adam_m.f32")
-            sz = export_tensor_padded(m_tensors, path, target_elements)
-            print(f"      epoch{epoch:02d}_adam_m.f32      {sz/1024/1024:.1f} MB")
-
-            # 3. Adam second moment
-            v_tensors = []
-            for group in optimizer.param_groups:
-                for p in group["params"]:
-                    if p in optimizer.state and "exp_avg_sq" in optimizer.state[p]:
-                        v_tensors.append(optimizer.state[p]["exp_avg_sq"])
-                    else:
-                        v_tensors.append(torch.zeros_like(p))
-            path = os.path.join(outdir, f"epoch{epoch:02d}_adam_v.f32")
-            sz = export_tensor_padded(v_tensors, path, target_elements)
-            print(f"      epoch{epoch:02d}_adam_v.f32      {sz/1024/1024:.1f} MB")
-
-            # 4. Gradients
+            # Compute gradients for this checkpoint
             model.train()
             optimizer.zero_grad()
             input_ids, labels = next(iter(train_loader))
             input_ids, labels = input_ids.to(device), labels.to(device)
             outputs = model(input_ids, labels=labels)
             outputs.loss.backward()
+            grad_tensors = [p.grad if p.grad is not None else torch.zeros_like(p)
+                            for p in model.parameters()]
 
-            grad_tensors = []
-            for p in model.parameters():
-                if p.grad is not None:
-                    grad_tensors.append(p.grad)
+            # Export 4 tensor types
+            tensor_sets = [
+                ("weights",   list(model.parameters())),
+                ("adam_m",    _adam_tensors("exp_avg")),
+                ("adam_v",    _adam_tensors("exp_avg_sq")),
+                ("gradients", grad_tensors),
+            ]
+
+            CSV_HEADER = ("epoch,tensor,algorithm,policy,mode,ratio,"
+                         "write_ms,read_ms,write_mbps,read_mbps,"
+                         "file_bytes,orig_bytes,mismatches,"
+                         "n_chunks,sgd_fires,explorations,"
+                         "mape_ratio_pct,mape_comp_pct,mape_decomp_pct,"
+                         "mae_ratio,mae_comp_ms,mae_decomp_ms,"
+                         "nn_ms,stats_ms,preproc_ms,comp_ms,decomp_ms,"
+                         "explore_ms,sgd_ms,"
+                         "stage1_ms,drain_ms,io_drain_ms,pipeline_ms,"
+                         "s2_busy_ms,s3_busy_ms\n")
+            CHUNK_CSV_HEADER = ("epoch,tensor,algorithm,policy,mode,"
+                                "chunk_idx,action,actual_ratio,predicted_ratio,"
+                                "comp_ms,predicted_comp_time,"
+                                "decomp_ms,predicted_decomp_time,"
+                                "sgd_fired,exploration_triggered\n")
+
+            if inline_bench is not None and bench_csv is None:
+                bench_csv = open(os.path.join(outdir, "inline_benchmark.csv"), "w")
+                bench_csv.write(CSV_HEADER)
+                chunk_csv = open(os.path.join(outdir, "inline_benchmark_chunks.csv"), "w")
+                chunk_csv.write(CHUNK_CSV_HEADER)
+
+            if bench_configs:
+                for bc in bench_configs:
+                    if bc["bench_csv"] is None:
+                        bc["bench_csv"] = open(os.path.join(bc["outdir"], "inline_benchmark.csv"), "w")
+                        bc["bench_csv"].write(CSV_HEADER)
+                        bc["chunk_csv"] = open(os.path.join(bc["outdir"], "inline_benchmark_chunks.csv"), "w")
+                        bc["chunk_csv"].write(CHUNK_CSV_HEADER)
+
+            for name, tensors in tensor_sets:
+                flat = concat_and_pad_gpu(tensors, target_elements)
+
+                if bench_configs:
+                    for bc in bench_configs:
+                        mode_label = "lossless" if bc["error_bound"] == 0.0 else f"lossy(eb={bc['error_bound']})"
+                        print(f"      [{bc['chunk_mb']}MB {mode_label}]")
+                        bc["bench"].run_checkpoint(
+                            hdf5_writer, flat, target_elements,
+                            epoch, name, bc["outdir"],
+                            chunk_elements=bc["chunk_mb"] * 1024 * 1024 // 4,
+                            error_bound=bc["error_bound"],
+                            csv_file=bc["bench_csv"],
+                            chunk_csv_file=bc["chunk_csv"],
+                        )
+                    h5_path = os.path.join(outdir, f"epoch{epoch:02d}_{name}.h5")
+                    hdf5_writer.write_gpu_tensor(
+                        flat.data_ptr(), target_elements, h5_path, "data",
+                        chunk_elements=args.chunk_mb * 1024 * 1024 // 4,
+                        error_bound=args.error_bound,
+                    )
+                elif inline_bench is not None:
+                    inline_bench.run_checkpoint(
+                        hdf5_writer, flat, target_elements,
+                        epoch, name, outdir,
+                        chunk_elements=args.chunk_mb * 1024 * 1024 // 4,
+                        error_bound=args.error_bound,
+                        csv_file=bench_csv,
+                        chunk_csv_file=chunk_csv,
+                    )
+                    h5_path = os.path.join(outdir, f"epoch{epoch:02d}_{name}.h5")
+                    hdf5_writer.write_gpu_tensor(
+                        flat.data_ptr(), target_elements, h5_path, "data",
+                        chunk_elements=args.chunk_mb * 1024 * 1024 // 4,
+                        error_bound=args.error_bound,
+                    )
+                elif hdf5_writer is not None:
+                    h5_path = os.path.join(outdir, f"epoch{epoch:02d}_{name}.h5")
+                    hdf5_writer.write_gpu_tensor(
+                        flat.data_ptr(), target_elements, h5_path, "data",
+                        chunk_elements=args.chunk_mb * 1024 * 1024 // 4,
+                        error_bound=args.error_bound,
+                    )
+                    sz = os.path.getsize(h5_path)
+                    print(f"      epoch{epoch:02d}_{name}.h5  {sz/1024/1024:>7.1f} MB")
                 else:
-                    grad_tensors.append(torch.zeros_like(p))
-            path = os.path.join(outdir, f"epoch{epoch:02d}_gradients.f32")
-            sz = export_tensor_padded(grad_tensors, path, target_elements)
-            print(f"      epoch{epoch:02d}_gradients.f32   {sz/1024/1024:.1f} MB")
+                    f32_path = os.path.join(outdir, f"epoch{epoch:02d}_{name}.f32")
+                    export_tensor_padded(tensors, f32_path, target_elements)
+                    sz = os.path.getsize(f32_path)
+                    print(f"      epoch{epoch:02d}_{name}.f32  {sz/1024/1024:>7.1f} MB")
+
+                del flat
+                torch.cuda.empty_cache()
 
             optimizer.zero_grad()
             export_time = time.time() - export_start
@@ -294,7 +428,38 @@ def main():
 
     total_time = time.time() - total_start
 
+    # ── Cleanup ──
+    if bench_csv is not None:
+        bench_csv.close()
+    if chunk_csv is not None:
+        chunk_csv.close()
+    for bc in bench_configs:
+        if bc.get("bench_csv"):
+            bc["bench_csv"].close()
+        if bc.get("chunk_csv"):
+            bc["chunk_csv"].close()
+    if hdf5_writer is not None:
+        hdf5_writer.cleanup()
+
+    # ── Auto-generate plots ──
+    plot_dirs = []
+    if bench_csv is not None:
+        plot_dirs.append(outdir)
+    for bc in bench_configs:
+        plot_dirs.append(bc["outdir"])
+    for pdir in plot_dirs:
+        csv_path = os.path.join(pdir, "inline_benchmark.csv")
+        if os.path.exists(csv_path):
+            print(f"\n  Generating plots for {os.path.basename(pdir)}...")
+            try:
+                from plot_inline_benchmark import main as plot_main
+                sys.argv = ["plot_inline_benchmark.py", csv_path]
+                plot_main()
+            except Exception as e:
+                print(f"    Plot generation failed: {e}")
+
     # ── Write metadata ──
+    _ext = ".h5" if args.hdf5_direct else ".f32"
     dims_str = f"{d0},{d1}"
     meta_path = os.path.join(outdir, "README.txt")
     with open(meta_path, "w") as f:
@@ -308,14 +473,14 @@ def main():
         f.write(f"Dims for benchmark: --dims {dims_str}\n\n")
         f.write(f"Files:\n")
         for fname in sorted(os.listdir(outdir)):
-            if fname.endswith(".f32"):
+            if fname.endswith(_ext):
                 fsize = os.path.getsize(os.path.join(outdir, fname))
                 f.write(f"  {fname:40s} {fsize/1024/1024:>8.1f} MB\n")
 
     # ── Summary ──
-    n_files = len([f for f in os.listdir(outdir) if f.endswith(".f32")])
+    n_files = len([f for f in os.listdir(outdir) if f.endswith(_ext)])
     total_disk = sum(os.path.getsize(os.path.join(outdir, f))
-                     for f in os.listdir(outdir) if f.endswith(".f32"))
+                     for f in os.listdir(outdir) if f.endswith(_ext))
 
     print()
     print("=" * 60)
@@ -324,7 +489,7 @@ def main():
     print(f"  Model         : GPT-2 Small ({n_params:,} params)")
     print(f"  Training time : {total_time:.0f}s ({total_time/60:.1f} min)")
     print(f"  Final val_ppl : {val_ppl:.1f}")
-    print(f"  Files         : {n_files} .f32 files")
+    print(f"  Files         : {n_files} {_ext} files")
     print(f"  Total disk    : {total_disk/1024/1024/1024:.1f} GB")
     print(f"  Dims          : --dims {dims_str}")
     print(f"  Output        : {outdir}")
@@ -336,3 +501,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
