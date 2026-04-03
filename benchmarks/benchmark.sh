@@ -139,6 +139,10 @@ VERIFY=${VERIFY:-1}
 # Tag for directory naming: _noverify when VERIFY=0, empty when VERIFY=1
 _VERIFY_TAG=""
 [ "$VERIFY" = "0" ] && _VERIFY_TAG="_noverify"
+_LOSSY_TAG=""
+if [ "${VPIC_ERROR_BOUND:-0}" != "0" ] && [ "${VPIC_ERROR_BOUND:-0}" != "0.0" ]; then
+    _LOSSY_TAG="_lossy${VPIC_ERROR_BOUND}"
+fi
 POLICIES=${POLICIES:-"balanced,ratio,speed"}
 PHASES=${PHASES:-"no-comp,lz4,snappy,deflate,gdeflate,zstd,ans,cascaded,bitcomp,nn,nn-rl,nn-rl+exp50"}
 DEBUG_NN=${DEBUG_NN:-0}
@@ -191,11 +195,20 @@ mpi_launch() {
             "$@"
             ;;
         srun)
-            # SLURM: srun handles rank-to-GPU binding natively with --gpus-per-task
-            srun --ntasks="$MPI_NP" \
-                 --gpus-per-task=1 \
-                 --kill-on-bad-exit=1 \
-                 "$@"
+            # SLURM: use pre-built hostfile from SLURM_HOSTFILE if available
+            if [ -n "$SLURM_HOSTFILE" ] && [ -f "$SLURM_HOSTFILE" ]; then
+                srun --ntasks="$MPI_NP" \
+                     --gpus-per-task=1 \
+                     --ntasks-per-node="$GPUS_PER_NODE" \
+                     --kill-on-bad-exit=1 \
+                     --distribution=arbitrary \
+                     "$@"
+            else
+                srun --ntasks="$MPI_NP" \
+                     --gpus-per-task=1 \
+                     --kill-on-bad-exit=1 \
+                     "$@"
+            fi
             ;;
         mpirun)
             # Non-SLURM: manual CUDA_VISIBLE_DEVICES mapping per rank
@@ -280,7 +293,7 @@ for bench in "${BENCH_LIST[@]}"; do
 
             GS_BIN="$SCRIPT_DIR/../build/grayscott_benchmark_pm"
             GS_WEIGHTS="$SCRIPT_DIR/../neural_net/weights/model.nnwt"
-            GS_EVAL_DIR="$SCRIPT_DIR/grayscott/results/eval_L${GS_L}_chunk${CHUNK_MB}mb_ts${TIMESTEPS}${_VERIFY_TAG}${VPIC_EVAL_SUFFIX:-}"
+            GS_EVAL_DIR="$SCRIPT_DIR/grayscott/results/eval_L${GS_L}_chunk${CHUNK_MB}mb_ts${TIMESTEPS}${_VERIFY_TAG}${_LOSSY_TAG}${VPIC_EVAL_SUFFIX:-}"
 
             VERIFY_ARG=""
             [ "$VERIFY" = "0" ] && VERIFY_ARG="--no-verify"
@@ -412,9 +425,10 @@ for bench in "${BENCH_LIST[@]}"; do
                         done
                     fi
 
-                    GS_DIR="$GS_NN_DIR" \
-                    python3 "$SCRIPT_DIR/plots/generate_dataset_figures.py" \
-                        --dataset gray_scott --policy "$LABEL" 2>&1 | grep -E "Generated"
+                    timeout 60 bash -c "GS_DIR='$GS_NN_DIR' \
+                    python3 '$SCRIPT_DIR/plots/generate_dataset_figures.py' \
+                        --dataset gray_scott --policy '$LABEL' 2>&1 | grep -E 'Generated'" \
+                    || echo "  [$LABEL] Plot generation skipped (timeout or matplotlib unavailable)"
                     echo ""
                     fi  # end rank-0 GS post-processing
                 done
@@ -450,7 +464,7 @@ for bench in "${BENCH_LIST[@]}"; do
                 esac
             done
 
-            VPIC_EVAL_DIR="$SCRIPT_DIR/vpic-kokkos/results/eval_NX${VPIC_NX}_chunk${CHUNK_MB}mb_ts${TIMESTEPS}${_VERIFY_TAG}${VPIC_EVAL_SUFFIX:-}"
+            VPIC_EVAL_DIR="$SCRIPT_DIR/vpic-kokkos/results/eval_NX${VPIC_NX}_chunk${CHUNK_MB}mb_ts${TIMESTEPS}${_VERIFY_TAG}${_LOSSY_TAG}${VPIC_EVAL_SUFFIX:-}"
 
             # Helper: build VPIC_EXCLUDE from a comma-separated list of phases to INCLUDE
             vpic_exclude_from() {
@@ -562,14 +576,18 @@ for bench in "${BENCH_LIST[@]}"; do
                     DST="$POL_DIR/$csv_name"
 
                     # Header + fixed rows (no "/" in phase) + this policy's NN rows (strip suffix)
-                    # Phase is in column $2 (after rank column)
+                    # Phase column: $2 for timesteps/chunks (rank,$2,...), $1 for ranking (phase,$2,...)
+                    local _phase_col=2
+                    case "$csv_base" in
+                        *ranking*) _phase_col=1 ;;
+                    esac
                     head -1 "$SRC" > "$DST"
-                    tail -n+2 "$SRC" | awk -F',' -v pol="/$pol" '{
-                        phase=$2;
+                    tail -n+2 "$SRC" | awk -F',' -v pol="/$pol" -v pc="$_phase_col" '{
+                        phase=$pc;
                         if (index(phase, "/") == 0) print;
                         else if (index(phase, pol) > 0) {
                             sub(pol, "", phase);
-                            $2 = phase;
+                            $pc = phase;
                             print;
                         }
                     }' OFS=',' >> "$DST"
@@ -682,10 +700,11 @@ with open('$AGG_CSV','w') as f:
 
                 echo "  [$LABEL] Split CSVs → $POL_DIR/"
 
-                # Generate plots for this policy
-                VPIC_DIR="$POL_DIR" \
-                python3 "$SCRIPT_DIR/plots/generate_dataset_figures.py" \
-                    --dataset vpic --policy "$LABEL" 2>&1 | grep -E "Generated"
+                # Generate plots for this policy (timeout 60s to avoid matplotlib hangs)
+                timeout 60 bash -c "VPIC_DIR='$POL_DIR' \
+                python3 '$SCRIPT_DIR/plots/generate_dataset_figures.py' \
+                    --dataset vpic --policy '$LABEL' 2>&1 | grep -E 'Generated'" \
+                || echo "  [$LABEL] Plot generation skipped (timeout or matplotlib unavailable)"
             done
 
             # ── Multi-rank aggregate throughput summary ──
@@ -887,7 +906,7 @@ print(s)
                 esac
             done
 
-            AI_EVAL_DIR="$SCRIPT_DIR/ai_training/results/eval_${AI_DIR_NAME}_chunk${CHUNK_MB}mb${_VERIFY_TAG}${VPIC_EVAL_SUFFIX:-}"
+            AI_EVAL_DIR="$SCRIPT_DIR/ai_training/results/eval_${AI_DIR_NAME}_chunk${CHUNK_MB}mb${_VERIFY_TAG}${_LOSSY_TAG}${VPIC_EVAL_SUFFIX:-}"
             VERIFY_ARG=""
             [ "$VERIFY" = "0" ] && VERIFY_ARG="--no-verify"
 
@@ -978,11 +997,12 @@ print(s)
                         done
                     fi
 
-                    # Generate plots
-                    AI_DIR="$AI_EVAL_DIR" AI_CHUNK="$CHUNK_MB" \
-                    AI_MODEL="$_AI_SHORT" AI_DATASET="$AI_DATASET" \
-                    python3 "$SCRIPT_DIR/plots/generate_dataset_figures.py" \
-                        --dataset "$AI_DIR_NAME" --policy "$LABEL" 2>&1 | grep -E "Generated"
+                    # Generate plots (timeout 60s to avoid matplotlib hangs)
+                    timeout 60 bash -c "AI_DIR='$AI_EVAL_DIR' AI_CHUNK='$CHUNK_MB' \
+                    AI_MODEL='$_AI_SHORT' AI_DATASET='$AI_DATASET' \
+                    python3 '$SCRIPT_DIR/plots/generate_dataset_figures.py' \
+                        --dataset '$AI_DIR_NAME' --policy '$LABEL' 2>&1 | grep -E 'Generated'" \
+                    || echo "  [$LABEL] Plot generation skipped (timeout or matplotlib unavailable)"
                     echo ""
                     fi  # end rank-0 AI post-processing
                 done

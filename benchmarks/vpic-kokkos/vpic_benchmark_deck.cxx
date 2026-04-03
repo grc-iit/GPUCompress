@@ -567,8 +567,8 @@ begin_initialization {
     clean_div_e_interval = 0;
     clean_div_b_interval = 0;
     // Single-process needs only 1 comm round (default 3 in vpic.cc).
-    // Saves 2/3 of boundary_p CPU-serial processing per step.
-    num_comm_round = 1;
+    // Multi-rank runs need 3 rounds for particles crossing multiple boundaries.
+    num_comm_round = (nproc() <= 1) ? 1 : 3;
 
     global->sim_steps       = warmup;
     global->timesteps       = timesteps;
@@ -696,18 +696,23 @@ begin_initialization {
     global->h_read    = NULL;
 
     const char* weights_path = getenv("GPUCOMPRESS_WEIGHTS");
+    fprintf(stderr, "[rank %d] gpucompress_init(weights=%s) ...\n", rank(), weights_path ? weights_path : "(null)");
     gpucompress_error_t gerr = gpucompress_init(weights_path);
     if (gerr != GPUCOMPRESS_SUCCESS) {
+        fprintf(stderr, "[rank %d] FATAL: gpucompress_init failed (err=%d)\n", rank(), (int)gerr);
         sim_log("FATAL: gpucompress_init failed (" << gerr << ")");
         return;
     }
+    fprintf(stderr, "[rank %d] gpucompress_init OK\n", rank());
 
     if (weights_path && !gpucompress_nn_is_loaded()) {
+        fprintf(stderr, "[rank %d] WARNING: NN weights not loaded from %s\n", rank(), weights_path);
         sim_log("WARNING: NN weights not loaded from " << weights_path);
     }
 
     H5Z_gpucompress_register();
     global->vol_id = H5VL_gpucompress_register();
+    fprintf(stderr, "[rank %d] HDF5 VOL registered (vol_id=%ld)\n", rank(), (long)global->vol_id);
 
     hid_t native_id = H5VLget_connector_id_by_name("native");
     global->vol_fapl = H5Pcreate(H5P_FILE_ACCESS);
@@ -781,7 +786,15 @@ begin_initialization {
 // ============================================================
 begin_diagnostics {
     if (global->benchmark_done) return;
-    if (!global->gpucompress_ready) return;
+    if (!global->gpucompress_ready) {
+        static int warn_count = 0;
+        if (warn_count < 3) {
+            fprintf(stderr, "[rank %d] begin_diagnostics: gpucompress_ready=0, skipping (step=%d)\n",
+                    rank(), (int)step());
+            warn_count++;
+        }
+        return;
+    }
 
     /* Weight fingerprints for cross-timestep verification (VPIC_VERIFY_WEIGHTS=1) */
     static float wt_fingerprints[3 * 3][3]; /* 3 policies × 3 NN base phases */
@@ -1102,6 +1115,8 @@ begin_diagnostics {
 
         // Open CSV on first timestep
         if (global->ts_count == 0) {
+            fprintf(stderr, "[rank %d] Entering benchmark loop (timesteps=%d, step=%d)\n",
+                    rank(), global->timesteps, (int)step());
             printf("\n══════════════════════════════════════════════════════════════\n");
             printf("  Multi-timestep mode: %d timesteps, nn-rl (SGD active)\n",
                    global->timesteps);
@@ -1109,6 +1124,8 @@ begin_diagnostics {
             printf("══════════════════════════════════════════════════════════════\n\n");
 
             global->ts_csv = fopen(TSTEP_CSV, "w");
+            fprintf(stderr, "[rank %d] fopen(%s) = %s\n", rank(), TSTEP_CSV,
+                    global->ts_csv ? "OK" : "FAILED");
             if (global->ts_csv) {
                 fprintf(global->ts_csv, "rank,phase,timestep,sim_step,write_ms,read_ms,ratio,"
                         "mape_ratio,mape_comp,mape_decomp,"
@@ -1567,6 +1584,10 @@ begin_diagnostics {
             }
 
             if (global->ts_csv) {
+                static int csv_write_count = 0;
+                if (csv_write_count < 3)
+                    fprintf(stderr, "[rank %d] Writing CSV row: phase=%s t=%d\n", rank(), display_name, t);
+                csv_write_count++;
                 fprintf(global->ts_csv,
                         "%d,%s,%d,%d,%.2f,%.2f,%.4f,%.2f,%.2f,%.2f,%d,%d,%d,%llu,%.1f,%.1f,"
                         "%zu,%.2f,"

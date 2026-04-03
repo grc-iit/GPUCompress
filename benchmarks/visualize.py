@@ -528,6 +528,9 @@ def make_timestep_figure(ts_csv_path, output_path):
         print(f"  No timestep data in {ts_csv_path}, skipping.")
         return
 
+    # Aggregate across ranks: average per (phase, timestep)
+    rows = _aggregate_timesteps_across_ranks(rows)
+
     # Detect whether this is timestep-based or field-based data
     has_field_idx = "field_idx" in rows[0] if rows else False
     has_field_name = "field_name" in rows[0] if rows else False
@@ -628,6 +631,9 @@ def make_mae_figure(ts_csv_path, output_path):
         print(f"  No timestep data in {ts_csv_path}, skipping MAE plot.")
         return
 
+    # Aggregate across ranks: average per (phase, timestep)
+    rows = _aggregate_timesteps_across_ranks(rows)
+
     # Check that MAE columns exist
     if "mae_ratio" not in rows[0]:
         print(f"  No MAE columns in {ts_csv_path}, skipping MAE plot.")
@@ -704,6 +710,9 @@ def make_psnr_figure(ts_csv_path, output_path):
     rows = parse_csv(ts_csv_path)
     if not rows:
         return
+
+    # Aggregate across ranks: average per (phase, timestep)
+    rows = _aggregate_timesteps_across_ranks(rows)
 
     if "psnr_db" not in rows[0]:
         return
@@ -791,6 +800,9 @@ def make_lossy_quality_figure(ts_csv_path, output_path):
     rows = parse_csv(ts_csv_path)
     if not rows:
         return
+
+    # Aggregate across ranks: average per (phase, timestep)
+    rows = _aggregate_timesteps_across_ranks(rows)
 
     # Check if lossy metrics exist and have nonzero values
     has_rmse = "rmse" in rows[0]
@@ -950,6 +962,9 @@ def make_sgd_exploration_figure(ts_csv_path, output_path):
         print(f"  No timestep data in {ts_csv_path}, skipping SGD/EXP plot.")
         return
 
+    # Aggregate across ranks: sum counts, average metrics per (phase, timestep)
+    rows = _aggregate_timesteps_across_ranks(rows)
+
     # Detect field-based vs timestep-based data
     is_field_based = "field_idx" in rows[0] and "timestep" not in rows[0]
     x_label = "Field" if is_field_based else "Timestep"
@@ -1040,6 +1055,9 @@ def make_timestep_chunks_figure(tc_csv_path, output_path, phase_filter="nn-rl"):
     if not all_rows:
         print(f"  No timestep chunk data in {tc_csv_path}, skipping.")
         return
+
+    # Aggregate across ranks: mode for action, mean for numerics
+    all_rows = _aggregate_chunks_across_ranks(all_rows)
 
     # Filter by phase if column exists
     has_phase = "phase" in all_rows[0]
@@ -1539,6 +1557,96 @@ def make_chunk_actions_figure(chunk_csv_path, output_path):
     print(f"  Saved: {output_path}")
 
 
+def _aggregate_chunks_across_ranks(rows):
+    """Aggregate chunk-level rows across ranks: mode for action, mean for numerics.
+
+    Groups by (phase, timestep, chunk) and returns one row per group.
+    """
+    from collections import Counter, defaultdict
+    groups = defaultdict(list)
+    for r in rows:
+        key = (r.get("phase", ""), r.get("timestep", "0"), r.get("chunk", "0"))
+        groups[key].append(r)
+
+    result = []
+    for (phase, ts, chunk), rank_rows in sorted(groups.items(),
+            key=lambda x: (x[0][0], int(x[0][1]), int(x[0][2]))):
+        agg = dict(rank_rows[0])  # copy first row as template
+        agg["rank"] = "-1"  # aggregated
+        # Mode for action columns
+        for col in ("action", "action_orig", "action_final"):
+            vals = [r.get(col, "") for r in rank_rows if r.get(col, "")]
+            if vals:
+                agg[col] = Counter(vals).most_common(1)[0][0]
+        # Average for numeric columns
+        numeric_cols = [
+            "predicted_ratio", "actual_ratio", "predicted_comp_ms",
+            "actual_comp_ms_raw", "predicted_decomp_ms", "actual_decomp_ms_raw",
+            "predicted_psnr_db", "actual_psnr_db", "mape_ratio", "mape_comp",
+            "mape_decomp", "mape_psnr", "cost_model_error_pct", "actual_cost",
+            "predicted_cost", "feat_entropy", "feat_mad", "feat_deriv",
+        ]
+        for col in numeric_cols:
+            vals = []
+            for r in rank_rows:
+                try:
+                    vals.append(float(r.get(col, 0)))
+                except (ValueError, TypeError):
+                    pass
+            if vals:
+                agg[col] = sum(vals) / len(vals)
+        # Sum for count columns
+        for col in ("sgd_fired", "exploration_triggered"):
+            vals = []
+            for r in rank_rows:
+                try:
+                    vals.append(int(float(r.get(col, 0))))
+                except (ValueError, TypeError):
+                    pass
+            if vals:
+                agg[col] = sum(vals)
+        result.append(agg)
+    return result
+
+
+def _aggregate_timesteps_across_ranks(rows):
+    """Aggregate timestep-level rows across ranks: mean for all numeric columns.
+
+    Groups by (phase, timestep) and returns one averaged row per group.
+    """
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for r in rows:
+        ts_key = r.get("timestep", r.get("field_idx", "0"))
+        key = (r.get("phase", ""), ts_key)
+        groups[key].append(r)
+
+    result = []
+    for (phase, ts), rank_rows in sorted(groups.items(),
+            key=lambda x: (x[0][0], int(x[0][1]))):
+        agg = dict(rank_rows[0])  # copy first row as template
+        agg["rank"] = "-1"  # aggregated
+        # Average/sum all numeric columns
+        for col in rank_rows[0].keys():
+            if col in ("rank", "phase", "timestep", "field_idx", "field_name",
+                        "sim_step"):
+                continue
+            vals = []
+            for r in rank_rows:
+                try:
+                    vals.append(float(r.get(col, 0)))
+                except (ValueError, TypeError):
+                    pass
+            if vals:
+                # n_chunks is the same across ranks, keep as-is; average everything else
+                if col == "n_chunks":
+                    agg[col] = vals[0]
+                else:
+                    agg[col] = sum(vals) / len(vals)
+        result.append(agg)
+    return result
+
+
 def make_milestone_actions_figure(tc_csv_path, output_path, chunk_csv_path=None):
     """Plot NN config selection per chunk at each milestone timestep.
 
@@ -1553,6 +1661,9 @@ def make_milestone_actions_figure(tc_csv_path, output_path, chunk_csv_path=None)
     if not all_rows:
         print(f"  No data in {tc_csv_path}, skipping milestone actions.")
         return
+
+    # Aggregate across ranks: mode for action, mean for numerics
+    all_rows = _aggregate_chunks_across_ranks(all_rows)
 
     # Group by (phase, timestep)
     by_phase_ts = {}
@@ -1569,6 +1680,7 @@ def make_milestone_actions_figure(tc_csv_path, output_path, chunk_csv_path=None)
             chunk_rows = parse_csv(chunk_csv_path)
             nn_chunks = [r for r in chunk_rows if r.get("phase", "") == "nn"]
             if nn_chunks:
+                nn_chunks = _aggregate_chunks_across_ranks(nn_chunks)
                 nn_chunks.sort(key=lambda r: int(g(r, "chunk")))
                 nn_ref_strip = [_config_to_idx(
                     r.get("action_final", r.get("action", "none")))
@@ -1919,6 +2031,9 @@ def make_pipeline_waterfall(ts_csv_path, output_path):
     if not all_rows or "vol_setup_ms" not in all_rows[0]:
         return
 
+    # Aggregate across ranks: average per (phase, timestep)
+    all_rows = _aggregate_timesteps_across_ranks(all_rows)
+
     by_phase = {}
     for r in all_rows:
         ph = r.get("phase", "")
@@ -2058,6 +2173,8 @@ def make_cross_phase_pipeline_overhead(phase_csv_map, output_path, title=""):
         if not os.path.exists(csv_path):
             continue
         rows = parse_csv(csv_path)
+        # Aggregate across ranks: average per (phase, timestep)
+        rows = _aggregate_timesteps_across_ranks(rows)
         # Skip T=0 (first-call warmup) when enough data available
         rows_use = [r for r in rows if g(r, "timestep") > 0]
         if not rows_use:
@@ -2161,6 +2278,9 @@ def make_gpu_breakdown_over_time(ts_csv_path, output_path):
     all_rows = parse_csv(ts_csv_path)
     if not all_rows:
         return
+
+    # Aggregate across ranks: average per (phase, timestep)
+    all_rows = _aggregate_timesteps_across_ranks(all_rows)
 
     by_phase = {}
     for r in all_rows:
