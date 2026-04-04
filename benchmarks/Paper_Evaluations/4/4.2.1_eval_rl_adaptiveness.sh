@@ -31,16 +31,31 @@ GPU_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 WEIGHTS="$GPU_DIR/neural_net/weights/model.nnwt"
 BIN="$GPU_DIR/build/generic_benchmark"
 DATA_BASE="$GPU_DIR/data/sdrbench"
-CHUNK_MB=${CHUNK_MB:-16}
+CHUNK_MB=${CHUNK_MB:-4}
 ERROR_BOUND=${ERROR_BOUND:-0.01}
 SGD_LR=${SGD_LR:-0.2}
 SGD_MAPE=${SGD_MAPE:-0.30}
 EXPLORE_THRESH=${EXPLORE_THRESH:-0.50}
 EXPLORE_K=${EXPLORE_K:-4}
+POLICY=${POLICY:-balanced}
 DRY_RUN=${DRY_RUN:-0}
 
-RESULTS_BASE="$SCRIPT_DIR/results/rl_adaptiveness"
-DATASETS=${DATASETS:-"nyx,hurricane_isabel,cesm_atm"}
+# Policy weights
+case "$POLICY" in
+    balanced) W0=1.0; W1=1.0; W2=1.0 ;;
+    ratio)    W0=0.0; W1=0.0; W2=1.0 ;;
+    speed)    W0=1.0; W1=1.0; W2=0.0 ;;
+    *) echo "ERROR: unknown policy '$POLICY' (use balanced, ratio, speed)"; exit 1 ;;
+esac
+
+# Error bound tag: 0 → "lossless", 0.01 → "eb0.01"
+if [ "$ERROR_BOUND" = "0" ] || [ "$ERROR_BOUND" = "0.0" ]; then
+    EB_TAG="lossless"
+else
+    EB_TAG="eb${ERROR_BOUND}"
+fi
+RESULTS_BASE="$SCRIPT_DIR/results/rl_adaptiveness_${POLICY}_${EB_TAG}_lr${SGD_LR}"
+DATASETS=${DATASETS:-"nyx,hurricane_isabel,cesm_atm,cesm_atm_26ts"}
 
 # ── Dataset configs ──
 declare -A DS_SUBDIR DS_DIMS DS_EXT
@@ -53,6 +68,9 @@ DS_EXT[hurricane_isabel]=".bin.f32"
 DS_SUBDIR[cesm_atm]="cesm_atm/SDRBENCH-CESM-ATM-cleared-1800x3600"
 DS_DIMS[cesm_atm]="1800,3600"
 DS_EXT[cesm_atm]=".dat"
+DS_SUBDIR[cesm_atm_26ts]="cesm_atm_26ts/SDRBENCH-CESM-ATM-26x1800x3600"
+DS_DIMS[cesm_atm_26ts]="26,1800,3600"
+DS_EXT[cesm_atm_26ts]=".f32"
 
 # ── Validate ──
 if [ ! -f "$BIN" ]; then
@@ -69,6 +87,7 @@ echo "============================================================"
 echo "4.2.1 RL Adaptiveness on Unseen Workloads"
 echo "  Datasets:        $DATASETS"
 echo "  Error bound:     $ERROR_BOUND"
+echo "  Policy:          $POLICY (w0=$W0, w1=$W1, w2=$W2)"
 echo "  Chunk MB:        $CHUNK_MB"
 echo "  SGD MAPE (X1):   $SGD_MAPE"
 echo "  Explore (X2):    $EXPLORE_THRESH"
@@ -108,7 +127,7 @@ for ds in "${DS_LIST[@]}"; do
     mkdir -p "$OUT_DIR"
 
     if [ "$DRY_RUN" -eq 1 ]; then
-        echo "  DRY_RUN: $BIN $WEIGHTS --data-dir $DATA_DIR --dims $DIMS --ext $EXT --chunk-mb $CHUNK_MB --error-bound $ERROR_BOUND --phase nn-rl+exp50 --mape $SGD_MAPE --explore-thresh $EXPLORE_THRESH --lr $SGD_LR --explore-k $EXPLORE_K --w0 1.0 --w1 1.0 --w2 1.0 --out-dir $OUT_DIR --name $ds --no-verify"
+        echo "  DRY_RUN: $BIN $WEIGHTS --data-dir $DATA_DIR --dims $DIMS --ext $EXT --chunk-mb $CHUNK_MB --error-bound $ERROR_BOUND --phase nn-rl+exp50 --mape $SGD_MAPE --explore-thresh $EXPLORE_THRESH --lr $SGD_LR --explore-k $EXPLORE_K --w0 $W0 --w1 $W1 --w2 $W2 --out-dir $OUT_DIR --name $ds --no-verify"
         continue
     fi
 
@@ -118,7 +137,7 @@ for ds in "${DS_LIST[@]}"; do
         --phase nn-rl+exp50 \
         --mape "$SGD_MAPE" --explore-thresh "$EXPLORE_THRESH" \
         --lr "$SGD_LR" --explore-k "$EXPLORE_K" \
-        --w0 1.0 --w1 1.0 --w2 1.0 \
+        --w0 "$W0" --w1 "$W1" --w2 "$W2" \
         --out-dir "$OUT_DIR" --name "$ds" \
         --no-verify \
         2>&1 | tee "$OUT_DIR/benchmark.log" | tail -5

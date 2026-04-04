@@ -78,6 +78,8 @@ def collect_data(sweep_dir):
     mape = np.full((n_x1, n_delta), np.nan)
     write_bw = np.full((n_x1, n_delta), np.nan)
     read_bw = np.full((n_x1, n_delta), np.nan)
+    explorations = np.full((n_x1, n_delta), np.nan)
+    sgd_fires = np.full((n_x1, n_delta), np.nan)
 
     found = 0
     for i, x1 in enumerate(X1_VALUES):
@@ -98,7 +100,8 @@ def collect_data(sweep_dir):
                 except (ValueError, TypeError):
                     pass
 
-                # Bandwidth
+                # End-to-end write/read bandwidth (write_ms already includes
+                # exploration and SGD — it's the wall-clock H5Dwrite→H5Fclose time)
                 try:
                     write_bw[i, j] = float(row.get("write_mibps", 0))
                 except (ValueError, TypeError):
@@ -108,67 +111,64 @@ def collect_data(sweep_dir):
                 except (ValueError, TypeError):
                     pass
 
+                # Exploration and SGD counts
+                try:
+                    explorations[i, j] = float(row.get("explorations", 0))
+                except (ValueError, TypeError):
+                    pass
+                try:
+                    sgd_fires[i, j] = float(row.get("sgd_fires", 0))
+                except (ValueError, TypeError):
+                    pass
+
             # Regret from ranking CSV
             r = read_ranking_csv(ranking_path)
             if r is not None:
                 regret[i, j] = r
 
     print(f"Collected data from {found}/{n_x1 * n_delta} runs")
-    return regret, mape, write_bw, read_bw
+    return regret, mape, write_bw, read_bw, explorations, sgd_fires
 
 
-def plot_3d_bars(data, title, zlabel, filename, cmap_name="viridis",
-                 invert_cmap=False):
-    """Create a 3D bar chart for a 2D grid of values."""
+def plot_heatmap(data, cbar_label, filename, cmap_name="viridis",
+                 fmt="%.2f", vmin=None, vmax=None):
+    """Create a 2D heatmap with annotated cell values."""
     n_x1, n_delta = data.shape
 
-    fig = plt.figure(figsize=(12, 9))
-    ax = fig.add_subplot(111, projection="3d")
+    fig, ax = plt.subplots(figsize=(8, 6))
 
-    # Bar positions
-    xpos, ypos = np.meshgrid(np.arange(n_x1), np.arange(n_delta), indexing="ij")
-    xpos = xpos.flatten()
-    ypos = ypos.flatten()
-    zpos = np.zeros_like(xpos)
+    valid = np.isfinite(data)
+    plot_data = np.where(valid, data, np.nan)
 
-    dx = dy = 0.6
-    dz = data.flatten()
+    if vmin is None:
+        vmin = np.nanmin(plot_data)
+    if vmax is None:
+        vmax = np.nanmax(plot_data)
 
-    # Handle NaN: replace with 0 for plotting, mark as missing
-    valid = np.isfinite(dz)
-    dz_plot = np.where(valid, dz, 0)
+    im = ax.imshow(plot_data, cmap=cmap_name, aspect="equal",
+                   vmin=vmin, vmax=vmax, origin="lower")
 
-    # Color by value
-    cmap = plt.colormaps.get_cmap(cmap_name)
-    valid_vals = dz[valid]
-    if len(valid_vals) > 0:
-        vmin, vmax = valid_vals.min(), valid_vals.max()
-        if vmax == vmin:
-            vmax = vmin + 1
-        norm = plt.Normalize(vmin, vmax)
-        if invert_cmap:
-            colors = [cmap(1.0 - norm(v)) if f else (0.8, 0.8, 0.8, 0.3)
-                      for v, f in zip(dz, valid)]
-        else:
-            colors = [cmap(norm(v)) if f else (0.8, 0.8, 0.8, 0.3)
-                      for v, f in zip(dz, valid)]
-    else:
-        colors = [(0.8, 0.8, 0.8, 0.3)] * len(dz)
+    # Annotate each cell
+    for i in range(n_x1):
+        for j in range(n_delta):
+            if valid[i, j]:
+                v = data[i, j]
+                # Pick text color for contrast
+                mid = (vmin + vmax) / 2
+                color = "white" if v > mid else "black"
+                ax.text(j, i, fmt % v, ha="center", va="center",
+                        fontsize=7, color=color, fontweight="bold")
 
-    ax.bar3d(xpos, ypos, zpos, dx, dy, dz_plot, color=colors, alpha=0.85,
-             edgecolor="grey", linewidth=0.3)
+    ax.set_xticks(np.arange(n_delta))
+    ax.set_xticklabels(DELTA_LABELS, fontsize=9)
+    ax.set_yticks(np.arange(n_x1))
+    ax.set_yticklabels(X1_LABELS, fontsize=9)
 
-    ax.set_xticks(np.arange(n_x1) + dx / 2)
-    ax.set_xticklabels(X1_LABELS, fontsize=8, rotation=15)
-    ax.set_yticks(np.arange(n_delta) + dy / 2)
-    ax.set_yticklabels(DELTA_LABELS, fontsize=8, rotation=-15)
+    ax.set_xlabel("X2 - X1 (exploration delta)", fontsize=11)
+    ax.set_ylabel("X1 (SGD MAPE threshold)", fontsize=11)
 
-    ax.set_xlabel("X1 (SGD MAPE threshold)", fontsize=10, labelpad=10)
-    ax.set_ylabel("X2 - X1 (exploration delta)", fontsize=10, labelpad=10)
-    ax.set_zlabel(zlabel, fontsize=10, labelpad=8)
-    ax.set_title(title, fontsize=13, pad=15)
-
-    ax.view_init(elev=25, azim=-50)
+    cbar = fig.colorbar(im, ax=ax, shrink=0.8)
+    cbar.set_label(cbar_label, fontsize=10)
 
     plt.tight_layout()
     plt.savefig(filename, dpi=200, bbox_inches="tight")
@@ -188,41 +188,56 @@ def main():
         sys.exit(1)
 
     print(f"Reading results from: {sweep_dir}")
-    regret, mape, write_bw, read_bw = collect_data(sweep_dir)
+    regret, mape, write_bw, read_bw, explorations, sgd_fires = collect_data(sweep_dir)
 
     out_dir = sweep_dir
     print(f"\nGenerating plots...")
 
-    plot_3d_bars(
+    plot_heatmap(
         regret,
-        "Average Selection Regret vs Thresholds",
-        "Regret (1.0 = optimal)",
+        "Regret (1.0x = optimal)",
         os.path.join(out_dir, "threshold_sweep_regret.png"),
         cmap_name="RdYlGn_r",
+        vmin=1.0,
     )
 
-    plot_3d_bars(
+    plot_heatmap(
         mape,
-        "Average MAPE vs Thresholds",
         "MAPE (%)",
         os.path.join(out_dir, "threshold_sweep_mape.png"),
         cmap_name="RdYlGn_r",
     )
 
-    plot_3d_bars(
+    plot_heatmap(
         write_bw,
-        "Write Bandwidth vs Thresholds",
         "Write BW (MiB/s)",
         os.path.join(out_dir, "threshold_sweep_write_bw.png"),
         cmap_name="viridis",
+        fmt="%.0f",
     )
 
-    plot_3d_bars(
+    plot_heatmap(
         read_bw,
-        "Read Bandwidth vs Thresholds",
         "Read BW (MiB/s)",
         os.path.join(out_dir, "threshold_sweep_read_bw.png"),
         cmap_name="viridis",
+        fmt="%.0f",
+    )
+
+    plot_heatmap(
+        explorations,
+        "Exploration Count",
+        os.path.join(out_dir, "threshold_sweep_explorations.png"),
+        cmap_name="YlOrRd",
+        fmt="%.0f",
+    )
+
+    plot_heatmap(
+        sgd_fires,
+        "SGD Fires",
+        os.path.join(out_dir, "threshold_sweep_sgd_fires.png"),
+        cmap_name="YlOrRd",
+        fmt="%.0f",
     )
 
     print(f"\nAll plots saved to: {out_dir}")

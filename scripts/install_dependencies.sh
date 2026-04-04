@@ -83,6 +83,8 @@ declare -A SDRBENCH_DATASETS=(
     ["hurricane_isabel"]="Hurricane-ISABEL/SDRBENCH-Hurricane-ISABEL-100x500x500.tar.gz"
     ["nyx"]="EXASKY/NYX/SDRBENCH-EXASKY-NYX-512x512x512.tar.gz"
     ["cesm_atm"]="CESM-ATM/SDRBENCH-CESM-ATM-cleared-1800x3600.tar.gz"
+    ["cesm_atm_26ts"]="CESM-ATM/SDRBENCH-CESM-ATM-26x1800x3600.tar.gz"
+    # ["miranda"]="Miranda/SDRBENCH-Miranda-3072x3072x3072.tar.gz"  # 49 GB download, ~550 GB uncompressed
 )
 
 # Default CUDA architecture (sm_80 = Ampere A100).

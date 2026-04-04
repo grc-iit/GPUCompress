@@ -184,7 +184,7 @@ extern "C" int gpucompress_active_learning_enabled(void) {
 }
 
 extern "C" void gpucompress_set_exploration_threshold(double threshold) {
-    if (threshold >= 0.0 && threshold < 1.0) {
+    if (threshold >= 0.0) {
         g_exploration_threshold = threshold;
     }
 }

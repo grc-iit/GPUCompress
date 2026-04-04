@@ -21,10 +21,10 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-DATASETS = ["nyx", "hurricane_isabel", "cesm_atm"]
-DATASET_LABELS = {"nyx": "NYX", "hurricane_isabel": "Hurricane", "cesm_atm": "CESM-ATM"}
-DATASET_COLORS = {"nyx": "#1f77b4", "hurricane_isabel": "#ff7f0e", "cesm_atm": "#2ca02c"}
-DATASET_MARKERS = {"nyx": "o", "hurricane_isabel": "s", "cesm_atm": "^"}
+DATASETS = ["nyx", "hurricane_isabel", "cesm_atm", "cesm_atm_26ts"]
+DATASET_LABELS = {"nyx": "NYX", "hurricane_isabel": "Hurricane", "cesm_atm": "CESM-ATM", "cesm_atm_26ts": "CESM-ATM-26ts"}
+DATASET_COLORS = {"nyx": "#1f77b4", "hurricane_isabel": "#ff7f0e", "cesm_atm": "#2ca02c", "cesm_atm_26ts": "#d62728"}
+DATASET_MARKERS = {"nyx": "o", "hurricane_isabel": "s", "cesm_atm": "^", "cesm_atm_26ts": "D"}
 
 
 def read_timestep_csv(path):
@@ -68,24 +68,27 @@ def collect_regret_by_timestep(ranking_rows):
 
 
 def collect_mape_by_timestep(timestep_rows):
-    """Extract per-timestep MAPE values."""
+    """Extract per-timestep MAPE values (all 4 statistics)."""
     ts_list = []
     mape_ratio = []
     mape_comp = []
     mape_decomp = []
+    mape_psnr = []
     for row in timestep_rows:
         try:
             t = int(row.get("field_idx", -1))
             mr = float(row.get("mape_ratio", 0))
             mc = float(row.get("mape_comp", 0))
             md = float(row.get("mape_decomp", 0))
+            mp = float(row.get("mape_psnr", 0))
             ts_list.append(t)
             mape_ratio.append(mr)
             mape_comp.append(mc)
             mape_decomp.append(md)
+            mape_psnr.append(mp)
         except (ValueError, TypeError):
             continue
-    return ts_list, mape_ratio, mape_comp, mape_decomp
+    return ts_list, mape_ratio, mape_comp, mape_decomp, mape_psnr
 
 
 def plot_regret_vs_timestep(data, out_path):
@@ -108,7 +111,6 @@ def plot_regret_vs_timestep(data, out_path):
                label="Optimal (1.0x)")
     ax.set_xlabel("Timestep (field index)", fontsize=11)
     ax.set_ylabel("Selection Regret (1.0x = optimal)", fontsize=11)
-    ax.set_title("Regret vs Timestep", fontsize=13)
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
 
@@ -136,7 +138,6 @@ def plot_comp_mape_vs_timestep(data, out_path):
 
     ax.set_xlabel("Timestep (field index)", fontsize=11)
     ax.set_ylabel("Compression Time MAPE (%)", fontsize=11)
-    ax.set_title("Compression Time MAPE vs Timestep", fontsize=13)
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
 
@@ -147,34 +148,78 @@ def plot_comp_mape_vs_timestep(data, out_path):
 
 
 def plot_avg_mape_bar(data, out_path):
-    """Chart 3: Average MAPE vs Dataset (clustered bar chart with error bars)."""
-    fig, ax = plt.subplots(figsize=(8, 5))
+    """Chart 3: Average MAPE vs Dataset (clustered bar chart with error bars).
+    Shows all 4 prediction statistics: Ratio, Comp Time, Decomp Time, PSNR."""
+    fig, ax = plt.subplots(figsize=(10, 5))
 
-    stat_names = ["Ratio", "Comp Time", "Decomp Time"]
-    stat_colors = ["#4c72b0", "#dd8452", "#55a868"]
+    # data[ds] = (ratio_list, comp_list, decomp_list, psnr_list)
+    stat_names = ["Ratio", "Comp Time", "Decomp Time", "PSNR"]
+    stat_indices = [0, 1, 2, 3]
+    stat_colors = ["#4c72b0", "#dd8452", "#55a868", "#c44e52"]
     n_stats = len(stat_names)
-    bar_width = 0.22
+    bar_width = 0.18
 
     ds_present = [ds for ds in DATASETS if ds in data]
     x = np.arange(len(ds_present))
 
-    for si, (stat, color) in enumerate(zip(stat_names, stat_colors)):
+    for si, (stat, idx, color) in enumerate(zip(stat_names, stat_indices, stat_colors)):
         means = []
         stds = []
         for ds in ds_present:
-            vals = data[ds][si]  # list of per-timestep values
+            vals = data[ds][idx] if idx < len(data[ds]) else []
             means.append(np.mean(vals) if vals else 0)
             stds.append(np.std(vals) if vals else 0)
 
+        # Clamp lower error bar at zero (MAPE can't be negative)
+        lower_err = [min(s, m) for s, m in zip(stds, means)]
         offset = (si - (n_stats - 1) / 2) * bar_width
-        ax.bar(x + offset, means, bar_width, yerr=stds,
+        ax.bar(x + offset, means, bar_width, yerr=[lower_err, stds],
                color=color, label=stat, capsize=3, alpha=0.85,
                edgecolor="white", linewidth=0.5)
 
     ax.set_xticks(x)
     ax.set_xticklabels([DATASET_LABELS[ds] for ds in ds_present], fontsize=10)
     ax.set_ylabel("MAPE (%)", fontsize=11)
-    ax.set_title("Average MAPE per Dataset", fontsize=13)
+    ax.legend(fontsize=9)
+    ax.grid(True, axis="y", alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: {out_path}")
+
+
+def plot_avg_regret_bar(data, out_path):
+    """Chart 4: Average Regret per Dataset (bar chart with error bars).
+    data: ds -> list of per-chunk regret values."""
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    ds_present = [ds for ds in DATASETS if ds in data]
+    x = np.arange(len(ds_present))
+    bar_width = 0.5
+
+    means = []
+    stds = []
+    for ds in ds_present:
+        vals = data[ds]
+        means.append(np.mean(vals) if vals else 1.0)
+        stds.append(np.std(vals) if vals else 0)
+
+    bars = ax.bar(x, means, bar_width, yerr=stds,
+                  color="#4c72b0", capsize=4, alpha=0.85,
+                  edgecolor="white", linewidth=0.5)
+
+    # Annotate values
+    for i, (bar, m) in enumerate(zip(bars, means)):
+        offset = stds[i] if stds[i] > 0 else 0
+        ax.text(bar.get_x() + bar.get_width() / 2, m + offset + 0.01,
+                f"{m:.2f}x", ha="center", va="bottom", fontsize=10, fontweight="bold")
+
+    ax.axhline(y=1.0, color="grey", linestyle="--", linewidth=0.8, alpha=0.7,
+               label="Optimal (1.0x)")
+    ax.set_xticks(x)
+    ax.set_xticklabels([DATASET_LABELS[ds] for ds in ds_present], fontsize=10)
+    ax.set_ylabel("Selection Regret (1.0x = optimal)", fontsize=11)
     ax.legend(fontsize=9)
     ax.grid(True, axis="y", alpha=0.3)
 
@@ -201,6 +246,7 @@ def main():
     regret_data = {}    # ds -> (timesteps, mean_regrets)
     comp_mape_data = {} # ds -> (timesteps, mape_comp)
     bar_data = {}       # ds -> (ratio_list, comp_list, decomp_list)
+    regret_bar_data = {} # ds -> list of all per-chunk regret values
 
     for ds in DATASETS:
         ds_dir = os.path.join(results_dir, ds)
@@ -216,6 +262,16 @@ def main():
         if ranking_rows:
             ts, regrets = collect_regret_by_timestep(ranking_rows)
             regret_data[ds] = (ts, regrets)
+            # Collect all per-chunk regret values for bar chart
+            all_regrets = []
+            for row in ranking_rows:
+                try:
+                    r = float(row["top1_regret"])
+                    if np.isfinite(r) and r > 0:
+                        all_regrets.append(r)
+                except (KeyError, ValueError):
+                    continue
+            regret_bar_data[ds] = all_regrets
             print(f"  [{ds}] Ranking: {len(ranking_rows)} rows, {len(ts)} milestones")
         else:
             print(f"  [{ds}] No ranking data.")
@@ -223,9 +279,9 @@ def main():
         # MAPE from timestep CSV
         ts_rows = read_timestep_csv(ts_path)
         if ts_rows:
-            ts_list, mr, mc, md = collect_mape_by_timestep(ts_rows)
+            ts_list, mr, mc, md, mp = collect_mape_by_timestep(ts_rows)
             comp_mape_data[ds] = (ts_list, mc)
-            bar_data[ds] = (mr, mc, md)
+            bar_data[ds] = (mr, mc, md, mp)
             print(f"  [{ds}] Timesteps: {len(ts_rows)} rows")
         else:
             print(f"  [{ds}] No timestep data.")
@@ -248,6 +304,11 @@ def main():
     plot_avg_mape_bar(
         bar_data,
         os.path.join(results_dir, "avg_mape_per_dataset.png"))
+
+    if regret_bar_data:
+        plot_avg_regret_bar(
+            regret_bar_data,
+            os.path.join(results_dir, "avg_regret_per_dataset.png"))
 
     print(f"\nAll plots saved to: {results_dir}")
 

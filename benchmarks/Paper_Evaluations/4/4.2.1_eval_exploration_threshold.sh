@@ -30,13 +30,28 @@ BIN="$GPU_DIR/build/generic_benchmark"
 DATA_DIR="$GPU_DIR/data/sdrbench/hurricane_isabel/100x500x500"
 DIMS="100,500,500"
 EXT=".bin.f32"
-CHUNK_MB=${CHUNK_MB:-16}
+CHUNK_MB=${CHUNK_MB:-4}
 ERROR_BOUND=${ERROR_BOUND:-0.01}
 EXPLORE_K=${EXPLORE_K:-4}
 SGD_LR=${SGD_LR:-0.2}
+POLICY=${POLICY:-balanced}
 DRY_RUN=${DRY_RUN:-0}
 
-SWEEP_DIR="$SCRIPT_DIR/results/threshold_sweep"
+# Policy weights
+case "$POLICY" in
+    balanced) W0=1.0; W1=1.0; W2=1.0 ;;
+    ratio)    W0=0.0; W1=0.0; W2=1.0 ;;
+    speed)    W0=1.0; W1=1.0; W2=0.0 ;;
+    *) echo "ERROR: unknown policy '$POLICY' (use balanced, ratio, speed)"; exit 1 ;;
+esac
+
+# Error bound tag: 0 → "lossless", 0.01 → "eb0.01"
+if [ "$ERROR_BOUND" = "0" ] || [ "$ERROR_BOUND" = "0.0" ]; then
+    EB_TAG="lossless"
+else
+    EB_TAG="eb${ERROR_BOUND}"
+fi
+SWEEP_DIR="$SCRIPT_DIR/results/threshold_sweep_${POLICY}_${EB_TAG}_lr${SGD_LR}"
 
 # ── Validate ──
 if [ ! -f "$BIN" ]; then
@@ -110,7 +125,7 @@ for x1 in "${X1_VALUES[@]}"; do
         mkdir -p "$OUT_DIR"
 
         if [ "$DRY_RUN" -eq 1 ]; then
-            echo "  DRY_RUN: $BIN $WEIGHTS --data-dir $DATA_DIR --dims $DIMS --ext $EXT --chunk-mb $CHUNK_MB --error-bound $ERROR_BOUND --phase nn-rl+exp50 --mape $x1 --explore-thresh $x2 --lr $SGD_LR --explore-k $EXPLORE_K --w0 1.0 --w1 1.0 --w2 1.0 --out-dir $OUT_DIR --name hurricane_isabel --no-verify"
+            echo "  DRY_RUN: $BIN $WEIGHTS --data-dir $DATA_DIR --dims $DIMS --ext $EXT --chunk-mb $CHUNK_MB --error-bound $ERROR_BOUND --phase nn-rl+exp50 --mape $x1 --explore-thresh $x2 --lr $SGD_LR --explore-k $EXPLORE_K --w0 $W0 --w1 $W1 --w2 $W2 --out-dir $OUT_DIR --name hurricane_isabel --no-verify"
             continue
         fi
 
@@ -120,7 +135,7 @@ for x1 in "${X1_VALUES[@]}"; do
             --phase nn-rl+exp50 \
             --mape "$x1" --explore-thresh "$x2" \
             --lr "$SGD_LR" --explore-k "$EXPLORE_K" \
-            --w0 1.0 --w1 1.0 --w2 1.0 \
+            --w0 $W0 --w1 $W1 --w2 $W2 \
             --out-dir "$OUT_DIR" --name hurricane_isabel \
             --no-verify \
             2>&1 | tail -3
