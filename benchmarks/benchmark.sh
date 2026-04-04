@@ -902,7 +902,7 @@ print(f'  Aggregate: {n_ranks} ranks, {len(phases)} phases -> $AGG_MULTI')
             MPI_NP=$MPI_NP \
             GPUS_PER_NODE=$GPUS_PER_NODE \
             LAUNCHER=$LAUNCHER \
-            bash "$SCRIPT_DIR/sdrbench/run_all_sdr.sh"
+            bash "$SCRIPT_DIR/sdrbench/run_sdr.sh"
             ;;
         ai_training)
             if [ "$MY_RANK" -eq 0 ]; then

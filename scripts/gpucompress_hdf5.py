@@ -20,6 +20,7 @@ Usage:
 """
 
 import ctypes
+import math
 import os
 import sys
 from pathlib import Path
@@ -346,24 +347,24 @@ class GPUCompressHDF5Writer:
                 r2_r_ss += (actual_ratio - predicted_ratio)**2; r2_r_n += 1
                 cnt_r += 1
 
-            # Compression time MAPE (clamped) / MAE+R² (unclamped raw)
+            # Compression time: MAPE, MAE, R² (all use clamped 5ms floor)
             if comp_ms > 0:
                 mape_c_sum += abs(predicted_comp - comp_ms) / abs(comp_ms)
-                mae_c_sum += abs(predicted_comp - comp_ms_raw)
-                r2_c_sum += comp_ms_raw; r2_c_sum2 += comp_ms_raw**2
-                r2_c_ss += (comp_ms_raw - predicted_comp)**2; r2_c_n += 1
+                mae_c_sum += abs(predicted_comp - comp_ms)
+                r2_c_sum += comp_ms; r2_c_sum2 += comp_ms**2
+                r2_c_ss += (comp_ms - predicted_comp)**2; r2_c_n += 1
                 cnt_c += 1
 
-            # Decompression time MAPE (clamped) / MAE+R² (unclamped raw)
+            # Decompression time: MAPE, MAE, R² (all use clamped 5ms floor)
             if decomp_ms > 0:
                 mape_d_sum += abs(predicted_decomp - decomp_ms) / abs(decomp_ms)
-                mae_d_sum += abs(predicted_decomp - decomp_ms_raw)
-                r2_d_sum += decomp_ms_raw; r2_d_sum2 += decomp_ms_raw**2
-                r2_d_ss += (decomp_ms_raw - predicted_decomp)**2; r2_d_n += 1
+                mae_d_sum += abs(predicted_decomp - decomp_ms)
+                r2_d_sum += decomp_ms; r2_d_sum2 += decomp_ms**2
+                r2_d_ss += (decomp_ms - predicted_decomp)**2; r2_d_n += 1
                 cnt_d += 1
 
-            # PSNR MAPE/MAE/R² (skip lossless: actual_psnr=120, no variance)
-            if predicted_psnr > 0 and 0 < actual_psnr < 120:
+            # PSNR MAPE/MAE/R² (skip lossless: actual_psnr=inf)
+            if predicted_psnr > 0 and 0 < actual_psnr and math.isfinite(actual_psnr):
                 a, p = actual_psnr, predicted_psnr
                 mape_p_sum += abs(p - a) / abs(a)
                 mae_p_sum += abs(p - a)
@@ -655,8 +656,8 @@ class GPUCompressHDF5Writer:
             algorithms: List of (name, algo_id) tuples, or None for all
 
         Returns:
-            List of dicts: algorithm, ratio, write_ms, read_ms, write_mbps,
-            read_mbps, file_bytes, orig_bytes, mismatches
+            List of dicts: algorithm, ratio, write_ms, read_ms, write_mibps,
+            read_mibps, file_bytes, orig_bytes, mismatches
         """
         import torch
         import time
@@ -683,27 +684,76 @@ class GPUCompressHDF5Writer:
         for algo_name, algo_id in algorithms:
             tmpfile = os.path.join(tmpdir, f"_bench_{algo_name}.h5")
 
-            # Write (compress)
+            # Write (compress) — file/dataset creation outside timer,
+            # matching C++ benchmark timing boundaries.
+            h5 = self._hdf5
+            native_id = h5.H5VLget_connector_id_by_name(b"native")
+            vol_id = self._vol.H5VL_gpucompress_register()
+            fapl = h5.H5Pcreate(self._H5P_FILE_ACCESS)
+            self._vol.H5Pset_fapl_gpucompress(fapl, native_id, None)
+            h5.H5VLclose(native_id)
+            fpath = tmpfile.encode("utf-8") if isinstance(tmpfile, str) else tmpfile
+            fid = h5.H5Fcreate(fpath, H5F_ACC_TRUNC, H5P_DEFAULT, fapl)
+            h5.H5Pclose(fapl)
+            dims_arr = (hsize_t * 1)(n_elements)
+            space = h5.H5Screate_simple(1, dims_arr, None)
+            dcpl = h5.H5Pcreate(self._H5P_DATASET_CREATE)
+            chunk = (hsize_t * 1)(min(chunk_elements, n_elements))
+            h5.H5Pset_chunk(dcpl, 1, chunk)
+            self._h5z.H5Pset_gpucompress(
+                dcpl, ctypes.c_int(algo_id),
+                ctypes.c_uint(0x02), ctypes.c_uint(4),
+                ctypes.c_double(error_bound))
+            dset = h5.H5Dcreate2(fid, b"data", self._H5T_NATIVE_FLOAT,
+                                 space, H5P_DEFAULT, dcpl, H5P_DEFAULT)
+            h5.H5Sclose(space)
+            h5.H5Pclose(dcpl)
+
             torch.cuda.synchronize()
             t0 = time.perf_counter()
-            self.write_gpu_tensor(gpu_ptr, n_elements, tmpfile, "data",
-                                  chunk_elements=chunk_elements,
-                                  error_bound=error_bound,
-                                  algorithm=algo_id)
+            h5.H5Dwrite(dset, self._H5T_NATIVE_FLOAT,
+                         H5S_ALL, H5S_ALL, H5P_DEFAULT,
+                         ctypes.c_void_p(gpu_ptr))
+            torch.cuda.synchronize()
+            h5.H5Dclose(dset)
+            h5.H5Fclose(fid)
+            h5.H5VLclose(vol_id)
             t1 = time.perf_counter()
             write_ms = (t1 - t0) * 1000.0
             file_bytes = os.path.getsize(tmpfile)
             ratio = orig_bytes / file_bytes if file_bytes > 0 else 0.0
 
-            # Read (decompress) + verify
+            # Read (decompress) + verify — file/dataset open outside timer
             read_ms = 0.0
             mismatches = -1
             if verify and d_read is not None:
                 d_read.zero_()
+                # Drop page cache for cold read (matching C++ benchmarks)
+                try:
+                    fd = os.open(tmpfile, os.O_RDONLY)
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                    os.close(fd)
+                except (OSError, AttributeError):
+                    pass
+                native_id = h5.H5VLget_connector_id_by_name(b"native")
+                vol_id = self._vol.H5VL_gpucompress_register()
+                fapl = h5.H5Pcreate(self._H5P_FILE_ACCESS)
+                self._vol.H5Pset_fapl_gpucompress(fapl, native_id, None)
+                h5.H5VLclose(native_id)
+                r_fid = h5.H5Fopen(fpath, H5F_ACC_RDONLY, fapl)
+                h5.H5Pclose(fapl)
+                r_dset = h5.H5Dopen2(r_fid, b"data", H5P_DEFAULT)
+
                 torch.cuda.synchronize()
                 t2 = time.perf_counter()
-                self.read_gpu_tensor(tmpfile, d_read.data_ptr(), n_elements)
+                h5.H5Dread(r_dset, self._H5T_NATIVE_FLOAT,
+                           H5S_ALL, H5S_ALL, H5P_DEFAULT,
+                           ctypes.c_void_p(d_read.data_ptr()))
+                torch.cuda.synchronize()
+                h5.H5Dclose(r_dset)
+                h5.H5Fclose(r_fid)
                 t3 = time.perf_counter()
+                h5.H5VLclose(vol_id)
                 read_ms = (t3 - t2) * 1000.0
                 # Bitwise comparison (NaN-safe: compares raw float32 bit patterns)
                 mismatches = int(d_original.view(torch.int32).ne(d_read.view(torch.int32)).sum().item())
@@ -711,8 +761,8 @@ class GPUCompressHDF5Writer:
             if os.path.exists(tmpfile):
                 os.unlink(tmpfile)
 
-            write_mbps = orig_bytes / (1 << 20) / (write_ms / 1000.0) if write_ms > 0 else 0
-            read_mbps = orig_bytes / (1 << 20) / (read_ms / 1000.0) if read_ms > 0 else 0
+            write_mibps = orig_bytes / (1 << 20) / (write_ms / 1000.0) if write_ms > 0 else 0
+            read_mibps = orig_bytes / (1 << 20) / (read_ms / 1000.0) if read_ms > 0 else 0
 
             results.append({
                 "algorithm": algo_name,
@@ -720,8 +770,8 @@ class GPUCompressHDF5Writer:
                 "ratio": ratio,
                 "write_ms": write_ms,
                 "read_ms": read_ms,
-                "write_mbps": write_mbps,
-                "read_mbps": read_mbps,
+                "write_mibps": write_mibps,
+                "read_mibps": read_mibps,
                 "file_bytes": file_bytes,
                 "orig_bytes": orig_bytes,
                 "mismatches": mismatches,
@@ -751,7 +801,7 @@ class GPUCompressHDF5Writer:
             d_read: Pre-allocated read-back buffer (None = skip verify)
 
         Returns:
-            Dict with ratio, write_ms, read_ms, write_mbps, read_mbps,
+            Dict with ratio, write_ms, read_ms, write_mibps, read_mibps,
             file_bytes, orig_bytes, mismatches
         """
         import torch
@@ -789,20 +839,20 @@ class GPUCompressHDF5Writer:
         dset = h5.H5Dcreate2(fid, b"data", self._H5T_NATIVE_FLOAT,
                               space, H5P_DEFAULT, dcpl, H5P_DEFAULT)
 
-        # 3. Timed write (only H5Dwrite + sync)
+        # 3. Timed write (H5Dwrite + sync + close, matching C benchmark boundary)
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         h5.H5Dwrite(dset, self._H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL,
                      H5P_DEFAULT, ctypes.c_void_p(d_original.data_ptr()))
         torch.cuda.synchronize()  # drain SGD stream for nn-rl
-        t1 = time.perf_counter()
-        write_ms = (t1 - t0) * 1000.0
-
-        # 4. Close write handles
         h5.H5Dclose(dset)
         h5.H5Sclose(space)
         h5.H5Pclose(dcpl)
         h5.H5Fclose(fid)
+        t1 = time.perf_counter()
+        write_ms = (t1 - t0) * 1000.0
+
+        # 4. Close VOL handle (outside timer — not done in C benchmarks)
         h5.H5VLclose(vol_id)
 
         file_bytes = os.path.getsize(tmpfile)
@@ -858,19 +908,36 @@ class GPUCompressHDF5Writer:
             data_range = d_original.float().max().item() - d_original.float().min().item()
 
             # Quality metrics (meaningful for lossy, trivial for lossless)
+            mean_abs_err = 0.0
+            ssim = 1.0
             if mismatches > 0:
-                diff = (d_original.float() - d_read.float())
+                diff = (d_original.double() - d_read.double())
                 mse = (diff ** 2).mean().item()
                 rmse = mse ** 0.5
-                max_abs_err = diff.abs().max().item()
+                abs_diff = diff.abs()
+                max_abs_err = abs_diff.max().item()
+                mean_abs_err = abs_diff.mean().item()
                 if mse > 0 and data_range > 0:
                     psnr_db = 10.0 * torch.log10(
                         torch.tensor(data_range ** 2 / mse)).item()
                 else:
-                    psnr_db = 120.0
+                    psnr_db = float('inf')
                 bit_rate = (file_bytes * 8.0) / n_elements if n_elements > 0 else 0.0
+                # Global SSIM: single-window over entire tensor
+                x = d_original.double()
+                y = d_read.double()
+                mu_x = x.mean().item()
+                mu_y = y.mean().item()
+                var_x = x.var(correction=0).item()
+                var_y = y.var(correction=0).item()
+                cov = ((x - mu_x) * (y - mu_y)).mean().item()
+                L = data_range if data_range > 0 else 1.0
+                C1 = (0.01 * L) ** 2
+                C2 = (0.03 * L) ** 2
+                ssim = ((2 * mu_x * mu_y + C1) * (2 * cov + C2)) / \
+                       ((mu_x ** 2 + mu_y ** 2 + C1) * (var_x + var_y + C2))
             else:
-                psnr_db = 120.0  # lossless = perfect
+                psnr_db = float('inf')  # lossless = perfect
 
         # 7. Collect diagnostics (chunk metrics + VOL timing + per-chunk details)
         diag = self.collect_chunk_metrics()
@@ -881,21 +948,23 @@ class GPUCompressHDF5Writer:
         if os.path.exists(tmpfile):
             os.unlink(tmpfile)
 
-        write_mbps = orig_bytes / (1 << 20) / (write_ms / 1000.0) if write_ms > 0 else 0
-        read_mbps = orig_bytes / (1 << 20) / (read_ms / 1000.0) if read_ms > 0 else 0
+        write_mibps = orig_bytes / (1 << 20) / (write_ms / 1000.0) if write_ms > 0 else 0
+        read_mibps = orig_bytes / (1 << 20) / (read_ms / 1000.0) if read_ms > 0 else 0
 
         result = {
             "ratio": ratio,
             "write_ms": write_ms,
             "read_ms": read_ms,
-            "write_mbps": write_mbps,
-            "read_mbps": read_mbps,
+            "write_mibps": write_mibps,
+            "read_mibps": read_mibps,
             "file_bytes": file_bytes,
             "orig_bytes": orig_bytes,
             "mismatches": mismatches,
             "psnr_db": psnr_db,
             "rmse": rmse,
             "max_abs_err": max_abs_err,
+            "mean_abs_err": mean_abs_err,
+            "ssim": ssim,
             "bit_rate": bit_rate,
             "data_range": data_range,
         }
@@ -1265,19 +1334,19 @@ class InlineFullBenchmark:
 
         # ── Write to CSV + print ──
         print(f"      epoch{epoch:02d}_{tensor_name}:")
-        print(f"        {'Config':>12s}  {'Ratio':>6s}  {'Write MB/s':>10s}  "
-              f"{'Read MB/s':>10s}  {'SGD':>4s}  {'Expl':>4s}  {'Mismatch':>8s}")
+        print(f"        {'Config':>12s}  {'Ratio':>6s}  {'Write MiB/s':>11s}  "
+              f"{'Read MiB/s':>11s}  {'SGD':>4s}  {'Expl':>4s}  {'Mismatch':>8s}")
         for r in results:
             mm_str = str(r['mismatches']) if r['mismatches'] >= 0 else "n/a"
             print(f"        {r['algorithm']:>12s}  {r['ratio']:>5.2f}x  "
-                  f"{r['write_mbps']:>9.0f}  {r['read_mbps']:>9.0f}  "
+                  f"{r['write_mibps']:>9.0f}  {r['read_mibps']:>9.0f}  "
                   f"{r.get('sgd_fires',0):>4d}  {r.get('explorations',0):>4d}  "
                   f"{mm_str:>8s}")
             csv_file.write(
                 f"{epoch},{tensor_name},{r['algorithm']},{r.get('policy','-')},"
                 f"{r.get('mode','-')},{r['ratio']:.4f},"
                 f"{r['write_ms']:.2f},{r['read_ms']:.2f},"
-                f"{r['write_mbps']:.1f},{r['read_mbps']:.1f},"
+                f"{r['write_mibps']:.1f},{r['read_mibps']:.1f},"
                 f"{r['file_bytes']},{r['orig_bytes']},{r['mismatches']},"
                 f"{r.get('n_chunks',0)},{r.get('sgd_fires',0)},{r.get('explorations',0)},"
                 f"{r.get('mape_ratio_pct',0):.2f},{r.get('mape_comp_pct',0):.2f},"
@@ -1294,7 +1363,8 @@ class InlineFullBenchmark:
                 f"{r.get('io_drain_ms',0):.3f},{r.get('pipeline_ms',0):.3f},"
                 f"{r.get('s2_busy_ms',0):.3f},{r.get('s3_busy_ms',0):.3f},"
                 f"{r.get('psnr_db',0):.2f},{r.get('rmse',0):.6f},"
-                f"{r.get('max_abs_err',0):.6f},{r.get('bit_rate',0):.4f},"
+                f"{r.get('max_abs_err',0):.6f},{r.get('mean_abs_err',0):.6f},"
+                f"{r.get('ssim',1.0):.8f},{r.get('bit_rate',0):.4f},"
                 f"{r.get('data_range',0):.6f}\n")
             # Write per-chunk details
             if chunk_csv_file and "chunk_details" in r:

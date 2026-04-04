@@ -164,28 +164,28 @@ def generate_figures(dataset, policy, out_dir):
 
     if os.path.exists(ts_csv):
         out_mape = os.path.join(out_dir, "5a_sgd_convergence.png")
-        viz.make_timestep_figure(ts_csv, out_mape)
+        viz.make_timestep_figure(ts_csv, out_mape, policy_filter=policy)
         count += 1
 
         out_firing = os.path.join(out_dir, "5b_sgd_exploration_firing.png")
-        viz.make_sgd_exploration_figure(ts_csv, out_firing)
+        viz.make_sgd_exploration_figure(ts_csv, out_firing, policy_filter=policy)
         count += 1
 
         out_mae = os.path.join(out_dir, "5c_mae_over_time.png")
-        viz.make_mae_figure(ts_csv, out_mae)
+        viz.make_mae_figure(ts_csv, out_mae, policy_filter=policy)
         count += 1
 
         out_r2 = os.path.join(out_dir, "5c2_r2_over_time.png")
-        viz.make_r2_figure(ts_csv, out_r2)
+        viz.make_r2_figure(ts_csv, out_r2, policy_filter=policy)
         count += 1
 
         out_psnr = os.path.join(out_dir, "5d_psnr_quality.png")
-        viz.make_psnr_figure(ts_csv, out_psnr)
+        viz.make_psnr_figure(ts_csv, out_psnr, policy_filter=policy)
         count += 1
 
         # ── 5e. Lossy quality metrics (RMSE, Max Error, Bit Rate, PSNR) ──
         out_lossy = os.path.join(out_dir, "5e_lossy_quality_metrics.png")
-        viz.make_lossy_quality_figure(ts_csv, out_lossy)
+        viz.make_lossy_quality_figure(ts_csv, out_lossy, policy_filter=policy)
         count += 1
 
     # ── 5f. Ranking quality (Kendall tau) ──

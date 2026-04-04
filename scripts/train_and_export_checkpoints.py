@@ -388,7 +388,7 @@ def main():
                          "explore_ms,sgd_ms,"
                          "stage1_ms,drain_ms,io_drain_ms,pipeline_ms,"
                          "s2_busy_ms,s3_busy_ms,"
-                         "psnr_db,rmse,max_abs_err,bit_rate,data_range\n")
+                         "psnr_db,rmse,max_abs_err,mean_abs_err,ssim,bit_rate,data_range\n")
             CHUNK_CSV_HEADER = ("epoch,tensor,algorithm,policy,mode,"
                                 "chunk_idx,action,actual_ratio,predicted_ratio,"
                                 "comp_ms,predicted_comp_time,"
@@ -545,7 +545,7 @@ def main():
     print(f"  Dims          : --dims {dims_str}")
     print(f"  Output        : {outdir}")
     print()
-    print(f"  Add to run_sdr_pm_eval.sh:")
+    print(f"  Add to run_sdr.sh:")
     if args.model.startswith("vit_"):
         ds_name = f"vit_{args.model.split('_')[1]}_{args.dataset}"
     else:

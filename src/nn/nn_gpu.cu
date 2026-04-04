@@ -180,6 +180,7 @@ __device__ static void nnForwardPass(
     comp_time   = fmaxf(1e-6f, fminf(comp_time,   1e6f));
     decomp_time = fmaxf(1e-6f, fminf(decomp_time, 1e6f));
     ratio       = fmaxf(0.1f,  fminf(ratio,        1e5f));
+    psnr        = fmaxf(0.0f,  fminf(psnr,         120.0f));
 
     /* Policy clamps: ct/dt floor at 5ms, ratio cap at 100x. */
     comp_time   = fmaxf(5.0f, comp_time);

@@ -607,7 +607,7 @@ typedef struct {
     float  predicted_comp_time;  /* NN-predicted compression time ms      */
     float  predicted_decomp_time;/* NN-predicted decompression time ms    */
     float  predicted_psnr;       /* NN-predicted PSNR in dB               */
-    float  actual_psnr;          /* analytical PSNR: 20*log10(range/eb), 120 lossless */
+    float  actual_psnr;          /* analytical PSNR: 10*log10(3*range²/eb²), 120 lossless */
 
     /* Filled during read (decompression) — 0 until VOL read completes   */
     float  decompression_ms;     /* actual decompression time (clamped to 5ms floor for MAPE) */

@@ -248,7 +248,7 @@ struct ChunkDiagInput {
     float compression_ms, compression_ms_raw, exploration_ms, sgd_ms;
     size_t input_size, primary_compressed_size, compressed_size;
     float predicted_ratio, predicted_comp_time, predicted_decomp_time, predicted_psnr;
-    float actual_psnr;  // analytical PSNR: 20*log10(range/error_bound), 120 for lossless
+    float actual_psnr;  // analytical PSNR: 10*log10(3*range²/eb²), 120 for lossless
     double error_bound;
     const AutoStatsGPU* d_stats_ptr;
     /* P4 fix: host-side copy of stats features, pre-copied before mutex */

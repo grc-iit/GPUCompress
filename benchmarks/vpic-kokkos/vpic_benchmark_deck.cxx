@@ -71,7 +71,7 @@ extern "C" double vpic_compute_psnr_gpu(
     const float* d_original, const float* d_decompressed, size_t n_floats);
 extern "C" double vpic_compute_quality_gpu(
     const float* d_original, const float* d_decompressed, size_t n_floats,
-    double* out_rmse, double* out_max_err);
+    double* out_rmse, double* out_max_err, double* out_mean_err, double* out_ssim);
 extern "C" float gpucompress_get_bandwidth_bytes_per_ms(void);
 
 // ============================================================
@@ -907,10 +907,11 @@ begin_diagnostics {
                                  "comp_gbps,decomp_gbps,"
                                  "mape_ratio_pct,mape_comp_pct,mape_decomp_pct,mape_psnr_pct,"
                                  "mae_ratio,mae_comp_ms,mae_decomp_ms,mae_psnr_db,"
+                                 "r2_ratio,r2_comp,r2_decomp,r2_psnr,"
                                  "comp_gbps_std,decomp_gbps_std,"
                                  "vol_stage1_ms,vol_drain_ms,vol_io_drain_ms,"
                                  "vol_s2_busy_ms,vol_s3_busy_ms,"
-                                 "r2_ratio,r2_comp,r2_decomp,r2_psnr\n");
+                                 "psnr_db,rmse,max_abs_err,mean_abs_err,ssim,bit_rate\n");
                     /* Parse timestep CSV to compute steady-state averages per phase */
                     FILE* ts = fopen(TSTEP_CSV, "r");
                     if (ts) {
@@ -931,6 +932,9 @@ begin_diagnostics {
                             double sum_vs2_busy, sum_vs3_busy;
                             double sum_mape_p;
                             double sum_r2_ratio, sum_r2_comp, sum_r2_decomp, sum_r2_psnr;
+                            double sum_mse, sum_range_sq, max_maxerr;
+                            double sum_meanerr, sum_ssim, sum_bitrate;
+                            int    psnr_count;
                             int    count;
                         };
                         const int N_AGG_PHASES = 12;
@@ -967,12 +971,30 @@ begin_diagnostics {
                                        &t_vs1, &t_drain, &t_io_drain,
                                        &t_vs2_busy, &t_vs3_busy);
                             /* Parse trailing fields by comma-counting.
-                             * Column layout: ...,mape_psnr(45),r2_ratio(46),r2_comp(47),r2_decomp(48),r2_psnr(49) */
+                             * Column layout: ...,psnr_db(40),psnr_predicted_db(41),rmse(42),
+                             * max_abs_err(43),mean_abs_err(44),ssim(45),bit_rate(46),
+                             * mape_psnr(47),r2_ratio(48),r2_comp(49),r2_decomp(50),r2_psnr(51) */
+                            double t_psnr = 0, t_rmse = 0, t_maxerr = 0;
+                            double t_meanerr = 0, t_ssim = 0, t_bitrate = 0;
                             {
                                 const char* p = line;
                                 int commas = 0;
-                                while (*p && commas < 45) { if (*p == ',') commas++; p++; }
-                                if (commas >= 45) t_mape_p = atof(p);
+                                while (*p && commas < 40) { if (*p == ',') commas++; p++; }
+                                if (commas >= 40) t_psnr = atof(p);
+                                while (*p && *p != ',') p++; if (*p == ',') p++;
+                                /* skip psnr_predicted_db */
+                                while (*p && *p != ',') p++; if (*p == ',') p++;
+                                t_rmse = atof(p);
+                                while (*p && *p != ',') p++; if (*p == ',') p++;
+                                t_maxerr = atof(p);
+                                while (*p && *p != ',') p++; if (*p == ',') p++;
+                                t_meanerr = atof(p);
+                                while (*p && *p != ',') p++; if (*p == ',') p++;
+                                t_ssim = atof(p);
+                                while (*p && *p != ',') p++; if (*p == ',') p++;
+                                t_bitrate = atof(p);
+                                while (*p && *p != ',') p++; if (*p == ',') p++;
+                                t_mape_p = atof(p);
                                 while (*p && *p != ',') p++; if (*p == ',') p++;
                                 t_r2_ratio = atof(p);
                                 while (*p && *p != ',') p++; if (*p == ',') p++;
@@ -1029,6 +1051,17 @@ begin_diagnostics {
                                             pa[pi].sum_vs2_busy += t_vs2_busy;
                                             pa[pi].sum_vs3_busy += t_vs3_busy;
                                         }
+                                        /* Quality metrics: accumulate MSE and range²
+                                         * for correct averaging (not dB averaging). */
+                                        pa[pi].sum_mse      += t_rmse * t_rmse;
+                                        if (std::isfinite(t_psnr) && t_psnr < 300.0 && t_rmse > 0.0) {
+                                            pa[pi].sum_range_sq += t_rmse * t_rmse * pow(10.0, t_psnr / 10.0);
+                                            pa[pi].psnr_count++;
+                                        }
+                                        pa[pi].max_maxerr    = (t_maxerr > pa[pi].max_maxerr) ? t_maxerr : pa[pi].max_maxerr;
+                                        pa[pi].sum_meanerr  += t_meanerr;
+                                        pa[pi].sum_ssim     += t_ssim;
+                                        pa[pi].sum_bitrate  += t_bitrate;
                                         /* R² (parsed via comma-counting) */
                                         pa[pi].sum_r2_ratio  += t_r2_ratio;
                                         pa[pi].sum_r2_comp   += t_r2_comp;
@@ -1076,9 +1109,10 @@ begin_diagnostics {
                                          "%.4f,%.4f,"
                                          "%.2f,%.2f,%.2f,%.2f,"
                                          "%.4f,%.4f,%.4f,%.4f,"
+                                         "%.4f,%.4f,%.4f,%.4f,"
                                          "0.0000,0.0000,"
                                          "%.2f,%.2f,%.2f,%.2f,%.2f,"
-                                         "%.4f,%.4f,%.4f,%.4f\n",
+                                         "%.2f,%.6e,%.6e,%.6e,%.8f,%.4f\n",
                                     rank(), pnames[pi], n, avg_wr, wr_std, avg_rd, rd_std,
                                     avg_file_mib, orig_mib, avg_ratio,
                                     wmbps, rmbps,
@@ -1091,10 +1125,17 @@ begin_diagnostics {
                                     fmin(200.0, pa[pi].sum_mape_d / n), fmin(200.0, pa[pi].sum_mape_p / n),
                                     pa[pi].sum_mae_r / n, pa[pi].sum_mae_c / n,
                                     pa[pi].sum_mae_d / n, pa[pi].sum_mae_p / n,
+                                    pa[pi].sum_r2_ratio / n, pa[pi].sum_r2_comp / n,
+                                    pa[pi].sum_r2_decomp / n, pa[pi].sum_r2_psnr / n,
                                     pa[pi].sum_vs1 / n, pa[pi].sum_vs2 / n, pa[pi].sum_vs3 / n,
                                     pa[pi].sum_vs2_busy / n, pa[pi].sum_vs3_busy / n,
-                                    pa[pi].sum_r2_ratio / n, pa[pi].sum_r2_comp / n,
-                                    pa[pi].sum_r2_decomp / n, pa[pi].sum_r2_psnr / n);
+                                    (pa[pi].psnr_count > 0 && pa[pi].sum_mse > 0.0
+                                        ? 10.0 * log10((pa[pi].sum_range_sq / pa[pi].psnr_count)
+                                                     / (pa[pi].sum_mse / n))
+                                        : INFINITY),
+                                    sqrt(pa[pi].sum_mse / n),
+                                    pa[pi].max_maxerr, pa[pi].sum_meanerr / n,
+                                    pa[pi].sum_ssim / n, pa[pi].sum_bitrate / n);
                         }
                     }
                 }
@@ -1161,7 +1202,7 @@ begin_diagnostics {
                         "vol_s2_busy_ms,vol_s3_busy_ms,"
                         "h5dwrite_ms,cuda_sync_ms,h5dclose_ms,h5fclose_ms,"
                         "vol_setup_ms,vol_pipeline_ms,"
-                        "psnr_db,psnr_predicted_db,rmse,max_abs_err,bit_rate,"
+                        "psnr_db,psnr_predicted_db,rmse,max_abs_err,mean_abs_err,ssim,bit_rate,"
                         "mape_psnr,"
                         "r2_ratio,r2_comp,r2_decomp,r2_psnr\n");
             }
@@ -1501,9 +1542,10 @@ begin_diagnostics {
             }
 
             /* Quality metrics: PSNR, RMSE, max error — computed on GPU, outside timed section */
-            double rmse = 0.0, max_abs_err = 0.0;
+            double rmse = 0.0, max_abs_err = 0.0, mean_abs_err = 0.0, ssim = 1.0;
             double psnr_db = vpic_compute_quality_gpu(d_fields, global->d_read, n_floats,
-                                                       &rmse, &max_abs_err);
+                                                       &rmse, &max_abs_err,
+                                                       &mean_abs_err, &ssim);
 
             /* File size for ratio + derived metrics */
             size_t file_sz = get_file_size(phases[pi].tmp_file);
@@ -1540,37 +1582,36 @@ begin_diagnostics {
                 ts_decomp_ms  += diag.decompression_ms_raw;
                 ts_explore_ms += diag.exploration_ms;
                 ts_sgd_ms     += diag.sgd_update_ms;
-                /* MAPE (clamped denominators) */
-                if (diag.actual_ratio > 0) {
-                    mape_r_sum += fabs(diag.predicted_ratio - diag.actual_ratio) / fabs(diag.actual_ratio);
+                /* Ratio: MAPE, MAE, R² — same guard for consistent population */
+                if (diag.actual_ratio > 0 && diag.predicted_ratio > 0) {
+                    double a = diag.actual_ratio, p = diag.predicted_ratio;
+                    mape_r_sum += fabs(p - a) / fabs(a);
+                    mae_r_sum  += fabs(p - a);
+                    r2_r_sum += a; r2_r_sum2 += a*a; r2_r_ss_res += (a-p)*(a-p); r2_r_cnt++;
                     mcnt_r++;
                 }
+                /* Comp time: MAPE on clamped, MAE/R² on raw */
                 if (diag.compression_ms > 0) {
                     mape_c_sum += fabs(diag.predicted_comp_time - diag.compression_ms) / fabs(diag.compression_ms);
                     mcnt_c++;
-                }
-                if (diag.decompression_ms > 0) {
-                    mape_d_sum += fabs(diag.predicted_decomp_time - diag.decompression_ms) / fabs(diag.decompression_ms);
-                    mcnt_d++;
-                }
-                /* MAE + R² accumulators */
-                if (diag.actual_ratio > 0 && diag.predicted_ratio > 0) {
-                    double a = diag.actual_ratio, p = diag.predicted_ratio;
-                    mae_r_sum += fabs(p - a);
-                    r2_r_sum += a; r2_r_sum2 += a*a; r2_r_ss_res += (a-p)*(a-p); r2_r_cnt++;
                 }
                 if (diag.compression_ms_raw > 0) {
                     double a = diag.compression_ms_raw, p = diag.predicted_comp_time;
                     mae_c_sum += fabs(p - a);
                     r2_c_sum += a; r2_c_sum2 += a*a; r2_c_ss_res += (a-p)*(a-p); r2_c_cnt++;
                 }
+                /* Decomp time: MAPE on clamped, MAE/R² on raw */
+                if (diag.decompression_ms > 0) {
+                    mape_d_sum += fabs(diag.predicted_decomp_time - diag.decompression_ms) / fabs(diag.decompression_ms);
+                    mcnt_d++;
+                }
                 if (diag.decompression_ms_raw > 0) {
                     double a = diag.decompression_ms_raw, p = diag.predicted_decomp_time;
                     mae_d_sum += fabs(p - a);
                     r2_d_sum += a; r2_d_sum2 += a*a; r2_d_ss_res += (a-p)*(a-p); r2_d_cnt++;
                 }
-                /* PSNR MAPE/MAE (skip lossless: both are 120, MAPE=0 is trivial) */
-                if (diag.predicted_psnr > 0.0f && diag.actual_psnr < 120.0f && diag.actual_psnr > 0.0f) {
+                /* PSNR MAPE/MAE (skip lossless: actual_psnr=inf, MAPE=0 is trivial) */
+                if (diag.predicted_psnr > 0.0f && std::isfinite(diag.actual_psnr) && diag.actual_psnr > 0.0f) {
                     double a = diag.actual_psnr, p = diag.predicted_psnr;
                     mape_p_sum += fabs(p - a) / fabs(a);
                     mae_p_sum  += fabs(p - a);
@@ -1649,7 +1690,7 @@ begin_diagnostics {
                         "%.2f,%.2f,"
                         "%.2f,%.2f,%.2f,%.2f,"
                         "%.2f,%.2f,"
-                        "%.2f,%.2f,%.6e,%.6e,%.4f,"
+                        "%.2f,%.2f,%.6e,%.6e,%.6e,%.8f,%.4f,"
                         "%.2f,"
                         "%.4f,%.4f,%.4f,%.4f\n",
                         rank(), display_name, t, (int)step(), write_ms_t, read_ms_t, ratio_t,
@@ -1665,7 +1706,7 @@ begin_diagnostics {
                         h5dwrite_ms, cuda_sync_ms, h5dclose_ms, h5fclose_ms,
                         vol_setup, vol_total,
                         psnr_db, psnr_predicted,
-                        rmse, max_abs_err, bit_rate,
+                        rmse, max_abs_err, mean_abs_err, ssim, bit_rate,
                         real_mape_p,
                         r2_ratio, r2_comp, r2_decomp, r2_psnr);
                 fflush(global->ts_csv);
@@ -1690,7 +1731,7 @@ begin_diagnostics {
                             mc = fmin(200.0, fabs(dd.predicted_comp_time - dd.compression_ms) / fabs(dd.compression_ms) * 100.0);
                         if (dd.decompression_ms > 0)
                             md = fmin(200.0, fabs(dd.predicted_decomp_time - dd.decompression_ms) / fabs(dd.decompression_ms) * 100.0);
-                        if (dd.actual_psnr > 0.0f && dd.actual_psnr < 120.0f && dd.predicted_psnr > 0.0f)
+                        if (dd.actual_psnr > 0.0f && std::isfinite(dd.actual_psnr) && dd.predicted_psnr > 0.0f)
                             mp = fmin(200.0, fabs(dd.predicted_psnr - dd.actual_psnr) / fabs(dd.actual_psnr) * 100.0);
 
                         char action_str[40], orig_str[40];

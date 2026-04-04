@@ -291,7 +291,9 @@ def _ordered(rows):
     _normalize_rows(rows)
     by_phase = {}
     for r in rows:
-        phase = _PHASE_ALIASES.get(r["phase"], r["phase"])
+        # Normalize: "nn/ratio" → "nn", "nn-rl/balanced" → "nn-rl"
+        phase = r["phase"].split("/")[0]
+        phase = _PHASE_ALIASES.get(phase, phase)
         r["phase"] = phase
         by_phase[phase] = r
     phases = [p for p in PHASE_ORDER if p in by_phase]
@@ -521,7 +523,7 @@ def make_summary_figure(source_name, rows, output_path, meta_text=""):
 # View 2: Timestep Adaptation (MAPE over timesteps)
 # ═══════════════════════════════════════════════════════════════════════
 
-def make_timestep_figure(ts_csv_path, output_path):
+def make_timestep_figure(ts_csv_path, output_path, policy_filter=None):
     """Plot MAPE for ratio/comp_time/decomp_time over timesteps, one line per phase."""
     rows = parse_csv(ts_csv_path)
     if not rows:
@@ -553,6 +555,8 @@ def make_timestep_figure(ts_csv_path, output_path):
                 if len(short) > 20:
                     short = short[:18] + ".."
                 field_names.append(short)
+
+    rows = _filter_and_strip_policy(rows, policy_filter)
 
     # Group by phase (new CSV has 'phase' column; old CSV doesn't)
     has_phase = "phase" in rows[0] if rows else False
@@ -624,7 +628,7 @@ def make_timestep_figure(ts_csv_path, output_path):
     print(f"  Saved: {output_path}")
 
 
-def make_mae_figure(ts_csv_path, output_path):
+def make_mae_figure(ts_csv_path, output_path, policy_filter=None):
     """Plot MAE for ratio/comp_time/decomp_time over timesteps, one line per phase."""
     rows = parse_csv(ts_csv_path)
     if not rows:
@@ -633,6 +637,7 @@ def make_mae_figure(ts_csv_path, output_path):
 
     # Aggregate across ranks: average per (phase, timestep)
     rows = _aggregate_timesteps_across_ranks(rows)
+    rows = _filter_and_strip_policy(rows, policy_filter)
 
     # Check that MAE columns exist
     if "mae_ratio" not in rows[0]:
@@ -644,7 +649,7 @@ def make_mae_figure(ts_csv_path, output_path):
 
     by_phase = {}
     for r in rows:
-        ph = r.get("phase", "nn-rl")
+        ph = r.get("phase", "nn-rl").split("/")[0]
         by_phase.setdefault(ph, []).append(r)
 
     phase_order = ["nn", "nn-rl", "nn-rl+exp50"]
@@ -701,7 +706,7 @@ def make_mae_figure(ts_csv_path, output_path):
     print(f"  Saved: {output_path}")
 
 
-def make_r2_figure(ts_csv_path, output_path):
+def make_r2_figure(ts_csv_path, output_path, policy_filter=None):
     """Plot R² for ratio/comp_time/decomp_time/PSNR over timesteps, one line per NN phase.
 
     R² = 1 - SS_res/SS_tot measures how well the NN predicts each target.
@@ -713,6 +718,7 @@ def make_r2_figure(ts_csv_path, output_path):
         return
 
     rows = _aggregate_timesteps_across_ranks(rows)
+    rows = _filter_and_strip_policy(rows, policy_filter)
 
     if "r2_ratio" not in rows[0]:
         print(f"  No R² columns in {ts_csv_path}, skipping R² plot.")
@@ -724,7 +730,7 @@ def make_r2_figure(ts_csv_path, output_path):
     # Normalize phase names: "nn/balanced" → "nn", "nn-rl/ratio" → "nn-rl"
     by_phase = {}
     for r in rows:
-        ph = r.get("phase", "nn-rl")
+        ph = r.get("phase", "nn-rl").split("/")[0]
         base_ph = ph.split("/")[0]  # strip policy suffix
         by_phase.setdefault(base_ph, []).append(r)
 
@@ -802,7 +808,7 @@ def make_r2_figure(ts_csv_path, output_path):
     print(f"  Saved: {output_path}")
 
 
-def make_psnr_figure(ts_csv_path, output_path):
+def make_psnr_figure(ts_csv_path, output_path, policy_filter=None):
     """Plot PSNR (actual and predicted) over timesteps.
 
     Layout: one row per NN phase, two columns (actual | predicted).
@@ -814,12 +820,14 @@ def make_psnr_figure(ts_csv_path, output_path):
 
     # Aggregate across ranks: average per (phase, timestep)
     rows = _aggregate_timesteps_across_ranks(rows)
+    rows = _filter_and_strip_policy(rows, policy_filter)
 
     if "psnr_db" not in rows[0]:
         return
 
-    # psnr_db=0 means "not computed" (lossless run). Only plot if real lossy data exists.
-    has_lossy = any(0 < g(r, "psnr_db") < 119.0 for r in rows)
+    # psnr_db=0 means "not computed" (lossless run), inf means perfect reconstruction.
+    # Only plot if real lossy data exists (finite PSNR > 0).
+    has_lossy = any(0 < g(r, "psnr_db") < float('inf') for r in rows)
     has_predicted = any(g(r, "psnr_predicted_db") > 0.0 for r in rows)
     if not has_lossy and not has_predicted:
         print(f"  Skipping PSNR plot (no lossy data in {ts_csv_path})")
@@ -828,9 +836,10 @@ def make_psnr_figure(ts_csv_path, output_path):
     is_field_based = "field_idx" in rows[0] and "timestep" not in rows[0]
     x_label = "Field" if is_field_based else "Timestep"
 
+    # Normalize phase names: "nn/balanced" → "nn", "nn-rl/ratio" → "nn-rl"
     by_phase = {}
     for r in rows:
-        ph = r.get("phase", "nn-rl")
+        ph = r.get("phase", "nn-rl").split("/")[0].split("/")[0]
         by_phase.setdefault(ph, []).append(r)
 
     phase_order = ["nn", "nn-rl", "nn-rl+exp50"]
@@ -847,7 +856,7 @@ def make_psnr_figure(ts_csv_path, output_path):
     fig, axes = plt.subplots(n_phases, 1, figsize=(14, 4 * n_phases),
                              squeeze=False, sharex=True)
     fig.suptitle("PSNR Quality Over Timesteps\n"
-                 "(higher = better quality, 120 dB = lossless)",
+                 "(higher = better quality, lossless timesteps omitted)",
                  fontsize=14, fontweight="bold", y=0.98)
 
     for row, ph in enumerate(phases_present):
@@ -855,11 +864,12 @@ def make_psnr_figure(ts_csv_path, output_path):
         ph_rows = by_phase[ph]
         ts = np.array([g(r, "timestep", "field_idx") for r in ph_rows])
         actual = np.array([g(r, "psnr_db") for r in ph_rows])
+        actual = np.where(np.isfinite(actual), actual, np.nan)  # inf → NaN
         predicted = np.array([g(r, "psnr_predicted_db") for r in ph_rows])
 
         ax = axes[row, 0]
 
-        # Actual PSNR (solid) — skip psnr_db=0 (means "not computed", lossless)
+        # Actual PSNR (solid) — skip psnr_db=0/NaN (not computed or lossless)
         mask = actual > 0
         if mask.any():
             ax.plot(ts[mask], actual[mask], color=info["color"], marker=info["marker"],
@@ -875,8 +885,8 @@ def make_psnr_figure(ts_csv_path, output_path):
                     markersize=5, linewidth=1.5, linestyle="--",
                     label="Predicted PSNR", zorder=3, alpha=0.7)
 
-        ax.axhline(y=120, color="#27ae60", linestyle=":", alpha=0.5,
-                   linewidth=1, label="Lossless (120 dB)")
+        ax.axhline(y=60, color="#95a5a6", linestyle="--", alpha=0.5,
+                   linewidth=0.8, label="60 dB reference")
 
         ax.set_ylabel("PSNR (dB)", fontweight="bold")
         ax.set_title(info["label"], fontweight="bold", fontsize=12)
@@ -898,7 +908,7 @@ def make_psnr_figure(ts_csv_path, output_path):
     print(f"  Saved: {output_path}")
 
 
-def make_lossy_quality_figure(ts_csv_path, output_path):
+def make_lossy_quality_figure(ts_csv_path, output_path, policy_filter=None):
     """Plot lossy compression quality metrics: PSNR, RMSE, Max Error, Bit Rate.
 
     4-panel figure showing all standard lossy metrics across timesteps,
@@ -911,6 +921,7 @@ def make_lossy_quality_figure(ts_csv_path, output_path):
 
     # Aggregate across ranks: average per (phase, timestep)
     rows = _aggregate_timesteps_across_ranks(rows)
+    rows = _filter_and_strip_policy(rows, policy_filter)
 
     # Check if lossy metrics exist and have nonzero values
     has_rmse = "rmse" in rows[0]
@@ -938,26 +949,49 @@ def make_lossy_quality_figure(ts_csv_path, output_path):
     if not phases_present:
         return
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10), facecolor="white")
-    fig.suptitle("Lossy Compression Quality Metrics\n"
-                 "(lower RMSE/Max Error = better quality, higher PSNR = better)",
+    has_mean_err = "mean_abs_err" in rows[0]
+    has_ssim = "ssim" in rows[0]
+
+    if has_mean_err or has_ssim:
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10), facecolor="white")
+    else:
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10), facecolor="white")
+    fig.suptitle("Lossy Compression Quality Metrics",
                  fontsize=14, fontweight="bold", y=0.98)
 
+    # Each panel: (ax, csv_col, ylabel, direction, use_log, description)
+    # direction: "up" = higher is better, "down" = lower is better
     panels = [
-        (axes[0, 0], "psnr_db",      "PSNR (dB)",           "higher = better", False),
-        (axes[0, 1], "rmse",          "RMSE",                "lower = better",  True),
-        (axes[1, 0], "max_abs_err",   "Max Absolute Error",  "lower = better",  True),
-        (axes[1, 1], "bit_rate",      "Bit Rate (bits/value)","lower = better", False),
+        (axes[0, 0], "psnr_db",      "PSNR (dB)",
+         "up", False, "Signal-to-noise ratio;\nhigher = less distortion"),
+        (axes[0, 1], "rmse",          "RMSE",
+         "down", True, "Root mean squared error;\nlower = closer to original"),
+        (axes[0, 2] if has_mean_err else None, "mean_abs_err", "Mean Abs Error",
+         "down", True, "Average per-element error;\nlower = better fidelity"),
+        (axes[1, 0], "max_abs_err",   "Max Absolute Error",
+         "down", True, "Worst-case element error;\nlower = tighter bound"),
+        (axes[1, 1], "ssim" if has_ssim else "bit_rate",
+         "SSIM" if has_ssim else "Bit Rate (bits/value)",
+         "up" if has_ssim else "down", False,
+         "Structural similarity (0\u20131);\ncloser to 1 = better" if has_ssim
+         else "Bits per value;\nlower = more compression"),
+        (axes[1, 2] if has_ssim else None, "bit_rate", "Bit Rate (bits/value)",
+         "down", False, "Bits per value;\nlower = more compression"),
     ]
+    panels = [(ax, col, yl, d, lg, desc)
+              for ax, col, yl, d, lg, desc in panels if ax is not None]
 
-    for ax, col, ylabel, subtitle, use_log in panels:
+    for ax, col, ylabel, direction, use_log, description in panels:
         for ph in phases_present:
             ph_rows = by_phase[ph]
             ts = [g(r, x_key) for r in ph_rows]
             vals = [g(r, col) for r in ph_rows]
 
-            # Skip phases with all zeros for this metric
-            if all(v == 0 for v in vals):
+            # Replace inf with NaN so matplotlib skips those points
+            vals = [v if np.isfinite(v) else float('nan') for v in vals]
+
+            # Skip phases with all zeros/NaN for this metric
+            if all(v == 0 or np.isnan(v) for v in vals):
                 continue
 
             color = PHASE_COLORS.get(ph, "#bdc3c7")
@@ -966,13 +1000,37 @@ def make_lossy_quality_figure(ts_csv_path, output_path):
             ax.plot(ts, vals, color=color, marker=marker, markersize=5,
                     linewidth=1.5, label=label, alpha=0.8)
 
+        # Direction arrow + description annotation
+        arrow = "\u2191 better" if direction == "up" else "\u2193 better"
+        arrow_color = "#27ae60" if direction == "up" else "#2980b9"
+        ax.annotate(arrow, xy=(1.0, 1.0), xycoords="axes fraction",
+                    fontsize=9, fontweight="bold", color=arrow_color,
+                    ha="right", va="top",
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=arrow_color, alpha=0.85))
+        # Description in bottom-left
+        ax.text(0.02, 0.02, description, transform=ax.transAxes,
+                fontsize=7, color="#555555", va="bottom", ha="left",
+                fontstyle="italic")
+
         ax.set_xlabel(x_label)
         ax.set_ylabel(ylabel)
-        ax.set_title(f"{ylabel}  ({subtitle})", fontweight="bold")
+        ax.set_title(ylabel, fontweight="bold")
         ax.legend(fontsize=7, loc="best", ncol=2)
         ax.grid(alpha=0.2, linestyle="--")
         if use_log:
             ax.set_yscale("log")
+
+        # PSNR: clip y-axis at 120 dB, add 60 dB reference line
+        if col == "psnr_db":
+            ax.set_ylim(top=min(ax.get_ylim()[1], 120))
+            ax.axhline(y=60, color="#95a5a6", linestyle="--", linewidth=0.8, zorder=1)
+            ax.text(0.98, 0.22, "60 dB reference",
+                    transform=ax.transAxes, fontsize=6, color="#95a5a6",
+                    ha="right", va="bottom")
+        # SSIM: fix y-axis around [0.9, 1.01] for readability
+        if col == "ssim":
+            ylo, yhi = ax.get_ylim()
+            ax.set_ylim(max(0, min(ylo, 0.9)), min(yhi, 1.01))
 
     _sc_finalize(fig, pad=1.5, rect=[0, 0, 1, 0.93])
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -994,7 +1052,7 @@ def make_ranking_quality_figure(ranking_csv_path, output_path):
 
     by_phase = {}
     for r in rows:
-        ph = r.get("phase", "nn-rl")
+        ph = r.get("phase", "nn-rl").split("/")[0]
         by_phase.setdefault(ph, []).append(r)
 
     phase_order = ["nn", "nn-rl", "nn-rl+exp50"]
@@ -1063,7 +1121,7 @@ def make_ranking_quality_figure(ranking_csv_path, output_path):
     print(f"  Saved: {output_path}")
 
 
-def make_sgd_exploration_figure(ts_csv_path, output_path):
+def make_sgd_exploration_figure(ts_csv_path, output_path, policy_filter=None):
     """Plot SGD fires and exploration triggers per timestep."""
     rows = parse_csv(ts_csv_path)
     if not rows:
@@ -1072,6 +1130,7 @@ def make_sgd_exploration_figure(ts_csv_path, output_path):
 
     # Aggregate across ranks: sum counts, average metrics per (phase, timestep)
     rows = _aggregate_timesteps_across_ranks(rows)
+    rows = _filter_and_strip_policy(rows, policy_filter)
 
     # Detect field-based vs timestep-based data
     is_field_based = "field_idx" in rows[0] and "timestep" not in rows[0]
@@ -1095,7 +1154,7 @@ def make_sgd_exploration_figure(ts_csv_path, output_path):
 
     by_phase = {}
     for r in rows:
-        ph = r.get("phase", "nn-rl")
+        ph = r.get("phase", "nn-rl").split("/")[0]
         by_phase.setdefault(ph, []).append(r)
 
     phase_order = ["nn", "nn-rl", "nn-rl+exp50"]
@@ -1717,6 +1776,26 @@ def _aggregate_chunks_across_ranks(rows):
     return result
 
 
+def _filter_and_strip_policy(rows, policy_filter=None):
+    """Filter rows to a single policy and strip the '/policy' suffix from phase names.
+
+    VPIC multi-policy runs produce phase names like 'nn-rl/balanced', 'nn-rl/ratio'.
+    This function keeps only rows matching the given policy and normalizes phase
+    names to 'nn-rl', 'nn-rl+exp50', etc.
+    """
+    if policy_filter:
+        pf = policy_filter.split("_")[0]  # "balanced_w1-1-1" → "balanced"
+        rows = [r for r in rows
+                if "/" not in r.get("phase", "") or
+                r.get("phase", "").split("/")[1] == pf]
+    # Strip policy suffix from phase names
+    for r in rows:
+        ph = r.get("phase", "")
+        if "/" in ph:
+            r["phase"] = ph.split("/")[0]
+    return rows
+
+
 def _aggregate_timesteps_across_ranks(rows):
     """Aggregate timestep-level rows across ranks: mean for all numeric columns.
 
@@ -1776,7 +1855,7 @@ def make_milestone_actions_figure(tc_csv_path, output_path, chunk_csv_path=None)
     # Group by (phase, timestep)
     by_phase_ts = {}
     for r in all_rows:
-        ph = r.get("phase", "nn-rl")
+        ph = r.get("phase", "nn-rl").split("/")[0]
         ts = int(g(r, "timestep", "field_idx"))
         by_phase_ts.setdefault(ph, {}).setdefault(ts, []).append(r)
 
@@ -2449,7 +2528,10 @@ def make_gpu_breakdown_over_time(ts_csv_path, output_path):
 # ═══════════════════════════════════════════════════════════════════════
 
 def make_cross_dataset_convergence_figure(ts_csv_paths, dataset_names, output_path):
-    """Overlay MAPE convergence curves from multiple datasets on one plot.
+    """Overlay MAPE convergence curves from multiple datasets.
+
+    2×2 grid: ratio MAPE, comp time MAPE, decomp time MAPE, PSNR MAPE.
+    One line per dataset, filtered to nn-rl phase.
 
     Args:
         ts_csv_paths: list of timestep CSV file paths
@@ -2458,40 +2540,58 @@ def make_cross_dataset_convergence_figure(ts_csv_paths, dataset_names, output_pa
     """
     dataset_colors = ["#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#9b59b6",
                       "#1abc9c", "#e67e22", "#34495e"]
-    dataset_linestyles = ["-", "--", "-.", ":", "-", "--", "-.", ":"]
     dataset_markers = ["o", "s", "D", "^", "v", "<", ">", "p"]
-    fig, ax = plt.subplots(figsize=(7, 5))
+
+    metrics = [
+        ("mape_ratio", "Ratio MAPE (%)"),
+        ("mape_comp", "Compression Time MAPE (%)"),
+        ("mape_decomp", "Decompression Time MAPE (%)"),
+        ("mape_psnr", "PSNR MAPE (%)"),
+    ]
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle("Online Learning Convergence Across Datasets (NN+SGD)\n"
+                 "Per-metric MAPE over timesteps/fields",
+                 fontsize=14, fontweight="bold", y=0.98)
+
+    is_field_based = False
 
     for i, (csv_path, ds_name) in enumerate(zip(ts_csv_paths, dataset_names)):
         if not os.path.exists(csv_path):
             continue
         rows = parse_csv(csv_path)
-        # Filter to nn-rl phase
-        rl_rows = [r for r in rows if r.get("phase", "nn-rl") == "nn-rl"]
+        rows = _aggregate_timesteps_across_ranks(rows)
+        # Filter to nn-rl phase (normalize "nn-rl/balanced" → "nn-rl")
+        rl_rows = [r for r in rows if r.get("phase", "").split("/")[0] == "nn-rl"]
         if not rl_rows:
-            rl_rows = rows  # fallback for old CSV without phase column
-        timesteps = np.array([g(r, "timestep") for r in rl_rows])
-        mape = np.array([g(r, "mape_ratio") for r in rl_rows])
-        clipped = np.clip(mape, 0, 300)
+            continue
+
+        is_field_based = "field_idx" in rl_rows[0] and "timestep" not in rl_rows[0]
+        x_key = "field_idx" if is_field_based else "timestep"
+        timesteps = np.array([g(r, x_key) for r in rl_rows])
         color = dataset_colors[i % len(dataset_colors)]
-        ls = dataset_linestyles[i % len(dataset_linestyles)]
         marker = dataset_markers[i % len(dataset_markers)]
-        ax.plot(timesteps, clipped, color=color, linewidth=2.0, marker=marker,
-                markersize=6, linestyle=ls, label=ds_name, alpha=0.85)
 
-    ax.axhline(20, color="#e67e22", linewidth=1, linestyle="--", alpha=0.6,
-               label="20% target")
-    ax.set_xlabel("Timestep", fontweight="bold")
-    ax.set_ylabel("Ratio MAPE (%)", fontweight="bold")
-    ax.set_title("Online Learning Convergence Across Datasets (nn-rl)",
-                 fontweight="bold")
-    ax.set_ylim(0, 300)
-    ax.legend(loc="upper right")
-    ax.grid(axis="y", alpha=0.2, linestyle="--")
-    ax.grid(axis="y", which='minor', alpha=0.1, linestyle=':')
-    ax.minorticks_on()
+        for mi, (mape_key, _) in enumerate(metrics):
+            ax = axes[mi // 2][mi % 2]
+            mape = np.array([g(r, mape_key) for r in rl_rows])
+            clipped = np.clip(mape, 0, 200)
+            ax.plot(timesteps, clipped, color=color, linewidth=2.0, marker=marker,
+                    markersize=5, label=ds_name, alpha=0.85)
 
-    _sc_finalize(fig, pad=1.5)
+    x_label = "Field" if is_field_based else "Timestep"
+    for mi, (_, title) in enumerate(metrics):
+        ax = axes[mi // 2][mi % 2]
+        ax.axhline(20, color="#7f8c8d", linewidth=1, linestyle="--", alpha=0.4)
+        ax.set_ylabel(title, fontweight="bold")
+        ax.set_title(title, fontsize=11, fontweight="bold")
+        ax.legend(loc="upper right", fontsize=8)
+        ax.grid(axis="y", alpha=0.2, linestyle="--")
+        ax.set_ylim(bottom=0)
+        if mi >= 2:
+            ax.set_xlabel(x_label, fontweight="bold")
+
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)

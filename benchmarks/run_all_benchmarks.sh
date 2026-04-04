@@ -164,7 +164,7 @@ run_sdr() {
             EXPLORE_K=$EXPLORE_K \
             EXPLORE_THRESH=$EXPLORE_THRESH \
             VPIC_EVAL_SUFFIX="$SUFFIX" \
-            bash "$SCRIPT_DIR/sdrbench/run_all_sdr.sh"
+            bash "$SCRIPT_DIR/sdrbench/run_sdr.sh"
         done
     done
 

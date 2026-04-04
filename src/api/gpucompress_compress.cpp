@@ -29,6 +29,15 @@
 
 using namespace nvcomp;
 
+/* Analytical PSNR for linear quantization.
+ * Uses expected MSE = eb²/3 (uniform error in [-eb, eb]),
+ * matching the real MSE formula: PSNR = 10*log10(range²/MSE). */
+static inline double analytical_psnr(double data_range, double error_bound) {
+    if (data_range <= 0.0 || error_bound <= 0.0) return -1.0;
+    double mse_expected = (error_bound * error_bound) / 3.0;
+    return fmin(10.0 * log10((data_range * data_range) / mse_expected), 120.0);
+}
+
 /* Detailed timing helpers — zero overhead when g_detailed_timing is false */
 #define DT_START(var) \
     auto var = g_detailed_timing ? std::chrono::steady_clock::now() \
@@ -553,9 +562,9 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
             primary_sgd[0].actual_psnr       = static_cast<float>(explored_samples[0].psnr);
             if (d_quantized && quant_result.isValid()) {
                 double range = quant_result.data_max - quant_result.data_min;
-                if (range > 0.0 && quant_result.error_bound > 0.0)
-                    primary_sgd[0].actual_psnr = static_cast<float>(
-                        fmin(20.0 * log10(range / quant_result.error_bound), 120.0));
+                double psnr = analytical_psnr(range, quant_result.error_bound);
+                if (psnr > 0.0)
+                    primary_sgd[0].actual_psnr = static_cast<float>(psnr);
             }
             {
                 std::lock_guard<std::mutex> sgd_lk(g_sgd_mutex);
@@ -739,8 +748,7 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
                 double alt_psnr = -1.0;
                 if (s.has_quant && s.quant_result.isValid()) {
                     double range = s.quant_result.data_max - s.quant_result.data_min;
-                    if (range > 0.0 && s.quant_result.error_bound > 0.0)
-                        alt_psnr = fmin(20.0 * log10(range / s.quant_result.error_bound), 120.0);
+                    alt_psnr = analytical_psnr(range, s.quant_result.error_bound);
                 }
 
                 /* Use measured comp_time; decomp_time uses NN prediction (no decomp at write) */
@@ -929,9 +937,9 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
         di.actual_psnr = 120.0f;  // lossless default
         if (d_quantized && quant_result.isValid()) {
             double range = quant_result.data_max - quant_result.data_min;
-            if (range > 0.0 && quant_result.error_bound > 0.0)
-                di.actual_psnr = static_cast<float>(
-                    fmin(20.0 * log10(range / quant_result.error_bound), 120.0));
+            double psnr = analytical_psnr(range, quant_result.error_bound);
+            if (psnr > 0.0)
+                di.actual_psnr = static_cast<float>(psnr);
         }
         di.error_bound = cfg.error_bound;
         di.d_stats_ptr = d_stats_ptr;

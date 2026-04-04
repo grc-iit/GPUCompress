@@ -130,8 +130,8 @@ def load_csv(path):
                        "explore_ms", "sgd_ms",
                        "stage1_ms", "drain_ms", "io_drain_ms", "pipeline_ms",
                        "s2_busy_ms", "s3_busy_ms",
-                       "psnr_db", "rmse", "max_abs_err", "bit_rate",
-                       "data_range"]:
+                       "psnr_db", "rmse", "max_abs_err", "mean_abs_err",
+                       "ssim", "bit_rate", "data_range"]:
                 r[k] = float(r.get(k, 0))
             rows.append(r)
     return rows
@@ -748,7 +748,7 @@ def fig5e_lossy_quality(rows, outdir, subtitle=""):
 
     One row per metric, one line per algorithm. Only shown when lossy data present.
     """
-    lossy_rows = [r for r in rows if r.get("psnr_db", 120) < 120 and r.get("psnr_db", 0) > 0]
+    lossy_rows = [r for r in rows if 0 < float(r.get("psnr_db", 0)) < float('inf') and r.get("psnr_db", 0) > 0]
     if not lossy_rows:
         print("  Skipping 5e_lossy_quality (no lossy data)")
         return
@@ -762,8 +762,13 @@ def fig5e_lossy_quality(rows, outdir, subtitle=""):
         ("psnr_db", "PSNR (dB)", "higher = better"),
         ("rmse", "RMSE", "lower = better"),
         ("max_abs_err", "Max Absolute Error", "lower = better"),
+        ("mean_abs_err", "Mean Absolute Error", "lower = better"),
+        ("ssim", "SSIM", "higher = better"),
         ("bit_rate", "Bit Rate (bits/value)", "lower = better"),
     ]
+    # Only include metrics that have data
+    metrics = [(k, l, n) for k, l, n in metrics
+               if any(r.get(k, 0) != 0 for r in lossy_rows)]
 
     n_metrics = len(metrics)
     fig, axes = plt.subplots(n_metrics, 1, figsize=(14, 3.5 * n_metrics + 1))
@@ -813,7 +818,7 @@ def fig5f_lossy_quality_table(all_rows, outdir, subtitle=""):
     """
     epoch = max(r["epoch"] for r in all_rows)
     rows = [r for r in all_rows if r["epoch"] == epoch]
-    lossy_rows = [r for r in rows if r.get("psnr_db", 120) < 120 and r.get("rmse", 0) > 0]
+    lossy_rows = [r for r in rows if 0 < float(r.get("psnr_db", 0)) < float('inf') and r.get("rmse", 0) > 0]
     if not lossy_rows:
         print("  Skipping 5f_lossy_quality_table (no lossy data)")
         return
@@ -839,6 +844,8 @@ def fig5f_lossy_quality_table(all_rows, outdir, subtitle=""):
                 "rmse": f"{rmse:.6f}",
                 "nrmse": f"{nrmse:.4%}",
                 "max_err": f"{r.get('max_abs_err', 0):.6f}",
+                "mean_err": f"{r.get('mean_abs_err', 0):.6f}",
+                "ssim": f"{r.get('ssim', 1.0):.6f}",
                 "bit_rate": f"{r.get('bit_rate', 0):.1f}",
                 "ratio": f"{r.get('ratio', 0):.2f}x",
                 "psnr": f"{r.get('psnr_db', 0):.1f}",
@@ -848,10 +855,12 @@ def fig5f_lossy_quality_table(all_rows, outdir, subtitle=""):
         return
 
     # Create figure with table
-    col_labels = ["Tensor", "Algorithm", "Range", "RMSE", "RMSE/Range", "Max Error",
+    col_labels = ["Tensor", "Algorithm", "Range", "RMSE", "RMSE/Range",
+                  "Mean Err", "Max Error", "SSIM",
                   "Bit Rate", "Ratio", "PSNR (dB)"]
     cell_text = [[d["tensor"], d["algorithm"], d["data_range"], d["rmse"],
-                  d["nrmse"], d["max_err"], d["bit_rate"], d["ratio"], d["psnr"]]
+                  d["nrmse"], d["mean_err"], d["max_err"], d["ssim"],
+                  d["bit_rate"], d["ratio"], d["psnr"]]
                  for d in table_data]
 
     n_rows = len(cell_text)

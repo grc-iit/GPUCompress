@@ -113,7 +113,7 @@ std::unique_ptr<nvcomp::nvcompManagerBase> createCompressionManager(
 
         case CompressionAlgorithm::CASCADED: {
             nvcompBatchedCascadedCompressOpts_t opts = nvcompBatchedCascadedCompressDefaultOpts;
-            opts.type = NVCOMP_TYPE_LONGLONG; // Good for floating-point/scientific data
+            opts.type = NVCOMP_TYPE_CHAR; // Byte-level: correct for any quantized precision (INT8/16/32)
             return std::make_unique<nvcomp::CascadedManager>(
                 chunk_size, opts, nvcompBatchedCascadedDecompressDefaultOpts, stream);
         }
