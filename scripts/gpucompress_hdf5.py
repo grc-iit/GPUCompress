@@ -346,20 +346,20 @@ class GPUCompressHDF5Writer:
                 r2_r_ss += (actual_ratio - predicted_ratio)**2; r2_r_n += 1
                 cnt_r += 1
 
-            # Compression time MAPE/MAE/R²
+            # Compression time MAPE (clamped) / MAE+R² (unclamped raw)
             if comp_ms > 0:
                 mape_c_sum += abs(predicted_comp - comp_ms) / abs(comp_ms)
-                mae_c_sum += abs(predicted_comp - comp_ms)
-                r2_c_sum += comp_ms; r2_c_sum2 += comp_ms**2
-                r2_c_ss += (comp_ms - predicted_comp)**2; r2_c_n += 1
+                mae_c_sum += abs(predicted_comp - comp_ms_raw)
+                r2_c_sum += comp_ms_raw; r2_c_sum2 += comp_ms_raw**2
+                r2_c_ss += (comp_ms_raw - predicted_comp)**2; r2_c_n += 1
                 cnt_c += 1
 
-            # Decompression time MAPE/MAE/R²
+            # Decompression time MAPE (clamped) / MAE+R² (unclamped raw)
             if decomp_ms > 0:
                 mape_d_sum += abs(predicted_decomp - decomp_ms) / abs(decomp_ms)
-                mae_d_sum += abs(predicted_decomp - decomp_ms)
-                r2_d_sum += decomp_ms; r2_d_sum2 += decomp_ms**2
-                r2_d_ss += (decomp_ms - predicted_decomp)**2; r2_d_n += 1
+                mae_d_sum += abs(predicted_decomp - decomp_ms_raw)
+                r2_d_sum += decomp_ms_raw; r2_d_sum2 += decomp_ms_raw**2
+                r2_d_ss += (decomp_ms_raw - predicted_decomp)**2; r2_d_n += 1
                 cnt_d += 1
 
             # PSNR MAPE/MAE/R² (skip lossless: actual_psnr=120, no variance)
@@ -468,6 +468,8 @@ class GPUCompressHDF5Writer:
                 "predicted_ratio": vals[12],
                 "predicted_comp_time": vals[13],
                 "predicted_decomp_time": vals[14],
+                "predicted_psnr": vals[15],
+                "actual_psnr": vals[16],
                 "decomp_ms": vals[17],     # decompression_ms (clamped 5ms floor)
                 "decomp_ms_raw": vals[18], # unclamped
             })
@@ -815,21 +817,45 @@ class GPUCompressHDF5Writer:
             pass
 
         # 6. Timed read + verify + quality metrics
+        # Match VPIC: open file/dataset OUTSIDE timer, time only H5Dread + sync + close
         read_ms = 0.0
         mismatches = -1
         psnr_db = 0.0
         rmse = 0.0
         max_abs_err = 0.0
         bit_rate = 0.0
+        data_range = 0.0
         if d_read is not None:
+            h5 = self._hdf5
             d_read.zero_()
+
+            # Open file + dataset OUTSIDE timed region
+            native_id = h5.H5VLget_connector_id_by_name(b"native")
+            vol_id = self._vol.H5VL_gpucompress_register()
+            fapl = h5.H5Pcreate(self._H5P_FILE_ACCESS)
+            self._vol.H5Pset_fapl_gpucompress(fapl, native_id, None)
+            fpath = tmpfile.encode("utf-8") if isinstance(tmpfile, str) else tmpfile
+            r_fid = h5.H5Fopen(fpath, H5F_ACC_RDONLY, fapl)
+            h5.H5Pclose(fapl)
+            h5.H5VLclose(native_id)
+            r_dset = h5.H5Dopen2(r_fid, b"data", H5P_DEFAULT)
+
+            # Timed region: H5Dread + sync + close (matches VPIC)
             torch.cuda.synchronize()
             t2 = time.perf_counter()
-            self.read_gpu_tensor(tmpfile, d_read.data_ptr(), n_elements)
+            h5.H5Dread(r_dset, self._H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL,
+                        H5P_DEFAULT, ctypes.c_void_p(d_read.data_ptr()))
+            torch.cuda.synchronize()
+            h5.H5Dclose(r_dset)
+            h5.H5Fclose(r_fid)
             t3 = time.perf_counter()
+            h5.H5VLclose(vol_id)
             read_ms = (t3 - t2) * 1000.0
             mismatches = int(d_original.view(torch.int32).ne(
                              d_read.view(torch.int32)).sum().item())
+
+            # Always compute data range (for normalized RMSE reporting)
+            data_range = d_original.float().max().item() - d_original.float().min().item()
 
             # Quality metrics (meaningful for lossy, trivial for lossless)
             if mismatches > 0:
@@ -837,7 +863,6 @@ class GPUCompressHDF5Writer:
                 mse = (diff ** 2).mean().item()
                 rmse = mse ** 0.5
                 max_abs_err = diff.abs().max().item()
-                data_range = d_original.float().max().item() - d_original.float().min().item()
                 if mse > 0 and data_range > 0:
                     psnr_db = 10.0 * torch.log10(
                         torch.tensor(data_range ** 2 / mse)).item()
@@ -872,6 +897,7 @@ class GPUCompressHDF5Writer:
             "rmse": rmse,
             "max_abs_err": max_abs_err,
             "bit_rate": bit_rate,
+            "data_range": data_range,
         }
         result.update(diag)
         result.update(vol_timing)
@@ -1172,6 +1198,10 @@ class InlineFullBenchmark:
 
         results = []
 
+        # Clone d_tensor for stable comparison baseline across all 15 configs.
+        # Prevents measurement artifacts if d_tensor is modified externally.
+        d_original_snapshot = d_tensor.clone()
+
         # ── Warmup (one throwaway write, not timed) ──
         warmup_file = os.path.join(tmpdir, "_warmup.h5")
         writer.write_gpu_tensor(d_tensor.data_ptr(), n_elements,
@@ -1187,7 +1217,7 @@ class InlineFullBenchmark:
         for algo_name, algo_id in FIXED_ALGOS:
             tmpfile = os.path.join(tmpdir, f"_bench_{algo_name}.h5")
             r = writer.benchmark_single(
-                d_tensor, n_elements, tmpfile,
+                d_original_snapshot, n_elements, tmpfile,
                 chunk_elements=chunk_elements,
                 error_bound=0.0,
                 algorithm=algo_id,
@@ -1213,7 +1243,7 @@ class InlineFullBenchmark:
 
             tmpfile = os.path.join(tmpdir, f"_bench_{config_name}.h5")
             r = writer.benchmark_single(
-                d_tensor, n_elements, tmpfile,
+                d_original_snapshot, n_elements, tmpfile,
                 chunk_elements=chunk_elements,
                 error_bound=error_bound,
                 algorithm=0,  # NN auto-selection
@@ -1264,7 +1294,8 @@ class InlineFullBenchmark:
                 f"{r.get('io_drain_ms',0):.3f},{r.get('pipeline_ms',0):.3f},"
                 f"{r.get('s2_busy_ms',0):.3f},{r.get('s3_busy_ms',0):.3f},"
                 f"{r.get('psnr_db',0):.2f},{r.get('rmse',0):.6f},"
-                f"{r.get('max_abs_err',0):.6f},{r.get('bit_rate',0):.4f}\n")
+                f"{r.get('max_abs_err',0):.6f},{r.get('bit_rate',0):.4f},"
+                f"{r.get('data_range',0):.6f}\n")
             # Write per-chunk details
             if chunk_csv_file and "chunk_details" in r:
                 for c in r["chunk_details"]:
@@ -1275,6 +1306,7 @@ class InlineFullBenchmark:
                         f"{c['actual_ratio']:.4f},{c['predicted_ratio']:.4f},"
                         f"{c['comp_ms']:.3f},{c['predicted_comp_time']:.3f},"
                         f"{c['decomp_ms']:.3f},{c['predicted_decomp_time']:.3f},"
+                        f"{c.get('predicted_psnr',0):.2f},{c.get('actual_psnr',0):.2f},"
                         f"{c['sgd_fired']},{c['exploration_triggered']}\n")
                 chunk_csv_file.flush()
         csv_file.flush()

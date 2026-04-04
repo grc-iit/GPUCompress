@@ -684,13 +684,19 @@ __global__ void nnSGDKernel(
                 s_d3[1] = 0.0f;
             }
 
-            // PSNR (output 3) — treat psnr<=0 as 120 dB (lossless = perfect reconstruction)
+            // PSNR (output 3) — skip gradient when psnr < 0 (sentinel for
+            // non-quantized actions where PSNR is undefined). Treat psnr=0
+            // as lossless (120 dB). Negative values = "do not train PSNR head".
             {
-                float psnr_val = (sample.actual_psnr <= 0.0f) ? 120.0f : sample.actual_psnr;
-                float clamped_psnr = fminf(psnr_val, 120.0f);
-                float y_std3 = weights->y_stds[3];
-                if (y_std3 < 1e-8f) y_std3 = 1e-8f;
-                s_d3[3] = s_y[3] - (clamped_psnr - weights->y_means[3]) / y_std3;
+                if (sample.actual_psnr >= 0.0f) {
+                    float psnr_val = (sample.actual_psnr == 0.0f) ? 120.0f : sample.actual_psnr;
+                    float clamped_psnr = fminf(psnr_val, 120.0f);
+                    float y_std3 = weights->y_stds[3];
+                    if (y_std3 < 1e-8f) y_std3 = 1e-8f;
+                    s_d3[3] = s_y[3] - (clamped_psnr - weights->y_means[3]) / y_std3;
+                } else {
+                    s_d3[3] = 0.0f;  // no PSNR gradient for non-quantized actions
+                }
             }
 
             // Clamp per-output error signals (Huber-style gradient clipping).

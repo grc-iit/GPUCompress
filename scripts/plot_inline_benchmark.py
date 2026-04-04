@@ -130,7 +130,8 @@ def load_csv(path):
                        "explore_ms", "sgd_ms",
                        "stage1_ms", "drain_ms", "io_drain_ms", "pipeline_ms",
                        "s2_busy_ms", "s3_busy_ms",
-                       "psnr_db", "rmse", "max_abs_err", "bit_rate"]:
+                       "psnr_db", "rmse", "max_abs_err", "bit_rate",
+                       "data_range"]:
                 r[k] = float(r.get(k, 0))
             rows.append(r)
     return rows
@@ -742,6 +743,153 @@ def fig5d_r2_over_time(rows, outdir, subtitle=""):
     print(f"  Saved {path}")
 
 
+def fig5e_lossy_quality(rows, outdir, subtitle=""):
+    """Lossy quality metrics over epochs: PSNR, RMSE, max_abs_err, bit_rate.
+
+    One row per metric, one line per algorithm. Only shown when lossy data present.
+    """
+    lossy_rows = [r for r in rows if r.get("psnr_db", 120) < 120 and r.get("psnr_db", 0) > 0]
+    if not lossy_rows:
+        print("  Skipping 5e_lossy_quality (no lossy data)")
+        return
+
+    epochs = sorted(set(r["epoch"] for r in lossy_rows))
+    algos = [a for a in ALL_ALGOS if any(r["algorithm"] == a for r in lossy_rows)]
+    if not algos or len(epochs) < 1:
+        return
+
+    metrics = [
+        ("psnr_db", "PSNR (dB)", "higher = better"),
+        ("rmse", "RMSE", "lower = better"),
+        ("max_abs_err", "Max Absolute Error", "lower = better"),
+        ("bit_rate", "Bit Rate (bits/value)", "lower = better"),
+    ]
+
+    n_metrics = len(metrics)
+    fig, axes = plt.subplots(n_metrics, 1, figsize=(14, 3.5 * n_metrics + 1))
+    if n_metrics == 1:
+        axes = [axes]
+    _t = "Lossy Compression Quality Over Epochs"
+    if subtitle:
+        _t += f"\n{subtitle}"
+    fig.suptitle(_t, fontsize=14, fontweight="bold", y=0.99)
+
+    for ax, (key, label, note) in zip(axes, metrics):
+        for algo in algos:
+            arows = [r for r in lossy_rows if r["algorithm"] == algo]
+            if not arows:
+                continue
+            ep_vals = defaultdict(list)
+            for r in arows:
+                ep_vals[r["epoch"]].append(r.get(key, 0))
+            xs = sorted(ep_vals.keys())
+            ys = [np.mean(ep_vals[e]) for e in xs]
+            color = ALGO_COLORS.get(algo, "#bdc3c7")
+            ax.plot(xs, ys, "o-", label=ALGO_LABELS.get(algo, algo).replace("\n", " "),
+                    color=color, markersize=5, linewidth=1.5)
+
+        ax.set_ylabel(f"{label}", fontweight="bold")
+        ax.set_title(f"{label} ({note})", fontsize=11)
+        ax.legend(fontsize=7, loc="best", ncol=min(3, len(algos)))
+        ax.grid(True, alpha=0.3)
+        if len(epochs) > 1:
+            ax.set_xticks(epochs)
+
+    axes[-1].set_xlabel("Epoch", fontweight="bold")
+
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    path = os.path.join(outdir, "5e_lossy_quality.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved {path}")
+
+
+def fig5f_lossy_quality_table(all_rows, outdir, subtitle=""):
+    """Per-tensor lossy quality table with normalized RMSE.
+
+    Shows a visual table: one row per tensor × algorithm, columns:
+    tensor, algorithm, data_range, RMSE, RMSE/range, max_err, bit_rate, ratio.
+    Uses last epoch data. Only generated when lossy data present.
+    """
+    epoch = max(r["epoch"] for r in all_rows)
+    rows = [r for r in all_rows if r["epoch"] == epoch]
+    lossy_rows = [r for r in rows if r.get("psnr_db", 120) < 120 and r.get("rmse", 0) > 0]
+    if not lossy_rows:
+        print("  Skipping 5f_lossy_quality_table (no lossy data)")
+        return
+
+    tensors = [t for t in TENSOR_ORDER if any(r["tensor"] == t for r in lossy_rows)]
+    algos = [a for a in ALL_ALGOS if any(r["algorithm"] == a for r in lossy_rows)]
+
+    # Build table data
+    table_data = []
+    for tensor in tensors:
+        for algo in algos:
+            r = [row for row in lossy_rows if row["tensor"] == tensor and row["algorithm"] == algo]
+            if not r:
+                continue
+            r = r[0]
+            rmse = r.get("rmse", 0)
+            data_range = r.get("data_range", 0)
+            nrmse = rmse / data_range if data_range > 0 else 0
+            table_data.append({
+                "tensor": tensor,
+                "algorithm": ALGO_LABELS.get(algo, algo).replace("\n", " "),
+                "data_range": f"{data_range:.4f}",
+                "rmse": f"{rmse:.6f}",
+                "nrmse": f"{nrmse:.4%}",
+                "max_err": f"{r.get('max_abs_err', 0):.6f}",
+                "bit_rate": f"{r.get('bit_rate', 0):.1f}",
+                "ratio": f"{r.get('ratio', 0):.2f}x",
+                "psnr": f"{r.get('psnr_db', 0):.1f}",
+            })
+
+    if not table_data:
+        return
+
+    # Create figure with table
+    col_labels = ["Tensor", "Algorithm", "Range", "RMSE", "RMSE/Range", "Max Error",
+                  "Bit Rate", "Ratio", "PSNR (dB)"]
+    cell_text = [[d["tensor"], d["algorithm"], d["data_range"], d["rmse"],
+                  d["nrmse"], d["max_err"], d["bit_rate"], d["ratio"], d["psnr"]]
+                 for d in table_data]
+
+    n_rows = len(cell_text)
+    fig_h = max(3, 0.4 * n_rows + 2)
+    fig, ax = plt.subplots(figsize=(16, fig_h), facecolor="white")
+    ax.axis("off")
+
+    _t = f"Lossy Compression Quality Summary — Epoch {epoch}"
+    if subtitle:
+        _t += f"\n{subtitle}"
+    ax.set_title(_t, fontsize=14, fontweight="bold", pad=20)
+
+    table = ax.table(cellText=cell_text, colLabels=col_labels,
+                     loc="center", cellLoc="center")
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1, 1.4)
+
+    # Style header
+    for j in range(len(col_labels)):
+        table[0, j].set_facecolor("#2c3e50")
+        table[0, j].set_text_props(color="white", fontweight="bold")
+
+    # Alternate row colors per tensor
+    tensor_colors = {"weights": "#eaf2f8", "adam_m": "#fef9e7",
+                     "adam_v": "#eafaf1", "gradients": "#fdedec"}
+    for i, d in enumerate(table_data):
+        color = tensor_colors.get(d["tensor"], "#f8f9fa")
+        for j in range(len(col_labels)):
+            table[i + 1, j].set_facecolor(color)
+
+    fig.tight_layout()
+    path = os.path.join(outdir, "5f_lossy_quality_table.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved {path}")
+
+
 def fig6b_pipeline_waterfall(rows, outdir, epoch=None, subtitle=""):
     """Pipeline stage timing breakdown: stage1, drain, io_drain."""
     if epoch is None:
@@ -1113,14 +1261,16 @@ def main():
         fig5b_sgd_exploration_firing(rows, out, subtitle=ctx)
         fig5c_mae_over_time(rows, out, subtitle=ctx)
         fig5d_r2_over_time(rows, out, subtitle=ctx)
+        fig5e_lossy_quality(rows, out, subtitle=ctx)
         fig6b_pipeline_waterfall(rows, out, args.epoch, subtitle=ctx)
         fig6c_gpu_breakdown(rows, out, args.epoch, subtitle=ctx)
         fig6d_pipeline_overhead(rows, out, args.epoch, subtitle=ctx)
         # fig7_epoch_evolution removed
 
-    # ── Top-level: cross-tensor characterization ──
+    # ── Top-level: cross-tensor figures ──
     _ctx = f"{chunk_mb}MB chunks | {_mode_tag}" if chunk_mb else ""
     fig0_tensor_characterization(all_rows, outdir, subtitle=_ctx)
+    fig5f_lossy_quality_table(all_rows, outdir, subtitle=_ctx)
 
     # ── Per-tensor × per-policy split ──
     tensors_present = [t for t in TENSOR_ORDER if any(r["tensor"] == t for r in all_rows)]

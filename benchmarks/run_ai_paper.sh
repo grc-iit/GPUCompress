@@ -43,9 +43,10 @@ export LD_LIBRARY_PATH=/tmp/hdf5-install/lib:${PROJECT_DIR}/build:${LD_LIBRARY_P
 # ── Overridable defaults ──
 VIT_MODEL=${AI_VIT_MODEL:-vit_b_16}
 EPOCHS=${AI_EPOCHS:-10}
-ERROR_BOUND=${AI_ERROR_BOUND:-0.01}
+ERROR_BOUND=${AI_ERROR_BOUND:-0.001}
 CHUNK_MB=${AI_CHUNK_MB:-16}
-SGD_LR=${AI_SGD_LR:-0.2}
+VIT_L_CHUNK_MB=${AI_VIT_L_CHUNK_MB:-32}
+SGD_LR=${AI_SGD_LR:-0.25}
 SGD_MAPE=${AI_SGD_MAPE:-0.10}
 EXPLORE_K=${AI_EXPLORE_K:-4}
 EXPLORE_THRESH=${AI_EXPLORE_THRESH:-0.20}
@@ -96,7 +97,7 @@ VIT_DEFAULT="${BASE_DIR}/${VIT_LABEL}_default_${RUN_ID}"
 VIT_CONFIGS="${CHUNK_MB}:0.0:${VIT_LL},${CHUNK_MB}:${ERROR_BOUND}:${VIT_LY}"
 
 echo "============================================================"
-echo "  Model 1/2: ${VIT_MODEL}"
+echo "  Model 1/3: ${VIT_MODEL}"
 echo "  Lossless → ${VIT_LL}"
 echo "  Lossy    → ${VIT_LY}"
 echo "  Started: $(date)"
@@ -126,7 +127,7 @@ GPT2_DEFAULT="${BASE_DIR}/gpt2_default_${RUN_ID}"
 GPT2_CONFIGS="${CHUNK_MB}:0.0:${GPT2_LL},${CHUNK_MB}:${ERROR_BOUND}:${GPT2_LY}"
 
 echo "============================================================"
-echo "  Model 2/2: GPT-2 Small"
+echo "  Model 2/3: GPT-2 Small"
 echo "  Lossless → ${GPT2_LL}"
 echo "  Lossy    → ${GPT2_LY}"
 echo "  Started: $(date)"
@@ -144,6 +145,38 @@ G_END=$(date +%s)
 G_MIN=$(( (G_END - G_START) / 60 ))
 echo ""
 echo "  GPT-2 done in ${G_MIN} minutes"
+echo ""
+
+# ============================================================
+# 3. ViT-Large (32MB chunks for larger tensors)
+# ============================================================
+VITL_LL="${BASE_DIR}/vit_l_${VIT_L_CHUNK_MB}mb_lossless_${RUN_ID}"
+VITL_LY="${BASE_DIR}/vit_l_${VIT_L_CHUNK_MB}mb_lossy_eb${ERROR_BOUND}_${RUN_ID}"
+VITL_DEFAULT="${BASE_DIR}/vit_l_default_${RUN_ID}"
+VITL_CONFIGS="${VIT_L_CHUNK_MB}:0.0:${VITL_LL},${VIT_L_CHUNK_MB}:${ERROR_BOUND}:${VITL_LY}"
+
+echo "============================================================"
+echo "  Model 3/3: ViT-Large (304M params, 1.16 GB/tensor)"
+echo "  Chunk size: ${VIT_L_CHUNK_MB} MB"
+echo "  Lossless → ${VITL_LL}"
+echo "  Lossy    → ${VITL_LY}"
+echo "  Started: $(date)"
+echo "============================================================"
+echo ""
+
+L_START=$(date +%s)
+
+python3 "${PROJECT_DIR}/scripts/train_and_export_checkpoints.py" \
+    --model vit_l_16 \
+    ${COMMON_ARGS} \
+    --chunk-mb "${VIT_L_CHUNK_MB}" \
+    --benchmark-configs "${VITL_CONFIGS}" \
+    --outdir "${VITL_DEFAULT}"
+
+L_END=$(date +%s)
+L_MIN=$(( (L_END - L_START) / 60 ))
+echo ""
+echo "  ViT-Large done in ${L_MIN} minutes"
 echo ""
 
 # ============================================================

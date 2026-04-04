@@ -732,8 +732,11 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
                 s.comp_time_ms = 0.0f;
                 cudaEventElapsedTime(&s.comp_time_ms, s.ev_start, s.ev_stop);
 
-                /* PSNR: analytical from error bound (no D->H needed) */
-                double alt_psnr = 120.0;
+                /* PSNR: analytical from error bound (no D->H needed).
+                 * For non-quantized actions, use -1.0 as sentinel — the SGD
+                 * kernel skips PSNR gradient when actual_psnr < 0. Using 0.0
+                 * doesn't work because nn_gpu.cu:689 remaps <=0 to 120. */
+                double alt_psnr = -1.0;
                 if (s.has_quant && s.quant_result.isValid()) {
                     double range = s.quant_result.data_max - s.quant_result.data_min;
                     if (range > 0.0 && s.quant_result.error_bound > 0.0)
@@ -779,9 +782,12 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
                         }
                         alt_hdr.setAlgorithmId((uint8_t)s.algo);
 
-                        /* Copy winner to output on ctx->stream (sync with caller) */
-                        cudaMemcpyAsync(d_out, &alt_hdr, sizeof(CompressionHeader),
-                                        cudaMemcpyHostToDevice, stream);
+                        /* Copy winner header to output. Use synchronous copy because
+                         * alt_hdr is stack-allocated and goes out of scope before
+                         * cudaStreamSynchronize — async would read freed stack memory
+                         * if multiple winners are found in the loop. */
+                        cudaMemcpy(d_out, &alt_hdr, sizeof(CompressionHeader),
+                                   cudaMemcpyHostToDevice);
                         cudaMemcpyAsync(d_out + hdr_sz, s.d_out, s.comp_size,
                                         cudaMemcpyDeviceToDevice, stream);
                         *output_size = alt_total;

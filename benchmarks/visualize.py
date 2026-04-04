@@ -818,9 +818,11 @@ def make_psnr_figure(ts_csv_path, output_path):
     if "psnr_db" not in rows[0]:
         return
 
-    has_lossy = any(g(r, "psnr_db") < 119.0 for r in rows)
+    # psnr_db=0 means "not computed" (lossless run). Only plot if real lossy data exists.
+    has_lossy = any(0 < g(r, "psnr_db") < 119.0 for r in rows)
     has_predicted = any(g(r, "psnr_predicted_db") > 0.0 for r in rows)
     if not has_lossy and not has_predicted:
+        print(f"  Skipping PSNR plot (no lossy data in {ts_csv_path})")
         return
 
     is_field_based = "field_idx" in rows[0] and "timestep" not in rows[0]
@@ -857,10 +859,15 @@ def make_psnr_figure(ts_csv_path, output_path):
 
         ax = axes[row, 0]
 
-        # Actual PSNR (solid)
-        ax.plot(ts, actual, color=info["color"], marker=info["marker"],
-                markersize=7, linewidth=2.5, label="Actual PSNR",
-                zorder=4, alpha=0.9)
+        # Actual PSNR (solid) — skip psnr_db=0 (means "not computed", lossless)
+        mask = actual > 0
+        if mask.any():
+            ax.plot(ts[mask], actual[mask], color=info["color"], marker=info["marker"],
+                    markersize=7, linewidth=2.5, label="Actual PSNR",
+                    zorder=4, alpha=0.9)
+        else:
+            ax.text(0.5, 0.5, "Lossless (no PSNR data)", transform=ax.transAxes,
+                    ha="center", va="center", fontsize=12, color="gray")
 
         # Predicted PSNR (dashed, same color)
         if np.max(predicted) > 0:
