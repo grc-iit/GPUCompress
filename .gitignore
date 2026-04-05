@@ -4,11 +4,20 @@ libs/
 *.o
 *.txt
 *.so
+*.so.*
 *.a
 *.dylib
 *.Linux
 .claude/
 .deps/
+# Build executables (in-tree builds at repo root)
+/test_*
+/bench_*
+/gpu_compress
+/gpu_decompress
+/*_benchmark
+/*_example
+
 # CMake
 CMakeCache.txt
 CMakeFiles/

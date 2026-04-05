@@ -16,6 +16,26 @@ target_include_directories(test_vpic_adapter PRIVATE
 target_link_libraries(test_vpic_adapter PRIVATE gpucompress CUDA::cudart m)
 set_target_properties(test_vpic_adapter PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
+# WarpX adapter test
+add_executable(test_warpx_adapter tests/unit/test_warpx_adapter.cu)
+set_source_files_properties(tests/unit/test_warpx_adapter.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(test_warpx_adapter PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_warpx_adapter PRIVATE gpucompress CUDA::cudart m)
+set_target_properties(test_warpx_adapter PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+# WarpX policy benchmark (fixed vs NN, ratio vs balanced, lossless vs lossy)
+add_executable(bench_warpx_policies tests/unit/bench_warpx_policies.cu)
+set_source_files_properties(tests/unit/bench_warpx_policies.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(bench_warpx_policies PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(bench_warpx_policies PRIVATE gpucompress CUDA::cudart m)
+set_target_properties(bench_warpx_policies PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
 # Compression core test suite
 add_executable(test_compression_core
     tests/unit/test_compression_core.cu

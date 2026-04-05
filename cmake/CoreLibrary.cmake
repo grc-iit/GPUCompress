@@ -27,6 +27,7 @@ set(LIB_SOURCES
     src/nyx/nyx_adapter.cu
     src/nekrs/nekrs_adapter.cu
     src/lammps/lammps_adapter.cu
+    src/warpx/warpx_adapter.cu
 )
 
 # Set language property for .cpp files that use CUDA
