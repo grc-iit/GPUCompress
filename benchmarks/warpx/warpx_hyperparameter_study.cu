@@ -200,6 +200,10 @@ int main()
     float  explore_thresh= envflt("WARPX_EXPLORE_THRESH", 0.20f);
     const char* weights  = envstr("GPUCOMPRESS_WEIGHTS", "neural_net/weights/model.nnwt");
     const char* policies_str = envstr("WARPX_POLICIES", "balanced,ratio");
+    const char* results_dir  = envstr("WARPX_RESULTS_DIR", ".");
+    const char* single_phase = envstr("WARPX_PHASE", "");
+    const char* exclude_str  = envstr("WARPX_EXCLUDE", "");
+    int    verify        = envint("WARPX_VERIFY", 0);
 
     /* Compute grid from target data size:
      * total_bytes = 6 * nx * ny * 4  =>  n_cells = total_bytes / (6*4) */
@@ -288,6 +292,16 @@ int main()
                n_policies, NN_BASE_PHASES, total_snaps, nn_bytes/1024.0);
     }
 
+    /* ---- Phase filtering helper ---- */
+    auto is_excluded = [&](const char* name) -> bool {
+        if (single_phase[0] != '\0') return strcmp(name, single_phase) != 0;
+        if (exclude_str[0] == '\0') return false;
+        char buf[512]; strncpy(buf, exclude_str, sizeof(buf)-1); buf[sizeof(buf)-1]='\0';
+        char* tok = strtok(buf, ",");
+        while (tok) { while(*tok==' ')tok++; if(strcmp(tok,name)==0) return true; tok=strtok(NULL,","); }
+        return false;
+    };
+
     /* ---- Phase definitions ---- */
     struct Phase {
         const char* name;
@@ -309,16 +323,23 @@ int main()
     };
     int n_phases = 11;
 
-    /* ---- Open CSV ---- */
-    FILE* csv = fopen("warpx_hyperparameter_study.csv", "w");
-    if (!csv) { fprintf(stderr, "Cannot open CSV\n"); return 1; }
-    fprintf(csv, "timestep,sim_step,sim_time,"
-                 "phase,policy,"
-                 "original_mb,compressed_mb,ratio,"
-                 "write_ms,throughput_gbps,"
-                 "n_chunks,sgd_fires,explorations,"
-                 "mape_ratio_pct,max_error,"
-                 "algorithm_used\n");
+    /* ---- Open CSVs (VPIC-compatible naming) ---- */
+    char ts_csv_path[512], agg_csv_path[512];
+    snprintf(ts_csv_path,  sizeof(ts_csv_path),  "%s/benchmark_warpx_deck_timesteps.csv", results_dir);
+    snprintf(agg_csv_path, sizeof(agg_csv_path), "%s/benchmark_warpx_deck.csv", results_dir);
+
+    FILE* csv = fopen(ts_csv_path, "w");
+    if (!csv) { fprintf(stderr, "Cannot open %s\n", ts_csv_path); return 1; }
+    /* Match VPIC timestep CSV columns for compatibility with plotting scripts */
+    fprintf(csv, "rank,phase,timestep,sim_step,write_ms,read_ms,ratio,"
+                 "mape_ratio,mape_comp,mape_decomp,"
+                 "sgd_fires,explorations,n_chunks,mismatches,"
+                 "write_mibps,read_mibps,"
+                 "file_bytes,orig_mib,"
+                 "stats_ms,nn_ms,preproc_ms,comp_ms,decomp_ms,explore_ms,sgd_ms,"
+                 "comp_gbps,decomp_gbps,"
+                 "mape_psnr,"
+                 "r2_ratio,r2_comp,r2_decomp,r2_psnr\n");
 
     /* ---- Warmup ---- */
     int global_step = 0;
@@ -356,6 +377,7 @@ int main()
 
         /* ---- Compress through all phases ---- */
         for (int pi = 0; pi < n_phases; pi++) {
+            if (is_excluded(phases[pi].name)) continue;
             bool is_nn = (phases[pi].nn_base_idx >= 0);
             if (is_nn && !has_nn) continue;
 
@@ -518,25 +540,161 @@ int main()
                 else
                     snprintf(disp, sizeof(disp), "%s", phases[pi].name);
 
+                /* Build phase name for CSV: "nn-rl/balanced" for NN, "zstd" for fixed */
+                char csv_phase[80];
+                if (is_nn && n_policies > 1)
+                    snprintf(csv_phase, sizeof(csv_phase), "%s/%s", phases[pi].name, policy_label);
+                else
+                    snprintf(csv_phase, sizeof(csv_phase), "%s", phases[pi].name);
+
+                double write_mibps = orig_mb / (write_ms / 1000.0);
+                double comp_gbps_val = (orig_mb / 1024.0) / (write_ms / 1000.0);
+                size_t file_bytes = comp_size;
+
                 printf("%-3d %-5d %-5.3f %-16s %-10s %7.2f %9.1f %9.2f %5d %4d %5d\n",
                        ts, global_step, sim_time,
-                       disp, is_nn ? "auto" : phases[pi].name,
+                       csv_phase, is_nn ? "auto" : phases[pi].name,
                        ratio, comp_mb, gbps,
                        chunk_count, sgd_fires, explorations);
 
-                fprintf(csv, "%d,%d,%.6f,%s,%s,%.2f,%.2f,%.4f,%.3f,%.4f,%d,%d,%d,%.2f,%.8f,%s\n",
-                        ts, global_step, sim_time,
-                        phases[pi].name, policy_label,
-                        orig_mb, comp_mb, ratio,
-                        write_ms, gbps,
-                        chunk_count, sgd_fires, explorations,
-                        avg_mape, max_err,
-                        is_nn ? "auto" : phases[pi].name);
+                /* VPIC-compatible timestep CSV row */
+                fprintf(csv, "0,%s,%d,%d,%.3f,0.0,%.4f,"
+                             "%.4f,0.0,0.0,"
+                             "%d,%d,%d,0,"
+                             "%.2f,0.0,"
+                             "%zu,%.2f,"
+                             "0.0,0.0,0.0,%.3f,0.0,0.0,0.0,"
+                             "%.4f,0.0,"
+                             "0.0,"
+                             "0.0,0.0,0.0,0.0\n",
+                        csv_phase, ts, global_step, write_ms, ratio,
+                        avg_mape,
+                        sgd_fires, explorations, chunk_count,
+                        write_mibps,
+                        file_bytes, orig_mb,
+                        write_ms,
+                        comp_gbps_val);
             }
         }
     }
 
     fclose(csv);
+
+    /* ---- Generate aggregate CSV (average across timesteps, per phase) ---- */
+    {
+        FILE* ts_in = fopen(ts_csv_path, "r");
+        FILE* agg = fopen(agg_csv_path, "w");
+        if (ts_in && agg) {
+            fprintf(agg, "rank,source,phase,n_runs,write_ms,write_ms_std,read_ms,read_ms_std,"
+                         "file_mib,orig_mib,ratio,write_mibps,read_mibps,mismatches,"
+                         "sgd_fires,explorations,n_chunks,"
+                         "nn_ms,stats_ms,preproc_ms,comp_ms,decomp_ms,explore_ms,sgd_ms,"
+                         "comp_gbps,decomp_gbps,"
+                         "mape_ratio_pct,mape_comp_pct,mape_decomp_pct,mape_psnr_pct,"
+                         "mae_ratio,mae_comp_ms,mae_decomp_ms,mae_psnr_db,"
+                         "r2_ratio,r2_comp,r2_decomp,r2_psnr\n");
+
+            /* Simple aggregation: accumulate per phase, compute mean */
+            struct PhaseAcc {
+                char name[80];
+                double sum_write_ms, sum_ratio, sum_mibps, sum_gbps, sum_mape;
+                double sum_write_ms_sq;
+                long   sum_sgd, sum_expl, sum_chunks;
+                size_t sum_file_bytes;
+                double sum_orig_mib;
+                int    count;
+            };
+            PhaseAcc accs[64];
+            int n_accs = 0;
+
+            char line[2048];
+            fgets(line, sizeof(line), ts_in); /* skip header */
+            while (fgets(line, sizeof(line), ts_in)) {
+                /* Parse: rank,phase,timestep,sim_step,write_ms,read_ms,ratio,
+                 *        mape_ratio,...,sgd_fires,explorations,n_chunks,...,
+                 *        write_mibps,...,file_bytes,orig_mib,...,comp_gbps,... */
+                char phase_name[80];
+                int ts_val, step_val;
+                double w_ms, ratio_val, mape_val, mibps, gbps_val, orig_mib_val;
+                int sgd_f, expl_f, nchk;
+                size_t fbytes;
+
+                if (sscanf(line, "0,%79[^,],%d,%d,%lf,%*f,%lf,"
+                                 "%lf,%*f,%*f,"
+                                 "%d,%d,%d,%*d,"
+                                 "%lf,%*f,"
+                                 "%zu,%lf",
+                           phase_name, &ts_val, &step_val, &w_ms, &ratio_val,
+                           &mape_val, &sgd_f, &expl_f, &nchk,
+                           &mibps, &fbytes, &orig_mib_val) < 10) continue;
+
+                /* Find or create accumulator */
+                int ai = -1;
+                for (int i = 0; i < n_accs; i++) {
+                    if (strcmp(accs[i].name, phase_name) == 0) { ai = i; break; }
+                }
+                if (ai < 0 && n_accs < 64) {
+                    ai = n_accs++;
+                    memset(&accs[ai], 0, sizeof(PhaseAcc));
+                    strncpy(accs[ai].name, phase_name, 79);
+                }
+                if (ai < 0) continue;
+
+                accs[ai].sum_write_ms += w_ms;
+                accs[ai].sum_write_ms_sq += w_ms * w_ms;
+                accs[ai].sum_ratio += ratio_val;
+                accs[ai].sum_mibps += mibps;
+                accs[ai].sum_gbps += gbps_val;
+                accs[ai].sum_mape += mape_val;
+                accs[ai].sum_sgd += sgd_f;
+                accs[ai].sum_expl += expl_f;
+                accs[ai].sum_chunks += nchk;
+                accs[ai].sum_file_bytes += fbytes;
+                accs[ai].sum_orig_mib += orig_mib_val;
+                accs[ai].count++;
+
+                /* Parse comp_gbps from later in the line */
+                /* Find 26th comma-separated field */
+                char* p = line;
+                int commas = 0;
+                while (*p && commas < 25) { if (*p == ',') commas++; p++; }
+                if (*p) sscanf(p, "%lf", &gbps_val);
+                accs[ai].sum_gbps += gbps_val;
+            }
+
+            for (int i = 0; i < n_accs; i++) {
+                int n = accs[i].count;
+                if (n == 0) continue;
+                double avg_wms = accs[i].sum_write_ms / n;
+                double std_wms = sqrt(fmax(0.0, accs[i].sum_write_ms_sq / n - avg_wms * avg_wms));
+                double avg_ratio = accs[i].sum_ratio / n;
+                double avg_mibps = accs[i].sum_mibps / n;
+                double avg_mape = accs[i].sum_mape / n;
+                double file_mib = (double)accs[i].sum_file_bytes / n / (1024.0*1024.0);
+                double orig_mib_avg = accs[i].sum_orig_mib / n;
+
+                fprintf(agg, "0,warpx_deck,%s,%d,"
+                             "%.3f,%.3f,0.0,0.0,"
+                             "%.2f,%.2f,%.4f,%.2f,0.0,0,"
+                             "%ld,%ld,%ld,"
+                             "0.0,0.0,0.0,%.3f,0.0,0.0,0.0,"
+                             "%.4f,0.0,"
+                             "%.4f,0.0,0.0,0.0,"
+                             "0.0,0.0,0.0,0.0,"
+                             "0.0,0.0,0.0,0.0\n",
+                        accs[i].name, n,
+                        avg_wms, std_wms,
+                        file_mib, orig_mib_avg, avg_ratio, avg_mibps,
+                        accs[i].sum_sgd, accs[i].sum_expl, accs[i].sum_chunks,
+                        avg_wms,
+                        0.0,
+                        avg_mape);
+            }
+            fclose(agg);
+            printf("\nAggregate CSV: %s (%d phases)\n", agg_csv_path, n_accs);
+        }
+        if (ts_in) fclose(ts_in);
+    }
 
     /* Cleanup */
     for (int i = 0; i < total_snaps; i++)
@@ -547,7 +705,9 @@ int main()
     gpucompress_cleanup();
 
     printf("\n=== Benchmark complete ===\n");
-    printf("CSV: warpx_hyperparameter_study.csv\n");
-    printf("%d timesteps x %d+ phases x ~%d chunks/write\n", timesteps, n_phases, n_chunks);
+    printf("Results dir: %s\n", results_dir);
+    printf("Timesteps CSV: %s\n", ts_csv_path);
+    printf("Aggregate CSV: %s\n", agg_csv_path);
+    printf("%d timesteps x ~%d chunks/write\n", timesteps, n_chunks);
     return 0;
 }
