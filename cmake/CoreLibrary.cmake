@@ -26,6 +26,7 @@ set(LIB_SOURCES
     src/vpic/vpic_adapter.cu
     src/nyx/nyx_adapter.cu
     src/nekrs/nekrs_adapter.cu
+    src/lammps/lammps_adapter.cu
 )
 
 # Set language property for .cpp files that use CUDA

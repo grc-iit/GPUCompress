@@ -1,0 +1,47 @@
+userSections = CASEDATA
+
+[GENERAL]
+polynomialOrder = 7
+cubaturePolynomialOrder = 9 
+
+stopAt = numSteps
+numSteps = 20
+
+timeStepper = tombo3
+dt = 3e-3
+
+checkpointControl = steps
+checkpointInterval = 10
+
+regularization = hpfrt + nModes=1 + scalingCoeff=1
+
+[FLUID PRESSURE]
+residualTol = 1e-04
+#solver = gmres+flexbile
+#smootherType = RAS+OptFourthChebyshev 
+#pMGSchedule = p=7+degree=2, p=3+degree=2, p=1, p=3+degree=2, p=7+degree=2
+
+solver = cg+flexible 
+smootherType = Jac+Cheby
+
+[FLUID VELOCITY]
+boundaryTypeMap = none
+rho = 1.0
+viscosity = 1/1600
+residualTol = 1e-06
+
+[CASEDATA]
+eps = 1.0
+U0 = 0
+V0 = 0
+W0 = 0 
+
+#eps = 0.3
+#U0 = 2.0
+#V0 = 2.0
+#W0 = 2.0
+
+[FLUID PRESSURE BOOMERAMG]
+#smootherType = 18
+iterations = 1
+chebyshevRelaxOrder = 1
