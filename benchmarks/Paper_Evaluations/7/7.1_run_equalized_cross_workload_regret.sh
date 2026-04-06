@@ -705,7 +705,10 @@ ax.set_xlabel("Chunk Index (sequential across profiled fields)")
 ax.set_ylabel("Top-1 Regret (%)")
 ax.grid(True, alpha=0.25)
 ax.legend(frameon=True, fontsize=9)
-ax.set_ylim(bottom=0, top=105)
+# Auto-scale y-axis to data with small headroom
+all_ys = [y for _, _, _, ys, _ in series for y in ys]
+y_max = min(max(all_ys) * 1.15 if all_ys else 100, 100)
+ax.set_ylim(bottom=0, top=max(y_max, 5))
 plt.tight_layout()
 plt.savefig(png_path, dpi=220, bbox_inches="tight")
 print(f"\nSaved: {png_path}")
@@ -778,38 +781,38 @@ combined_csv = os.path.join(results_dir, "cross_workload_comp_mape.csv")
 series = []
 
 for key, label, color in workload_order:
-    # Try chunks CSV first, then timestep_chunks
-    chunks_csv = os.path.join(results_dir, key, f"benchmark_{key}_chunks.csv")
-    tc_csv = os.path.join(results_dir, key, f"benchmark_{key}_timestep_chunks.csv")
-
-    src_csv = None
-    if os.path.isfile(chunks_csv):
-        src_csv = chunks_csv
-    elif os.path.isfile(tc_csv):
-        src_csv = tc_csv
-    else:
+    # Use ranking CSV directly — same rows as Figure 7a, guarantees equal x-axis.
+    # Compute cost prediction error from predicted_best_cost vs actual_best_cost.
+    ranking_csv = os.path.join(results_dir, key, f"benchmark_{key}_ranking.csv")
+    if not os.path.isfile(ranking_csv):
         continue
 
     rows = []
-    with open(src_csv, newline="") as f:
+    with open(ranking_csv, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
             p = row.get("phase", "")
             if not p.startswith(phase_prefix):
                 continue
-            chunk = int(row.get("chunk", 0))
-            mape_comp = float(row.get("mape_comp", 0.0))
-            rows.append((chunk, mape_comp))
+            ts = int(row.get("timestep", 0))
+            chunk = int(row["chunk"])
+            pred_cost = float(row.get("predicted_best_cost", 0))
+            actual_cost = float(row.get("actual_best_cost", 0))
+            # Cost prediction error as percentage
+            if actual_cost > 0:
+                cost_err = abs(pred_cost - actual_cost) / actual_cost * 100.0
+            else:
+                cost_err = 0.0
+            rows.append((ts, chunk, cost_err))
 
     if not rows:
-        print(f"  {label}: no {phase_prefix} rows in {os.path.basename(src_csv)}, skipping")
         continue
 
-    # mape_comp is already a percentage (0-200, clamped)
+    rows.sort(key=lambda r: (r[0], r[1]))
     xs = list(range(len(rows)))
-    ys = [r[1] for r in rows]
+    ys = [r[2] for r in rows]
     series.append((label, color, xs, ys, key))
-    print(f"  {label}: {len(rows)} chunks from {os.path.basename(src_csv)}")
+    print(f"  {label}: {len(rows)} chunks from {os.path.basename(ranking_csv)}")
 
 if not series:
     print("ERROR: no workload data to plot for MAPE", file=sys.stderr)
@@ -859,10 +862,12 @@ for label, color, xs, ys, _ in series:
 x_val = f"~{max_convergence}" if max_convergence > 0 else "X"
 
 ax.set_xlabel("Chunk Index (sequential across profiled fields)")
-ax.set_ylabel("Compression Time MAPE (%)")
+ax.set_ylabel("Cost Prediction Error (%)")
 ax.grid(True, alpha=0.25)
 ax.legend(frameon=True, fontsize=9)
-ax.set_ylim(bottom=0)
+all_ys = [y for _, _, _, ys, _ in series for y in ys]
+y_max = max(all_ys) * 1.15 if all_ys else 100
+ax.set_ylim(bottom=0, top=max(y_max, 5))
 plt.tight_layout()
 plt.savefig(png_path, dpi=220, bbox_inches="tight")
 print(f"\nSaved: {png_path}")

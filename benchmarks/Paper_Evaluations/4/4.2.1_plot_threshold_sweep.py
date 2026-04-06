@@ -25,13 +25,17 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 import matplotlib.cm as cm
 
-# ── Threshold values (must match eval_exploration_threshold.sh) ──
-X1_VALUES = [0.05, 0.10, 0.20, 0.30, 0.50, 1.00, 10.00]
-DELTA_VALUES = [0.05, 0.10, 0.20, 0.30, 0.50, 1.00, 10.00]
+# ── Threshold values (must match eval_vpic_threshold_sweep.sh) ──
+X1_VALUES = [0.05, 0.10, 0.20, 0.30]
+# X1_VALUES = [0.05, 0.10, 0.20, 0.30, 0.50, 1.00, 10.00]
+DELTA_VALUES = [0.05, 0.10, 0.20, 0.30]
+# DELTA_VALUES = [0.05, 0.10, 0.20, 0.30, 0.50, 1.00, 10.00]
 
 # Display labels (percentages)
-X1_LABELS = ["5%", "10%", "20%", "30%", "50%", "100%", "1000%"]
-DELTA_LABELS = ["5%", "10%", "20%", "30%", "50%", "100%", "1000%"]
+X1_LABELS = ["5%", "10%", "20%", "30%"]
+# X1_LABELS = ["5%", "10%", "20%", "30%", "50%", "100%", "1000%"]
+DELTA_LABELS = ["5%", "10%", "20%", "30%"]
+# DELTA_LABELS = ["5%", "10%", "20%", "30%", "50%", "100%", "1000%"]
 
 DATASET_NAME = None  # auto-detected from first run directory
 
@@ -41,15 +45,21 @@ def read_summary_csv(path):
     if not os.path.isfile(path):
         return None
     with open(path, "r") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            phase = row.get("phase", "").strip()
-            if "exp" in phase or "nn-rl" in phase:
-                return row
-        # If no nn-rl phase found, return last row
-        f.seek(0)
         rows = list(csv.DictReader(f))
-        return rows[-1] if rows else None
+    if not rows:
+        return None
+    # Prefer exact "nn-rl+exp50" (possibly with /policy suffix)
+    for row in rows:
+        phase = row.get("phase", "").strip()
+        if phase.startswith("nn-rl+exp50"):
+            return row
+    # Fall back to any nn-rl phase
+    for row in rows:
+        phase = row.get("phase", "").strip()
+        if phase.startswith("nn-rl"):
+            return row
+    # Last resort: return last row
+    return rows[-1]
 
 
 def read_ranking_csv(path):
@@ -215,7 +225,16 @@ def main():
         sweep_dir = sys.argv[1]
     else:
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        sweep_dir = os.path.join(script_dir, "results", "threshold_sweep")
+        # Auto-detect: find the first vpic_threshold_sweep_* directory
+        results_dir = os.path.join(script_dir, "results")
+        sweep_dir = None
+        if os.path.isdir(results_dir):
+            for d in sorted(os.listdir(results_dir)):
+                if d.startswith("vpic_threshold_sweep_"):
+                    sweep_dir = os.path.join(results_dir, d)
+                    break
+        if sweep_dir is None:
+            sweep_dir = os.path.join(script_dir, "results", "vpic_threshold_sweep_balanced_eb0.01_lr0.2")
 
     if not os.path.isdir(sweep_dir):
         print(f"ERROR: sweep directory not found: {sweep_dir}")

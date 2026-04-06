@@ -80,11 +80,25 @@ X1_VALUES=(0.05 0.10 0.20 0.30)
 DELTA_VALUES=(0.05 0.10 0.20 0.30)
 # DELTA_VALUES=(0.05 0.10 0.20 0.30 0.50 1.00 10.00)
 
-TOTAL=$(( ${#X1_VALUES[@]} * ${#DELTA_VALUES[@]} ))
+# ── Build randomized parameter pairs ──
+PAIRS=()
+for x1 in "${X1_VALUES[@]}"; do
+    for delta in "${DELTA_VALUES[@]}"; do
+        PAIRS+=("${x1},${delta}")
+    done
+done
+TOTAL=${#PAIRS[@]}
+
+# Fisher-Yates shuffle (randomize run order to avoid systematic drift)
+for (( i=TOTAL-1; i>0; i-- )); do
+    j=$(( RANDOM % (i+1) ))
+    tmp="${PAIRS[$i]}"; PAIRS[$i]="${PAIRS[$j]}"; PAIRS[$j]="$tmp"
+done
+
 RUN=0
 
 echo "============================================================"
-echo "VPIC Exploration Threshold Sweep: $TOTAL runs"
+echo "VPIC Exploration Threshold Sweep: $TOTAL runs (randomized)"
 echo "  VPIC NX:     $VPIC_NX"
 echo "  Timesteps:   $TIMESTEPS"
 echo "  Chunk MB:    $CHUNK_MB"
@@ -96,10 +110,11 @@ echo "  Output:      $SWEEP_DIR"
 echo "============================================================"
 
 # ── Sweep ──
-for x1 in "${X1_VALUES[@]}"; do
-    for delta in "${DELTA_VALUES[@]}"; do
-        RUN=$((RUN + 1))
-        x2=$(echo "$x1 + $delta" | bc -l)
+for pair in "${PAIRS[@]}"; do
+    x1="${pair%%,*}"
+    delta="${pair##*,}"
+    RUN=$((RUN + 1))
+    x2=$(echo "$x1 + $delta" | bc -l)
 
         OUT_DIR="$SWEEP_DIR/x1_${x1}_delta_${delta}"
 
@@ -140,7 +155,6 @@ for x1 in "${X1_VALUES[@]}"; do
             continue
         fi
         echo "  Done. CSV: $OUT_DIR/benchmark_vpic_deck.csv"
-    done
 done
 
 echo ""
