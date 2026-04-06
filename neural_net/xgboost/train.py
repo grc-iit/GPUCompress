@@ -27,17 +27,25 @@ FEATURE_LABELS = {
     'alg_lz4': 'LZ4', 'alg_snappy': 'Snappy', 'alg_deflate': 'Deflate',
     'alg_gdeflate': 'GDeflate', 'alg_zstd': 'Zstd', 'alg_ans': 'ANS',
     'alg_cascaded': 'Cascaded', 'alg_bitcomp': 'Bitcomp',
-    'quant_enc': 'Quantization', 'shuffle_enc': 'Shuffle',
-    'algo_aggregate': 'Compression Library',
-    'error_bound_enc': 'Error Bound', 'data_size_enc': 'Data Size',
-    'entropy': 'Entropy', 'mad': 'MAD', 'second_derivative': 'Second Derivative',
+    'quant_enc': 'Quantization Mode',
+    'shuffle_enc': 'Byte Shuffle',
+    'algo_aggregate': 'Compression Algorithm',
+    'error_bound_enc': 'Error Bound (log₁₀)',
+    'data_size_enc': 'Data Size (log₂)',
+    'entropy': 'Shannon Entropy',
+    'mad': 'Mean Absolute Deviation',
+    'second_derivative': 'Second Derivative',
 }
 
 OUTPUT_LABELS = {
-    'comp_time_log': 'Compression Time',
-    'decomp_time_log': 'Decompression Time',
-    'ratio_log': 'Compression Ratio',
-    'psnr_clamped': 'PSNR',
+    'comp_time_log': 'Compression\nTime (ms)',
+    'decomp_time_log': 'Decompression\nTime (ms)',
+    'ratio_log': 'Compression\nRatio',
+    'psnr_clamped': 'PSNR\n(dB)',
+    'rmse_log': 'RMSE',
+    'max_error_log': 'Max Abs.\nError',
+    'comp_tp_log': 'Compression\nThroughput',
+    'decomp_tp_log': 'Decompression\nThroughput',
 }
 
 
@@ -107,19 +115,24 @@ def collect_feature_importance(models, val_X, feature_names, output_dir):
         shap_matrix[:, col] = values
 
     # SHAP heatmap
-    fig, ax = plt.subplots(figsize=(10, 6))
+    n_out = len(output_labels)
+    fig_w = max(10, 2.0 * n_out + 3)
+    fig, ax = plt.subplots(figsize=(fig_w, 6))
     im = ax.imshow(shap_matrix, cmap='YlOrRd', aspect='auto')
-    ax.set_xticks(range(len(output_labels)))
-    ax.set_xticklabels(output_labels, fontsize=11)
+    ax.set_xticks(range(n_out))
+    ax.set_xticklabels(output_labels, fontsize=10, ha='center')
     ax.set_yticks(range(len(labels)))
     ax.set_yticklabels(labels, fontsize=11)
     for i in range(shap_matrix.shape[0]):
         for j in range(shap_matrix.shape[1]):
             val = shap_matrix[i, j]
             color = 'white' if val > shap_matrix.max() * 0.6 else 'black'
-            ax.text(j, i, f'{val:.3f}', ha='center', va='center', color=color, fontsize=10)
-    cbar = fig.colorbar(im, ax=ax)
+            ax.text(j, i, f'{val:.3f}', ha='center', va='center', color=color, fontsize=9)
+    cbar = fig.colorbar(im, ax=ax, shrink=0.85)
     cbar.set_label('Mean |SHAP value|', fontsize=11)
+    ax.set_title('SHAP Feature Importance Across Compression Metrics', fontsize=13, pad=12)
+    ax.set_xlabel('Prediction Target', fontsize=11, labelpad=8)
+    ax.set_ylabel('Input Feature', fontsize=11, labelpad=8)
     plt.tight_layout()
     shap_path = output_dir / 'feature_importance_shap.png'
     fig.savefig(shap_path, dpi=150, bbox_inches='tight')
@@ -139,7 +152,7 @@ def train_and_evaluate(data):
     print(f"Features: {train_X.shape[1]}, Outputs: {train_Y.shape[1]}")
 
     # Train one model per output
-    output_names = ['comp_time_log', 'decomp_time_log', 'ratio_log', 'psnr_clamped']
+    output_names = data['output_cols_internal']
     models = {}
     val_preds = np.zeros_like(val_Y)
 
@@ -159,25 +172,22 @@ def train_and_evaluate(data):
         models[name] = model
         print(f"  Best iteration: {model.best_iteration}")
 
-    # Inverse transform and compute metrics
-    pred_orig = inverse_transform_outputs(val_preds, data['y_means'], data['y_stds'])
-    actual_orig = inverse_transform_outputs(data['val_Y'], data['y_means'], data['y_stds'])
-
     print(f"\n{'='*65}")
     print("XGBOOST VALIDATION METRICS")
     print(f"{'='*65}")
 
-    for name in OUTPUT_COLUMNS:
-        p = pred_orig[name]
-        a = actual_orig[name]
+    for i, name in enumerate(output_names):
+        p = val_preds[:, i]
+        a = val_Y[:, i]
         mae = np.mean(np.abs(p - a))
         ss_res = np.sum((a - p) ** 2)
         ss_tot = np.sum((a - a.mean()) ** 2)
         r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
         mask = np.abs(a) > 0.1
         mape = np.mean(np.abs((a[mask] - p[mask]) / a[mask])) * 100 if mask.sum() > 0 else 0.0
+        label = OUTPUT_LABELS.get(name, name).replace('\n', ' ')
 
-        print(f"\n  {name}:")
+        print(f"\n  {label}:")
         print(f"    MAE:  {mae:.4f}")
         print(f"    R²:   {r2:.4f}")
         print(f"    MAPE: {mape:.1f}%")

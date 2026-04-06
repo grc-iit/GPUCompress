@@ -47,6 +47,11 @@ def encode_and_split(df: pd.DataFrame, val_fraction: float = 0.2,
     df = df[df['success'] == True].copy()
     print(f"  After filtering failures: {len(df)} rows")
 
+    # Fallback: use first_derivative as second_derivative if missing
+    if 'second_derivative' not in df.columns and 'first_derivative' in df.columns:
+        df['second_derivative'] = df['first_derivative']
+        print("  Note: using first_derivative as second_derivative")
+
     # ---- Encode inputs ----
 
     # Algorithm: one-hot
@@ -79,6 +84,16 @@ def encode_and_split(df: pd.DataFrame, val_fraction: float = 0.2,
     # PSNR: clamp inf and NaN to 120, keep as-is
     df['psnr_clamped'] = df['psnr_db'].replace([np.inf, -np.inf], 120.0).fillna(120.0).clip(upper=120.0).astype(np.float32)
 
+    # Additional error/quality metrics (optional columns)
+    if 'rmse' in df.columns:
+        df['rmse_log'] = np.log1p(df['rmse'].clip(lower=0).fillna(0)).astype(np.float32)
+    if 'max_error' in df.columns:
+        df['max_error_log'] = np.log1p(df['max_error'].clip(lower=0).fillna(0)).astype(np.float32)
+    if 'compression_throughput_mbps' in df.columns:
+        df['comp_tp_log'] = np.log1p(df['compression_throughput_mbps'].clip(lower=0).fillna(0)).astype(np.float32)
+    if 'decompression_throughput_mbps' in df.columns:
+        df['decomp_tp_log'] = np.log1p(df['decompression_throughput_mbps'].clip(lower=0).fillna(0)).astype(np.float32)
+
     # ---- Split by file ----
     files = sorted(df['file'].unique())
     rng = np.random.RandomState(seed)
@@ -101,6 +116,9 @@ def encode_and_split(df: pd.DataFrame, val_fraction: float = 0.2,
                                 'entropy', 'mad', 'second_derivative']
 
     output_cols = ['comp_time_log', 'decomp_time_log', 'ratio_log', 'psnr_clamped']
+    for extra in ['rmse_log', 'max_error_log', 'comp_tp_log', 'decomp_tp_log']:
+        if extra in df.columns:
+            output_cols.append(extra)
 
     # ---- Compute normalization stats from training set only ----
     train_X_raw = df_train[feature_cols].values.astype(np.float32)
