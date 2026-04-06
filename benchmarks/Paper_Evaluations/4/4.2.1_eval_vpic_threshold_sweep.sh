@@ -161,7 +161,14 @@ echo ""
 echo "============================================================"
 echo "VPIC threshold sweep complete."
 echo "Results: $SWEEP_DIR"
-echo ""
-echo "Generate plots:"
-echo "  python3 benchmarks/Paper_Evaluations/4/4.2.1_plot_threshold_sweep.py $SWEEP_DIR"
 echo "============================================================"
+
+# ── Generate plots ──
+PLOT_SCRIPT="$SCRIPT_DIR/4.2.1_plot_threshold_sweep.py"
+if [ -f "$PLOT_SCRIPT" ]; then
+    echo ""
+    echo ">>> Generating threshold sweep plots..."
+    python3 "$PLOT_SCRIPT" "$SWEEP_DIR"
+else
+    echo "WARNING: plot script not found at $PLOT_SCRIPT"
+fi

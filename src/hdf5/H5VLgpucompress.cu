@@ -403,10 +403,33 @@ static double s_total_ms  = 0;         /* Total pipeline wall clock (stage1 + dr
 static double s_vol_func_ms = 0;       /* Total gpu_aware_chunked_write wall clock */
 static double s_setup_ms = 0;          /* Setup before pipeline (VolWriteCtx, threads, etc) */
 
+/* ── Lifetime accumulators (never reset, printed at process exit) ── */
+static double g_lifetime_vol_ms = 0;   /* Sum of wall-clock across all H5Dwrite calls */
+static double g_lifetime_io_ms  = 0;   /* Sum of actual disk I/O time (s3_busy) across all calls */
+static int    g_lifetime_writes = 0;   /* Number of H5Dwrite calls */
+static std::once_flag g_atexit_flag;
+
 static double _now_ms() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
+static void gpucompress_vol_atexit() {
+    if (g_lifetime_writes == 0) return;
+    double gpu_ms = g_lifetime_vol_ms - g_lifetime_io_ms;
+    fprintf(stderr,
+        "\n[GPUCompress VOL Summary]\n"
+        "  H5Dwrite calls:  %d\n"
+        "  Total VOL time:  %.1f ms (%.2f s)\n"
+        "  Disk I/O time:   %.1f ms (%.2f s) — %.1f%%\n"
+        "  GPU compute:     %.1f ms (%.2f s) — %.1f%%\n",
+        g_lifetime_writes,
+        g_lifetime_vol_ms, g_lifetime_vol_ms / 1000.0,
+        g_lifetime_io_ms,  g_lifetime_io_ms / 1000.0,
+        g_lifetime_io_ms / g_lifetime_vol_ms * 100.0,
+        gpu_ms, gpu_ms / 1000.0,
+        gpu_ms / g_lifetime_vol_ms * 100.0);
 }
 
 /* Wrapper: track and execute cudaMemcpy */
@@ -1694,6 +1717,12 @@ done_write:
 #endif
 
         s_vol_func_ms = _now_ms() - _vol_func_start;
+
+        /* ---- Accumulate lifetime totals ---- */
+        g_lifetime_vol_ms += s_vol_func_ms;
+        g_lifetime_io_ms  += s_s3_busy_ms;
+        g_lifetime_writes++;
+        std::call_once(g_atexit_flag, []{ std::atexit(gpucompress_vol_atexit); });
 
         /* ---- Cleanup (per-write only; buffers persist in write_ctx) ---- */
         if (d_dset_dims) free_dim_arrays(d_dset_dims, d_chunk_dims, d_chunk_start);

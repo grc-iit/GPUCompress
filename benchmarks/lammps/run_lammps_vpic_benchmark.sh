@@ -54,7 +54,7 @@ EXPLORE_THRESH="${EXPLORE_THRESH:-0.20}"
 TOTAL_STEPS=$((WARMUP_STEPS + TIMESTEPS * SIM_INTERVAL))
 NATOMS_APPROX=$(python3 -c "print(4 * $LMP_ATOMS**3)" 2>/dev/null || echo "unknown")
 DATA_MB=$(python3 -c "print(f'{4 * $LMP_ATOMS**3 * 12 / 1048576:.1f}')" 2>/dev/null || echo "unknown")
-RESULTS_DIR="${RESULTS_DIR:-$SCRIPT_DIR/results/vpic_eval_box${LMP_ATOMS}_chunk${CHUNK_MB}mb_ts${TIMESTEPS}}"
+RESULTS_DIR="${RESULTS_DIR:-$SCRIPT_DIR/results/lammps_eval_box${LMP_ATOMS}_chunk${CHUNK_MB}mb_ts${TIMESTEPS}}"
 
 export LD_LIBRARY_PATH="$GPUC_DIR/build:$GPUC_DIR/examples:/tmp/hdf5-install/lib:/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
@@ -267,6 +267,42 @@ for policy in "${POL_ARRAY[@]}"; do
         echo "  $policy: $N_ROWS rows in $COMBINED"
     fi
 done
+
+echo ""
+
+# ============================================================
+# Phase 3: Generate figures per policy per field type
+# ============================================================
+echo ">>> Phase 3: Generating figures"
+
+VISUALIZER="$GPUC_DIR/benchmarks/visualize.py"
+if [ ! -f "$VISUALIZER" ]; then
+    echo "WARNING: visualize.py not found at $VISUALIZER — skipping figures"
+else
+    for policy in "${POL_ARRAY[@]}"; do
+        for field_type in positions velocities forces; do
+            FIELD_DIR="$RESULTS_DIR/${policy}/${field_type}"
+            [ -d "$FIELD_DIR" ] || continue
+            FIG_DIR="$FIELD_DIR/figures"
+
+            echo "  ── $policy / $field_type ──"
+
+            # Symlink CSVs to vpic_deck naming so visualize.py can find them
+            for src in "$FIELD_DIR"/benchmark_lammps_${field_type}*.csv; do
+                [ -f "$src" ] || continue
+                dst=$(basename "$src" | sed "s/benchmark_lammps_${field_type}/benchmark_vpic_deck/")
+                ln -sf "$src" "$FIELD_DIR/$dst"
+            done
+
+            python3 "$VISUALIZER" \
+                --vpic-dir "$FIELD_DIR" \
+                --output-dir "$FIG_DIR" \
+                2>&1 | grep -E "Saved:|Done" || true
+            N_FIGS=$(ls "$FIG_DIR"/*.png 2>/dev/null | wc -l)
+            echo "    $N_FIGS figures in $FIG_DIR/"
+        done
+    done
+fi
 
 echo ""
 echo "============================================================"
