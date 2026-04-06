@@ -403,11 +403,20 @@ static double s_total_ms  = 0;         /* Total pipeline wall clock (stage1 + dr
 static double s_vol_func_ms = 0;       /* Total gpu_aware_chunked_write wall clock */
 static double s_setup_ms = 0;          /* Setup before pipeline (VolWriteCtx, threads, etc) */
 
-/* ── Lifetime accumulators (never reset, printed at process exit) ── */
-static double g_lifetime_vol_ms = 0;   /* Sum of wall-clock across all H5Dwrite calls */
-static double g_lifetime_io_ms  = 0;   /* Sum of actual disk I/O time (s3_busy) across all calls */
-static int    g_lifetime_writes = 0;   /* Number of H5Dwrite calls */
+/* ── Lifetime accumulators (never reset, printed/written at process exit) ── */
+static double g_life_vol_ms   = 0;  /* wall-clock inside gpu_aware_chunked_write */
+static double g_life_io_ms    = 0;  /* actual disk write time (s3_busy) */
+static double g_life_s1_ms    = 0;  /* Stage 1: stats + NN inference (main thread) */
+static double g_life_s2_ms    = 0;  /* Stage 2: max worker wall-clock (compress + D2H) */
+static double g_life_drain_ms = 0;  /* worker drain (S1 end → workers joined) */
+static double g_life_iodrain_ms = 0; /* I/O drain (workers joined → I/O thread joined) */
+static double g_life_setup_ms = 0;  /* VOL setup (alloc, thread launch) */
+static size_t g_life_bytes_in = 0;  /* total uncompressed bytes written */
+static size_t g_life_bytes_out = 0; /* total compressed bytes written */
+static int    g_life_writes   = 0;  /* number of H5Dwrite calls */
+static int    g_life_chunks   = 0;  /* total chunks processed */
 static std::once_flag g_atexit_flag;
+static char   g_life_output_dir[512] = "";
 
 static double _now_ms() {
     struct timespec ts;
@@ -416,20 +425,73 @@ static double _now_ms() {
 }
 
 static void gpucompress_vol_atexit() {
-    if (g_lifetime_writes == 0) return;
-    double gpu_ms = g_lifetime_vol_ms - g_lifetime_io_ms;
+    if (g_life_writes == 0) return;
+
+    double vol_s  = g_life_vol_ms / 1000.0;
+    double io_s   = g_life_io_ms / 1000.0;
+    double s1_s   = g_life_s1_ms / 1000.0;
+    double s2_s   = g_life_s2_ms / 1000.0;
+    double drain_s = g_life_drain_ms / 1000.0;
+    double iodrain_s = g_life_iodrain_ms / 1000.0;
+    double setup_s = g_life_setup_ms / 1000.0;
+    double ratio  = (g_life_bytes_out > 0) ? (double)g_life_bytes_in / g_life_bytes_out : 1.0;
+    double in_mb  = g_life_bytes_in / (1024.0 * 1024.0);
+    double out_mb = g_life_bytes_out / (1024.0 * 1024.0);
+    double wr_bw  = (vol_s > 0) ? in_mb / vol_s : 0;
+
+    /* Print to stderr */
     fprintf(stderr,
-        "\n[GPUCompress VOL Summary]\n"
-        "  H5Dwrite calls:  %d\n"
-        "  Total VOL time:  %.1f ms (%.2f s)\n"
-        "  Disk I/O time:   %.1f ms (%.2f s) — %.1f%%\n"
-        "  GPU compute:     %.1f ms (%.2f s) — %.1f%%\n",
-        g_lifetime_writes,
-        g_lifetime_vol_ms, g_lifetime_vol_ms / 1000.0,
-        g_lifetime_io_ms,  g_lifetime_io_ms / 1000.0,
-        g_lifetime_io_ms / g_lifetime_vol_ms * 100.0,
-        gpu_ms, gpu_ms / 1000.0,
-        gpu_ms / g_lifetime_vol_ms * 100.0);
+        "\n========================================\n"
+        " GPUCompress VOL — Lifetime Summary\n"
+        "========================================\n"
+        "  H5Dwrite calls:    %d (%d chunks)\n"
+        "  Data in:            %.1f MiB\n"
+        "  Data out:           %.1f MiB (%.2fx ratio)\n"
+        "  Write throughput:   %.1f MiB/s\n"
+        "----------------------------------------\n"
+        "  Total VOL time:     %.3f s  (wall-clock, app blocked)\n"
+        "  Disk I/O time:      %.3f s  (actual writes to storage)\n"
+        "  Stage 1 (stats+NN): %.3f s  (sequential, main thread)\n"
+        "  Stage 2 (compress): %.3f s  (max worker wall-clock)\n"
+        "  Worker drain:       %.3f s  (S1 done → workers joined)\n"
+        "  I/O drain:          %.3f s  (workers done → I/O done)\n"
+        "  Setup:              %.3f s\n"
+        "========================================\n",
+        g_life_writes, g_life_chunks,
+        in_mb, out_mb, ratio, wr_bw,
+        vol_s, io_s, s1_s, s2_s, drain_s, iodrain_s, setup_s);
+
+    /* Write to file */
+    char path[600];
+    const char *dir = g_life_output_dir[0] ? g_life_output_dir : ".";
+    snprintf(path, sizeof(path), "%s/gpucompress_vol_summary.txt", dir);
+    FILE *fp = fopen(path, "w");
+    if (fp) {
+        fprintf(fp,
+            "GPUCompress VOL — Lifetime Summary\n"
+            "==================================\n"
+            "h5dwrite_calls,%d\n"
+            "total_chunks,%d\n"
+            "bytes_in,%zu\n"
+            "bytes_out,%zu\n"
+            "ratio,%.4f\n"
+            "vol_time_ms,%.2f\n"
+            "disk_io_ms,%.2f\n"
+            "stage1_ms,%.2f\n"
+            "stage2_ms,%.2f\n"
+            "worker_drain_ms,%.2f\n"
+            "io_drain_ms,%.2f\n"
+            "setup_ms,%.2f\n"
+            "write_mibps,%.1f\n",
+            g_life_writes, g_life_chunks,
+            g_life_bytes_in, g_life_bytes_out, ratio,
+            g_life_vol_ms, g_life_io_ms,
+            g_life_s1_ms, g_life_s2_ms,
+            g_life_drain_ms, g_life_iodrain_ms,
+            g_life_setup_ms, wr_bw);
+        fclose(fp);
+        fprintf(stderr, "  Written to: %s\n\n", path);
+    }
 }
 
 /* Wrapper: track and execute cudaMemcpy */
@@ -1145,6 +1207,9 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
          * nvcc requires no init-bypass for non-trivial types). */
         double _pipeline_start = 0, _s1_start = 0, _t_drain_end = 0;
         double io_write_total_ms = 0;  /* direct S3 measurement from I/O thread */
+        size_t io_bytes_written  = 0;  /* total compressed bytes written to disk */
+        size_t life_n_chunks     = 0;  /* chunks this call (for lifetime tracking) */
+        size_t life_chunk_bytes  = 0;  /* uncompressed chunk size (for lifetime tracking) */
         double worker_comp_ms[M4_N_COMP_WORKERS];
         memset(worker_comp_ms, 0, sizeof(worker_comp_ms));
         hsize_t *d_dset_dims = NULL, *d_chunk_dims = NULL, *d_chunk_start = NULL;
@@ -1250,6 +1315,7 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                 herr_t r = write_chunk_to_native(o->under_object, o->under_vol_id,
                                                   item.cs, item.data, item.sz, dxpl_id);
                 io_write_total_ms += _now_ms() - _t_io_w;
+                io_bytes_written  += item.sz;
                 pool_release(item.data);
                 if (r < 0) { std::lock_guard<std::mutex> lk(io_mtx); io_err = r; }
             }
@@ -1374,6 +1440,8 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                     num_chunks[d] = (dset_dims[d] + chunk_dims[d] - 1) / chunk_dims[d];
                 size_t total_chunks = 1;
                 for (int d = 0; d < ndims; d++) total_chunks *= (size_t)num_chunks[d];
+                life_n_chunks = total_chunks;
+                life_chunk_bytes = chunk_bytes;
 
                 ret = 0;
                 s_gpu_writes++;
@@ -1719,10 +1787,23 @@ done_write:
         s_vol_func_ms = _now_ms() - _vol_func_start;
 
         /* ---- Accumulate lifetime totals ---- */
-        g_lifetime_vol_ms += s_vol_func_ms;
-        g_lifetime_io_ms  += s_s3_busy_ms;
-        g_lifetime_writes++;
-        std::call_once(g_atexit_flag, []{ std::atexit(gpucompress_vol_atexit); });
+        g_life_vol_ms     += s_vol_func_ms;
+        g_life_io_ms      += s_s3_busy_ms;
+        g_life_s1_ms      += s_stage1_ms;
+        g_life_s2_ms      += s_s2_busy_ms;
+        g_life_drain_ms   += s_drain_ms;
+        g_life_iodrain_ms += s_io_drain_ms;
+        g_life_setup_ms   += s_setup_ms;
+        g_life_bytes_in   += life_n_chunks * life_chunk_bytes;
+        g_life_bytes_out  += io_bytes_written;
+        g_life_chunks     += (int)life_n_chunks;
+        g_life_writes++;
+        std::call_once(g_atexit_flag, []{
+            const char *dir = getenv("GPUCOMPRESS_RESULTS_DIR");
+            if (!dir) dir = getenv("VPIC_RESULTS_DIR");
+            if (dir) snprintf(g_life_output_dir, sizeof(g_life_output_dir), "%s", dir);
+            std::atexit(gpucompress_vol_atexit);
+        });
 
         /* ---- Cleanup (per-write only; buffers persist in write_ctx) ---- */
         if (d_dset_dims) free_dim_arrays(d_dset_dims, d_chunk_dims, d_chunk_start);
