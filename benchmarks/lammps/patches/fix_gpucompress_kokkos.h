@@ -15,6 +15,8 @@
      GPUCOMPRESS_POLICY   - NN ranking policy (speed/balanced/ratio)
      GPUCOMPRESS_VERIFY   - 1 to enable lossless verification
      GPUCOMPRESS_WEIGHTS  - path to NN model weights
+     GPUCOMPRESS_SGD      - 0/1: enable online SGD (default 1 for auto)
+     GPUCOMPRESS_EXPLORE  - 0/1: enable exploration (default 1 for auto)
 ------------------------------------------------------------------------- */
 
 #ifdef FIX_CLASS
@@ -57,6 +59,8 @@ class FixGPUCompressKokkos : public Fix {
   int write_count;        /* running write counter for CSV timestep col */
   int total_writes;       /* estimated total writes for milestone check */
   float cw0, cw1, cw2;   /* cost model weights for ranking profiler */
+  int do_sgd;            /* 1 if online SGD is enabled (GPUCOMPRESS_SGD) */
+  int do_explore;        /* 1 if exploration is enabled (GPUCOMPRESS_EXPLORE) */
   int gpuc_ready;
 };
 

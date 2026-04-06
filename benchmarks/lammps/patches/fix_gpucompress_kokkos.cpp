@@ -87,6 +87,7 @@ FixGPUCompressKokkos::FixGPUCompressKokkos(LAMMPS *lmp, int narg, char **arg) :
   const char *tw_env = getenv("GPUCOMPRESS_TOTAL_WRITES");
   total_writes = tw_env ? atoi(tw_env) : 10;
   cw0 = 1; cw1 = 1; cw2 = 1;
+  do_sgd = 1; do_explore = 1;
 
   gpuc_ready = 0;
 }
@@ -122,26 +123,46 @@ void FixGPUCompressKokkos::init()
     if (rc == 0) {
       gpuc_ready = 1;
 
-      /* Enable online SGD learning + exploration for NN-RL phase */
+      /* Enable online SGD learning + exploration for NN phases.
+       * GPUCOMPRESS_SGD=0 disables SGD (nn phase: inference-only).
+       * GPUCOMPRESS_SGD=1 (default for auto) enables SGD (nn-rl phase).
+       * GPUCOMPRESS_EXPLORE=0 disables exploration (nn or nn-rl phase).
+       * GPUCOMPRESS_EXPLORE=1 (default for auto) enables exploration (nn-rl+exp50).
+       * This allows the shell script to distinguish all 3 NN phases. */
       if (strcmp(algo_name, "auto") == 0) {
-        const char *lr_env = getenv("GPUCOMPRESS_LR");
-        const char *mape_env = getenv("GPUCOMPRESS_MAPE");
-        const char *ek_env = getenv("GPUCOMPRESS_EXPLORE_K");
-        const char *et_env = getenv("GPUCOMPRESS_EXPLORE_THRESH");
-        float lr   = lr_env   ? (float)atof(lr_env)   : 0.2f;
-        float mape = mape_env ? (float)atof(mape_env)  : 0.10f;
-        int   ek   = ek_env   ? atoi(ek_env)           : 4;
-        float et   = et_env   ? (float)atof(et_env)    : 0.20f;
+        const char *sgd_env = getenv("GPUCOMPRESS_SGD");
+        const char *exp_env = getenv("GPUCOMPRESS_EXPLORE");
+        do_sgd     = sgd_env ? atoi(sgd_env) : 1;
+        do_explore = exp_env ? atoi(exp_env) : 1;
 
-        gpucompress_enable_online_learning();
-        gpucompress_set_reinforcement(1, lr, mape, 0.0f);
-        gpucompress_set_exploration(1);
-        gpucompress_set_exploration_k(ek);
-        gpucompress_set_exploration_threshold(et);
+        if (do_sgd) {
+          const char *lr_env = getenv("GPUCOMPRESS_LR");
+          const char *mape_env = getenv("GPUCOMPRESS_MAPE");
+          float lr   = lr_env   ? (float)atof(lr_env)   : 0.2f;
+          float mape = mape_env ? (float)atof(mape_env)  : 0.10f;
+
+          gpucompress_enable_online_learning();
+          gpucompress_set_reinforcement(1, lr, mape, 0.0f);
+        } else {
+          gpucompress_disable_online_learning();
+        }
+
+        if (do_explore) {
+          const char *ek_env = getenv("GPUCOMPRESS_EXPLORE_K");
+          const char *et_env = getenv("GPUCOMPRESS_EXPLORE_THRESH");
+          int   ek   = ek_env   ? atoi(ek_env)           : 4;
+          float et   = et_env   ? (float)atof(et_env)    : 0.20f;
+
+          gpucompress_set_exploration(1);
+          gpucompress_set_exploration_k(ek);
+          gpucompress_set_exploration_threshold(et);
+        } else {
+          gpucompress_set_exploration(0);
+        }
 
         if (comm->me == 0)
-          fprintf(stdout, "[GPUCompress-LAMMPS] Online learning: lr=%.2f mape=%.2f explore_k=%d explore_thresh=%.2f\n",
-                  lr, mape, ek, et);
+          fprintf(stdout, "[GPUCompress-LAMMPS] NN mode: sgd=%d explore=%d\n",
+                  do_sgd, do_explore);
       }
 
       if (comm->me == 0) {
@@ -341,7 +362,14 @@ void FixGPUCompressKokkos::end_of_step()
   /* Log per-chunk diagnostics to CSV */
   if (log_chunks && tc_csv && comm->me == 0) {
     int n_hist = gpucompress_get_chunk_history_count();
-    const char *phase = (strcmp(algo_name, "auto") == 0) ? "nn-rl+exp50" : algo_name;
+    const char *phase;
+    if (strcmp(algo_name, "auto") == 0) {
+      if (do_sgd && do_explore)  phase = "nn-rl+exp50";
+      else if (do_sgd)           phase = "nn-rl";
+      else                       phase = "nn";
+    } else {
+      phase = algo_name;
+    }
     for (int ci = 0; ci < n_hist; ci++) {
       gpucompress_chunk_diag_t dd;
       if (gpucompress_get_chunk_diag(ci, &dd) != 0) continue;

@@ -387,6 +387,72 @@ FlushFormatGPUCompress::WriteToFile (
                        << " MB original data to " << dirname << "\n";
     }
 
+    /* ── Raw field dump for standalone benchmark (WARPX_DUMP_FIELDS=1) ── */
+    {
+        static int warpx_dump_raw = -1;
+        if (warpx_dump_raw < 0) {
+            const char* env = std::getenv("WARPX_DUMP_FIELDS");
+            warpx_dump_raw = (env && std::atoi(env)) ? 1 : 0;
+        }
+        if (warpx_dump_raw && amrex::ParallelDescriptor::IOProcessor()) {
+            const char* raw_dir = std::getenv("WARPX_DUMP_DIR");
+            if (raw_dir && raw_dir[0]) {
+                char ts_dir[700];
+                std::snprintf(ts_dir, sizeof(ts_dir), "%s/diag%05d",
+                              raw_dir, iteration[0]);
+                mkdir(ts_dir, 0755);
+
+                for (int lev = 0; lev < nlev; ++lev) {
+                    int fab_idx = 0;
+                    for (amrex::MFIter mfi(mf[lev]); mfi.isValid(); ++mfi, ++fab_idx) {
+                        const amrex::FArrayBox& fab = mf[lev][mfi];
+                        long ncells = mfi.validbox().numPts();
+
+                        for (int icomp = 0; icomp < mf[lev].nComp(); ++icomp) {
+                            const void* d_ptr = static_cast<const void*>(
+                                fab.dataPtr(icomp));
+                            size_t nbytes = (size_t)ncells * elem_size;
+                            void* h_buf = std::malloc(nbytes);
+                            cudaMemcpy(h_buf, d_ptr, nbytes,
+                                       cudaMemcpyDeviceToHost);
+
+                            const std::string& vn =
+                                (icomp < static_cast<int>(varnames.size()))
+                                    ? varnames[icomp]
+                                    : "field_" + std::to_string(icomp);
+                            char fpath[800];
+                            std::snprintf(fpath, sizeof(fpath),
+                                "%s/lev%d_%s_fab%04d.f32",
+                                ts_dir, lev, vn.c_str(), fab_idx);
+                            FILE* fp = std::fopen(fpath, "wb");
+                            if (fp) {
+                                if (elem_size == 8) {
+                                    /* amrex::Real is double — downcast to float32 */
+                                    float* f32 = (float*)std::malloc(
+                                        (size_t)ncells * sizeof(float));
+                                    const double* src = (const double*)h_buf;
+                                    for (long i = 0; i < ncells; i++)
+                                        f32[i] = (float)src[i];
+                                    std::fwrite(f32, sizeof(float),
+                                                (size_t)ncells, fp);
+                                    std::free(f32);
+                                } else {
+                                    std::fwrite(h_buf, sizeof(float),
+                                                (size_t)ncells, fp);
+                                }
+                                std::fclose(fp);
+                            }
+                            std::free(h_buf);
+                        }
+                    }
+                }
+                if (s_write_count == 0)
+                    amrex::Print() << "[GPUCompress] Raw field dump → "
+                                   << raw_dir << "\n";
+            }
+        }
+    }
+
     /* Run ranking profiler at milestone writes */
     if (s_ranking_csv && amrex::ParallelDescriptor::IOProcessor()
         && is_ranking_milestone(s_write_count, s_total_writes)) {

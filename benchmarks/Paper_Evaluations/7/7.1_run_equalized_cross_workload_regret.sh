@@ -53,11 +53,11 @@ MODE="${MODE:-snapshot}"  # "snapshot" or "simulation"
 RUN_NAME="${RUN_NAME:-cross_workload_${MODE}_$(date +%Y%m%d_%H%M%S)}"
 RESULTS_DIR="$SCRIPT_DIR/results/$RUN_NAME"
 
-POLICY="${POLICY:-balanced}"
-PHASE="${PHASE:-nn-rl+exp50}"
-ERROR_BOUND="${ERROR_BOUND:-0.01}"
+POLICY="${POLICY:-ratio}"
+PHASE="${PHASE:-nn-rl}"
+ERROR_BOUND="${ERROR_BOUND:-0.0}"
 CHUNK_MB="${CHUNK_MB:-4}"
-SGD_LR="${SGD_LR:-0.2}"
+SGD_LR="${SGD_LR:-0.1}"
 SGD_MAPE="${SGD_MAPE:-0.10}"
 EXPLORE_K="${EXPLORE_K:-4}"
 EXPLORE_THRESH="${EXPLORE_THRESH:-0.20}"
@@ -117,30 +117,38 @@ NYX_NCELL="${NYX_NCELL:-64}"
 NYX_MAX_STEP="${NYX_MAX_STEP:-500}"
 NYX_PLOT_INT="${NYX_PLOT_INT:-100}"
 
-# ── VPIC: plasma PIC — 500 warmup steps lets laser-plasma instabilities
-#    develop; 190 steps between dumps spans vacuum → laser → bubble →
-#    wakefield → trapping → saturation stages, giving diverse fields.
-#    NX=200 yields ~520 MB/field ≈ 130 chunks/field.  6 timesteps (<10)
-#    means the ranking profiler runs on EVERY field: 6×130 ≈ 780 chunks.
-VPIC_NX="${VPIC_NX:-200}"
-VPIC_TIMESTEPS="${VPIC_TIMESTEPS:-6}"
-VPIC_WARMUP_STEPS="${VPIC_WARMUP_STEPS:-500}"
-VPIC_SIM_INTERVAL="${VPIC_SIM_INTERVAL:-190}"
+# ── VPIC: plasma PIC — fast reconnection (mi_me=5) reaches nonlinear
+#    phase within ~500 steps. Perturbation=0.30 seeds instability faster.
+#    Short warmup + frequent dumps catch the rapid structural changes.
+VPIC_NX="${VPIC_NX:-147}"
+VPIC_TIMESTEPS="${VPIC_TIMESTEPS:-8}"
+VPIC_WARMUP_STEPS="${VPIC_WARMUP_STEPS:-200}"
+VPIC_SIM_INTERVAL="${VPIC_SIM_INTERVAL:-80}"
+VPIC_MI_ME="${VPIC_MI_ME:-5}"
+VPIC_WPE_WCE="${VPIC_WPE_WCE:-1}"
+VPIC_TI_TE="${VPIC_TI_TE:-5}"
 
-# ── WarpX: laser-wakefield acceleration — runs real WarpX PIC simulation.
-#    32x32x256 grid by default (small/fast). Increase for larger data.
-#    Uses gpucompress diagnostic format for per-chunk CSV logging.
-WARPX_NCELL="${WARPX_NCELL:-32 32 256}"
-WARPX_MAX_STEP="${WARPX_MAX_STEP:-100}"
-WARPX_DIAG_INTERVAL="${WARPX_DIAG_INTERVAL:-20}"
+# ── NYX: Sedov blast wave — tighter dump interval (25 steps) catches
+#    the shock front moving through chunk boundaries more frequently.
+NYX_NCELL="${NYX_NCELL:-160}"
+NYX_MAX_STEP="${NYX_MAX_STEP:-200}"
+NYX_PLOT_INT="${NYX_PLOT_INT:-25}"
 
-# ── LAMMPS: MD hot-sphere expansion — 200 warmup steps lets initial
-#    shock form; 100 steps between dumps captures shock propagation,
-#    mixing front evolution, and thermal equilibration.
-LMP_ATOMS="${LMP_ATOMS:-80}"
-LMP_TIMESTEPS="${LMP_TIMESTEPS:-22}"
-LMP_SIM_INTERVAL="${LMP_SIM_INTERVAL:-100}"
-LMP_WARMUP_STEPS="${LMP_WARMUP_STEPS:-200}"
+# ── WarpX: laser-wakefield acceleration — more steps (200) lets the
+#    plasma bubble mature; tighter dumps (20 steps) capture transient.
+WARPX_NCELL="${WARPX_NCELL:-128 128 320}"
+WARPX_MAX_STEP="${WARPX_MAX_STEP:-200}"
+WARPX_DIAG_INTERVAL="${WARPX_DIAG_INTERVAL:-25}"
+
+# ── LAMMPS: MD hot-sphere expansion — extreme temperature (T_hot=100)
+#    creates violent shock; frequent dumps (every 10 steps) capture
+#    the rapid transient as density/velocity gradients evolve.
+LMP_ATOMS="${LMP_ATOMS:-161}"
+LMP_TIMESTEPS="${LMP_TIMESTEPS:-8}"
+LMP_SIM_INTERVAL="${LMP_SIM_INTERVAL:-25}"
+LMP_WARMUP_STEPS="${LMP_WARMUP_STEPS:-50}"
+LMP_T_HOT="${LMP_T_HOT:-100.0}"
+LMP_T_COLD="${LMP_T_COLD:-0.01}"
 
 # ── Policy weights ────────────────────────────────────────────
 case "$POLICY" in
@@ -148,6 +156,17 @@ case "$POLICY" in
     ratio)    W0="0.0"; W1="0.0"; W2="1.0" ;;
     speed)    W0="1.0"; W1="1.0"; W2="0.0" ;;
     *)        echo "ERROR: unknown POLICY=$POLICY" >&2; exit 1 ;;
+esac
+
+# ── Phase → SGD/Explore mapping ───────────────────────────────
+# nn:           inference only (no SGD, no exploration)
+# nn-rl:        SGD enabled, no exploration
+# nn-rl+exp50:  SGD + exploration
+case "$PHASE" in
+    nn)           DO_SGD=0; DO_EXPLORE=0 ;;
+    nn-rl)        DO_SGD=1; DO_EXPLORE=0 ;;
+    nn-rl+exp50)  DO_SGD=1; DO_EXPLORE=1 ;;
+    *)            DO_SGD=1; DO_EXPLORE=1 ;;
 esac
 
 # ── LD_LIBRARY_PATH ───────────────────────────────────────────
@@ -366,15 +385,18 @@ run_vpic_sim() {
     local vpic_out="$RESULTS_DIR/vpic"
     mkdir -p "$vpic_out"
 
-    note "Running VPIC simulation with nn-rl+exp50 (NX=$VPIC_NX, timesteps=$VPIC_TIMESTEPS)"
+    note "Running VPIC simulation with $PHASE (NX=$VPIC_NX, timesteps=$VPIC_TIMESTEPS)"
 
-    # VPIC_PHASE restricts to nn-rl+exp50 only (skip fixed + nn + nn-rl)
+    # VPIC_PHASE restricts to this phase only (skip all others)
     GPUCOMPRESS_WEIGHTS="$WEIGHTS" \
     VPIC_TIMESTEPS="$VPIC_TIMESTEPS" \
     VPIC_WARMUP_STEPS="$VPIC_WARMUP_STEPS" \
     VPIC_SIM_INTERVAL="$VPIC_SIM_INTERVAL" \
+    VPIC_MI_ME="$VPIC_MI_ME" \
+    VPIC_WPE_WCE="$VPIC_WPE_WCE" \
+    VPIC_TI_TE="$VPIC_TI_TE" \
     VPIC_POLICIES="$POLICY" \
-    VPIC_PHASE="nn-rl+exp50" \
+    VPIC_PHASE="$PHASE" \
     VPIC_NX="$VPIC_NX" \
     VPIC_CHUNK_MB="$CHUNK_MB" \
     VPIC_ERROR_BOUND="$ERROR_BOUND" \
@@ -479,7 +501,7 @@ run_lammps_sim() {
 
     local total_steps=$((LMP_WARMUP_STEPS + LMP_TIMESTEPS * LMP_SIM_INTERVAL))
 
-    note "Running LAMMPS simulation with nn-rl+exp50 (atoms=$LMP_ATOMS^3, timesteps=$LMP_TIMESTEPS)"
+    note "Running LAMMPS simulation with $PHASE (atoms=$LMP_ATOMS^3, timesteps=$LMP_TIMESTEPS)"
 
     cat > "$work_dir/input.lmp" <<LMPEOF
 units           lj
@@ -493,8 +515,8 @@ mass            1 1.0
 region          hot sphere $(($LMP_ATOMS/2)) $(($LMP_ATOMS/2)) $(($LMP_ATOMS/2)) $(($LMP_ATOMS/4))
 group           hot region hot
 group           cold subtract all hot
-velocity        cold create 0.01 87287 loop geom
-velocity        hot create 10.0 12345 loop geom
+velocity        cold create $LMP_T_COLD 87287 loop geom
+velocity        hot create $LMP_T_HOT 12345 loop geom
 
 pair_style      lj/cut 2.5
 pair_coeff      1 1 1.0 1.0 2.5
@@ -513,6 +535,8 @@ LMPEOF
     GPUCOMPRESS_ALGO="auto" \
     GPUCOMPRESS_POLICY="$POLICY" \
     GPUCOMPRESS_VERIFY="0" \
+    GPUCOMPRESS_SGD="$DO_SGD" \
+    GPUCOMPRESS_EXPLORE="$DO_EXPLORE" \
     GPUCOMPRESS_LR="$SGD_LR" \
     GPUCOMPRESS_MAPE="$SGD_MAPE" \
     GPUCOMPRESS_EXPLORE_K="$EXPLORE_K" \
@@ -781,38 +805,38 @@ combined_csv = os.path.join(results_dir, "cross_workload_comp_mape.csv")
 series = []
 
 for key, label, color in workload_order:
-    # Use ranking CSV directly — same rows as Figure 7a, guarantees equal x-axis.
-    # Compute cost prediction error from predicted_best_cost vs actual_best_cost.
-    ranking_csv = os.path.join(results_dir, key, f"benchmark_{key}_ranking.csv")
-    if not os.path.isfile(ranking_csv):
+    # Read actual compression time MAPE from timestep_chunks CSV.
+    # mape_comp = |predicted_comp_time - actual_comp_time| / actual_comp_time * 100
+    # This measures how well the NN predicts compression time for its chosen
+    # algorithm — should start high (cold NN) and decrease as SGD corrects.
+    tc_csv = os.path.join(results_dir, key, f"benchmark_{key}_timestep_chunks.csv")
+    if not os.path.isfile(tc_csv):
         continue
 
-    rows = []
-    with open(ranking_csv, newline="") as f:
+    rows_by_ts = {}
+    with open(tc_csv, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
             p = row.get("phase", "")
             if not p.startswith(phase_prefix):
                 continue
-            ts = int(row.get("timestep", 0))
-            chunk = int(row["chunk"])
-            pred_cost = float(row.get("predicted_best_cost", 0))
-            actual_cost = float(row.get("actual_best_cost", 0))
-            # Cost prediction error as percentage
-            if actual_cost > 0:
-                cost_err = abs(pred_cost - actual_cost) / actual_cost * 100.0
-            else:
-                cost_err = 0.0
-            rows.append((ts, chunk, cost_err))
+            ts = int(row.get("timestep", row.get("field_idx", 0)))
+            chunk = int(row.get("chunk", 0))
+            mape_comp = float(row.get("mape_comp", 0.0))
+            rows_by_ts.setdefault(ts, []).append((chunk, mape_comp))
 
-    if not rows:
+    if not rows_by_ts:
         continue
 
-    rows.sort(key=lambda r: (r[0], r[1]))
+    rows = []
+    for ts in sorted(rows_by_ts.keys()):
+        for chunk_idx, mape in rows_by_ts[ts]:
+            rows.append((ts, chunk_idx, mape))
+
     xs = list(range(len(rows)))
     ys = [r[2] for r in rows]
     series.append((label, color, xs, ys, key))
-    print(f"  {label}: {len(rows)} chunks from {os.path.basename(ranking_csv)}")
+    print(f"  {label}: {len(rows)} chunks from {os.path.basename(tc_csv)}")
 
 if not series:
     print("ERROR: no workload data to plot for MAPE", file=sys.stderr)
@@ -849,25 +873,23 @@ max_convergence = max(convergence_chunks) if convergence_chunks else 0
 
 # Plot
 fig, ax = plt.subplots(figsize=(5.4, 3.8))
+MAPE_CAP = 100.0
 for label, color, xs, ys, _ in series:
+    ys_capped = [min(y, MAPE_CAP) for y in ys]
     window = min(5, max(1, len(ys) // 3))
     if len(ys) > window:
-        smooth = np.convolve(ys, np.ones(window)/window, mode='valid')
+        smooth = np.convolve(ys_capped, np.ones(window)/window, mode='valid')
         smooth_x = list(range(window - 1, len(ys)))
         ax.plot(smooth_x, smooth, color=color, linewidth=2.0, label=label)
-        ax.plot(xs, ys, color=color, alpha=0.15, linewidth=0.5)
+        ax.plot(xs, ys_capped, color=color, alpha=0.15, linewidth=0.5)
     else:
-        ax.plot(xs, ys, color=color, linewidth=2.0, label=label)
-
-x_val = f"~{max_convergence}" if max_convergence > 0 else "X"
+        ax.plot(xs, ys_capped, color=color, linewidth=2.0, label=label)
 
 ax.set_xlabel("Chunk Index (sequential across profiled fields)")
-ax.set_ylabel("Cost Prediction Error (%)")
+ax.set_ylabel("Compression Time MAPE (%)")
 ax.grid(True, alpha=0.25)
 ax.legend(frameon=True, fontsize=9)
-all_ys = [y for _, _, _, ys, _ in series for y in ys]
-y_max = max(all_ys) * 1.15 if all_ys else 100
-ax.set_ylim(bottom=0, top=max(y_max, 5))
+ax.set_ylim(bottom=0, top=MAPE_CAP * 1.05)
 plt.tight_layout()
 plt.savefig(png_path, dpi=220, bbox_inches="tight")
 print(f"\nSaved: {png_path}")

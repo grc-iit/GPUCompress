@@ -169,6 +169,55 @@ Nyx::writePlotFile (const std::string& dir,
         cnt++;
     }
 
+    /* ── Raw field dump for standalone benchmark (NYX_DUMP_FIELDS=1) ── */
+    static int nyx_dump_raw = -1;
+    if (nyx_dump_raw < 0) {
+        const char* env = getenv("NYX_DUMP_FIELDS");
+        nyx_dump_raw = (env && atoi(env)) ? 1 : 0;
+    }
+    if (nyx_dump_raw && ParallelDescriptor::IOProcessor()) {
+        const char* raw_dir = getenv("NYX_DUMP_DIR");
+        if (!raw_dir) raw_dir = ".";
+        static int nyx_dump_count = 0;
+        char ts_dir[700];
+        snprintf(ts_dir, sizeof(ts_dir), "%s/plt%05d", raw_dir, nyx_dump_count);
+        amrex::UtilCreateDirectory(ts_dir, 0755);
+
+        for (MFIter mfi(plotMF); mfi.isValid(); ++mfi) {
+            const FArrayBox& fab = plotMF[mfi];
+            long ncells = mfi.validbox().numPts();
+            for (int comp = 0; comp < plotMF.nComp(); comp++) {
+                const Real* d_ptr = fab.dataPtr(comp);
+                size_t nbytes = (size_t)ncells * sizeof(Real);
+                void* h_buf = malloc(nbytes);
+                cudaMemcpy(h_buf, d_ptr, nbytes, cudaMemcpyDeviceToHost);
+
+                char fpath[800];
+                snprintf(fpath, sizeof(fpath), "%s/fab%04d_comp%02d_%s.f32",
+                         ts_dir, mfi.index(), comp,
+                         (comp < (int)varnames.size()) ? varnames[comp].c_str() : "unk");
+                FILE* fp = fopen(fpath, "wb");
+                if (fp) {
+                    if (sizeof(Real) == 8) {
+                        /* amrex::Real is double — downcast to float32 */
+                        float* f32 = (float*)malloc((size_t)ncells * sizeof(float));
+                        const double* src = (const double*)h_buf;
+                        for (long i = 0; i < ncells; i++) f32[i] = (float)src[i];
+                        fwrite(f32, sizeof(float), (size_t)ncells, fp);
+                        free(f32);
+                    } else {
+                        fwrite(h_buf, sizeof(float), (size_t)ncells, fp);
+                    }
+                    fclose(fp);
+                }
+                free(h_buf);
+            }
+        }
+        if (nyx_dump_count == 0)
+            amrex::Print() << "[GPUCompress] Raw field dump enabled → " << raw_dir << "\n";
+        nyx_dump_count++;
+    }
+
     /* Initialize GPUCompress + HDF5 VOL connector (once) */
     static hid_t vol_fapl = H5I_INVALID_HID;
     if (vol_fapl < 0) {
@@ -184,7 +233,7 @@ Nyx::writePlotFile (const std::string& dir,
         if (policy == "speed")
             gpucompress_set_ranking_weights(1.0f, 0.0f, 0.0f);
         else if (policy == "balanced")
-            gpucompress_set_ranking_weights(1.0f, 1.0f, 0.5f);
+            gpucompress_set_ranking_weights(1.0f, 1.0f, 1.0f);
         else /* ratio */
             gpucompress_set_ranking_weights(0.0f, 0.0f, 1.0f);
 
@@ -238,7 +287,7 @@ Nyx::writePlotFile (const std::string& dir,
             std::string lpol = "ratio";
             { ParmParse pp("nyx"); pp.query("gpucompress_policy", lpol); }
             if (lpol == "speed")    { lw0=1; lw1=0; lw2=0; }
-            else if (lpol == "balanced") { lw0=1; lw1=1; lw2=0.5; }
+            else if (lpol == "balanced") { lw0=1; lw1=1; lw2=1; }
             else { lw0=0; lw1=0; lw2=1; }
 
             if (ParallelDescriptor::IOProcessor()) {
