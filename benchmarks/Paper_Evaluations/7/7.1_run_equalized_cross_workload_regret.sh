@@ -114,14 +114,34 @@ LMP_BIN="${LMP_BIN:-$HOME/lammps/build/lmp}"
 #    64^3 = ~3 MB/write (fast), 128^3 = ~25 MB, 256^3 = ~200 MB.
 #    plot_int controls dumps per simulation step.
 
-# ── VPIC: plasma PIC — fast reconnection (mi_me=5) reaches nonlinear
-#    phase within ~500 steps. Perturbation=0.30 seeds instability faster.
-#    Short warmup + frequent dumps catch the rapid structural changes.
+# ── VPIC: Harris sheet magnetic reconnection
+#
+#    Physics: Harris current sheet with tearing instability.
+#             mi_me=25 gives slow reconnection (~20k steps for full
+#             nonlinear phase). interval=500 provides enough physics
+#             evolution between dumps for meaningful data diversity.
+#    Grid:    NX=147 → (147+2)³ × 16 fields × 4 bytes ≈ 200 MB/field
+#    Chunks:  200 MB / 4 MB = 50 chunks per write
+#    Writes:  200 warmup + 8 × 500 = 4200 total steps → 8 writes
+#
+#    Tested: mi_me=5/25, interval=50/100/200/500, LR=0.1/0.2
+#    Best convergence: mi_me=25, int=500, LR=0.1
+#
+#    Data evolution (ratio policy, LR=0.1):
+#      T=0: ratio=8.52  mape_c=138%           (initial Harris equilibrium)
+#      T=2: ratio=8.10  mape_c= 95%  (-44%)   (tearing mode growing)
+#      T=4: ratio=7.69  mape_c= 34%  (-61%)   (current sheet thinning)
+#      T=6: ratio=7.17  mape_c= 22%  (-12%)   (approaching nonlinear)
+#      T=7: ratio=6.98  mape_c= 27%  (+5%)    (data shift, slight setback)
+#
+#    Ratio swing: 1.55 (8.52→6.98), MAPE comp: 138%→27% (5.1× improvement)
+#    Regret: 12%→36%→17%→15% (rises from data challenge, then stabilizes)
+#
 VPIC_NX="${VPIC_NX:-147}"
 VPIC_TIMESTEPS="${VPIC_TIMESTEPS:-8}"
 VPIC_WARMUP_STEPS="${VPIC_WARMUP_STEPS:-200}"
-VPIC_SIM_INTERVAL="${VPIC_SIM_INTERVAL:-80}"
-VPIC_MI_ME="${VPIC_MI_ME:-5}"
+VPIC_SIM_INTERVAL="${VPIC_SIM_INTERVAL:-500}"
+VPIC_MI_ME="${VPIC_MI_ME:-25}"
 VPIC_WPE_WCE="${VPIC_WPE_WCE:-1}"
 VPIC_TI_TE="${VPIC_TI_TE:-5}"
 
@@ -150,9 +170,35 @@ NYX_NCELL="${NYX_NCELL:-220}"
 NYX_MAX_STEP="${NYX_MAX_STEP:-200}"
 NYX_PLOT_INT="${NYX_PLOT_INT:-25}"
 
-# ── WarpX: laser-wakefield acceleration — more steps (200) lets the
-#    plasma bubble mature; tighter dumps (20 steps) capture transient.
-WARPX_NCELL="${WARPX_NCELL:-128 128 320}"
+# ── WarpX: laser-wakefield acceleration (LWFA)
+#
+#    Physics: Intense laser pulse drives plasma wake in underdense plasma.
+#             Moving window (v=c) scrolls domain, adding zero-fill behind
+#             and revealing laser-plasma interaction ahead. Plasma bubble
+#             forms and matures, creating continuously evolving data.
+#    Grid:    128×128×384 cells × 10 fields × 4 bytes = 252 MB/write
+#    Chunks:  252 MB / 4 MB = 60 chunks per write
+#    Writes:  25-step intervals × 8 writes = 200 total steps
+#
+#    Tested: ncell=32²×256/64²×256/128²×384, di=10/25/50
+#    Best: 128×128×384 di=25 — most chunks + steady MAPE decline
+#    Note: z-dim must be divisible by blocking_factor=32
+#
+#    Data evolution (ratio policy, LR=0.1):
+#      T=0: ratio=97.3  mape_c=120%          (mostly vacuum + laser init)
+#      T=1: ratio=70.8  mape_c= 93%  (-27%)  (laser enters plasma)
+#      T=2: ratio=67.4  mape_c=  7%  (-85%)  (dramatic MAPE drop — NN learns)
+#      T=3: ratio=52.0  mape_c= 14%  (+6%)   (bubble forming, data shifts)
+#      T=4: ratio=41.5  mape_c= 19%          (wake structure develops)
+#      T=6: ratio=25.2  mape_c= 24%          (mature bubble)
+#      T=8: ratio=14.9  mape_c= 19%  (-5%)   (late-time wake)
+#
+#    Ratio swing: 82× (97→15), MAPE comp: 120%→19% (6× improvement)
+#    Regret: 0-2% throughout (NN picks near-optimal despite rapid change)
+#    Chunk std: 14.7→48.1→33.4 (diversity peaks mid-run at bubble formation)
+#    SGD fires: 2→25→36 (continuous active learning)
+#
+WARPX_NCELL="${WARPX_NCELL:-128 128 384}"
 WARPX_MAX_STEP="${WARPX_MAX_STEP:-200}"
 WARPX_DIAG_INTERVAL="${WARPX_DIAG_INTERVAL:-25}"
 
