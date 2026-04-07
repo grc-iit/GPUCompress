@@ -32,7 +32,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 export LD_LIBRARY_PATH=/tmp/hdf5-install/lib:${PROJECT_DIR}/build:${LD_LIBRARY_PATH:-}
 
 # ── Global defaults ──
-WORKLOADS=${WORKLOADS:-"vpic,sdr,ai"}
+WORKLOADS=${WORKLOADS:-"vpic,ai"}
 ERROR_BOUND=${ERROR_BOUND:-0.01}
 POLICIES=${POLICIES:-"balanced,ratio"}
 VERIFY=${VERIFY:-1}
@@ -136,40 +136,9 @@ run_vpic() {
 # SDRBench
 # ============================================================
 run_sdr() {
-    echo ""
-    echo "============================================================"
-    echo "  SDRBench (${SDR_DATASETS})"
-    echo "  LR sweep: ${SGD_LR_LIST}"
-    echo "============================================================"
-
-    local W_START=$(date +%s)
-
-    for LR in "${LR_LIST[@]}"; do
-        for cfg in "${CONFIGS[@]}"; do
-            IFS=: read -r CHUNK EB LABEL <<< "$cfg"
-
-            # Unique suffix: _4mb_lossless_lr0.2_20260403_053900
-            local SUFFIX="_${LABEL}_lr${LR}_${RUN_ID}"
-
-            echo ""
-            echo "  ── SDR ${LABEL} lr=${LR} ──"
-
-            SDR_DATASETS="$SDR_DATASETS" \
-            CHUNK_MB=$CHUNK \
-            ERROR_BOUND=$EB \
-            VERIFY=$VERIFY \
-            POLICIES=$POLICIES \
-            SGD_LR=$LR \
-            SGD_MAPE=$SGD_MAPE \
-            EXPLORE_K=$EXPLORE_K \
-            EXPLORE_THRESH=$EXPLORE_THRESH \
-            VPIC_EVAL_SUFFIX="$SUFFIX" \
-            bash "$SCRIPT_DIR/sdrbench/run_sdr.sh"
-        done
-    done
-
-    local W_END=$(date +%s)
-    echo "  SDRBench complete: $(( (W_END - W_START) / 60 )) minutes"
+    echo "ERROR: 'sdr' workload removed per project rule (no static archives)."
+    echo "       Use 'vpic' or 'ai' instead."
+    return 1
 }
 
 # ============================================================

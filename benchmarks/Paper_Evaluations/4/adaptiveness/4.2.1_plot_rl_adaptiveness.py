@@ -21,13 +21,13 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-DATASETS = ["nyx", "hurricane_isabel", "cesm_atm", "cesm_atm_26ts", "vpic_deck"]
+DATASETS = ["nyx", "hurricane_isabel", "cesm_atm", "cesm_atm_26ts", "vpic_deck", "lammps"]
 DATASET_LABELS = {"nyx": "NYX", "hurricane_isabel": "Hurricane", "cesm_atm": "CESM-ATM",
-                  "cesm_atm_26ts": "CESM-ATM-26ts", "vpic_deck": "VPIC"}
+                  "cesm_atm_26ts": "CESM-ATM-26ts", "vpic_deck": "VPIC", "lammps": "LAMMPS"}
 DATASET_COLORS = {"nyx": "#1f77b4", "hurricane_isabel": "#ff7f0e", "cesm_atm": "#2ca02c",
-                  "cesm_atm_26ts": "#d62728", "vpic_deck": "#9467bd"}
+                  "cesm_atm_26ts": "#d62728", "vpic_deck": "#9467bd", "lammps": "#8c564b"}
 DATASET_MARKERS = {"nyx": "o", "hurricane_isabel": "s", "cesm_atm": "^",
-                   "cesm_atm_26ts": "D", "vpic_deck": "P"}
+                   "cesm_atm_26ts": "D", "vpic_deck": "P", "lammps": "X"}
 
 
 def read_timestep_csv(path):

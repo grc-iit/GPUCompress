@@ -6,7 +6,7 @@
 #   1. nvcomp 5.1.0       -> /tmp/include, /tmp/lib
 #   2. HDF5 2.0.0         -> /tmp/hdf5-install  (for VOL connector)
 #   3. Builds the project -> build/
-#   4. SDRBench datasets  -> data/sdrbench/  (for SC benchmarks)
+#   4. (SDRBench downloads removed: project rule forbids static archives)
 #   5. (optional) AI training checkpoint data  --with-ai-training
 #
 # Run with:
@@ -77,13 +77,17 @@ HDF5_INSTALL_DIR="${HDF5_INSTALL_DIR:-/tmp/hdf5-install}"
 HDF5_URL="https://github.com/HDFGroup/hdf5/releases/download/${HDF5_VERSION}/hdf5-${HDF5_VERSION}.tar.gz"
 
 # SDRBench datasets for SC benchmark evaluation
-SDRBENCH_DIR="${_PROJECT_DIR}/data/sdrbench"
-SDRBENCH_BASE_URL="https://g-8d6b0.fd635.8443.data.globus.org/ds131.2/Data-Reduction-Repo/raw-data"
+# SDRBench dataset downloads are intentionally removed from the installer.
+# The project rule (README: "Always evaluate against live simulations")
+# forbids using pre-existing static archives in any evaluation. The variables
+# below are kept commented out for historical reference only.
+# SDRBENCH_DIR="${_PROJECT_DIR}/data/sdrbench"
+# SDRBENCH_BASE_URL="https://g-8d6b0.fd635.8443.data.globus.org/ds131.2/Data-Reduction-Repo/raw-data"
 declare -A SDRBENCH_DATASETS=(
-    ["hurricane_isabel"]="Hurricane-ISABEL/SDRBENCH-Hurricane-ISABEL-100x500x500.tar.gz"
-    ["nyx"]="EXASKY/NYX/SDRBENCH-EXASKY-NYX-512x512x512.tar.gz"
-    ["cesm_atm"]="CESM-ATM/SDRBENCH-CESM-ATM-cleared-1800x3600.tar.gz"
-    ["cesm_atm_26ts"]="CESM-ATM/SDRBENCH-CESM-ATM-26x1800x3600.tar.gz"
+    # ["hurricane_isabel"]="Hurricane-ISABEL/SDRBENCH-Hurricane-ISABEL-100x500x500.tar.gz"
+    # ["nyx"]="EXASKY/NYX/SDRBENCH-EXASKY-NYX-512x512x512.tar.gz"
+    # ["cesm_atm"]="CESM-ATM/SDRBENCH-CESM-ATM-cleared-1800x3600.tar.gz"
+    # ["cesm_atm_26ts"]="CESM-ATM/SDRBENCH-CESM-ATM-26x1800x3600.tar.gz"
     # ["miranda"]="Miranda/SDRBENCH-Miranda-3072x3072x3072.tar.gz"  # 49 GB download, ~550 GB uncompressed
 )
 
@@ -310,35 +314,12 @@ cmake .. \
 make -j$(nproc)
 
 # ============================================================================
-# Download SDRBench datasets
+# SDRBench downloads removed
 # ============================================================================
-
-echo_info "=== Step 4/4: Downloading SDRBench datasets ==="
-
-mkdir -p "${SDRBENCH_DIR}"
-
-for dataset in "${!SDRBENCH_DATASETS[@]}"; do
-    DATASET_DIR="${SDRBENCH_DIR}/${dataset}"
-    ARCHIVE="${SDRBENCH_DIR}/${dataset}.tar.gz"
-    URL="${SDRBENCH_BASE_URL}/${SDRBENCH_DATASETS[$dataset]}"
-
-    if [[ -d "${DATASET_DIR}" ]] && [[ -n "$(ls -A "${DATASET_DIR}" 2>/dev/null)" ]]; then
-        echo_info "  ${dataset} already exists, skipping"
-        continue
-    fi
-
-    echo_info "  Downloading ${dataset}..."
-    if curl -L -o "${ARCHIVE}" "${URL}" 2>/dev/null; then
-        mkdir -p "${DATASET_DIR}"
-        tar xzf "${ARCHIVE}" -C "${DATASET_DIR}"
-        rm -f "${ARCHIVE}"
-        echo_info "  ${dataset} ... OK"
-    else
-        echo_warn "  ${dataset} download failed (non-critical, can retry later)"
-    fi
-done
-
-echo_info "SDRBench datasets installed at ${SDRBENCH_DIR}"
+# Per the project rule (see top-level README "Always evaluate against live
+# simulations"), no static archive datasets are downloaded by the installer.
+# All evaluations drive a real simulation binary; the simulations themselves
+# generate the data the GPUCompress pipeline sees.
 
 # ============================================================================
 # (Optional) AI Training Checkpoint Data
@@ -423,7 +404,6 @@ if [[ "$FAIL" -eq 0 ]]; then
     echo "Dependencies installed:"
     echo "  - nvcomp ${NVCOMP_VERSION}       -> /tmp/include, /tmp/lib"
     echo "  - HDF5 ${HDF5_VERSION}           -> ${HDF5_INSTALL_DIR}"
-    echo "  - SDRBench datasets    -> ${SDRBENCH_DIR}"
     if [[ "$WITH_AI_TRAINING" -eq 1 ]] && [[ -d "${_AI_DIR:-/nonexistent}" ]]; then
     echo "  - AI checkpoints       -> ${_AI_DIR}"
     fi
@@ -438,10 +418,9 @@ if [[ "$FAIL" -eq 0 ]]; then
     echo "Before running, set up the environment:"
     echo "  source scripts/setup_env.sh"
     echo ""
-    echo "Run benchmarks:"
+    echo "Run benchmarks (live simulations only):"
     echo "  BENCHMARKS=grayscott bash benchmarks/benchmark.sh    # HPC: reaction-diffusion"
     echo "  BENCHMARKS=vpic bash benchmarks/benchmark.sh         # HPC: plasma physics"
-    echo "  BENCHMARKS=sdrbench bash benchmarks/benchmark.sh     # Scientific datasets"
     echo "  BENCHMARKS=ai_training bash benchmarks/benchmark.sh  # AI checkpoints"
     echo ""
 else

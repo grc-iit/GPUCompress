@@ -37,11 +37,11 @@ batch -- Generate full dataset collection
   -o, --output-dir PATH    Output directory (default: datasets)
   -s, --size TEXT          Size(s) per dataset, comma-separated
                            (e.g. 128KB or 16KB,256KB,1MB)
-                           Training default: 16KB,64KB,256KB,1MB,4MB
+                           Training default: 64KB,256KB,1MB,4MB
   -m, --mode TEXT          Batch mode [training|comprehensive]
                            (default: training)
                              training:      7 palettes x 7 widths x 8 perts
-                                            x 5 fills x 5 sizes = 9800/dtype
+                                            x 5 fills x 4 sizes = 7840/dtype
                              comprehensive: 7 palettes x 7 widths x 8 perts
                                             x 5 fills = 1960 per dtype
   -d, --dtypes TEXT        Comma-separated dtypes (default: float32 for
@@ -110,7 +110,7 @@ COMPREHENSIVE_PERTURBATIONS = [0.0, 0.05, 0.1, 0.2, 0.325, 0.5, 0.75, 0.9]
 TRAINING_BIN_WIDTHS = [0.1, 0.12, 0.15, 0.25, 0.5, 1.0, 16.0]
 TRAINING_PERTURBATIONS = [0.0, 0.1, 0.2, 0.325, 0.5, 0.75, 0.95, 1.0]
 TRAINING_FILL_MODES = ['constant', 'linear', 'quadratic', 'sinusoidal', 'random']
-TRAINING_SIZES = ['16KB', '64KB', '256KB', '1MB', '4MB']
+TRAINING_SIZES = ['64KB', '256KB', '1MB', '4MB']
 
 
 # ============================================================
@@ -640,13 +640,13 @@ def batch(output_dir, size, mode, dtypes, repeats, fmt, quiet, threads):
     \b
     Modes (matching newScript.cc):
       training:       7 palettes x 7 widths x 8 perturbations x 5 fills
-                      x 5 sizes = 9800 per dtype (default sizes: 16KB..4MB)
+                      x 4 sizes = 7840 per dtype (default sizes: 64KB..4MB)
       comprehensive:  7 palettes x 7 widths x 8 perturbations x 5 fills = 1960 per dtype
     \b
     Size can be a single value or comma-separated list:
       -s 128KB            Single size
       -s 16KB,256KB,4MB   Multiple sizes (encoded in filename)
-    Training mode defaults to TRAINING_SIZES (16KB,64KB,256KB,1MB,4MB) if -s is omitted.
+    Training mode defaults to TRAINING_SIZES (64KB,256KB,1MB,4MB) if -s is omitted.
     """
     os.makedirs(output_dir, exist_ok=True)
 

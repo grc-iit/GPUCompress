@@ -1,5 +1,9 @@
 #!/bin/bash
-# Run all Section 4 paper evaluations sequentially
+# Run all Section 4 paper evaluations sequentially.
+#
+# Per the project's "Always evaluate against live simulations" rule
+# (see top-level README), every step here drives a real simulation
+# binary; no static SDRBench archives are read.
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -8,14 +12,6 @@ POLICY=${POLICY:-balanced}
 ERROR_BOUND=${ERROR_BOUND:-0.01}
 export SGD_LR POLICY ERROR_BOUND
 
-echo "============================================================"
-echo "Section 4: Full Paper Evaluation Pipeline"
-echo "  Policy: $POLICY  LR: $SGD_LR  Error bound: $ERROR_BOUND"
-echo "============================================================"
-
-# 4.2.1 Exploration Threshold Sweep (~2.5 hours)
-echo ""
-echo ">>> 4.2.1 Exploration Threshold Sweep"
 # Error bound tag for directory names
 if [ "$ERROR_BOUND" = "0" ] || [ "$ERROR_BOUND" = "0.0" ]; then
     EB_TAG="lossless"
@@ -23,28 +19,34 @@ else
     EB_TAG="eb${ERROR_BOUND}"
 fi
 
-bash "$SCRIPT_DIR/threshold_sweep/4.2.1_eval_exploration_threshold.sh"
-python3 "$SCRIPT_DIR/threshold_sweep/4.2.1_plot_threshold_sweep.py" "$SCRIPT_DIR/results/threshold_sweep_${POLICY}_${EB_TAG}_lr${SGD_LR}"
+echo "============================================================"
+echo "Section 4: Full Paper Evaluation Pipeline (live-sim only)"
+echo "  Policy: $POLICY  LR: $SGD_LR  Error bound: $ERROR_BOUND"
+echo "============================================================"
 
-# 4.2.1 RL Adaptiveness (~15 min)
-echo ""
-echo ">>> 4.2.1 RL Adaptiveness on Unseen Workloads"
-bash "$SCRIPT_DIR/adaptiveness/4.2.1_eval_rl_adaptiveness.sh"
-python3 "$SCRIPT_DIR/adaptiveness/4.2.1_plot_rl_adaptiveness.py" "$SCRIPT_DIR/results/rl_adaptiveness_${POLICY}_${EB_TAG}_lr${SGD_LR}"
-
-# 4.2.1 VPIC Threshold Sweep (~12 min)
+# 4.2.1 VPIC Threshold Sweep (live VPIC plasma sim, ~12 min)
 echo ""
 echo ">>> 4.2.1 VPIC Threshold Sweep"
 VPIC_ERROR_BOUND=$ERROR_BOUND bash "$SCRIPT_DIR/threshold_sweep/4.2.1_eval_vpic_threshold_sweep.sh"
-python3 "$SCRIPT_DIR/threshold_sweep/4.2.1_plot_threshold_sweep.py" "$SCRIPT_DIR/results/vpic_threshold_sweep_${POLICY}_${EB_TAG}_lr${SGD_LR}"
+python3 "$SCRIPT_DIR/threshold_sweep/4.2.1_plot_threshold_sweep.py" \
+    "$SCRIPT_DIR/results/vpic_threshold_sweep_${POLICY}_${EB_TAG}_lr${SGD_LR}"
 
-# 4.2.1 VPIC RL Adaptiveness (~5 min)
+# 4.2.1 WarpX Threshold Sweep (live WarpX LWFA sim, ~30 min at paper grid)
+echo ""
+echo ">>> 4.2.1 WarpX Threshold Sweep"
+ERROR_BOUND=$ERROR_BOUND bash "$SCRIPT_DIR/threshold_sweep/4.2.1_eval_warpx_threshold_sweep.sh"
+python3 "$SCRIPT_DIR/threshold_sweep/4.2.1_plot_threshold_sweep.py" \
+    "$SCRIPT_DIR/results/warpx_threshold_sweep_${POLICY}_${EB_TAG}_lr${SGD_LR}"
+
+# 4.2.1 VPIC RL Adaptiveness (live VPIC, ~5 min)
 echo ""
 echo ">>> 4.2.1 VPIC RL Adaptiveness"
 VPIC_ERROR_BOUND=$ERROR_BOUND bash "$SCRIPT_DIR/adaptiveness/4.2.1_eval_vpic_adaptiveness.sh"
-python3 "$SCRIPT_DIR/adaptiveness/4.2.1_plot_rl_adaptiveness.py" "$SCRIPT_DIR/results/vpic_adaptiveness_${POLICY}_${EB_TAG}_lr${SGD_LR}"
+python3 "$SCRIPT_DIR/adaptiveness/4.2.1_plot_rl_adaptiveness.py" \
+    "$SCRIPT_DIR/results/vpic_adaptiveness_${POLICY}_${EB_TAG}_lr${SGD_LR}"
 
-# 4.2.1 AI Workload Adaptiveness (~30 min) — run separately:
+# 4.2.1 AI Workload Adaptiveness — runs ViT-B/16 training itself, then benchmarks
+# the produced checkpoints. Long (~30 min including training); run separately:
 #   bash benchmarks/Paper_Evaluations/4/adaptiveness/4.2.1_eval_ai_workloads.sh
 
 echo ""

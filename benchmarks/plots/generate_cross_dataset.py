@@ -38,12 +38,7 @@ def auto_discover():
         csv_paths.append(d)
         names.append(f"VPIC {label.replace('eval_', '')}")
 
-    # SDRBench results
-    for d in sorted(glob.glob(os.path.join(base, "sdrbench/results/eval_*/balanced_*/merged_csv/benchmark_*.csv"))):
-        ds = os.path.basename(d).replace("benchmark_", "").replace(".csv", "")
-        eval_dir = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(d))))
-        csv_paths.append(d)
-        names.append(f"{ds} ({eval_dir.replace('eval_', '')})")
+    # SDRBench cross-dataset loader removed (project rule: live sims only).
 
     # AI inline benchmark results
     for d in sorted(glob.glob(os.path.join(base, "../data/ai_training/*/inline_benchmark.csv"))):

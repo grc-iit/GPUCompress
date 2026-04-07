@@ -38,6 +38,14 @@ data/
 
 # Benchmark results (generated at runtime)
 benchmarks/Paper_Evaluations/*/results/
+benchmarks/lammps/results/
+benchmarks/warpx/results/
+benchmarks/vpic-kokkos/results/
+benchmarks/nyx/results/
+benchmarks/grayscott/results/
+benchmarks/sdrbench/results/
+benchmarks/ai_training/results/
+/results/
 
 # Test / benchmark results
 test_results/

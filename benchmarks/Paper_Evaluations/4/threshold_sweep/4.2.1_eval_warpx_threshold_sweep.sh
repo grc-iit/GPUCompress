@@ -1,40 +1,49 @@
 #!/bin/bash
 # ============================================================
-# WarpX Threshold Sweep: SGD MAPE (X1) x Exploration delta (X2-X1)
+# WarpX Exploration Threshold Sweep
 #
-# Two-phase design (mirrors 4.2.1_eval_exploration_threshold.sh):
-#   Phase 1 — Run warpx.3d once to dump raw E/B/J/rho fields as .f32
-#             (cached: re-runs reuse the dump unless WARPX_FORCE_DUMP=1)
-#   Phase 2 — Sweep generic_benchmark over a 4x4 (X1, delta) grid on the
-#             flattened field dump, recording per-cell MAPE / I/O bandwidth
-#             into benchmark_warpx_field_*.csv files
+# Mirrors 4.2.1_eval_vpic_threshold_sweep.sh: re-runs warpx.3d once
+# per (X1, X2-X1) cell so each configuration trains the online
+# learner on fresh, evolving WarpX LWFA fields. The compression
+# pipeline is driven through the GPUCompress VOL connector
+# (diag1.format=gpucompress) with sgd_mape and explore_thresh set
+# per cell via WarpX gpucompress.* parser params.
 #
-# Output layout (under PARENT_DIR/results/warpx_threshold_sweep_<...>):
-#   raw_fields/diag*/*.f32       (cached field dump)
-#   flat_fields/                  (symlink-flattened pool, 1 file per .f32)
-#   baseline/                     (no-comp reference)
-#   x1_<x1>_delta_<delta>/        (per-grid-cell sweep result)
-#     benchmark_warpx_field.csv
+# X1 (SGD MAPE):    {0.05, 0.10, 0.20, 0.30}
+# delta (X2-X1):    {0.05, 0.10, 0.20, 0.30}
+# Total: 16 runs
 #
-# Pair with 4.2.1_plot_threshold_sweep.py to render the heatmaps used in
-# the paper's "Effect of online learning thresholds" figure
-# (panels a/b = prediction quality, c/d = I/O bandwidth).
+# Per-cell output (under
+#   PARENT_DIR/results/warpx_threshold_sweep_<...>/x1_<x1>_delta_<delta>/):
+#   gpucompress_vol_summary.txt          (cumulative bytes / mibps / ratio)
+#   benchmark_warpx_timestep_chunks.csv  (per-chunk MAPE + sgd + explore)
+#   benchmark_warpx_ranking.csv          (per-timestep regret data)
+#   benchmark_warpx_ranking_costs.csv
+#   benchmark_warpx.csv                  (synthesized aggregate)
+#   warpx.log
+#
+# Pair with 4.2.1_plot_threshold_sweep.py to render the heatmaps for
+# the paper's "Effect of online learning thresholds" figure.
 #
 # Environment overrides:
-#   CHUNK_MB             4         Chunk size MB (generic_benchmark)
-#   ERROR_BOUND          0.01      Lossy error bound
+#   CHUNK_MB             4         HDF5 chunk size MB
+#   ERROR_BOUND          0.0       Lossless (0.0). Set >0 for lossy quantization.
+#                                  NOTE: must be 0.0 when gpucompress.verify=1
+#                                  (which the sweep enables) — bitwise verify
+#                                  is incompatible with lossy quantization.
 #   EXPLORE_K            4         Exploration alternatives K
 #   SGD_LR               0.2       SGD learning rate
 #   POLICY               balanced  Cost policy (balanced|ratio|speed)
-#   WARPX_BIN            (auto)    Path to warpx.3d (default: $HOME/sims/warpx/build-gpucompress/bin/warpx.3d)
+#   WARPX_BIN            (auto)    Path to warpx.3d
 #   WARPX_INPUTS         (auto)    LWFA inputs file
-#   WARPX_MAX_STEP       200       Simulation steps
+#   WARPX_MAX_STEP       200       Simulation steps per cell
 #   WARPX_DIAG_INT       10        Diagnostics interval
-#   WARPX_NCELL          "32 32 256"
-#   WARPX_FORCE_DUMP     0         If 1, re-run Phase 1 even if cached
+#   WARPX_NCELL          "32 32 256"  Grid (must be divisible by max_grid_size=32)
 #   DRY_RUN              0         Print commands without running
 # ============================================================
-set -e
+set -eo pipefail
+
+command -v bc >/dev/null 2>&1 || { echo "ERROR: bc not found"; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 GPU_DIR="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
@@ -42,19 +51,17 @@ PARENT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ── Fixed parameters ──
 WEIGHTS="${GPUCOMPRESS_WEIGHTS:-$GPU_DIR/neural_net/weights/model.nnwt}"
-BIN="$GPU_DIR/build/generic_benchmark"
 WARPX_BIN="${WARPX_BIN:-$HOME/sims/warpx/build-gpucompress/bin/warpx.3d}"
 WARPX_INPUTS="${WARPX_INPUTS:-$HOME/sims/warpx/Examples/Physics_applications/laser_acceleration/inputs_base_3d}"
 
 CHUNK_MB=${CHUNK_MB:-4}
-ERROR_BOUND=${ERROR_BOUND:-0.01}
+ERROR_BOUND=${ERROR_BOUND:-0.0}
 EXPLORE_K=${EXPLORE_K:-4}
 SGD_LR=${SGD_LR:-0.2}
 POLICY=${POLICY:-balanced}
 WARPX_MAX_STEP=${WARPX_MAX_STEP:-200}
 WARPX_DIAG_INT=${WARPX_DIAG_INT:-10}
 WARPX_NCELL="${WARPX_NCELL:-32 32 256}"
-WARPX_FORCE_DUMP=${WARPX_FORCE_DUMP:-0}
 DRY_RUN=${DRY_RUN:-0}
 
 # Policy weights
@@ -73,14 +80,11 @@ else
 fi
 
 SWEEP_DIR="$PARENT_DIR/results/warpx_threshold_sweep_${POLICY}_${EB_TAG}_lr${SGD_LR}"
-RAW_DIR="$SWEEP_DIR/raw_fields"
-FLAT_DIR="$SWEEP_DIR/flat_fields"
 
 # ── Validate ──
-[ -f "$BIN" ]        || { echo "ERROR: generic_benchmark not found at $BIN"; exit 1; }
-[ -f "$WEIGHTS" ]    || { echo "ERROR: NN weights not found at $WEIGHTS"; exit 1; }
-[ -x "$WARPX_BIN" ]  || { echo "ERROR: warpx.3d not found at $WARPX_BIN"; exit 1; }
+[ -x "$WARPX_BIN" ]   || { echo "ERROR: warpx.3d not found at $WARPX_BIN"; exit 1; }
 [ -f "$WARPX_INPUTS" ] || { echo "ERROR: WarpX input deck not found at $WARPX_INPUTS"; exit 1; }
+[ -f "$WEIGHTS" ]     || { echo "ERROR: NN weights not found at $WEIGHTS"; exit 1; }
 
 mkdir -p "$SWEEP_DIR"
 
@@ -97,29 +101,61 @@ echo "  Output:      $SWEEP_DIR"
 echo "============================================================"
 echo ""
 
-# ============================================================
-# Phase 1: Dump raw E/B/J/rho fields once (cached)
-# ============================================================
-echo ">>> Phase 1: Dump raw WarpX fields (cached if present)"
+# ── Threshold values ──
+X1_VALUES=(0.05 0.10 0.20 0.30)
+DELTA_VALUES=(0.05 0.10 0.20 0.30)
 
-NEED_DUMP=1
-if [ "$WARPX_FORCE_DUMP" != "1" ] && [ -d "$RAW_DIR" ] && \
-   [ "$(find "$RAW_DIR" -name '*.f32' -type f | wc -l)" -gt 0 ]; then
-    NEED_DUMP=0
-    echo "  Reusing cached dump in $RAW_DIR"
-fi
+# ── Build randomized parameter pairs (Fisher-Yates) ──
+PAIRS=()
+for x1 in "${X1_VALUES[@]}"; do
+    for delta in "${DELTA_VALUES[@]}"; do
+        PAIRS+=("${x1},${delta}")
+    done
+done
+TOTAL=${#PAIRS[@]}
+for (( i=TOTAL-1; i>0; i-- )); do
+    j=$(( RANDOM % (i+1) ))
+    tmp="${PAIRS[$i]}"; PAIRS[$i]="${PAIRS[$j]}"; PAIRS[$j]="$tmp"
+done
 
-if [ "$NEED_DUMP" = "1" ]; then
-    rm -rf "$RAW_DIR" "$FLAT_DIR"
-    mkdir -p "$RAW_DIR"
+RUN=0
+for pair in "${PAIRS[@]}"; do
+    x1="${pair%%,*}"
+    delta="${pair##*,}"
+    RUN=$((RUN + 1))
+    x2=$(echo "$x1 + $delta" | bc -l)
+
+    OUT_DIR="$SWEEP_DIR/x1_${x1}_delta_${delta}"
+
+    if [ -f "$OUT_DIR/benchmark_warpx.csv" ]; then
+        echo "[$RUN/$TOTAL] X1=$x1 delta=$delta — already done, skipping."
+        continue
+    fi
+
+    echo ""
+    echo "[$RUN/$TOTAL] X1=$x1 delta=$delta (X2=$x2)"
+    mkdir -p "$OUT_DIR"
 
     if [ "$DRY_RUN" = "1" ]; then
-        echo "  DRY_RUN: would run warpx.3d to dump fields into $RAW_DIR"
-    else
-        echo "  Running warpx.3d (max_step=$WARPX_MAX_STEP, diag_int=$WARPX_DIAG_INT)"
-        export WARPX_DUMP_FIELDS=1
-        export WARPX_DUMP_DIR="$RAW_DIR"
-        ( cd "$SWEEP_DIR" && "$WARPX_BIN" "$WARPX_INPUTS" \
+        echo "  DRY_RUN: warpx.3d gpucompress.sgd_mape=$x1 gpucompress.explore_thresh=$x2"
+        continue
+    fi
+
+    # Run WarpX with this (X1, X2). The patched FlushFormatGPUCompress
+    # writes per-chunk CSVs into WARPX_LOG_DIR and the cumulative VOL
+    # summary into the diag dir parent (cwd).
+    #
+    # WARPX_PROFILE_DECOMP=1 enables the in-situ read-back inside the
+    # patched FlushFormat: every H5Dwrite is followed by an in-process
+    # H5Dread of the same file (page-cache hit), which routes through
+    # the GPUCompress VOL and populates decompression_ms_raw in the
+    # chunk-history slots so the per-chunk CSV gets a real mape_decomp
+    # value (instead of 0). The threshold sweep always opts in.
+    (
+        cd "$OUT_DIR"
+        WARPX_LOG_DIR="$OUT_DIR" \
+        WARPX_PROFILE_DECOMP=1 \
+        "$WARPX_BIN" "$WARPX_INPUTS" \
             warpx.max_step="$WARPX_MAX_STEP" \
             amr.n_cell="$WARPX_NCELL" \
             diagnostics.diags_names=diag1 \
@@ -128,96 +164,156 @@ if [ "$NEED_DUMP" = "1" ]; then
             diag1.format=gpucompress \
             gpucompress.weights_path="$WEIGHTS" \
             gpucompress.algorithm=auto \
-            gpucompress.policy=$POLICY \
+            gpucompress.policy="$POLICY" \
             gpucompress.error_bound="$ERROR_BOUND" \
             gpucompress.chunk_bytes=$((CHUNK_MB * 1024 * 1024)) \
-            > "$SWEEP_DIR/warpx_dump.log" 2>&1 ) || \
-            echo "  WARNING: WarpX exited non-zero (teardown segfault is harmless if dump completed)"
-        unset WARPX_DUMP_FIELDS WARPX_DUMP_DIR
-    fi
-fi
+            gpucompress.sgd_lr="$SGD_LR" \
+            gpucompress.sgd_mape="$x1" \
+            gpucompress.explore_k="$EXPLORE_K" \
+            gpucompress.explore_thresh="$x2" \
+            gpucompress.verify=1 \
+            > warpx.log 2>&1
+    ) || echo "  WARNING: warpx exited non-zero (teardown segfault is harmless if VOL summary present)"
 
-N_F32=$(find "$RAW_DIR" -name '*.f32' -type f 2>/dev/null | wc -l)
-[ "$N_F32" -gt 0 ] || { echo "ERROR: no .f32 files dumped under $RAW_DIR"; exit 1; }
-echo "  Field files: $N_F32"
+    # Synthesize the aggregate benchmark_warpx.csv that the plotter expects.
+    python3 - "$OUT_DIR" "$x1" "$x2" "$W0" "$W1" "$W2" <<'PYEOF'
+import os, sys, csv
 
-# Flatten symlinks so generic_benchmark sees a single data dir
-mkdir -p "$FLAT_DIR"
-for ts_dir in "$RAW_DIR"/diag*; do
-    [ -d "$ts_dir" ] || continue
-    ts_name=$(basename "$ts_dir")
-    for f in "$ts_dir"/*.f32; do
-        [ -f "$f" ] || continue
-        ln -sf "$f" "$FLAT_DIR/${ts_name}_$(basename "$f")"
-    done
-done
+run_dir, x1, x2, w0, w1, w2 = sys.argv[1:7]
 
-# Determine per-file dimensions from first .f32 (1D flattened)
-FIRST=$(find "$FLAT_DIR" -name '*.f32' -type f | head -1)
-N_FLOATS=$(( $(stat -c%s "$FIRST") / 4 ))
-DIMS="${N_FLOATS},1"
-echo "  Per-file: $N_FLOATS floats ($((N_FLOATS * 4 / 1024 / 1024)) MB), dims=$DIMS"
-echo ""
+# 1) Cumulative VOL summary (key,value)
+summary = {}
+sp = os.path.join(run_dir, "gpucompress_vol_summary.txt")
+if os.path.isfile(sp):
+    with open(sp) as f:
+        for line in f:
+            line = line.strip()
+            if "," in line and not line.startswith("="):
+                k, _, v = line.partition(",")
+                summary[k.strip()] = v.strip()
 
-# ============================================================
-# Phase 2: Baseline (no-comp) reference
-# ============================================================
-BASELINE_DIR="$SWEEP_DIR/baseline"
-if [ ! -f "$BASELINE_DIR/benchmark_warpx_field.csv" ]; then
-    echo ">>> Phase 2a: no-comp baseline"
-    mkdir -p "$BASELINE_DIR"
-    if [ "$DRY_RUN" = "1" ]; then
-        echo "  DRY_RUN: baseline no-comp"
-    else
-        "$BIN" "$WEIGHTS" \
-            --data-dir "$FLAT_DIR" --dims "$DIMS" --ext .f32 \
-            --chunk-mb "$CHUNK_MB" --error-bound "$ERROR_BOUND" \
-            --phase no-comp \
-            --out-dir "$BASELINE_DIR" --name warpx_field \
-            --no-verify 2>&1 | tail -5
-    fi
-    echo ""
-fi
+# 2) Per-chunk MAPE / sgd / exploration counts.
+#
+# The chunk CSV's mape_ratio / mape_comp columns are written by
+# FlushFormatGPUCompress.cpp ALREADY in percent (not as a 0..1 fraction).
+# Aggregator must:
+#   - read them as-is, no extra * 100
+#   - average ONLY over rows where the value is non-zero (rows with 0 are
+#     chunks that took the cached-cost path and never ran nvCOMP, so
+#     there is nothing to compare against — counting them as zeros would
+#     drag the mean toward zero artificially).
+#
+# Both heads of the NN clamp their outputs to a 5 ms floor; the patched
+# FlushFormatGPUCompress now uses max(compression_ms_raw, 5) as the
+# denominator, so future runs will have non-zero mape_comp on every chunk
+# that actually compressed. Old runs only have ~12% non-zero rows because
+# of the previous predicate; that is what we have to work with for the
+# already-collected sweep, and averaging over non-zero rows is the
+# honest treatment.
+chunk_csv = os.path.join(run_dir, "benchmark_warpx_timestep_chunks.csv")
+n_chunks = 0
+sum_mape_ratio_pct  = 0.0
+sum_mape_comp_pct   = 0.0
+sum_mape_decomp_pct = 0.0
+n_mape_ratio  = 0
+n_mape_comp   = 0
+n_mape_decomp = 0
+sum_decomp_ms_raw = 0.0   # for read bandwidth (in-situ decomp profiling)
+n_decomp_rows     = 0
+sgd_fires = 0
+explorations = 0
+if os.path.isfile(chunk_csv):
+    with open(chunk_csv) as f:
+        for r in csv.DictReader(f):
+            try:
+                mr  = float(r.get("mape_ratio",  0))
+                mc  = float(r.get("mape_comp",   0))
+                # mape_decomp is added by the in-situ profiling patch
+                # (FlushFormatGPUCompress.cpp). Old chunk CSVs without this
+                # column return 0 from r.get(), get filtered by the >0 guard,
+                # and contribute nothing — so the aggregator stays
+                # backward-compatible with pre-decomp-patch sweep results.
+                md  = float(r.get("mape_decomp", 0))
+                ad  = float(r.get("actual_decomp_ms_raw", 0))
+                if mr > 0:
+                    sum_mape_ratio_pct  += mr; n_mape_ratio  += 1
+                if mc > 0:
+                    sum_mape_comp_pct   += mc; n_mape_comp   += 1
+                if md > 0:
+                    sum_mape_decomp_pct += md; n_mape_decomp += 1
+                if ad > 0:
+                    sum_decomp_ms_raw   += ad; n_decomp_rows += 1
+                sgd_fires      += int(float(r.get("sgd_fired", 0)))
+                explorations   += int(float(r.get("exploration_triggered", 0)))
+                n_chunks += 1
+            except (ValueError, TypeError):
+                pass
 
-# ============================================================
-# Phase 2b: (X1, delta) sweep
-# ============================================================
-echo ">>> Phase 2b: (X1, X2-X1) threshold sweep"
-X1_VALUES=(0.05 0.10 0.20 0.30)
-DELTA_VALUES=(0.05 0.10 0.20 0.30)
-TOTAL=$(( ${#X1_VALUES[@]} * ${#DELTA_VALUES[@]} ))
-RUN=0
+avg_mape_ratio  = (sum_mape_ratio_pct  / n_mape_ratio ) if n_mape_ratio  else 0.0
+avg_mape_comp   = (sum_mape_comp_pct   / n_mape_comp  ) if n_mape_comp   else 0.0
+avg_mape_decomp = (sum_mape_decomp_pct / n_mape_decomp) if n_mape_decomp else 0.0
 
-for x1 in "${X1_VALUES[@]}"; do
-    for delta in "${DELTA_VALUES[@]}"; do
-        RUN=$((RUN + 1))
-        x2=$(echo "$x1 + $delta" | bc -l)
-        OUT_DIR="$SWEEP_DIR/x1_${x1}_delta_${delta}"
+ratio       = float(summary.get("ratio", 0))
+write_mibps = float(summary.get("write_mibps", 0))
+bytes_in    = float(summary.get("bytes_in", 0))
+bytes_out   = float(summary.get("bytes_out", 0))
+calls       = int(float(summary.get("h5dwrite_calls", 0)))
 
-        if [ -f "$OUT_DIR/benchmark_warpx_field.csv" ]; then
-            echo "[$RUN/$TOTAL] x1=$x1 delta=$delta — already done, skipping."
-            continue
-        fi
+# Read bandwidth from in-situ decomp profiling (kernel-only throughput).
+# Every H5Dwrite is followed by an in-process H5Dread of the same file
+# (page-cache hit), so the total bytes read back equals bytes_in. The
+# decomp time is the sum of per-chunk nvCOMP-decompress kernel time
+# from the chunk CSV — so this is kernel-only throughput, the symmetric
+# counterpart of how compression kernel throughput is computed
+# elsewhere. NOT directly comparable to write_mibps (which is VOL
+# end-to-end including disk I/O), but tracks the same units (MiB/s)
+# and is the right number for "how fast can the GPU decompress."
+read_mibps = 0.0
+if sum_decomp_ms_raw > 0 and bytes_in > 0:
+    read_mibps = (bytes_in / 1048576.0) / (sum_decomp_ms_raw / 1000.0)
 
-        echo "[$RUN/$TOTAL] x1=$x1 delta=$delta (X2=$x2)"
-        mkdir -p "$OUT_DIR"
+# 3) Synthesize benchmark_warpx.csv
+out_csv = os.path.join(run_dir, "benchmark_warpx.csv")
+fields = [
+    "rank", "source", "phase", "n_runs",
+    "write_ms", "write_ms_std", "read_ms", "read_ms_std",
+    "file_mib", "orig_mib", "ratio", "write_mibps", "read_mibps",
+    "mismatches", "sgd_fires", "explorations", "n_chunks",
+    "mape_ratio_pct", "mape_comp_pct", "mape_decomp_pct", "mape_psnr_pct",
+    "x1_sgd_mape", "x2_explore_thresh",
+]
+row = {f: 0 for f in fields}
+row["rank"] = 0
+row["source"] = "warpx"
+row["phase"] = "nn-rl+exp"
+row["n_runs"] = 1
+row["file_mib"] = bytes_out / (1024.0*1024.0)
+row["orig_mib"] = bytes_in  / (1024.0*1024.0)
+row["ratio"] = ratio
+row["write_mibps"] = write_mibps
+# read_mibps is now populated from in-situ decomp profiling (the patched
+# FlushFormatGPUCompress reads back every write through the GPUCompress
+# VOL when WARPX_PROFILE_DECOMP=1). Pre-patch sweeps fall back to 0.
+row["read_mibps"] = read_mibps
+row["sgd_fires"] = sgd_fires
+row["explorations"] = explorations
+row["n_chunks"] = n_chunks
+row["mape_ratio_pct"]  = avg_mape_ratio
+row["mape_comp_pct"]   = avg_mape_comp
+row["mape_decomp_pct"] = avg_mape_decomp
+row["mape_psnr_pct"]   = 0.0  # WarpX is lossless; no PSNR
+row["x1_sgd_mape"] = float(x1)
+row["x2_explore_thresh"] = float(x2)
 
-        if [ "$DRY_RUN" = "1" ]; then
-            echo "  DRY_RUN: nn-rl+exp50 mape=$x1 explore-thresh=$x2"
-            continue
-        fi
+with open(out_csv, "w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=fields)
+    w.writeheader()
+    w.writerow(row)
 
-        NO_RANKING=1 "$BIN" "$WEIGHTS" \
-            --data-dir "$FLAT_DIR" --dims "$DIMS" --ext .f32 \
-            --chunk-mb "$CHUNK_MB" --error-bound "$ERROR_BOUND" \
-            --phase nn-rl+exp50 \
-            --mape "$x1" --explore-thresh "$x2" \
-            --lr "$SGD_LR" --explore-k "$EXPLORE_K" \
-            --w0 $W0 --w1 $W1 --w2 $W2 \
-            --out-dir "$OUT_DIR" --name warpx_field \
-            --no-verify \
-            2>&1 | tail -3
-    done
+print(f"  ratio={ratio:.2f}x  write={write_mibps:.0f}MiB/s  "
+      f"mape_ratio={avg_mape_ratio:.1f}%  sgd={sgd_fires}  expl={explorations}  chunks={n_chunks}")
+PYEOF
+
 done
 
 echo ""
@@ -228,3 +324,11 @@ echo ""
 echo "Generate heatmaps:"
 echo "  python3 $SCRIPT_DIR/4.2.1_plot_threshold_sweep.py $SWEEP_DIR"
 echo "============================================================"
+
+# ── Generate plots if matplotlib available ──
+PLOT_SCRIPT="$SCRIPT_DIR/4.2.1_plot_threshold_sweep.py"
+if [ -f "$PLOT_SCRIPT" ] && python3 -c "import matplotlib" 2>/dev/null; then
+    echo ""
+    echo ">>> Generating threshold sweep plots..."
+    python3 "$PLOT_SCRIPT" "$SWEEP_DIR" || echo "WARNING: plotter failed"
+fi

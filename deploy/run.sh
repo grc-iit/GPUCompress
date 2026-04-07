@@ -188,13 +188,21 @@ setup_lammps() {
     cd "$src"
     if [ ! -f src/KOKKOS/fix_gpucompress_kokkos.h ]; then
         info "Applying GPUCompress patch..."
-        cp "${GPUC_DIR}/benchmarks/lammps/patches/fix_gpucompress_kokkos.h" src/KOKKOS/
-        cp "${GPUC_DIR}/benchmarks/lammps/patches/fix_gpucompress_kokkos.cpp" src/KOKKOS/
+        # Apply inline edits via git
         git apply "${GPUC_DIR}/benchmarks/lammps/patches/lammps-gpucompress.patch" || \
             warn "Patch may already be applied or needs manual resolution"
     else
         info "Patch already applied"
     fi
+
+    # Always overlay the canonical loose files (idempotent). The .patch
+    # only carries inline edits; the loose files are the source of truth
+    # for the new fix and the LAMMPS Kokkos cmake module.
+    info "Overlaying canonical LAMMPS GPUCompress sources..."
+    cp "${GPUC_DIR}/benchmarks/lammps/patches/fix_gpucompress_kokkos.h"   src/KOKKOS/
+    cp "${GPUC_DIR}/benchmarks/lammps/patches/fix_gpucompress_kokkos.cpp" src/KOKKOS/
+    cp "${GPUC_DIR}/benchmarks/lammps/patches/lammps_ranking_profiler.cu" src/KOKKOS/
+    cp "${GPUC_DIR}/benchmarks/lammps/patches/KOKKOS.cmake"               cmake/Modules/Packages/KOKKOS.cmake
 
     local kokkos_arch="${LAMMPS_KOKKOS_ARCH:-AMPERE80}"
 
@@ -237,6 +245,14 @@ setup_nyx() {
     else
         info "Patch already applied"
     fi
+
+    # Overlay canonical loose files. The .patch is the bare-minimum inline
+    # edit set; these files carry the full GPUCompress integration the
+    # benchmarks/Paper_Evaluations scripts depend on.
+    info "Overlaying canonical Nyx GPUCompress sources..."
+    cp "${GPUC_DIR}/benchmarks/nyx/patches/Nyx.H"          Source/Driver/Nyx.H
+    cp "${GPUC_DIR}/benchmarks/nyx/patches/Nyx.cpp"        Source/Driver/Nyx.cpp
+    cp "${GPUC_DIR}/benchmarks/nyx/patches/Nyx_output.cpp" Source/IO/Nyx_output.cpp
 
     # Build
     info "Building Nyx (Sedov blast wave target)..."
@@ -286,6 +302,23 @@ setup_warpx() {
         info "Patch already applied"
     fi
 
+    # Overlay all canonical loose files on top of whatever the .patch
+    # produced. These carry features the .patch's embedded versions are
+    # missing (WARPX_DUMP_FIELDS raw-dump hook in FlushFormatGPUCompress,
+    # per-chunk ranking CSVs in Diagnostics/FullDiagnostics, the
+    # GPUCompress.cmake dependency module).
+    info "Overlaying canonical WarpX GPUCompress sources..."
+    cp "${GPUC_DIR}/benchmarks/warpx/patches/FlushFormatGPUCompress.H" \
+       Source/Diagnostics/FlushFormats/FlushFormatGPUCompress.H
+    cp "${GPUC_DIR}/benchmarks/warpx/patches/FlushFormatGPUCompress.cpp" \
+       Source/Diagnostics/FlushFormats/FlushFormatGPUCompress.cpp
+    cp "${GPUC_DIR}/benchmarks/warpx/patches/Diagnostics.cpp" \
+       Source/Diagnostics/Diagnostics.cpp
+    cp "${GPUC_DIR}/benchmarks/warpx/patches/FullDiagnostics.cpp" \
+       Source/Diagnostics/FullDiagnostics.cpp
+    cp "${GPUC_DIR}/benchmarks/warpx/patches/GPUCompress.cmake" \
+       cmake/dependencies/GPUCompress.cmake
+
     # Build
     info "Building WarpX (3D CUDA)..."
     export CC=$(which gcc)
@@ -294,15 +327,22 @@ setup_warpx() {
     export CUDAHOSTCXX=$(which g++)
 
     mkdir -p build-gpucompress && cd build-gpucompress
+    # Project rule: ALL scientific data through GPUCompress is fp32. WarpX
+    # defaults to DOUBLE precision; we override field+particle precision to
+    # SINGLE so the data the GPUCompress VOL sees matches the distribution
+    # the pre-trained NN was trained on. See top-level README "Project Rule".
     cmake -S .. -B . \
         -DCMAKE_BUILD_TYPE=Release \
         -DWarpX_COMPUTE=CUDA \
         -DWarpX_MPI=ON \
         -DWarpX_DIMS=3 \
+        -DWarpX_PRECISION=SINGLE \
+        -DWarpX_PARTICLE_PRECISION=SINGLE \
         -DWarpX_GPUCOMPRESS=ON \
         -DGPUCOMPRESS_PREFIX="${GPUC_DIR}/build" \
         "-DCMAKE_PREFIX_PATH=${HDF5_ROOT}" \
-        "-DCMAKE_CXX_FLAGS=-I${GPUC_DIR}/include -I${GPUC_DIR}/examples -I${HDF5_ROOT}/include" \
+        "-DCMAKE_CXX_FLAGS=-I${GPUC_DIR}/include -I${GPUC_DIR}/examples -I${GPUC_DIR}/benchmarks -I${HDF5_ROOT}/include" \
+        "-DCMAKE_CUDA_FLAGS=-I${GPUC_DIR}/include -I${GPUC_DIR}/examples -I${GPUC_DIR}/benchmarks -I${HDF5_ROOT}/include" \
         "-DCMAKE_EXE_LINKER_FLAGS=-L${GPUC_DIR}/build -lgpucompress -lH5VLgpucompress -lH5Zgpucompress -L${HDF5_ROOT}/lib -lhdf5 -L/usr/local/cuda/lib64 -lcudart"
     cmake --build . -j"$(nproc)"
 

@@ -9,7 +9,7 @@
 #
 # Output:
 #   benchmarks/grayscott/results/smoke_L128/
-#   benchmarks/sdrbench/results/smoke/
+#   benchmarks/vpic-kokkos/results/smoke_vpic.log
 #   benchmarks/vpic-kokkos/results/
 #   benchmarks/results/smoke_plots/
 # ============================================================
@@ -27,7 +27,7 @@ VPIC_LD_PATH="/tmp/hdf5-install/lib:$GPU_DIR/build:/tmp/lib:/opt/cray/libfabric/
 
 # ── Create output dirs ──
 mkdir -p benchmarks/grayscott/results/smoke_L128
-mkdir -p benchmarks/sdrbench/results/smoke
+# sdrbench results dir creation removed: no static archives allowed
 mkdir -p benchmarks/vpic-kokkos/results
 mkdir -p benchmarks/results/smoke_plots
 
@@ -64,49 +64,10 @@ run_test "Gray-Scott (all phases, L=128, ts=5)" \
         --L 128 --steps 100 --chunk-mb 4 --timesteps 5 \
         --out-dir benchmarks/grayscott/results/smoke_L128
 
-# ── 2. SDRBench: Hurricane Isabel ──
-HURRICANE_DIR="$GPU_DIR/data/sdrbench/hurricane_isabel/100x500x500"
-if [ -d "$HURRICANE_DIR" ]; then
-    run_test "SDRBench Hurricane Isabel (all phases)" \
-        "benchmarks/sdrbench/results/smoke/hurricane_smoke.log" \
-        "$SDR_BIN" "$WEIGHTS" \
-            --data-dir "$HURRICANE_DIR" \
-            --dims 100,500,500 --ext .bin.f32 --runs 1 \
-            --out-dir benchmarks/sdrbench/results/smoke
-else
-    echo "  SKIP Hurricane Isabel — data not found"
-    SKIP=$((SKIP + 1))
-fi
+# SDRBench tests removed: project rule forbids static archives. Smoke test
+# now covers Gray-Scott and VPIC only — both are live-simulation workloads.
 
-# ── 3. SDRBench: Nyx ──
-NYX_DIR="$GPU_DIR/data/sdrbench/nyx/SDRBENCH-EXASKY-NYX-512x512x512"
-if [ -d "$NYX_DIR" ]; then
-    run_test "SDRBench Nyx (all phases)" \
-        "benchmarks/sdrbench/results/smoke/nyx_smoke.log" \
-        "$SDR_BIN" "$WEIGHTS" \
-            --data-dir "$NYX_DIR" \
-            --dims 512,512,512 --ext .f32 --runs 1 \
-            --out-dir benchmarks/sdrbench/results/smoke
-else
-    echo "  SKIP Nyx — data not found"
-    SKIP=$((SKIP + 1))
-fi
-
-# ── 4. SDRBench: CESM-ATM ──
-CESM_DIR="$GPU_DIR/data/sdrbench/cesm_atm/SDRBENCH-CESM-ATM-cleared-1800x3600"
-if [ -d "$CESM_DIR" ]; then
-    run_test "SDRBench CESM-ATM (all phases)" \
-        "benchmarks/sdrbench/results/smoke/cesm_smoke.log" \
-        "$SDR_BIN" "$WEIGHTS" \
-            --data-dir "$CESM_DIR" \
-            --dims 1800,3600 --ext .dat --runs 1 \
-            --out-dir benchmarks/sdrbench/results/smoke
-else
-    echo "  SKIP CESM-ATM — data not found"
-    SKIP=$((SKIP + 1))
-fi
-
-# ── 5. VPIC ──
+# ── 2. VPIC ──
 if [ -f "$VPIC_BIN" ] && [ -f /tmp/hdf5-install/lib/libhdf5.so ]; then
     # Only restore JIT wrapper if the binary is not already a valid ELF executable
     # (build_vpic_benchmark.sh produces a pre-linked binary that should not be overwritten)
@@ -150,7 +111,6 @@ echo "════════════════════════�
 python3 benchmarks/visualize.py \
     --gs-dir benchmarks/grayscott/results/smoke_L128 \
     --vpic-dir benchmarks/vpic-kokkos/results \
-    --sdrbench-dir benchmarks/sdrbench/results/smoke \
     2>&1 || echo "  WARNING: visualizer had errors"
 
 # ── Summary ──
@@ -164,7 +124,6 @@ echo "  SKIPPED: $SKIP"
 echo ""
 echo "  Logs:"
 echo "    benchmarks/grayscott/results/smoke_L128/*.log"
-echo "    benchmarks/sdrbench/results/smoke/*.log"
 echo "    benchmarks/vpic-kokkos/results/smoke_vpic.log"
 echo ""
 echo "  Plots:"

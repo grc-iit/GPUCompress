@@ -97,8 +97,10 @@ export WARPX_DUMP_DIR="$RAW_DIR"
 
 cd "$RESULTS_DIR"
 "$WARPX_BIN" "$WARPX_INPUTS" \
-    warpx.max_step="$WARPX_MAX_STEP" \
+    max_step="$WARPX_MAX_STEP" \
     amr.n_cell="$WARPX_NCELL" \
+    ${WARPX_MAX_GRID_SIZE:+amr.max_grid_size="$WARPX_MAX_GRID_SIZE"} \
+    ${WARPX_BLOCKING_FACTOR:+amr.blocking_factor="$WARPX_BLOCKING_FACTOR"} \
     diagnostics.diags_names=diag1 \
     diag1.intervals="$WARPX_DIAG_INT" \
     diag1.diag_type=Full \
@@ -130,7 +132,7 @@ if [ -z "$FIRST_FILE" ]; then
 fi
 FIRST_SIZE=$(stat -c%s "$FIRST_FILE")
 N_FLOATS=$((FIRST_SIZE / 4))
-DIMS="${N_FLOATS},1"
+DIMS="1,${N_FLOATS}"
 echo "  Per-component: $N_FLOATS floats ($((FIRST_SIZE / 1024 / 1024)) MB), dims=$DIMS"
 
 # Flatten all .f32 files into a single directory
@@ -184,6 +186,7 @@ for policy in "${POL_ARRAY[@]}"; do
         --explore-k "$EXPLORE_K" \
         --explore-thresh "$EXPLORE_THRESH" \
         --error-bound "$ERROR_BOUND" \
+        ${EXTRA_PHASE_ARGS:-} \
         > "$OUT_DIR/benchmark.log" 2>&1 || {
             echo "    WARNING: benchmark exited with error"
         }

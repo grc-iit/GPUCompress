@@ -4,7 +4,7 @@ Fine-tune a pretrained ViT model and export training checkpoints as raw .f32 fil
 
 Produces evolving checkpoint data at multiple training stages, with 4 tensor
 types per checkpoint: weights, adam_m (1st moment), adam_v (2nd moment), gradients.
-Each .f32 file is a flat float32 array, compatible with the SDRBench
+Each .f32 file is a flat float32 array, compatible with the generic_benchmark
 generic_benchmark.cu driver.
 
 Files are named epoch-major (epoch01_adam_m.f32, epoch01_adam_v.f32, etc.)
@@ -36,7 +36,7 @@ import torchvision.transforms as T
 
 
 def compute_dims_2d(n_elements):
-    """Find a 2D factorization for SDRBench --dims. Returns (d0, d1) with d0*d1 >= n_elements."""
+    """Find a 2D factorization for generic_benchmark --dims. Returns (d0, d1) with d0*d1 >= n_elements."""
     # Try exact factorization first
     s = int(math.isqrt(n_elements))
     while s > 1 and n_elements % s != 0:
@@ -87,7 +87,7 @@ def main():
     parser.add_argument("--num-workers", type=int, default=4,
                         help="DataLoader workers (default: 4)")
     parser.add_argument("--outdir", type=str, default=None,
-                        help="Output directory (default: data/sdrbench/vit_{model}_{dataset})")
+                        help="Output directory (default: data/ai_training/vit_{model}_{dataset})")
     parser.add_argument("--data-root", type=str, default=None,
                         help="Dataset cache root (default: data/)")
     parser.add_argument("--device", type=str, default="cuda",
@@ -516,7 +516,7 @@ def main():
         f.write(f"Dataset: {args.dataset}\n")
         f.write(f"Epochs: {args.epochs}, checkpoints at: {checkpoint_epochs}\n")
         f.write(f"Optimizer: AdamW (lr={args.lr}, wd={args.weight_decay})\n")
-        f.write(f"Dims for SDRBench: --dims {dims_str}\n")
+        f.write(f"Dims for generic_benchmark: --dims {dims_str}\n")
         f.write(f"Padded elements: {target_elements:,} ({pad_elements} zeros appended)\n")
         f.write(f"Total training time: {total_time:.0f}s\n\n")
         f.write(f"Files:\n")
@@ -555,7 +555,7 @@ def main():
     print(f'    DS_EXT[{ds_name}]="{_ext}"')
     print()
     print(f"  Run benchmark:")
-    print(f"    BENCHMARKS=sdrbench SDR_DATASETS={ds_name} \\")
+    print(f"    BENCHMARKS=ai_training AI_MODEL={ds_name} \\")
     print(f"      CHUNK_MB=4 POLICIES=balanced VERIFY=0 bash benchmarks/benchmark.sh")
 
 

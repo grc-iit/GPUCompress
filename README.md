@@ -6,6 +6,97 @@ A GPU-accelerated compression library with neural network–driven algorithm sel
 
 GPUCompress replaces static compression choices with a lightweight neural network that evaluates **all 32 compression configurations** (8 algorithms × 2 preprocessing options) in a single GPU kernel (~0.22 ms), selecting the best one per data chunk based on learned data characteristics.  An online SGD loop adapts the model in real time — demonstrated MAPE drops from ~700% to ~10% within 20 timesteps on unseen VPIC plasma data.
 
+## Project Rule: Always use float32 (single precision)
+
+> **All scientific data flowing through GPUCompress MUST be 32-bit floating point.**
+>
+> This is a hard project-wide rule, not a recommendation. It applies to every simulation
+> integration (VPIC, WarpX, Nyx, LAMMPS, nekRS, Gray-Scott), every benchmark, every dataset,
+> and every artifact saved to disk. The pre-trained NN weights, the per-chunk feature
+> extractors (entropy, MAD, 2nd derivative), and the cost model are all calibrated to fp32
+> byte distributions; running them on fp64 input produces a different feature distribution
+> than what the model was trained on, which silently degrades prediction quality
+> (we observed ~19,000% per-chunk MAPE on a fp64 WarpX run as a result).
+>
+> **Concrete consequences:**
+> - WarpX: build with `-DWarpX_PRECISION=SINGLE -DWarpX_PARTICLE_PRECISION=SINGLE`
+> - AMReX-based codes (Nyx, WarpX): `-DAMReX_PRECISION=SINGLE -DAMReX_PARTICLES_PRECISION=SINGLE`
+> - VPIC: built with `float` field type (default in `vpic_benchmark_deck.cxx`)
+> - LAMMPS / nekRS: dump field data as fp32 (`USE_FP32=1` for nekRS)
+> - SDRBench / training datasets: `.bin.f32` only
+> - Any new integration: cast to `float` at the GPUCompress boundary if upstream uses `double`
+>
+> If you find a place in the codebase or in any deploy script that defaults to fp64 or
+> `double`, fix it.
+
+## Project Rule: Always evaluate against live simulations, never static dataset files
+
+> **Every evaluation pipeline MUST invoke a real simulation binary as part of its
+> own execution. The simulation can either feed data directly into the GPUCompress
+> path (live), or dump fields once that the same pipeline then sweeps an evaluator
+> over (cached-dump). What is forbidden is using a pre-existing static archive that
+> was downloaded once and just sits in the repo (e.g. SDRBench Hurricane Isabel,
+> SDRBench Nyx snapshots, SDRBench CESM-ATM).**
+>
+> This is a hard project-wide rule, not a recommendation. Static archive files let
+> the evaluator see the *same* data on every machine, with no provenance from a
+> simulation that was actually run, which:
+>
+> 1. Defeats the paper's online-learning claim — there is no real "evolving data" for
+>    SGD to adapt to, just the same N tensors replayed in the same order.
+> 2. Lets a stale NN appear to converge by memorizing the file, not by learning the
+>    workload's chunk-level statistics.
+> 3. Is not representative of the in-situ I/O scenario the system is designed for —
+>    real HPC workloads emit fresh fields every timestep from a live physics step.
+>
+> **Two acceptable patterns:**
+>
+> - **Live-evaluation pattern.** The evaluation script runs the simulation and the
+>   simulation feeds GPUCompress directly via the HDF5 VOL on every diagnostic flush.
+>   `4.2.1_eval_vpic_threshold_sweep.sh` and `4.2.1_eval_warpx_threshold_sweep.sh`
+>   work this way.
+> - **Cached-dump pattern.** The evaluation script runs the simulation once,
+>   the simulation dumps full-resolution field snapshots into a working directory
+>   inside the script's results folder, and subsequent steps of the *same* script
+>   sweep the evaluator (e.g. `generic_benchmark`) over those just-produced files.
+>   The dump and the sweep are part of the same pipeline execution. This is fine
+>   because the data has provenance from a simulation that just ran on this machine.
+>
+> **Still forbidden:** downloading or reading any pre-existing archive
+> (`data/sdrbench/...`, snapshot tarballs, anything in `data/` that did not come
+> from a simulation invoked by the current evaluation script).
+>
+> **Required workloads (each evaluation must drive at least one of these binaries):**
+>
+> | Domain | Live binary | Where it's built |
+> |---|---|---|
+> | Plasma PIC | `vpic_benchmark_deck.Linux` | `benchmarks/vpic-kokkos/` |
+> | Laser–plasma EM | `warpx.3d.MPI.CUDA.SP.PSP.OPMD.EB.QED` | `~/sims/warpx/build-gpucompress/bin/` |
+> | Cosmological hydro | `nyx_HydroTests` | `~/sims/Nyx/build-gpucompress/Exec/HydroTests/` |
+> | Molecular dynamics | `lmp` (LAMMPS w/ Kokkos+gpucompress fix) | `~/sims/lammps/build/` |
+> | Spectral CFD | `nekrs-fp32` | `~/.local/nekrs/bin/` |
+> | Reaction-diffusion | `grayscott_benchmark_pm` | `build/` |
+>
+> **What this rules out:**
+>
+> - Calling `generic_benchmark` against `data/sdrbench/hurricane_isabel/...`,
+>   `data/sdrbench/nyx/...`, `data/sdrbench/cesm_atm/...`, or any other pre-recorded
+>   `.f32` / `.dat` archive as the *primary* evaluation workload.
+> - Reading dumped fields from a previous simulation run and re-evaluating them
+>   (cached field-dump shortcuts).
+> - Using AI checkpoint files as a *workload proxy* for paper claims about scientific
+>   in-situ I/O. (Checkpoint compression is its own experiment, not a stand-in for
+>   live simulation data.)
+>
+> **Acceptable uses of static files:**
+>
+> - One-time NN training set construction (`neural_net/training/`).
+> - Smoke tests / unit tests where you just need a known input to verify a code path.
+> - The pre-trained NN weights themselves (`neural_net/weights/model.nnwt`).
+>
+> If you find an evaluation script that drives `generic_benchmark` against an SDRBench
+> directory, replace it with a script that runs the corresponding simulation binary.
+
 ## Architecture Overview
 
 ```
