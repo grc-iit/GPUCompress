@@ -328,62 +328,28 @@ void FixGPUCompressKokkos::end_of_step()
     }
   }
 
-  /* Reset chunk history so per-write diagnostics are clean */
-  gpucompress_reset_chunk_history();
-
-  if (dump_positions) {
-    /* Get raw CUDA device pointer from KOKKOS view
-     * k_x is a DualView; view_device() returns the device Kokkos::View
-     * .data() returns the raw pointer to the underlying CUDA allocation */
-    auto d_x = atomKK->k_x.view_device();
-    const void *d_ptr = (const void *)d_x.data();
-    size_t n_elements = (size_t)nlocal * 3;
-
-    snprintf(fname, sizeof(fname), "%s/x_rank%04d.h5", dir, rank);
-    rc = gpucompress_lammps_write_field(fname, "positions", d_ptr,
-                                         n_elements, elem_bytes,
-                                         algo_name, error_bound, verify);
-    if (comm->me == 0 && rc != 0)
-      fprintf(stderr, "[GPUCompress-LAMMPS] positions write failed\n");
+  /* Resolve phase string once — used by per-field log_chunks_now() below. */
+  const char *phase;
+  if (strcmp(algo_name, "auto") == 0) {
+    if (do_sgd && do_explore)  phase = "nn-rl+exp50";
+    else if (do_sgd)           phase = "nn-rl";
+    else                       phase = "nn";
+  } else {
+    phase = algo_name;
   }
 
-  if (dump_velocities) {
-    auto d_v = atomKK->k_v.view_device();
-    const void *d_ptr = (const void *)d_v.data();
-    size_t n_elements = (size_t)nlocal * 3;
-
-    snprintf(fname, sizeof(fname), "%s/v_rank%04d.h5", dir, rank);
-    rc = gpucompress_lammps_write_field(fname, "velocities", d_ptr,
-                                         n_elements, elem_bytes,
-                                         algo_name, error_bound, verify);
-    if (comm->me == 0 && rc != 0)
-      fprintf(stderr, "[GPUCompress-LAMMPS] velocities write failed\n");
-  }
-
-  if (dump_forces) {
-    auto d_f = atomKK->k_f.view_device();
-    const void *d_ptr = (const void *)d_f.data();
-    size_t n_elements = (size_t)nlocal * 3;
-
-    snprintf(fname, sizeof(fname), "%s/f_rank%04d.h5", dir, rank);
-    rc = gpucompress_lammps_write_field(fname, "forces", d_ptr,
-                                         n_elements, elem_bytes,
-                                         algo_name, error_bound, verify);
-    if (comm->me == 0 && rc != 0)
-      fprintf(stderr, "[GPUCompress-LAMMPS] forces write failed\n");
-  }
-
-  /* Log per-chunk diagnostics to CSV */
-  if (log_chunks && tc_csv && comm->me == 0) {
+  /* ── Per-field chunk-history logger ──
+   *
+   * Walks current chunk history and writes one CSV row per slot. Must be
+   * called once per H5Dwrite (not once per dump): the GPUCompress VOL
+   * read-back path keys decompression_ms by per-dataset chunk index
+   * (H5VLgpucompress.cu:2181), so writing 3 datasets without an
+   * intervening reset+log makes datasets 2 and 3 stomp dataset 1's
+   * decomp_ms slots. Reset → write+read → log per field keeps every
+   * chunk's decomp time intact. */
+  auto log_chunks_now = [&]() {
+    if (!(log_chunks && tc_csv && comm->me == 0)) return;
     int n_hist = gpucompress_get_chunk_history_count();
-    const char *phase;
-    if (strcmp(algo_name, "auto") == 0) {
-      if (do_sgd && do_explore)  phase = "nn-rl+exp50";
-      else if (do_sgd)           phase = "nn-rl";
-      else                       phase = "nn";
-    } else {
-      phase = algo_name;
-    }
     for (int ci = 0; ci < n_hist; ci++) {
       gpucompress_chunk_diag_t dd;
       if (gpucompress_get_chunk_diag(ci, &dd) != 0) continue;
@@ -438,27 +404,84 @@ void FixGPUCompressKokkos::end_of_step()
               pred_psnr_out, actual_psnr_out, mp);
     }
     fflush(tc_csv);
+  };  /* end log_chunks_now lambda */
 
-    /* Ranking profiler at milestone writes */
-    if (ranking_csv && lammps_is_ranking_milestone(write_count, total_writes)) {
-      auto d_x = atomKK->k_x.view_device();
-      const void *rank_ptr = (const void *)d_x.data();
-      size_t rank_bytes = (size_t)nlocal * 3 * elem_bytes;
-      float bw = gpucompress_get_bandwidth_bytes_per_ms();
-      RankingMilestoneResult result = {};
-      size_t chunk_bytes = 4 * 1024 * 1024; /* 4 MiB default */
-      const char *cb_env = getenv("GPUCOMPRESS_CHUNK_MB");
-      if (cb_env) chunk_bytes = (size_t)atoi(cb_env) * 1024 * 1024;
-      lammps_run_ranking_profiler(rank_ptr, rank_bytes, chunk_bytes,
-                                   0.0, cw0, cw1, cw2, bw,
-                                   3, ranking_csv, ranking_costs_csv,
-                                   phase, write_count, &result);
-      fprintf(stdout, "    [ranking] T=%d: tau=%.3f regret=%.3fx (%.0fms)\n",
-              write_count, result.mean_tau, result.mean_regret, result.profiling_ms);
-      fflush(stdout);
-    }
-    write_count++;
+  /* ── Per-field write+read+log cycles ──
+   *
+   * Each field gets its own reset → write+readback → log_chunks_now
+   * cycle so the chunk-history slots match exactly the chunks of THIS
+   * field's H5Dwrite. Sharing one history across positions+velocities+
+   * forces caused the read-back of the next field to overwrite the
+   * previous field's decomp_ms slots (because the VOL keys decomp_ms
+   * by per-dataset chunk index — see H5VLgpucompress.cu:2181). */
+  if (dump_positions) {
+    auto d_x = atomKK->k_x.view_device();
+    const void *d_ptr = (const void *)d_x.data();
+    size_t n_elements = (size_t)nlocal * 3;
+
+    snprintf(fname, sizeof(fname), "%s/x_rank%04d.h5", dir, rank);
+    gpucompress_reset_chunk_history();
+    rc = gpucompress_lammps_write_field(fname, "positions", d_ptr,
+                                         n_elements, elem_bytes,
+                                         algo_name, error_bound, verify);
+    if (comm->me == 0 && rc != 0)
+      fprintf(stderr, "[GPUCompress-LAMMPS] positions write failed\n");
+    log_chunks_now();
   }
+
+  if (dump_velocities) {
+    auto d_v = atomKK->k_v.view_device();
+    const void *d_ptr = (const void *)d_v.data();
+    size_t n_elements = (size_t)nlocal * 3;
+
+    snprintf(fname, sizeof(fname), "%s/v_rank%04d.h5", dir, rank);
+    gpucompress_reset_chunk_history();
+    rc = gpucompress_lammps_write_field(fname, "velocities", d_ptr,
+                                         n_elements, elem_bytes,
+                                         algo_name, error_bound, verify);
+    if (comm->me == 0 && rc != 0)
+      fprintf(stderr, "[GPUCompress-LAMMPS] velocities write failed\n");
+    log_chunks_now();
+  }
+
+  if (dump_forces) {
+    auto d_f = atomKK->k_f.view_device();
+    const void *d_ptr = (const void *)d_f.data();
+    size_t n_elements = (size_t)nlocal * 3;
+
+    snprintf(fname, sizeof(fname), "%s/f_rank%04d.h5", dir, rank);
+    gpucompress_reset_chunk_history();
+    rc = gpucompress_lammps_write_field(fname, "forces", d_ptr,
+                                         n_elements, elem_bytes,
+                                         algo_name, error_bound, verify);
+    if (comm->me == 0 && rc != 0)
+      fprintf(stderr, "[GPUCompress-LAMMPS] forces write failed\n");
+    log_chunks_now();
+  }
+
+  /* Ranking profiler at milestone writes — runs ONCE per dump
+   * (not per field), since it's a separate offline benchmark of
+   * positions only. write_count is the dump-level timestep tag. */
+  if (log_chunks && tc_csv && comm->me == 0 &&
+      ranking_csv && lammps_is_ranking_milestone(write_count, total_writes)) {
+    auto d_x = atomKK->k_x.view_device();
+    const void *rank_ptr = (const void *)d_x.data();
+    size_t rank_bytes = (size_t)nlocal * 3 * elem_bytes;
+    float bw = gpucompress_get_bandwidth_bytes_per_ms();
+    RankingMilestoneResult result = {};
+    size_t chunk_bytes = 4 * 1024 * 1024; /* 4 MiB default */
+    const char *cb_env = getenv("GPUCOMPRESS_CHUNK_MB");
+    if (cb_env) chunk_bytes = (size_t)atoi(cb_env) * 1024 * 1024;
+    lammps_run_ranking_profiler(rank_ptr, rank_bytes, chunk_bytes,
+                                 0.0, cw0, cw1, cw2, bw,
+                                 3, ranking_csv, ranking_costs_csv,
+                                 phase, write_count, &result);
+    fprintf(stdout, "    [ranking] T=%d: tau=%.3f regret=%.3fx (%.0fms)\n",
+            write_count, result.mean_tau, result.mean_regret, result.profiling_ms);
+    fflush(stdout);
+  }
+  if (log_chunks && tc_csv && comm->me == 0) write_count++;
+
   gpucompress_reset_chunk_history();
 
   if (comm->me == 0) {
