@@ -65,7 +65,7 @@ export SGD_LR="0.2"
 export SGD_MAPE="0.10"
 export EXPLORE_K="4"
 export EXPLORE_THRESH="0.20"
-export CHUNK_MB="2"
+export CHUNK_MB="${CHUNK_MB:-2}"
 
 # ── Workload binaries (paths the runner needs) ─────────────
 export VPIC_BIN="${VPIC_BIN:-$PROJECT_DIR/benchmarks/vpic-kokkos/vpic_benchmark_deck.Linux}"

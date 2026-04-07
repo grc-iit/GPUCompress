@@ -88,7 +88,18 @@ int gpucompress_lammps_write_field(const char* filename,
     gpucompress_algorithm_t algo = algo_from_name(algo_name);
     hid_t h5type = (elem_bytes == 8) ? H5T_NATIVE_DOUBLE : H5T_NATIVE_FLOAT;
 
-    size_t chunk_elems = (4 * 1024 * 1024) / elem_bytes;
+    /* HDF5 chunk size: honor GPUCOMPRESS_CHUNK_MB so the SC26 sweep can
+     * sweep chunk size across all 4 workloads consistently. Default to
+     * 4 MiB for backward compatibility when the env var is unset. */
+    size_t chunk_mb = 4;
+    {
+        const char* cb_env = getenv("GPUCOMPRESS_CHUNK_MB");
+        if (cb_env && cb_env[0]) {
+            int v = atoi(cb_env);
+            if (v > 0) chunk_mb = (size_t)v;
+        }
+    }
+    size_t chunk_elems = (chunk_mb * 1024 * 1024) / elem_bytes;
     if (chunk_elems > n_elements) chunk_elems = n_elements;
 
     hsize_t dims[1]  = { (hsize_t)n_elements };

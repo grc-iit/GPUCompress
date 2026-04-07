@@ -1,0 +1,24 @@
+units           lj
+atom_style      atomic
+lattice         fcc 0.8442
+region          box block 0 161 0 161 0 161
+create_box      1 box
+create_atoms    1 box
+mass            1 1.0
+
+region          hot sphere 80 80 80 40
+group           hot region hot
+group           cold subtract all hot
+velocity        cold create 0.7 87287 loop geom
+velocity        hot create 2.0 12345 loop geom
+
+pair_style      lj/cut 2.5
+pair_coeff      1 1 1.0 1.0 2.5
+neighbor        0.3 bin
+neigh_modify    every 10 delay 0 check no
+
+fix             1 all nve
+fix             gpuc all gpucompress 500 positions velocities forces
+thermo          500
+timestep        0.003
+run             4000
