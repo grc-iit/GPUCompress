@@ -110,7 +110,7 @@ static void init_tmp_paths(int mpi_rank) {
 }
 
 #define DEFAULT_OUT_DIR "benchmarks/sdrbench/results"
-#define MAX_FIELDS      128
+#define MAX_FIELDS      4096
 #define MAX_PATH_LEN    512
 
 /* Phase bitmask */
@@ -885,7 +885,7 @@ static void run_phase_all_fields(
     PhaseResult *out, int *any_fail)
 {
     /* Per-field arrays for std computation */
-    const int MAX_F = 256;
+    const int MAX_F = 4096;
     double *f_write = (double*)calloc(MAX_F, sizeof(double));
     double *f_read  = (double*)calloc(MAX_F, sizeof(double));
     double *f_cgbps = (double*)calloc(MAX_F, sizeof(double));
@@ -906,6 +906,12 @@ static void run_phase_all_fields(
     double agg_meanerr = 0, agg_ssim = 0;
     double sum_mae_p = 0;
     int count = 0;
+    /* count_psnr: number of fields whose per-field aggregate had real PSNR
+     * data (i.e. mape_psnr_pct was finite, not NaN). Used as the divisor for
+     * the per-phase PSNR-family means so fully-lossless fields don't dilute
+     * the reported numbers. See the lossless-filter comment in the
+     * accumulation loop below. */
+    int count_psnr = 0;
     int first_n_chunks = 0;
 
     for (int fi = 0; fi < n_fields; fi++) {
@@ -956,15 +962,25 @@ static void run_phase_all_fields(
         sum_mape_r       += fr.mape_ratio_pct;
         sum_mape_c       += fr.mape_comp_pct;
         sum_mape_d       += fr.mape_decomp_pct;
-        sum_mape_p       += fr.mape_psnr_pct;
+        /* PSNR-family metrics: skip NaN (timesteps with no lossy chunks).
+         * Without this filter, lossless rows that wrote 0.0 would dilute
+         * the per-phase mean and silently scale down reported PSNR MAPE.
+         * Track count_psnr separately so the divisor matches the lossy
+         * row count, not the total row count. */
+        if (std::isfinite(fr.mape_psnr_pct)) {
+            sum_mape_p += fr.mape_psnr_pct;
+            count_psnr++;
+        }
+        if (std::isfinite(fr.mae_psnr_db))
+            sum_mae_p += fr.mae_psnr_db;
+        if (std::isfinite(fr.r2_psnr))
+            sum_r2_p += fr.r2_psnr;
         sum_mae_r        += fr.mae_ratio;
         sum_mae_c        += fr.mae_comp_ms;
         sum_mae_d        += fr.mae_decomp_ms;
-        sum_mae_p        += fr.mae_psnr_db;
         sum_r2_r         += fr.r2_ratio;
         sum_r2_c         += fr.r2_comp;
         sum_r2_d         += fr.r2_decomp;
-        sum_r2_p         += fr.r2_psnr;
         agg_mse          += fr.rmse * fr.rmse;  /* accumulate MSE = RMSE² */
         if (std::isfinite(fr.psnr_db) && fr.psnr_db < 300.0 && fr.rmse > 0.0)
             agg_range_sq += fr.rmse * fr.rmse * pow(10.0, fr.psnr_db / 10.0);
@@ -1005,15 +1021,19 @@ static void run_phase_all_fields(
         out->mape_ratio_pct  = sum_mape_r / count;
         out->mape_comp_pct   = sum_mape_c / count;
         out->mape_decomp_pct = sum_mape_d / count;
-        out->mape_psnr_pct   = sum_mape_p / count;
+        /* PSNR-family per-phase mean: divide by lossy field count, not by
+         * total field count. If no field had lossy data, emit NaN rather
+         * than 0/0 (= NaN anyway, but explicit) so consumers using nanmean
+         * propagate "no data" honestly. */
+        out->mape_psnr_pct   = (count_psnr > 0) ? (sum_mape_p / count_psnr) : std::nan("");
         out->mae_ratio       = sum_mae_r / count;
         out->mae_comp_ms     = sum_mae_c / count;
         out->mae_decomp_ms   = sum_mae_d / count;
-        out->mae_psnr_db     = sum_mae_p / count;
+        out->mae_psnr_db     = (count_psnr > 0) ? (sum_mae_p / count_psnr)  : std::nan("");
         out->r2_ratio        = sum_r2_r / count;
         out->r2_comp         = sum_r2_c / count;
         out->r2_decomp       = sum_r2_d / count;
-        out->r2_psnr         = sum_r2_p / count;
+        out->r2_psnr         = (count_psnr > 0) ? (sum_r2_p / count_psnr)   : std::nan("");
         out->n_runs       = count;
         out->n_chunks     = first_n_chunks;
         if (g_error_bound > 0.0) {
@@ -1465,7 +1485,7 @@ int main(int argc, char **argv)
         gpucompress_set_exploration(0);
         if (n_fields > 1) {
             /* Run on all fields and average for fair comparison */
-            const int MAX_F = 256;
+            const int MAX_F = 4096;
             double *f_wr = (double*)calloc(MAX_F, sizeof(double));
             double *f_rd = (double*)calloc(MAX_F, sizeof(double));
             double sum_wr = 0, sum_rd = 0, sum_rat = 0;
@@ -1735,7 +1755,7 @@ int main(int argc, char **argv)
              * including it unfairly penalizes nn-rl vs fixed-algo baselines.
              * Clamp to n_fields-1 so at least one field is always counted. */
             const int WARMUP_SKIP = (warmup_skip < n_fields) ? warmup_skip : (n_fields > 1 ? n_fields - 1 : 0);
-            const int MAX_F = 256;
+            const int MAX_F = 4096;
             double *f_write_ms = (double*)calloc(MAX_F, sizeof(double));
             double *f_read_ms  = (double*)calloc(MAX_F, sizeof(double));
             double *f_cgbps    = (double*)calloc(MAX_F, sizeof(double));
@@ -1753,6 +1773,11 @@ int main(int argc, char **argv)
             int    sum_sgd = 0, sum_expl = 0;
             size_t last_file_sz = 0;
             int n_steady = 0;
+            /* count_psnr_steady: number of steady-state fields whose per-field
+             * aggregate had real PSNR data (mape_psnr_pct finite, not NaN).
+             * Used as the divisor for the per-phase PSNR-family means below
+             * so fully-lossless fields don't dilute reported numbers. */
+            int n_psnr_steady = 0;
 
             for (int fi = 0; fi < n_fields; fi++) {
                 /* Load field to GPU */
@@ -1852,15 +1877,23 @@ int main(int argc, char **argv)
                     sum_mape_r += field_r.mape_ratio_pct;
                     sum_mape_c += field_r.mape_comp_pct;
                     sum_mape_d += field_r.mape_decomp_pct;
-                    sum_mape_p += field_r.mape_psnr_pct;
+                    /* PSNR-family: skip NaN (lossless field). Track n_psnr_steady
+                     * separately so the divisor below matches the lossy field
+                     * count, not the total steady-state field count. */
+                    if (std::isfinite(field_r.mape_psnr_pct)) {
+                        sum_mape_p += field_r.mape_psnr_pct;
+                        n_psnr_steady++;
+                    }
+                    if (std::isfinite(field_r.mae_psnr_db))
+                        sum_mae_p += field_r.mae_psnr_db;
+                    if (std::isfinite(field_r.r2_psnr))
+                        sum_r2_p += field_r.r2_psnr;
                     sum_mae_r  += field_r.mae_ratio;
                     sum_mae_c  += field_r.mae_comp_ms;
                     sum_mae_d  += field_r.mae_decomp_ms;
-                    sum_mae_p  += field_r.mae_psnr_db;
                     sum_r2_r   += field_r.r2_ratio;
                     sum_r2_c   += field_r.r2_comp;
                     sum_r2_d   += field_r.r2_decomp;
-                    sum_r2_p   += field_r.r2_psnr;
                     sum_nn_ms       += field_r.nn_ms;
                     sum_stats_ms    += field_r.stats_ms;
                     sum_preproc_ms  += field_r.preproc_ms;
@@ -1927,11 +1960,14 @@ int main(int argc, char **argv)
                             field_r.r2_ratio, field_r.r2_comp, field_r.r2_decomp, field_r.r2_psnr);
                 }
 
-                /* Write per-chunk detail at milestone fields */
+                /* Write per-chunk detail for every field (was: milestones only).
+                 * Set GPUCOMPRESS_TC_MILESTONES_ONLY=1 to restore old behavior. */
                 bool is_milestone = false;
                 for (int mi = 0; mi < 5; mi++)
                     if (fi == milestones[mi]) { is_milestone = true; break; }
-                if (is_milestone && tc_csv) {
+                static const bool tc_milestones_only =
+                    (getenv("GPUCOMPRESS_TC_MILESTONES_ONLY") != nullptr);
+                if ((!tc_milestones_only || is_milestone) && tc_csv) {
                     int nh = gpucompress_get_chunk_history_count();
                     for (int ci = 0; ci < nh; ci++) {
                         gpucompress_chunk_diag_t d;
@@ -1992,15 +2028,17 @@ int main(int argc, char **argv)
                 pr->mape_ratio_pct  = sum_mape_r / n_steady;
                 pr->mape_comp_pct   = sum_mape_c / n_steady;
                 pr->mape_decomp_pct = sum_mape_d / n_steady;
-                pr->mape_psnr_pct   = sum_mape_p / n_steady;
+                /* PSNR-family per-phase mean: divide by lossy field count, not
+                 * total field count. NaN if no lossy fields contributed. */
+                pr->mape_psnr_pct   = (n_psnr_steady > 0) ? (sum_mape_p / n_psnr_steady) : std::nan("");
                 pr->mae_ratio       = sum_mae_r / n_steady;
                 pr->mae_comp_ms     = sum_mae_c / n_steady;
                 pr->mae_decomp_ms   = sum_mae_d / n_steady;
-                pr->mae_psnr_db     = sum_mae_p / n_steady;
+                pr->mae_psnr_db     = (n_psnr_steady > 0) ? (sum_mae_p / n_psnr_steady)  : std::nan("");
                 pr->r2_ratio        = sum_r2_r / n_steady;
                 pr->r2_comp         = sum_r2_c / n_steady;
                 pr->r2_decomp       = sum_r2_d / n_steady;
-                pr->r2_psnr         = sum_r2_p / n_steady;
+                pr->r2_psnr         = (n_psnr_steady > 0) ? (sum_r2_p / n_psnr_steady)   : std::nan("");
                 pr->nn_ms       = sum_nn_ms / n_steady;
                 pr->stats_ms    = sum_stats_ms / n_steady;
                 pr->preproc_ms  = sum_preproc_ms / n_steady;

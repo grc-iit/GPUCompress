@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <math.h>      /* nan(), isfinite() — used by per-chunk PSNR emit */
 #include <sys/stat.h>
 #include <cuda_runtime.h>
 
@@ -74,6 +75,12 @@ FixGPUCompressKokkos::FixGPUCompressKokkos(LAMMPS *lmp, int narg, char **arg) :
 
   const char *venv = getenv("GPUCOMPRESS_VERIFY");
   verify = (venv && atoi(venv)) ? 1 : 0;
+
+  /* Lossy error bound (relative). Default 0.0 = lossless.
+   * Must be > 0 for the NN to pick quantized configs and produce per-chunk
+   * PSNR data — required for the Section 7.1 cross-workload PSNR figure. */
+  const char *eb_env = getenv("GPUCOMPRESS_ERROR_BOUND");
+  error_bound = eb_env ? atof(eb_env) : 0.0;
 
   const char *denv = getenv("LAMMPS_DUMP_FIELDS");
   dump_raw_fields = (denv && atoi(denv)) ? 1 : 0;
@@ -166,8 +173,8 @@ void FixGPUCompressKokkos::init()
       }
 
       if (comm->me == 0) {
-        fprintf(stdout, "[GPUCompress-LAMMPS] Initialized: algo=%s policy=%s verify=%d\n",
-                algo_name, policy, verify);
+        fprintf(stdout, "[GPUCompress-LAMMPS] Initialized: algo=%s policy=%s verify=%d error_bound=%g\n",
+                algo_name, policy, verify, error_bound);
         fprintf(stdout, "[GPUCompress-LAMMPS] Fields: pos=%d vel=%d force=%d every=%d\n",
                 dump_positions, dump_velocities, dump_forces, dump_every);
 
@@ -181,12 +188,18 @@ void FixGPUCompressKokkos::init()
                    "%s/benchmark_lammps_timestep_chunks.csv", csv_dir);
           tc_csv = fopen(csv_path, "w");
           if (tc_csv) {
+            /* PSNR columns are populated only when the NN selected a quantized
+             * config. Lossless chunks emit `nan` for all three so cross-timestep
+             * aggregators using nanmean correctly skip them rather than averaging
+             * zeros (which silently scales down the reported PSNR MAPE). Same
+             * sentinel pattern as VPIC, NYX bridge, and the WarpX patch. */
             fprintf(tc_csv, "rank,phase,timestep,chunk,"
                     "predicted_ratio,actual_ratio,"
                     "predicted_comp_ms,actual_comp_ms_raw,"
                     "mape_ratio,mape_comp,"
                     "sgd_fired,exploration_triggered,"
-                    "cost_model_error_pct,actual_cost,predicted_cost\n");
+                    "cost_model_error_pct,actual_cost,predicted_cost,"
+                    "predicted_psnr_db,actual_psnr_db,mape_psnr\n");
           }
 
           /* Ranking CSV (top1_regret from oracle comparison) */
@@ -328,7 +341,7 @@ void FixGPUCompressKokkos::end_of_step()
     snprintf(fname, sizeof(fname), "%s/x_rank%04d.h5", dir, rank);
     rc = gpucompress_lammps_write_field(fname, "positions", d_ptr,
                                          n_elements, elem_bytes,
-                                         algo_name, 0.0, verify);
+                                         algo_name, error_bound, verify);
     if (comm->me == 0 && rc != 0)
       fprintf(stderr, "[GPUCompress-LAMMPS] positions write failed\n");
   }
@@ -341,7 +354,7 @@ void FixGPUCompressKokkos::end_of_step()
     snprintf(fname, sizeof(fname), "%s/v_rank%04d.h5", dir, rank);
     rc = gpucompress_lammps_write_field(fname, "velocities", d_ptr,
                                          n_elements, elem_bytes,
-                                         algo_name, 0.0, verify);
+                                         algo_name, error_bound, verify);
     if (comm->me == 0 && rc != 0)
       fprintf(stderr, "[GPUCompress-LAMMPS] velocities write failed\n");
   }
@@ -354,7 +367,7 @@ void FixGPUCompressKokkos::end_of_step()
     snprintf(fname, sizeof(fname), "%s/f_rank%04d.h5", dir, rank);
     rc = gpucompress_lammps_write_field(fname, "forces", d_ptr,
                                          n_elements, elem_bytes,
-                                         algo_name, 0.0, verify);
+                                         algo_name, error_bound, verify);
     if (comm->me == 0 && rc != 0)
       fprintf(stderr, "[GPUCompress-LAMMPS] forces write failed\n");
   }
@@ -378,17 +391,39 @@ void FixGPUCompressKokkos::end_of_step()
         mr = fabs(dd.predicted_ratio - dd.actual_ratio) / fabs(dd.actual_ratio) * 100.0;
       if (dd.compression_ms > 0)
         mc = fabs(dd.predicted_comp_time - dd.compression_ms) / fabs(dd.compression_ms) * 100.0;
+      /* PSNR MAPE: lossless filter via the actual_psnr = -1.0 sentinel set in
+       * gpucompress_compress.cpp:259. For lossless chunks emit NaN (not 0) so
+       * cross-timestep aggregators using nanmean skip them. The compression-side
+       * analytical PSNR is only set when quantize_simple actually ran, so this
+       * gate matches what VPIC, the NYX bridge, and the WarpX patch use. */
+      double mp;
+      double pred_psnr_out, actual_psnr_out;
+      if (dd.predicted_psnr > 0.0f
+          && isfinite(dd.actual_psnr)
+          && dd.actual_psnr > 0.0f) {
+        mp = fabs((double)dd.predicted_psnr - (double)dd.actual_psnr)
+             / fabs((double)dd.actual_psnr) * 100.0;
+        if (mp > 200.0) mp = 200.0;
+        pred_psnr_out   = (double)dd.predicted_psnr;
+        actual_psnr_out = (double)dd.actual_psnr;
+      } else {
+        mp              = nan("");
+        pred_psnr_out   = nan("");
+        actual_psnr_out = nan("");
+      }
       fprintf(tc_csv,
               "0,%s,%d,%d,"
               "%.4f,%.4f,%.4f,%.4f,"
               "%.2f,%.2f,%d,%d,"
-              "%.4f,%.4f,%.4f\n",
+              "%.4f,%.4f,%.4f,"
+              "%.4f,%.4f,%.2f\n",
               phase, write_count, ci,
               (double)dd.predicted_ratio, (double)dd.actual_ratio,
               (double)dd.predicted_comp_time, (double)dd.compression_ms_raw,
               mr, mc, dd.sgd_fired, dd.exploration_triggered,
               (double)dd.cost_model_error_pct,
-              (double)dd.actual_cost, (double)dd.predicted_cost);
+              (double)dd.actual_cost, (double)dd.predicted_cost,
+              pred_psnr_out, actual_psnr_out, mp);
     }
     fflush(tc_csv);
 

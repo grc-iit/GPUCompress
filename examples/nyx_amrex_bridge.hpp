@@ -120,7 +120,7 @@ struct DiagLogger {
             gpucompress_chunk_diag_t dd;
             if (gpucompress_get_chunk_diag(ci, &dd) != 0) continue;
 
-            double mr = 0, mc = 0, md = 0, mp = 0;
+            double mr = 0, mc = 0, md = 0;
             if (dd.actual_ratio > 0)
                 mr = fmin(200.0, fabs(dd.predicted_ratio - dd.actual_ratio)
                           / fabs(dd.actual_ratio) * 100.0);
@@ -130,10 +130,26 @@ struct DiagLogger {
             if (dd.decompression_ms > 0)
                 md = fmin(200.0, fabs(dd.predicted_decomp_time - dd.decompression_ms)
                           / fabs(dd.decompression_ms) * 100.0);
-            if (dd.actual_psnr > 0.0f && std::isfinite(dd.actual_psnr)
-                && dd.predicted_psnr > 0.0f)
-                mp = fmin(200.0, fabs(dd.predicted_psnr - dd.actual_psnr)
-                          / fabs(dd.actual_psnr) * 100.0);
+            /* PSNR MAPE: lossless filter via the actual_psnr = -1.0 sentinel
+             * set in gpucompress_compress.cpp:259. For lossless chunks emit
+             * NaN (not 0) so cross-timestep aggregators using nanmean skip
+             * them entirely rather than averaging zeros (which silently
+             * scales down the reported PSNR MAPE). Same gate used by VPIC,
+             * WarpX, and the LAMMPS fix. */
+            double mp;
+            double pred_psnr_out, actual_psnr_out;
+            if (dd.predicted_psnr > 0.0f
+                && std::isfinite(dd.actual_psnr)
+                && dd.actual_psnr > 0.0f) {
+                mp = fmin(200.0, fabs((double)dd.predicted_psnr - (double)dd.actual_psnr)
+                                  / fabs((double)dd.actual_psnr) * 100.0);
+                pred_psnr_out   = (double)dd.predicted_psnr;
+                actual_psnr_out = (double)dd.actual_psnr;
+            } else {
+                mp              = std::nan("");
+                pred_psnr_out   = std::nan("");
+                actual_psnr_out = std::nan("");
+            }
 
             char action_str[40], orig_str[40];
             action_to_str(dd.nn_action, action_str, sizeof(action_str));
@@ -149,7 +165,7 @@ struct DiagLogger {
                     (double)dd.predicted_ratio, (double)dd.actual_ratio,
                     (double)dd.predicted_comp_time, (double)dd.compression_ms_raw,
                     (double)dd.predicted_decomp_time, (double)dd.decompression_ms_raw,
-                    (double)dd.predicted_psnr, (double)dd.actual_psnr,
+                    pred_psnr_out, actual_psnr_out,
                     mr, mc, md, mp,
                     dd.sgd_fired, dd.exploration_triggered,
                     (double)dd.cost_model_error_pct,

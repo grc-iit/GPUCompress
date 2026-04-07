@@ -937,6 +937,11 @@ begin_diagnostics {
                             double sum_vs1, sum_vs2, sum_vs3;
                             double sum_vs2_busy, sum_vs3_busy;
                             double sum_mape_p;
+                            int    mape_p_count;   /* count of timesteps with at least 1 lossy
+                                                      chunk (i.e. non-NaN mape_p). Used as the
+                                                      divisor for the per-phase PSNR MAPE so
+                                                      fully-lossless timesteps don't dilute the
+                                                      reported number. */
                             double sum_r2_ratio, sum_r2_comp, sum_r2_decomp, sum_r2_psnr;
                             double sum_mse, sum_range_sq, max_maxerr;
                             double sum_meanerr, sum_ssim, sum_bitrate;
@@ -1045,8 +1050,17 @@ begin_diagnostics {
                                             pa[pi].sum_mae_r += t_mae_r;
                                             pa[pi].sum_mae_c += t_mae_c;
                                             pa[pi].sum_mae_d += t_mae_d;
-                                            pa[pi].sum_mae_p += t_mae_p;
-                                            pa[pi].sum_mape_p += t_mape_p;
+                                            /* PSNR-family metrics: skip NaN (which means
+                                             * "no lossy chunks in this timestep, no PSNR
+                                             * data to contribute"). atof("nan") returns
+                                             * IEEE NaN, so this filter catches the new
+                                             * sentinel without any changes upstream. */
+                                            if (!std::isnan(t_mae_p))
+                                                pa[pi].sum_mae_p += t_mae_p;
+                                            if (!std::isnan(t_mape_p)) {
+                                                pa[pi].sum_mape_p += t_mape_p;
+                                                pa[pi].mape_p_count++;
+                                            }
                                         }
                                         /* VOL additive timing (columns 26-28, nf >= 28) */
                                         if (nf >= 28) {
@@ -1141,9 +1155,19 @@ begin_diagnostics {
                                     pa[pi].sum_explore_ms / n, pa[pi].sum_sgd_ms / n,
                                     cgbps, dgbps,
                                     fmin(200.0, pa[pi].sum_mape_r / n), fmin(200.0, pa[pi].sum_mape_c / n),
-                                    fmin(200.0, pa[pi].sum_mape_d / n), fmin(200.0, pa[pi].sum_mape_p / n),
+                                    fmin(200.0, pa[pi].sum_mape_d / n),
+                                    /* PSNR-family per-phase mean: divide by lossy
+                                     * timestep count, not by total timestep count.
+                                     * If no timesteps had lossy chunks, emit NaN
+                                     * (rather than 0/0 → div by zero or 0/n → bias). */
+                                    pa[pi].mape_p_count > 0
+                                        ? fmin(200.0, pa[pi].sum_mape_p / pa[pi].mape_p_count)
+                                        : std::nan(""),
                                     pa[pi].sum_mae_r / n, pa[pi].sum_mae_c / n,
-                                    pa[pi].sum_mae_d / n, pa[pi].sum_mae_p / n,
+                                    pa[pi].sum_mae_d / n,
+                                    pa[pi].mape_p_count > 0
+                                        ? pa[pi].sum_mae_p / pa[pi].mape_p_count
+                                        : std::nan(""),
                                     pa[pi].sum_r2_ratio / n, pa[pi].sum_r2_comp / n,
                                     pa[pi].sum_r2_decomp / n, pa[pi].sum_r2_psnr / n,
                                     cgbps_std, dgbps_std,
@@ -1670,9 +1694,15 @@ begin_diagnostics {
             double real_mape_r = fmin(200.0, mcnt_r ? (mape_r_sum / mcnt_r) * 100.0 : 0.0);
             double real_mape_c = fmin(200.0, mcnt_c ? (mape_c_sum / mcnt_c) * 100.0 : 0.0);
             double real_mape_d = fmin(200.0, mcnt_d ? (mape_d_sum / mcnt_d) * 100.0 : 0.0);
-            double real_mape_p = fmin(200.0, mcnt_p ? (mape_p_sum / mcnt_p) * 100.0 : 0.0);
-            double ts_mae_p = mcnt_p ? mae_p_sum / mcnt_p : 0.0;
-            double psnr_predicted = psnr_pred_cnt ? psnr_pred_sum / psnr_pred_cnt : 0.0;
+            /* PSNR-family aggregates: emit NaN when there were zero lossy
+             * chunks in this timestep (mcnt_p == 0). The cross-timestep
+             * aggregator below uses a NaN-aware sum so fully-lossless
+             * timesteps are excluded from the per-phase mean rather than
+             * being averaged in as zeros (which silently scales down the
+             * reported PSNR MAPE). */
+            double real_mape_p = mcnt_p ? fmin(200.0, (mape_p_sum / mcnt_p) * 100.0) : std::nan("");
+            double ts_mae_p    = mcnt_p ? (mae_p_sum / mcnt_p) : std::nan("");
+            double psnr_predicted = psnr_pred_cnt ? psnr_pred_sum / psnr_pred_cnt : std::nan("");
 
             double wr_mbps = (write_ms_t > 0) ? orig_mib / (write_ms_t / 1000.0) : 0;
             double rd_mbps = (read_ms_t > 0)  ? orig_mib / (read_ms_t  / 1000.0) : 0;
@@ -1752,15 +1782,34 @@ begin_diagnostics {
                         gpucompress_chunk_diag_t dd;
                         if (gpucompress_get_chunk_diag(ci, &dd) != 0) continue;
 
-                        double mr = 0, mc = 0, md = 0, mp = 0;
+                        double mr = 0, mc = 0, md = 0;
                         if (dd.actual_ratio > 0)
                             mr = fmin(200.0, fabs(dd.predicted_ratio - dd.actual_ratio) / fabs(dd.actual_ratio) * 100.0);
                         if (dd.compression_ms > 0)
                             mc = fmin(200.0, fabs(dd.predicted_comp_time - dd.compression_ms) / fabs(dd.compression_ms) * 100.0);
                         if (dd.decompression_ms > 0)
                             md = fmin(200.0, fabs(dd.predicted_decomp_time - dd.decompression_ms) / fabs(dd.decompression_ms) * 100.0);
-                        if (dd.actual_psnr > 0.0f && std::isfinite(dd.actual_psnr) && dd.predicted_psnr > 0.0f)
-                            mp = fmin(200.0, fabs(dd.predicted_psnr - dd.actual_psnr) / fabs(dd.actual_psnr) * 100.0);
+                        /* PSNR MAPE: lossless filter via the actual_psnr = -1.0
+                         * sentinel set in gpucompress_compress.cpp:259. For
+                         * lossless chunks emit NaN (not 0) so cross-timestep
+                         * aggregators using nanmean correctly skip them rather
+                         * than averaging zeros (which silently scales down the
+                         * reported PSNR MAPE). Same gate used by WarpX, LAMMPS,
+                         * and the NYX bridge. */
+                        double mp;
+                        double pred_psnr_out, actual_psnr_out;
+                        if (dd.predicted_psnr > 0.0f
+                            && std::isfinite(dd.actual_psnr)
+                            && dd.actual_psnr > 0.0f) {
+                            mp = fmin(200.0, fabs((double)dd.predicted_psnr - (double)dd.actual_psnr)
+                                              / fabs((double)dd.actual_psnr) * 100.0);
+                            pred_psnr_out   = (double)dd.predicted_psnr;
+                            actual_psnr_out = (double)dd.actual_psnr;
+                        } else {
+                            mp              = std::nan("");
+                            pred_psnr_out   = std::nan("");
+                            actual_psnr_out = std::nan("");
+                        }
 
                         char action_str[40], orig_str[40];
                         action_to_str(dd.nn_action, action_str, sizeof(action_str));
@@ -1775,7 +1824,7 @@ begin_diagnostics {
                                 (double)dd.predicted_ratio, (double)dd.actual_ratio,
                                 (double)dd.predicted_comp_time, (double)dd.compression_ms_raw,
                                 (double)dd.predicted_decomp_time, (double)dd.decompression_ms_raw,
-                                (double)dd.predicted_psnr, (double)dd.actual_psnr,
+                                pred_psnr_out, actual_psnr_out,
                                 mr, mc, md, mp,
                                 dd.sgd_fired, dd.exploration_triggered,
                                 (double)dd.cost_model_error_pct,

@@ -2,7 +2,7 @@
 # ============================================================
 # GPUCompress Benchmark Suite
 #
-# Single entry point for all benchmarks: Gray-Scott, VPIC, SDRBench.
+# Single entry point for all live-simulation benchmarks: Gray-Scott, VPIC.
 # Fixed phases run once; NN phases run per policy with GPU weight isolation.
 #
 # Usage:
@@ -20,8 +20,9 @@ Usage: bash benchmarks/benchmark.sh
 All configuration is via environment variables. Defaults shown in [brackets].
 
 GENERAL
-  BENCHMARKS          [grayscott,vpic,sdrbench]  Which benchmarks to run
-                        Options: grayscott, vpic, sdrbench, ai_training
+  BENCHMARKS          [grayscott,vpic]           Which benchmarks to run
+                        Options: grayscott, vpic, ai_training
+                        (sdrbench removed: live simulations only — see README rule)
   DATA_MB             [512]                      Per-snapshot data size in MB
   CHUNK_MB            [16]                       HDF5 chunk size in MB
   TIMESTEPS           [50]                       Number of benchmark write cycles
@@ -59,9 +60,6 @@ VPIC (GPU plasma particle-in-cell simulation)
   VPIC_GUIDE_FIELD    [0.0]                      By guide field (0.2-0.5 for 3D structure)
   VPIC_DUMP_FIELDS    [0]                        Dump raw field binary per timestep
 
-SDRBENCH (static scientific datasets)
-  SDR_DATASETS        [nyx,hurricane_isabel,cesm_atm]  Datasets to run
-
 AI_TRAINING (neural network checkpoint compression)
   AI_MODEL            [vit_b_16]                   Model: vit_b_16 (327MB), gpt2 (473MB)
   AI_DATASET          [cifar10]                    Training dataset (cifar10 for ViT, wikitext2 for GPT-2)
@@ -75,12 +73,7 @@ STANDALONE BENCHMARKS
   # ── 2. VPIC (GPU plasma particle-in-cell simulation) ──
   BENCHMARKS=vpic DATA_MB=512 CHUNK_MB=4 TIMESTEPS=25 VERIFY=0 bash benchmarks/benchmark.sh
 
-  # ── 3. SDRBench (static scientific datasets from disk) ──
-  # Available: nyx (512MB/field), hurricane_isabel (100MB/field), cesm_atm (25MB/field)
-  BENCHMARKS=sdrbench SDR_DATASETS=nyx CHUNK_MB=4 VERIFY=0 bash benchmarks/benchmark.sh
-  BENCHMARKS=sdrbench SDR_DATASETS="nyx,hurricane_isabel,cesm_atm" bash benchmarks/benchmark.sh
-
-  # ── 4. AI Training (neural network checkpoint compression) ──
+  # ── 3. AI Training (neural network checkpoint compression) ──
   # Step 1: Generate checkpoint data (one-time)
   python3 scripts/train_and_export_checkpoints.py --model vit_b_16 --epochs 20  # ~25 min, 10 GB
   python3 scripts/train_gpt2_checkpoints.py --epochs 5                          # ~20 min, 7.4 GB
@@ -93,8 +86,8 @@ EXAMPLES
   # Quick smoke test (smallest config, ~2 min)
   BENCHMARKS=grayscott DATA_MB=8 CHUNK_MB=4 TIMESTEPS=3 VERIFY=0 bash benchmarks/benchmark.sh
 
-  # All 4 benchmarks, balanced policy
-  BENCHMARKS="grayscott,vpic,sdrbench,ai_training" POLICIES=balanced VERIFY=0 bash benchmarks/benchmark.sh
+  # All live benchmarks, balanced policy
+  BENCHMARKS="grayscott,vpic,ai_training" POLICIES=balanced VERIFY=0 bash benchmarks/benchmark.sh
 
   # All 3 policies for comparison
   BENCHMARKS=ai_training POLICIES="balanced,ratio,speed" CHUNK_MB=4 VERIFY=0 bash benchmarks/benchmark.sh
@@ -111,7 +104,6 @@ EXAMPLES
 OUTPUT
   benchmarks/grayscott/results/eval_<params>/<policy>/      Gray-Scott CSVs + plots
   benchmarks/vpic-kokkos/results/eval_<params>/<policy>/    VPIC CSVs + plots
-  benchmarks/sdrbench/results/eval_<dataset>_<params>/      SDRBench CSVs + plots
   benchmarks/ai_training/results/eval_<model>_<params>/     AI Training CSVs + plots
   benchmarks/results/per_dataset/<dataset>/<eval>/<policy>/  Auto-generated plots
   Logs:   benchmarks/<benchmark>/results/eval_<params>/<policy>/*_benchmark.log
@@ -127,7 +119,7 @@ set +e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # ── Shared defaults ──
-BENCHMARKS=${BENCHMARKS:-"grayscott,vpic,sdrbench"}
+BENCHMARKS=${BENCHMARKS:-"grayscott,vpic"}
 DATA_MB=${DATA_MB:-512}
 CHUNK_MB=${CHUNK_MB:-16}
 TIMESTEPS=${TIMESTEPS:-50}
@@ -276,7 +268,6 @@ echo "    EXPLORE_K=${EXPLORE_K}  EXPLORE_THRESH=${EXPLORE_THRESH}"
 echo ""
 echo "  Gray-Scott  : L=${GS_L} (~${GS_DATA} MB), steps=${GS_STEPS}"
 echo "  VPIC        : NX=${VPIC_NX} (~${VPIC_DATA} MB), warmup=${VPIC_WARMUP_STEPS:-500}, interval=${VPIC_SIM_INTERVAL:-190}"
-echo "  SDRBench    : datasets=${SDR_DATASETS:-nyx,hurricane_isabel,cesm_atm}"
 echo "  AI Training : model=${AI_MODEL}, dataset=${AI_DATASET}"
 echo "============================================================"
 echo ""
@@ -665,7 +656,7 @@ for bench in "${BENCH_LIST[@]}"; do
                 AGG_CSV="$POL_DIR/benchmark_vpic_deck.csv"
                 if [ -f "$TS_CSV" ]; then
                     python3 -c "
-import csv, sys
+import csv, math, sys
 rows = list(csv.DictReader(open('$TS_CSV')))
 phases = {}
 for r in rows:
@@ -677,7 +668,12 @@ for r in rows:
                      'sum_mape_p':0,'sum_mae_r':0,'sum_mae_c':0,'sum_mae_d':0,'sum_mae_p':0,
                      'sum_stats':0,'sum_nn':0,'sum_pre':0,'sum_comp':0,'sum_dec':0,
                      'sum_expl_ms':0,'sum_sgd_ms':0,
-                     'sum_r2_ratio':0,'sum_r2_comp':0,'sum_r2_decomp':0,'sum_r2_psnr':0}
+                     'sum_r2_ratio':0,'sum_r2_comp':0,'sum_r2_decomp':0,'sum_r2_psnr':0,
+                     # PSNR-family lossy-only counter: counts timesteps where the
+                     # workload reported real PSNR data (mape_psnr is not NaN).
+                     # Used as the divisor for mape_psnr/mae_psnr/r2_psnr so
+                     # fully-lossless timesteps don't dilute the per-phase mean.
+                     'n_psnr':0}
     d = phases[p]
     wr_val = float(r.get('write_ms',0))
     rd_val = float(r.get('read_ms',0))
@@ -692,11 +688,22 @@ for r in rows:
     d['sum_mape_r'] += float(r.get('mape_ratio',0))
     d['sum_mape_c'] += float(r.get('mape_comp',0))
     d['sum_mape_d'] += float(r.get('mape_decomp',0))
-    d['sum_mape_p'] += float(r.get('mape_psnr',0))
+    # PSNR-family metrics: skip NaN rows (= timesteps with no lossy chunks).
+    # Without this filter, lossless timesteps that wrote 0.0 (or NaN now)
+    # would dilute the per-phase mean and silently scale down reported MAPE.
+    mape_p_val = float(r.get('mape_psnr','nan') or 'nan')
+    mae_p_val  = float(r.get('mae_psnr_db','nan') or 'nan')
+    r2_p_val   = float(r.get('r2_psnr','nan') or 'nan')
+    if not math.isnan(mape_p_val):
+        d['sum_mape_p'] += mape_p_val
+        d['n_psnr'] += 1
+    if not math.isnan(mae_p_val):
+        d['sum_mae_p'] += mae_p_val
+    if not math.isnan(r2_p_val):
+        d['sum_r2_psnr'] += r2_p_val
     d['sum_mae_r'] += float(r.get('mae_ratio',0))
     d['sum_mae_c'] += float(r.get('mae_comp_ms',0))
     d['sum_mae_d'] += float(r.get('mae_decomp_ms',0))
-    d['sum_mae_p'] += float(r.get('mae_psnr_db',0))
     d['sum_stats'] += float(r.get('stats_ms',0))
     d['sum_nn'] += float(r.get('nn_ms',0))
     d['sum_pre'] += float(r.get('preproc_ms',0))
@@ -707,7 +714,6 @@ for r in rows:
     d['sum_r2_ratio'] += float(r.get('r2_ratio',0))
     d['sum_r2_comp'] += float(r.get('r2_comp',0))
     d['sum_r2_decomp'] += float(r.get('r2_decomp',0))
-    d['sum_r2_psnr'] += float(r.get('r2_psnr',0))
     d['n'] += 1
 # Get constant orig size: prefer orig_mib column if present, else from no-comp file_bytes
 first_orig = 0
@@ -735,7 +741,6 @@ with open('$AGG_CSV','w') as f:
         total_rd = d['sum_rd']
         avg_wr = total_wr / n
         avg_rd = total_rd / n
-        import math
         wr_var = (d['sum_wr_sq']/n - avg_wr**2) * n/(n-1) if n > 1 else 0
         rd_var = (d['sum_rd_sq']/n - avg_rd**2) * n/(n-1) if n > 1 else 0
         wr_std = math.sqrt(wr_var) if wr_var > 0 else 0
@@ -756,11 +761,19 @@ with open('$AGG_CSV','w') as f:
         nn=d['sum_nn']/n; st=d['sum_stats']/n; pre=d['sum_pre']/n
         exms=d['sum_expl_ms']/n; sgms=d['sum_sgd_ms']/n
         mr=min(200,d['sum_mape_r']/n); mc=min(200,d['sum_mape_c']/n)
-        md=min(200,d['sum_mape_d']/n); mp=min(200,d['sum_mape_p']/n)
+        md=min(200,d['sum_mape_d']/n)
+        # PSNR-family per-phase mean: divide by lossy timestep count, not by
+        # total timestep count. If no timesteps had lossy chunks, emit NaN
+        # rather than dividing by zero or by n (which would silently scale
+        # the result toward zero).
+        np_lossy = d['n_psnr']
+        mp = min(200, d['sum_mape_p']/np_lossy) if np_lossy > 0 else float('nan')
+        ap = (d['sum_mae_p']/np_lossy)          if np_lossy > 0 else float('nan')
+        rp = (d['sum_r2_psnr']/np_lossy)        if np_lossy > 0 else float('nan')
         ar=d['sum_mae_r']/n; ac=d['sum_mae_c']/n
-        ad=d['sum_mae_d']/n; ap=d['sum_mae_p']/n
+        ad=d['sum_mae_d']/n
         rr=d['sum_r2_ratio']/n; rc=d['sum_r2_comp']/n
-        rd2=d['sum_r2_decomp']/n; rp=d['sum_r2_psnr']/n
+        rd2=d['sum_r2_decomp']/n
         f.write(f'-1,vpic,{p},{n},{avg_wr:.2f},{wr_std:.2f},{avg_rd:.2f},{rd_std:.2f},'
                 f'{avg_file_mib:.2f},{orig_mib:.2f},{rat:.4f},{wr_mibps:.1f},{rd_mibps:.1f},0,'
                 f'{sgd:.0f},{expl:.0f},{nch},'
@@ -885,24 +898,10 @@ print(f'  Aggregate: {n_ranks} ranks, {len(phases)} phases -> $AGG_MULTI')
             fi  # end rank-0 post-processing
             ;;
         sdrbench)
-            echo ""
-            echo ">>> Running SDRBench benchmark (all datasets)..."
-            echo ""
-            SDR_DATASETS=${SDR_DATASETS:-"nyx,hurricane_isabel,cesm_atm"} \
-            CHUNK_MB=$CHUNK_MB \
-            PHASES=$PHASES \
-            POLICIES=$POLICIES \
-            SGD_LR=$SGD_LR \
-            SGD_MAPE=$SGD_MAPE \
-            EXPLORE_K=$EXPLORE_K \
-            EXPLORE_THRESH=$EXPLORE_THRESH \
-            VERIFY=$VERIFY \
-            ERROR_BOUND=${ERROR_BOUND:-0.0} \
-            DEBUG_NN=$DEBUG_NN \
-            MPI_NP=$MPI_NP \
-            GPUS_PER_NODE=$GPUS_PER_NODE \
-            LAUNCHER=$LAUNCHER \
-            bash "$SCRIPT_DIR/sdrbench/run_sdr.sh"
+            echo "ERROR: 'sdrbench' workload removed per project rule (no static archives)."
+            echo "  Use one of: grayscott, vpic, ai_training, or any of the live"
+            echo "  simulation drivers under benchmarks/Paper_Evaluations/4/."
+            exit 1
             ;;
         ai_training)
             if [ "$MY_RANK" -eq 0 ]; then
@@ -1108,7 +1107,7 @@ print(s)
             fi
             ;;
         *)
-            echo "ERROR: Unknown benchmark '$bench'. Use: grayscott, vpic, sdrbench, ai_training"
+            echo "ERROR: Unknown benchmark '$bench'. Use: grayscott, vpic, ai_training"
             ;;
     esac
 done

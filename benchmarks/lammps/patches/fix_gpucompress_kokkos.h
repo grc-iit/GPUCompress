@@ -17,6 +17,9 @@
      GPUCOMPRESS_WEIGHTS  - path to NN model weights
      GPUCOMPRESS_SGD      - 0/1: enable online SGD (default 1 for auto)
      GPUCOMPRESS_EXPLORE  - 0/1: enable exploration (default 1 for auto)
+     GPUCOMPRESS_ERROR_BOUND - relative error bound for lossy quantization
+                               (default 0.0 = lossless). Must be > 0 to
+                               populate per-chunk PSNR data.
 ------------------------------------------------------------------------- */
 
 #ifdef FIX_CLASS
@@ -61,6 +64,10 @@ class FixGPUCompressKokkos : public Fix {
   float cw0, cw1, cw2;   /* cost model weights for ranking profiler */
   int do_sgd;            /* 1 if online SGD is enabled (GPUCOMPRESS_SGD) */
   int do_explore;        /* 1 if exploration is enabled (GPUCOMPRESS_EXPLORE) */
+  double error_bound;    /* relative error bound for lossy quantization;
+                            0.0 = lossless. Set from GPUCOMPRESS_ERROR_BOUND
+                            env var. Must be > 0 for the NN to pick quantized
+                            configs and populate per-chunk PSNR data. */
   int gpuc_ready;
 };
 

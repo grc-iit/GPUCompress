@@ -17,7 +17,7 @@
 #
 # Overrides:
 #   RUN_NAME=paper_fig7a
-#   POLICY=ratio CHUNK_MB=4 SGD_LR=0.1
+#   POLICY=balanced CHUNK_MB=4 SGD_LR=0.2
 #   SKIP_VPIC=1 SKIP_NYX=1 SKIP_WARPX=1 SKIP_LAMMPS=1
 #   PLOT_ONLY=1          # just regenerate figures from existing CSVs
 # ============================================================
@@ -32,11 +32,33 @@ cd "$PROJECT_DIR"
 RUN_NAME="${RUN_NAME:-cross_workload_$(date +%Y%m%d_%H%M%S)}"
 RESULTS_DIR="$SCRIPT_DIR/results/$RUN_NAME"
 
-POLICY="${POLICY:-ratio}"
-PHASE="${PHASE:-nn-rl}"
-ERROR_BOUND="${ERROR_BOUND:-0.0}"
+# Cross-workload regret figure uses the balanced cost model uniformly:
+#   cost = comp_time + decomp_time + (data_size / (ratio * bandwidth))
+# i.e. w0 = w1 = w2 = 1.0. This breaks ties at the ratio cap (100x) — under
+# the ratio-only policy, multiple algorithms saturate the cap on
+# highly-compressible chunks (e.g. WarpX vacuum fields), making the oracle
+# ranking degenerate and trivially yielding regret = 0. Balanced uses
+# comp/decomp times to disambiguate, which gives a real regret signal.
+POLICY="${POLICY:-balanced}"
+# All cross-workload regret runs use nn-rl+exp50 (online SGD + always-on
+# exploration). Exploration is required so the ranking profiler has K=4
+# alternative actions per chunk to compute true top-1 regret against the
+# oracle. nn-rl alone only explores when confidence drops, which leaves
+# gaps in the regret trajectory.
+PHASE="${PHASE:-nn-rl+exp50}"
+# All cross-workload regret runs are LOSSY (relative error bound 1e-3) so
+# that the NN can pick quantized configs and the per-chunk PSNR data exists
+# for Figure 7c (PSNR MAPE). Lossless (ERROR_BOUND=0) leaves all PSNR cells
+# as NaN — useful for regret/comp-MAPE only. Combined with the balanced
+# policy above, this is the canonical 3-in-1 evaluation configuration:
+# regret + comp MAPE + PSNR MAPE in a single run.
+ERROR_BOUND="${ERROR_BOUND:-0.001}"
 CHUNK_MB="${CHUNK_MB:-4}"
-SGD_LR="${SGD_LR:-0.1}"
+# Equalized hyperparameters for cross-workload regret figure (Section 7).
+# These values apply uniformly to NYX, VPIC, WarpX, and LAMMPS so that
+# differences in regret/MAPE convergence reflect data distribution, not
+# tuning. Change here to re-tune the whole figure at once.
+SGD_LR="${SGD_LR:-0.2}"
 SGD_MAPE="${SGD_MAPE:-0.10}"
 EXPLORE_K="${EXPLORE_K:-4}"
 EXPLORE_THRESH="${EXPLORE_THRESH:-0.20}"
@@ -287,6 +309,7 @@ NYXEOF
     cd "$nyx_work"
     GPUCOMPRESS_WEIGHTS="$WEIGHTS" \
     NYX_LOG_DIR="$nyx_out" \
+    NYX_PHASE="$PHASE" \
     "$NYX_BIN" inputs > "$nyx_out/nyx_sim.log" 2>&1 || {
         note "WARNING: NYX exited with error (check $nyx_out/nyx_sim.log)"
     }
@@ -339,7 +362,11 @@ run_vpic_sim() {
     VPIC_EXPLORE_K="$EXPLORE_K" \
     VPIC_VERIFY="0" \
     VPIC_RESULTS_DIR="$vpic_out" \
-    "$VPIC_BIN" > "$vpic_out/vpic_sim.log" 2>&1
+    "$VPIC_BIN" > "$vpic_out/vpic_sim.log" 2>&1 || {
+        note "WARNING: VPIC exited with non-zero status (check $vpic_out/vpic_sim.log)"
+        note "  this is usually a known shutdown-cleanup segfault that fires AFTER"
+        note "  'normal exit' — CSVs are still written. Continuing pipeline."
+    }
 
     # Estimate: ~50 chunks/field × timesteps ranking rows
 
@@ -479,6 +506,7 @@ LMPEOF
     GPUCOMPRESS_EXPLORE_K="$EXPLORE_K" \
     GPUCOMPRESS_EXPLORE_THRESH="$EXPLORE_THRESH" \
     GPUCOMPRESS_CHUNK_MB="$CHUNK_MB" \
+    GPUCOMPRESS_ERROR_BOUND="$ERROR_BOUND" \
     GPUCOMPRESS_TOTAL_WRITES="$LMP_TIMESTEPS" \
     LAMMPS_LOG_CHUNKS="1" \
     LAMMPS_LOG_DIR="$lammps_out" \
@@ -801,6 +829,185 @@ for (label, _, xs, ys, _), c in zip(series, convergence_chunks):
 PY
 }
 
+# ════════════════════════════════════════════════════════════════
+# FIGURE 7c: PSNR MAPE CONVERGENCE (lossy quality prediction)
+# ════════════════════════════════════════════════════════════════
+#
+# This figure measures how accurately the NN predicts the lossy quality
+# (PSNR) of the algorithm it picked. Only meaningful on chunks where the
+# NN actually selected a quantized config — chunks running lossless emit
+# NaN in the per-workload CSV (see WarpX/LAMMPS/VPIC/NYX patches), and
+# this plotter filters those rows so they don't dilute the curve.
+#
+# A useful Figure 7c needs ERROR_BOUND > 0 for at least one workload.
+# Lossless runs leave every cell as NaN — the plotter will report zero
+# usable rows and skip the figure rather than producing an empty plot.
+plot_cross_workload_psnr_mape() {
+    note "Plotting cross-workload PSNR MAPE convergence (Figure 7c)"
+    RESULTS_DIR="$RESULTS_DIR" PHASE="$PHASE" python3 - <<'PY'
+import csv, math, os, sys
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+
+results_dir = os.environ["RESULTS_DIR"]
+phase_prefix = os.environ["PHASE"].split("/")[0]
+
+workload_order = [
+    ("vpic",          "VPIC",          "#e41a1c"),
+    ("nyx",           "NYX",           "#377eb8"),
+    ("warpx",         "WarpX",         "#4daf4a"),
+    ("lammps",        "LAMMPS",        "#ff7f00"),
+]
+
+png_path     = os.path.join(results_dir, "cross_workload_psnr_mape.png")
+combined_csv = os.path.join(results_dir, "cross_workload_psnr_mape.csv")
+
+def parse_float_or_nan(s):
+    """CSV cells may be 'nan' (lossless sentinel), empty, or a real number.
+    Return float('nan') for any non-numeric input so downstream filtering
+    via math.isnan() catches them uniformly."""
+    if s is None or s == "":
+        return float("nan")
+    try:
+        return float(s)
+    except ValueError:
+        return float("nan")
+
+series = []
+for key, label, color in workload_order:
+    tc_csv = os.path.join(results_dir, key, f"benchmark_{key}_timestep_chunks.csv")
+    if not os.path.isfile(tc_csv):
+        continue
+
+    rows_by_ts = {}
+    n_total = 0
+    n_lossy = 0
+    with open(tc_csv, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            p = row.get("phase", "")
+            if not p.startswith(phase_prefix):
+                continue
+            n_total += 1
+            mape_psnr = parse_float_or_nan(row.get("mape_psnr"))
+            # Lossless filter: NaN means "this chunk had no quantization,
+            # PSNR is undefined". Skip entirely so they don't show up as
+            # zeros in the plot (which would falsely look like perfect
+            # prediction). The per-chunk emitters in WarpX, LAMMPS, VPIC,
+            # and the NYX bridge all use the same NaN sentinel.
+            if math.isnan(mape_psnr):
+                continue
+            n_lossy += 1
+            ts    = int(row.get("timestep", row.get("field_idx", 0)))
+            chunk = int(row.get("chunk", 0))
+            rows_by_ts.setdefault(ts, []).append((chunk, mape_psnr))
+
+    if n_total == 0:
+        continue
+    if n_lossy == 0:
+        print(f"  {label}: no lossy chunks (run was lossless or workload "
+              f"didn't emit PSNR cols) — skipping")
+        continue
+
+    # If a simulation writes multiple fields per timestep (e.g. LAMMPS:
+    # positions+velocities+forces), keep only the first field's chunks
+    # to match the regret/comp-MAPE plot conventions above.
+    chunks_per_ts = max(len(v) for v in rows_by_ts.values()) if rows_by_ts else 0
+    expected_chunks = 50
+    if chunks_per_ts > expected_chunks * 2:
+        keep = chunks_per_ts // 3
+    else:
+        keep = chunks_per_ts
+
+    rows = []
+    for ts in sorted(rows_by_ts.keys()):
+        for chunk_idx, mape in rows_by_ts[ts][:keep]:
+            rows.append((ts, chunk_idx, mape))
+
+    xs = list(range(len(rows)))
+    ys = [r[2] for r in rows]
+    series.append((label, color, xs, ys, key))
+    pct_lossy = (100.0 * n_lossy / n_total) if n_total else 0.0
+    print(f"  {label}: {len(rows)} lossy chunks "
+          f"({n_lossy}/{n_total}, {pct_lossy:.0f}%) from "
+          f"{os.path.basename(tc_csv)}")
+
+if not series:
+    print("ERROR: no workload data with lossy chunks to plot for PSNR MAPE.",
+          file=sys.stderr)
+    print("       Set ERROR_BOUND > 0 in the run config so the NN can pick",
+          file=sys.stderr)
+    print("       quantized configs and produce per-chunk PSNR data.",
+          file=sys.stderr)
+    sys.exit(1)
+
+# Combined CSV: one row per (workload, lossy chunk index)
+with open(combined_csv, "w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow(["workload", "chunk_index", "psnr_mape_pct"])
+    for label, _, xs, ys, _ in series:
+        for x, y in zip(xs, ys):
+            writer.writerow([label, x, f"{y:.4f}"])
+
+# PSNR MAPE typically converges to a slightly higher floor than ratio MAPE
+# because PSNR depends on the quantizer's error distribution which has
+# more variance than the byte-level ratio. Threshold 20% empirically.
+def find_convergence(ys, window=None, threshold_pct=20.0):
+    if not ys:
+        return 0
+    if window is None:
+        window = min(5, max(1, len(ys) // 3))
+    if len(ys) < window:
+        return len(ys)
+    for i in range(window, len(ys)):
+        avg = float(np.nanmean(ys[i-window:i]))
+        if not math.isnan(avg) and avg < threshold_pct:
+            return i - window
+    return len(ys)
+
+convergence_chunks = [find_convergence(ys) for _, _, _, ys, _ in series]
+
+# Plot
+fig, ax = plt.subplots(figsize=(5.4, 3.8))
+MAPE_CAP = 100.0
+for label, color, xs, ys, _ in series:
+    ys_capped = [min(y, MAPE_CAP) for y in ys]
+    window = min(5, max(1, len(ys) // 3))
+    if len(ys) > window:
+        smooth = np.convolve(ys_capped, np.ones(window)/window, mode='valid')
+        smooth_x = list(range(window - 1, len(ys)))
+        ax.plot(smooth_x, smooth, color=color, linewidth=2.0, label=label)
+        ax.plot(xs, ys_capped, color=color, alpha=0.15, linewidth=0.5)
+    else:
+        ax.plot(xs, ys_capped, color=color, linewidth=2.0, label=label)
+
+ax.set_xlabel("Lossy Chunk Index (sequential, NaN/lossless rows skipped)")
+ax.set_ylabel("PSNR MAPE (%)")
+ax.grid(True, alpha=0.25)
+ax.legend(frameon=True, fontsize=9)
+ax.set_ylim(bottom=0, top=MAPE_CAP * 1.05)
+plt.tight_layout()
+plt.savefig(png_path, dpi=220, bbox_inches="tight")
+print(f"\nSaved: {png_path}")
+print(f"Saved: {combined_csv}")
+
+# Summary stats — uses nanmean since the underlying ys list is already
+# filtered, but keep nanmean as a defensive choice in case future emitters
+# leak NaN through.
+print("\n--- PSNR MAPE Convergence Summary ---")
+print("Note: only chunks where the NN picked a quantized config are counted.")
+print("Lossless chunks (NaN sentinel) are filtered upstream so they don't")
+print("dilute the per-workload mean.")
+for (label, _, xs, ys, _), c in zip(series, convergence_chunks):
+    final_avg = float(np.nanmean(ys[-min(20, len(ys)):])) if ys else float("nan")
+    print(f"  {label:15s}: converges ~chunk {c:4d}, "
+          f"final avg PSNR MAPE = {final_avg:.2f}%")
+PY
+}
+
 # ── Banner ────────────────────────────────────────────────────
 print_banner() {
     echo "============================================================"
@@ -839,15 +1046,19 @@ main() {
 
     plot_cross_workload_regret
     plot_cross_workload_mape
+    plot_cross_workload_psnr_mape || \
+        note "PSNR MAPE plot skipped (no lossy chunks — set ERROR_BOUND > 0)"
 
     cat <<EOF
 
 ============================================================
 Complete.  Results:
-  Figure 7a: $RESULTS_DIR/cross_workload_regret.png
-  Figure 7b: $RESULTS_DIR/cross_workload_comp_mape.png
+  Figure 7a: $RESULTS_DIR/cross_workload_regret.png       (top-1 regret)
+  Figure 7b: $RESULTS_DIR/cross_workload_comp_mape.png    (compression-time MAPE)
+  Figure 7c: $RESULTS_DIR/cross_workload_psnr_mape.png    (PSNR MAPE — lossy only)
   Data:      $RESULTS_DIR/cross_workload_regret.csv
              $RESULTS_DIR/cross_workload_comp_mape.csv
+             $RESULTS_DIR/cross_workload_psnr_mape.csv
 ============================================================
 EOF
 }

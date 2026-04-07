@@ -19,6 +19,7 @@ Usage:
 
 import argparse
 import csv
+import math
 import os
 import sys
 from collections import OrderedDict
@@ -228,8 +229,21 @@ _PHASE_ALIASES = {}
 
 
 def _avg_all(all_rows, key):
-    """Average a numeric field across all rows."""
-    return sum(g(r, key) for r in all_rows) / len(all_rows)
+    """Average a numeric field across all rows.
+
+    Skips NaN values (the canonical "no data here" sentinel emitted by the
+    workload patches for lossy-only metrics on lossless chunks). Without this
+    filter, lossless rows that wrote 0.0 would dilute averages of metrics
+    like `mape_psnr`, scaling reported PSNR MAPE down by however many
+    lossless rows were averaged in. Returns NaN if every row was NaN
+    (i.e. nothing to average).
+    """
+    vals = [v for r in all_rows
+              for v in (g(r, key),)
+              if isinstance(v, (int, float)) and not math.isnan(float(v))]
+    if not vals:
+        return float("nan")
+    return sum(vals) / len(vals)
 
 
 def _merge_timestep_phases(rows, ts_csv_path, orig_mib):
@@ -2875,7 +2889,7 @@ def main():
     parser.add_argument("--vpic-csv", help="VPIC aggregate CSV")
     parser.add_argument("--vpic-dir", help="VPIC results directory (e.g. .../eval_NX156_chunk4mb_ts100/balanced_w1-1-1)")
     parser.add_argument("--gs-dir", help="Gray-Scott results directory")
-    parser.add_argument("--sdrbench-dir", help="SDRBench results directory (contains benchmark_*.csv)")
+    # --sdrbench-dir removed: SDRBench loader gone per project rule.
     parser.add_argument("--output-dir", help="Output directory (default: alongside CSV)")
     parser.add_argument("--view", action="append", default=None,
                         help=f"Views to generate: {ALL_VIEWS} (default: all)")
@@ -3043,62 +3057,15 @@ def main():
         except Exception as e:
             print(f"  Warning: VPIC milestone actions plot failed: {e}")
 
-    # ── SDRBench datasets ──
-    sdrbench_dir = args.sdrbench_dir or os.path.join(SCRIPT_DIR, "sdrbench", "results")
-
-    if os.path.isdir(sdrbench_dir) and "summary" in views:
-        import glob as _glob
-        sdr_csvs = sorted(_glob.glob(os.path.join(sdrbench_dir, "benchmark_*.csv")))
-        # Exclude chunk/timestep CSVs
-        sdr_csvs = [c for c in sdr_csvs
-                     if "_chunks" not in c and "_timesteps" not in c
-                     and "_timestep_" not in c]
-        for sdr_csv in sdr_csvs:
-            found_any = True
-            print(f"Loading SDRBench: {sdr_csv}")
-            rows = parse_csv(sdr_csv)
-            if not rows:
-                continue
-            r0 = rows[0]
-            dataset_name = r0.get("dataset", os.path.basename(sdr_csv).replace("benchmark_", "").replace(".csv", ""))
-            orig_bytes = g(r0, "orig_bytes")
-            orig_mib = orig_bytes / (1024 * 1024) if orig_bytes > 1024 else orig_bytes
-            n_ch = int(g(r0, "n_chunks"))
-            chunk_mb = orig_mib / max(n_ch, 1)
-            n_runs = int(g(r0, "n_runs")) if g(r0, "n_runs") else 1
-            meta = f"Dataset: {dataset_name} ({orig_mib:.0f} MiB) | Chunks: {n_ch} x {chunk_mb:.0f} MiB"
-            # Infer cost model policy from directory name
-            dir_lower = sdrbench_dir.lower()
-            if "ratio_only" in dir_lower or "w0-0-1" in dir_lower:
-                meta += " | Policy: ratio-only (w0=0, w1=0, w2=1)"
-            elif "speed_only" in dir_lower or "w1-1-0" in dir_lower:
-                meta += " | Policy: speed-only (w0=1, w1=1, w2=0)"
-            elif "balanced" in dir_lower or "w1-1-1" in dir_lower:
-                meta += " | Policy: balanced (w0=1, w1=1, w2=1)"
-            if n_runs > 1:
-                meta += f" | Runs: {n_runs}"
-
-            # Merge multi-field phases if timestep CSV exists
-            ts_csv = os.path.join(sdrbench_dir, f"benchmark_{dataset_name}_timesteps.csv")
-            if os.path.exists(ts_csv):
-                _merge_timestep_phases(rows, ts_csv, orig_mib)
-
-            out_name = f"benchmark_{dataset_name}.png"
-            _DATASET_TITLES = {
-                "hurricane_isabel": "Hurricane Isabel (Climate, 100x500x500)",
-                "nyx": "Nyx Cosmology (512x512x512)",
-                "cesm_atm": "CESM-ATM Atmosphere (1800x3600)",
-            }
-            display_name = _DATASET_TITLES.get(dataset_name, dataset_name)
-            make_summary_figure(f"SDRBench: {display_name}", rows,
-                                os.path.join(sdrbench_dir, out_name), meta)
+    # SDRBench loader removed: project rule forbids static archives.
+    # The visualizer now only handles live-simulation outputs (Gray-Scott, VPIC,
+    # plus per-simulation CSVs from the Paper_Evaluations scripts).
 
     if not found_any:
         print("ERROR: No benchmark CSV files found.")
         print("Expected locations:")
         for p in DEFAULT_GS_AGG + DEFAULT_VPIC_AGG:
             print(f"  {p}")
-        print(f"  {sdrbench_dir}/benchmark_*.csv")
         print("\nRun benchmarks first, or specify paths explicitly.")
         sys.exit(1)
 
@@ -3114,15 +3081,7 @@ def main():
         rows = parse_csv(vpic_agg)
         if rows:
             all_datasets_for_comparison.append(("VPIC", rows))
-    if os.path.isdir(sdrbench_dir):
-        import glob as _glob2
-        for sdr_csv in sorted(_glob2.glob(os.path.join(sdrbench_dir, "benchmark_*.csv"))):
-            if "_chunks" in sdr_csv or "_timesteps" in sdr_csv or "_timestep_" in sdr_csv:
-                continue
-            rows = parse_csv(sdr_csv)
-            if rows:
-                ds = rows[0].get("dataset", os.path.basename(sdr_csv).replace("benchmark_", "").replace(".csv", ""))
-                all_datasets_for_comparison.append((ds, rows))
+    # SDRBench multi-dataset comparison loader removed (project rule).
 
     if len(all_datasets_for_comparison) >= 2 and "summary" in views:
         out_dir = args.output_dir or os.path.join(SCRIPT_DIR, "results")
@@ -3140,13 +3099,7 @@ def main():
     if gs_chunks_path and os.path.exists(gs_chunks_path):
         chunk_csv_paths.append(("Gray-Scott", gs_chunks_path))
 
-    if os.path.isdir(sdrbench_dir):
-        import glob as _glob3
-        for sdr_csv in sorted(_glob3.glob(os.path.join(sdrbench_dir, "benchmark_*_chunks.csv"))):
-            if "_timestep_" in sdr_csv:
-                continue
-            ds = os.path.basename(sdr_csv).replace("benchmark_", "").replace("_chunks.csv", "")
-            chunk_csv_paths.append((ds, sdr_csv))
+    # SDRBench chunk CSV loader removed (project rule).
 
     if chunk_csv_paths and "summary" in views:
         out_dir = args.output_dir or os.path.join(SCRIPT_DIR, "results")

@@ -227,7 +227,11 @@ Nyx::writePlotFile (const std::string& dir,
         const char* wp = weights_path.empty() ? NULL : weights_path.c_str();
         vol_fapl = gpucompress_nyx_bridge::init(wp);
 
-        /* Policy: speed (w0=1,w1=0,w2=0), balanced (w0=1,w1=1,w2=0.5), ratio (w0=0,w1=0,w2=1) */
+        /* Policy: speed (w0=1,w1=0,w2=0), balanced (w0=1,w1=1,w2=1), ratio (w0=0,w1=0,w2=1).
+         * The 'balanced' weights MUST match the other workloads (VPIC, WarpX,
+         * LAMMPS) so the cross-workload regret figure compares like-for-like
+         * cost models. Earlier versions of this patch used (1,1,0.5) which
+         * silently broke comparability — see Section 7.1 audit notes. */
         std::string policy = "ratio";
         pp_gc.query("gpucompress_policy", policy);
         if (policy == "speed")
@@ -267,6 +271,30 @@ Nyx::writePlotFile (const std::string& dir,
     }
     gpucompress_algorithm_t algo = gpucompress_algorithm_from_string(algo_str.c_str());
 
+    /* Parse error_bound and chunk_mb ONCE at the top of every plotfile call.
+     * Both DiagLogger.open() and write_multifab_compressed() consume them, so
+     * they must be available before either is invoked. Earlier versions of
+     * this patch parsed them only at the write_multifab call site, leaving
+     * DiagLogger initialized with hardcoded 0.0 / 4 MiB defaults — which made
+     * the ranking profiler compute top-1 regret against the wrong oracle on
+     * any lossy run. */
+    double gpuc_error_bound = 0.0;
+    int    gpuc_chunk_mb    = 4;
+    {
+        ParmParse pp_eb("nyx");
+        pp_eb.query("gpucompress_error_bound", gpuc_error_bound);
+        pp_eb.query("gpucompress_chunk_mb",    gpuc_chunk_mb);
+    }
+    size_t gpuc_chunk_bytes = (size_t)gpuc_chunk_mb * 1024 * 1024;
+
+    /* Phase string used to tag CSV rows. The Section 7.1 cross-workload
+     * plotter filters by phase prefix, so this must match what the runner
+     * passes for the other workloads (default: nn-rl+exp50). Settable via
+     * env var NYX_PHASE so the runner can sweep phases without recompiling. */
+    const char* nyx_phase_env = getenv("NYX_PHASE");
+    const char* nyx_phase = (nyx_phase_env && nyx_phase_env[0]) ? nyx_phase_env
+                                                                : "nn-rl+exp50";
+
     /* Per-chunk diagnostic logger for cross-workload regret benchmarks */
     static gpucompress_nyx_bridge::DiagLogger diag_logger;
     static int nyx_write_count = 0;
@@ -282,7 +310,9 @@ Nyx::writePlotFile (const std::string& dir,
               if (pi <= 0) pi = 1; }
             int est_writes = (pi > 0) ? (ms / pi + 1) : 10;
 
-            /* Read policy weights */
+            /* Read policy weights — must match the runtime cost model set
+             * above (lines 233-238). Any drift between this block and the
+             * earlier one silently breaks ranking-profiler regret numbers. */
             float lw0 = 1, lw1 = 1, lw2 = 1;
             std::string lpol = "ratio";
             { ParmParse pp("nyx"); pp.query("gpucompress_policy", lpol); }
@@ -292,9 +322,15 @@ Nyx::writePlotFile (const std::string& dir,
 
             if (ParallelDescriptor::IOProcessor()) {
                 amrex::UtilCreateDirectory(log_dir, 0755);
+                /* Pass the parsed error_bound and chunk_bytes through so the
+                 * ranking profiler oracle uses the same values the actual
+                 * compression run uses. */
                 diag_logger.open(log_dir, "nyx", est_writes,
-                                 lw0, lw1, lw2, 0.0, 4*1024*1024);
-                amrex::Print() << "[GPUCompress] Chunk CSV logging to " << log_dir << "\n";
+                                 lw0, lw1, lw2, gpuc_error_bound, gpuc_chunk_bytes);
+                amrex::Print() << "[GPUCompress] Chunk CSV logging to " << log_dir
+                               << " (error_bound=" << gpuc_error_bound
+                               << " chunk_mb=" << gpuc_chunk_mb
+                               << " phase=" << nyx_phase << ")\n";
             }
         }
     }
@@ -302,19 +338,14 @@ Nyx::writePlotFile (const std::string& dir,
     /* Write compressed HDF5 via VOL — same pattern as VPIC deck */
     std::string gpuc_dir = dir_final + "_gpuc";
     Real t0 = ParallelDescriptor::second();
-    double gpuc_error_bound = 0.0;
-    { ParmParse pp_eb("nyx"); pp_eb.query("gpucompress_error_bound", gpuc_error_bound); }
 
     long orig_bytes = gpucompress_nyx_bridge::write_multifab_compressed(
         gpuc_dir, plotMF, varnames, vol_fapl,
-        [&]() -> size_t {
-            int cmb = 4; ParmParse pp_cb("nyx"); pp_cb.query("gpucompress_chunk_mb", cmb);
-            return (size_t)cmb * 1024 * 1024;
-        }() /* chunk bytes from nyx.gpucompress_chunk_mb */,
+        gpuc_chunk_bytes,
         algo, gpuc_error_bound,
         gpucompress_verify != 0 /* verify */,
         diag_logger.enabled ? &diag_logger : nullptr,
-        "nn-rl+exp50", nyx_write_count);
+        nyx_phase, nyx_write_count);
     nyx_write_count++;
     Real elapsed_ms = (ParallelDescriptor::second() - t0) * 1000.0;
 

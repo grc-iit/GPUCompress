@@ -45,6 +45,18 @@ static double s_error_bound = 0.0;
 static int   s_chunk_bytes = 4 * 1024 * 1024;
 static bool  s_learning_initialized = false;
 
+/* In-situ decompression profiling. When set, every H5Dwrite is followed
+ * by an in-process H5Dread of the same file (page-cache hit, no real
+ * disk I/O). The H5Dread routes through the GPUCompress VOL, which
+ * times the nvCOMP decompress kernel with cudaEventRecord and updates
+ * the same chunk-history slot the write filled — so each slot ends up
+ * with both predicted_decomp_time (set at write) and decompression_ms_raw
+ * (set at read), enabling per-chunk decomp MAPE in the CSV.
+ *
+ * Enabled by env var WARPX_PROFILE_DECOMP=1. The threshold sweep
+ * always sets it; production WarpX runs leave it off and pay nothing. */
+static bool  s_profile_decomp = false;
+
 static void action_to_str_warpx(int action, char *buf, size_t bufsz) {
     static const char* algo_names[] = {"lz4","snappy","deflate","gdeflate","zstd","ans","cascaded","bitcomp"};
     int algo = action % 8;
@@ -107,6 +119,19 @@ FlushFormatGPUCompress::FlushFormatGPUCompress ()
                            << " explore_thresh=" << explore_thresh << "\n";
         }
 
+        /* Parse in-situ decomp profiling toggle (off by default; the
+         * threshold sweep always enables it). Done once at constructor
+         * time so the WriteToFile hot path can branch on a static. */
+        {
+            const char* pd_env = std::getenv("WARPX_PROFILE_DECOMP");
+            s_profile_decomp = (pd_env && atoi(pd_env) != 0);
+            if (s_profile_decomp && amrex::ParallelDescriptor::IOProcessor()) {
+                amrex::Print() << "[GPUCompress] In-situ decompression profiling enabled "
+                                  "(every H5Dwrite is followed by an in-process H5Dread "
+                                  "to populate decompression_ms_raw in chunk history)\n";
+            }
+        }
+
         /* Open per-chunk CSV + ranking CSV if WARPX_LOG_DIR is set */
         const char* log_dir = std::getenv("WARPX_LOG_DIR");
         if (log_dir && log_dir[0] && !s_tc_csv && amrex::ParallelDescriptor::IOProcessor()) {
@@ -133,12 +158,20 @@ FlushFormatGPUCompress::FlushFormatGPUCompress ()
                      "%s/benchmark_warpx_timestep_chunks.csv", log_dir);
             s_tc_csv = fopen(csv_path, "w");
             if (s_tc_csv) {
+                /* PSNR columns (predicted_psnr_db, actual_psnr_db, mape_psnr)
+                 * are populated only for chunks where the NN selected a
+                 * quantized config. Lossless chunks emit `nan` for all three
+                 * so cross-timestep aggregators using nanmean correctly skip
+                 * them rather than averaging zeros (which silently scales
+                 * down the reported PSNR MAPE). */
                 fprintf(s_tc_csv, "rank,phase,timestep,chunk,"
                         "predicted_ratio,actual_ratio,"
                         "predicted_comp_ms,actual_comp_ms_raw,"
                         "mape_ratio,mape_comp,"
                         "sgd_fired,exploration_triggered,"
-                        "cost_model_error_pct,actual_cost,predicted_cost\n");
+                        "cost_model_error_pct,actual_cost,predicted_cost,"
+                        "predicted_decomp_ms,actual_decomp_ms_raw,mape_decomp,"
+                        "predicted_psnr_db,actual_psnr_db,mape_psnr\n");
             }
 
             snprintf(csv_path, sizeof(csv_path),
@@ -289,46 +322,31 @@ FlushFormatGPUCompress::WriteToFile (
                      * compresses each chunk on GPU before writing */
                     H5Dwrite(dset, h5type, H5S_ALL, H5S_ALL, H5P_DEFAULT, d_ptr);
 
-                    /* Log per-chunk diagnostics to CSV */
-                    if (s_tc_csv && amrex::ParallelDescriptor::IOProcessor()) {
-                        int n_hist = gpucompress_get_chunk_history_count();
-                        for (int ci = 0; ci < n_hist; ci++) {
-                            gpucompress_chunk_diag_t dd;
-                            if (gpucompress_get_chunk_diag(ci, &dd) != 0) continue;
-                            double mr = 0, mc = 0;
-                            if (dd.actual_ratio > 0)
-                                mr = std::fabs(dd.predicted_ratio - dd.actual_ratio)
-                                     / std::fabs(dd.actual_ratio) * 100.0;
-                            if (dd.compression_ms > 0)
-                                mc = std::fabs(dd.predicted_comp_time - dd.compression_ms)
-                                     / std::fabs(dd.compression_ms) * 100.0;
-                            char act_s[40], orig_s[40];
-                            action_to_str_warpx(dd.nn_action, act_s, sizeof(act_s));
-                            action_to_str_warpx(dd.nn_original_action, orig_s, sizeof(orig_s));
-                            fprintf(s_tc_csv,
-                                    "0,nn-rl+exp50,%d,%d,"
-                                    "%.4f,%.4f,%.4f,%.4f,"
-                                    "%.2f,%.2f,%d,%d,"
-                                    "%.4f,%.4f,%.4f\n",
-                                    s_write_count, ci,
-                                    (double)dd.predicted_ratio, (double)dd.actual_ratio,
-                                    (double)dd.predicted_comp_time, (double)dd.compression_ms_raw,
-                                    mr, mc, dd.sgd_fired, dd.exploration_triggered,
-                                    (double)dd.cost_model_error_pct,
-                                    (double)dd.actual_cost, (double)dd.predicted_cost);
-                        }
-                        fflush(s_tc_csv);
-                    }
-
-                    /* Verify round-trip if requested */
-                    if (verify && m_initialized) {
+                    /* ── Optional in-situ read-back ──
+                     *
+                     * If decomp profiling or verify is enabled, reopen the
+                     * file we just wrote and H5Dread it. The read routes
+                     * through the GPUCompress VOL, which times the nvCOMP
+                     * decompress kernel with cudaEventRecord and updates
+                     * decompression_ms_raw / decompression_ms in the SAME
+                     * chunk-history slots that H5Dwrite filled. After this
+                     * block returns, every slot that compressed will also
+                     * have its decomp timing populated.
+                     *
+                     * Note: chunk history is not reset between write and
+                     * read — the read updates existing slots in place. See
+                     * src/hdf5/H5VLgpucompress.cu:2181 and
+                     * src/api/gpucompress_diagnostics.cpp:74. This is the
+                     * same pattern VPIC and sdrbench use. */
+                    if (m_initialized && (s_profile_decomp || verify)) {
                         cudaDeviceSynchronize();
-                        H5Dclose(dset);
-                        H5Pclose(dcpl);
-                        H5Sclose(space);
-                        H5Fclose(fid);
+                        /* Close the writer's handles so the file is fully
+                         * flushed before we reopen it. */
+                        H5Dclose(dset);  dset  = H5I_INVALID_HID;
+                        H5Pclose(dcpl);  dcpl  = H5I_INVALID_HID;
+                        H5Sclose(space); space = H5I_INVALID_HID;
+                        H5Fclose(fid);   fid   = H5I_INVALID_HID;
 
-                        /* Read back and compare bitwise */
                         hid_t rfid = H5Fopen(fname, H5F_ACC_RDONLY, fapl);
                         if (rfid >= 0) {
                             hid_t rdset = H5Dopen2(rfid, "data", H5P_DEFAULT);
@@ -339,37 +357,132 @@ FlushFormatGPUCompress::WriteToFile (
                                         H5P_DEFAULT, d_readback);
                                 cudaDeviceSynchronize();
 
-                                /* Host-side comparison */
-                                std::vector<char> h_orig(fab_bytes);
-                                std::vector<char> h_read(fab_bytes);
-                                cudaMemcpy(h_orig.data(), d_ptr, fab_bytes,
-                                           cudaMemcpyDeviceToHost);
-                                cudaMemcpy(h_read.data(), d_readback, fab_bytes,
-                                           cudaMemcpyDeviceToHost);
-                                cudaFree(d_readback);
-
-                                if (std::memcmp(h_orig.data(), h_read.data(), fab_bytes) != 0) {
-                                    amrex::Print()
-                                        << "[GPUCompress] VERIFY FAILED: "
-                                        << vname << " lev" << lev
-                                        << " fab" << fab_idx << "\n";
-                                    amrex::Abort("GPUCompress lossless verification failed");
+                                /* Bitwise verify (host-side memcmp) only when
+                                 * gpucompress.verify=1 was requested in the
+                                 * inputs deck. Decomp profiling alone skips
+                                 * this — the chunk-history update happens
+                                 * inside H5Dread regardless. */
+                                if (verify) {
+                                    std::vector<char> h_orig(fab_bytes);
+                                    std::vector<char> h_read(fab_bytes);
+                                    cudaMemcpy(h_orig.data(), d_ptr, fab_bytes,
+                                               cudaMemcpyDeviceToHost);
+                                    cudaMemcpy(h_read.data(), d_readback, fab_bytes,
+                                               cudaMemcpyDeviceToHost);
+                                    if (std::memcmp(h_orig.data(), h_read.data(),
+                                                    fab_bytes) != 0) {
+                                        amrex::Print()
+                                            << "[GPUCompress] VERIFY FAILED: "
+                                            << vname << " lev" << lev
+                                            << " fab" << fab_idx << "\n";
+                                        cudaFree(d_readback);
+                                        H5Dclose(rdset);
+                                        H5Fclose(rfid);
+                                        amrex::Abort("GPUCompress lossless verification failed");
+                                    }
                                 }
+                                cudaFree(d_readback);
                                 H5Dclose(rdset);
                             }
                             H5Fclose(rfid);
                         }
-                        /* Skip normal cleanup since we did it above */
-                        total_original += fab_bytes;
-                        continue;
                     }
 
-                    H5Dclose(dset);
+                    /* ── Per-chunk CSV row ──
+                     *
+                     * Walk chunk history once. By this point each slot has:
+                     *   - compress-time fields from H5Dwrite (predicted_*,
+                     *     compression_ms_raw, actual_ratio, …)
+                     *   - decomp-time fields from H5Dread (decompression_ms_raw,
+                     *     decompression_ms), if the read-back ran. Otherwise
+                     *     decompression_ms_raw is 0 and the row's mape_decomp
+                     *     comes out as 0, which the aggregator skips. */
+                    if (s_tc_csv && amrex::ParallelDescriptor::IOProcessor()) {
+                        int n_hist = gpucompress_get_chunk_history_count();
+                        for (int ci = 0; ci < n_hist; ci++) {
+                            gpucompress_chunk_diag_t dd;
+                            if (gpucompress_get_chunk_diag(ci, &dd) != 0) continue;
+                            /* Per-chunk MAPE in percent.
+                             *
+                             * Both heads of the NN clamp their outputs to a
+                             * 5 ms floor (training artifact), so the
+                             * comparison must use the same clamped denominator
+                             * — otherwise we'd be comparing a clamped
+                             * prediction against a sub-millisecond actual and
+                             * the MAPE explodes. Gate on the unclamped raw
+                             * wall-clock so every measured chunk gets a row,
+                             * but use max(raw, 5) as the denominator. */
+                            double mr = 0, mc = 0, md = 0;
+                            if (dd.actual_ratio > 0)
+                                mr = std::fabs(dd.predicted_ratio - dd.actual_ratio)
+                                     / std::fabs(dd.actual_ratio) * 100.0;
+                            if (dd.compression_ms_raw > 0) {
+                                double clamped =
+                                    std::max((double)dd.compression_ms_raw, 5.0);
+                                mc = std::fabs((double)dd.predicted_comp_time - clamped)
+                                     / clamped * 100.0;
+                            }
+                            if (dd.decompression_ms_raw > 0) {
+                                double clamped =
+                                    std::max((double)dd.decompression_ms_raw, 5.0);
+                                md = std::fabs((double)dd.predicted_decomp_time - clamped)
+                                     / clamped * 100.0;
+                            }
+                            /* PSNR MAPE: lossless filter via the actual_psnr
+                             * = -1.0 sentinel set in gpucompress_compress.cpp:259.
+                             * For lossless chunks we emit NaN (not 0) so the
+                             * cross-timestep aggregator can use nanmean and
+                             * skip them entirely. The compression-side analytical
+                             * PSNR is only set when quantize_simple actually
+                             * ran, so this gate is the same one VPIC and the
+                             * NYX bridge use. */
+                            double mp;
+                            double pred_psnr_out, actual_psnr_out;
+                            if (dd.predicted_psnr > 0.0f
+                                && std::isfinite(dd.actual_psnr)
+                                && dd.actual_psnr > 0.0f) {
+                                mp = std::fabs((double)dd.predicted_psnr
+                                               - (double)dd.actual_psnr)
+                                     / std::fabs((double)dd.actual_psnr) * 100.0;
+                                if (mp > 200.0) mp = 200.0;
+                                pred_psnr_out   = (double)dd.predicted_psnr;
+                                actual_psnr_out = (double)dd.actual_psnr;
+                            } else {
+                                mp              = std::nan("");
+                                pred_psnr_out   = std::nan("");
+                                actual_psnr_out = std::nan("");
+                            }
+                            char act_s[40], orig_s[40];
+                            action_to_str_warpx(dd.nn_action, act_s, sizeof(act_s));
+                            action_to_str_warpx(dd.nn_original_action, orig_s, sizeof(orig_s));
+                            fprintf(s_tc_csv,
+                                    "0,nn-rl+exp50,%d,%d,"
+                                    "%.4f,%.4f,%.4f,%.4f,"
+                                    "%.2f,%.2f,%d,%d,"
+                                    "%.4f,%.4f,%.4f,"
+                                    "%.4f,%.4f,%.2f,"
+                                    "%.4f,%.4f,%.2f\n",
+                                    s_write_count, ci,
+                                    (double)dd.predicted_ratio, (double)dd.actual_ratio,
+                                    (double)dd.predicted_comp_time, (double)dd.compression_ms_raw,
+                                    mr, mc, dd.sgd_fired, dd.exploration_triggered,
+                                    (double)dd.cost_model_error_pct,
+                                    (double)dd.actual_cost, (double)dd.predicted_cost,
+                                    (double)dd.predicted_decomp_time,
+                                    (double)dd.decompression_ms_raw, md,
+                                    pred_psnr_out, actual_psnr_out, mp);
+                        }
+                        fflush(s_tc_csv);
+                    }
                 }
 
-                H5Pclose(dcpl);
-                H5Sclose(space);
-                H5Fclose(fid);
+                /* Unified cleanup. The read-back branch above closes its own
+                 * handles and sets them to H5I_INVALID_HID, so the guards
+                 * here are no-ops in that case. */
+                if (dset  >= 0) H5Dclose(dset);
+                if (dcpl  >= 0) H5Pclose(dcpl);
+                if (space >= 0) H5Sclose(space);
+                if (fid   >= 0) H5Fclose(fid);
 
                 total_original += fab_bytes;
             }
