@@ -237,8 +237,14 @@ WORKLOADS=(
     nyx
     warpx
     lammps
-    # ai  # Temporarily disabled
+    ai
 )
+
+# Python binary for the AI workload. The ViT/resnet training script depends
+# on torch+torchvision, which are installed in the project venv at
+# /home/cc/gpuc-venv rather than system python. Override via AI_PYTHON if
+# your venv lives elsewhere.
+export AI_PYTHON="${AI_PYTHON:-/home/cc/gpuc-venv/bin/python3}"
 
 # Determine which policies to run
 if [ -n "$ONLY_POLICY" ]; then

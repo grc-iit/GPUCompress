@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot NN 5-fold CV MAPE and R² bar charts.
+"""Plot NN CV MAPE and R² bar charts.
 
 Parses the full-pipeline output file automatically, or accepts hardcoded values.
 Produces two PNGs:
@@ -11,11 +11,13 @@ Usage:
     python scripts/plot_cv_comparison.py full-pipeline-12345.out  # specific file
 """
 
+import re
+import glob
+import sys
+from collections import defaultdict
+
 import matplotlib.pyplot as plt
 import numpy as np
-import sys
-import glob
-import re
 
 
 def parse_cv_summary(filepath):
@@ -54,6 +56,43 @@ def parse_cv_summary(filepath):
     return results
 
 
+def parse_cv_folds(filepath):
+    """Fallback parser for live/incomplete CV logs.
+
+    Parses per-fold metric lines like:
+      compression_time_ms  MAE= 15.0636  R²=0.2854  MAPE= 86.6%
+    and aggregates mean/std across all observed folds.
+    """
+    with open(filepath) as f:
+        text = f.read()
+
+    # key -> dict(metric -> list)
+    acc = defaultdict(lambda: {'mae': [], 'r2': [], 'mape': []})
+
+    # Optional [lossy-only] suffix is ignored.
+    pat = re.compile(
+        r'^\s+(\S+)\s+MAE=\s*([0-9.eE+-]+)\s+R²=\s*([0-9.eE+-]+)\s+MAPE=\s*([0-9.eE+-]+)%',
+        re.MULTILINE
+    )
+    for m in pat.finditer(text):
+        name = m.group(1)
+        acc[name]['mae'].append(float(m.group(2)))
+        acc[name]['r2'].append(float(m.group(3)))
+        acc[name]['mape'].append(float(m.group(4)))
+
+    if not acc:
+        return {}
+
+    out = {'nn': {}}
+    for name, vals in acc.items():
+        out['nn'][name] = {
+            'mae': (float(np.mean(vals['mae'])), float(np.std(vals['mae']))),
+            'r2': (float(np.mean(vals['r2'])), float(np.std(vals['r2']))),
+            'mape': (float(np.mean(vals['mape'])), float(np.std(vals['mape']))),
+        }
+    return out
+
+
 # Output display order and labels
 OUTPUT_ORDER = [
     ('compression_time_ms', 'Compression\nTime'),
@@ -78,8 +117,11 @@ print(f"Parsing: {logfile}")
 results = parse_cv_summary(logfile)
 
 if 'nn' not in results:
-    print("Could not find NN CV summary in the file.")
-    sys.exit(1)
+    print("Summary block not found; falling back to fold-level aggregation.")
+    results = parse_cv_folds(logfile)
+    if 'nn' not in results:
+        print("Could not find usable NN CV metrics in the file.")
+        sys.exit(1)
 
 # Build arrays
 labels = []
@@ -160,6 +202,13 @@ def _r2_linear_chart(values, errs, out_path):
 # MAPE chart on log y-axis with floor cap so quality bars (PSNR/MAE/SSIM)
 # are visible alongside the much larger timing bars.
 _mape_log_chart(nn_mape, mape_std, 'neural_net/weights/cv_comparison.png')
+
+# Log tiny-quality MAPE values explicitly for easier reading in terminal logs.
+for k in ['mean_abs_err', 'ssim']:
+    if k in results['nn']:
+        m = results['nn'][k]['mape'][0]
+        safe_m = max(m, 1e-12)
+        print(f"{k} MAPE: {m:.6f}%  log10(MAPE)={np.log10(safe_m):.4f}")
 
 # R² chart on linear scale (values are already in 0..1 range — readable).
 _r2_linear_chart(nn_r2, r2_std, 'neural_net/weights/cv_r2.png')

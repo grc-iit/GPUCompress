@@ -58,6 +58,9 @@ METRIC_DEFS = [
 
 
 def chunks_csv(rdir, key):
+    if key == "ai":
+        p = os.path.join(rdir, "ai", "inline_benchmark_chunks.csv")
+        return p if os.path.isfile(p) else None
     p = os.path.join(rdir, key, f"benchmark_{key}_timestep_chunks.csv")
     if os.path.isfile(p):
         return p
@@ -117,6 +120,154 @@ def final_mean(vals, frac=0.2):
         return None
     n = max(1, int(round(len(vals) * frac)))
     return float(np.mean(vals[-n:]))
+
+
+# ============================================================
+# AI-specific loader
+# ============================================================
+#
+# The AI workload emits a different CSV schema because it uses
+# gpucompress_inline_benchmark (not the HDF5 VOL). Every
+# (epoch, tensor, chunk_idx) group has up to 15 rows: 9 fixed
+# algorithms (mode='-' policy='-') + 6 NN configs (3 learning
+# modes × 2 policies). No pre-computed mape_* columns — we have
+# to compute them here from the raw comp_ms / predicted_comp_time
+# / actual_ratio / predicted_ratio fields.
+#
+# Regret is computed the same way the live sims compute it: find
+# the cost of the NN's chosen row, find the oracle cost (minimum
+# across all 15 rows in the group), ratio them, subtract 1,
+# multiply by 100. Cost is the policy-weighted scalar from the
+# live-sim cost model (see src/api/gpucompress_compress.cpp:541-544).
+#
+# Matches the in-runner plotter in 7.1_run_equalized_cross_workload_regret.sh
+# (load_ai_inline_chunks_regret / _comp_mape) so numbers align.
+
+
+def _policy_weights(policy):
+    if policy == "speed":    return (1.0, 0.0, 0.0)
+    if policy == "balanced": return (1.0, 1.0, 1.0)
+    if policy == "ratio":    return (0.0, 0.0, 1.0)
+    return (1.0, 1.0, 1.0)
+
+
+def _compute_cost(comp_ms, decomp_ms, ratio, chunk_bytes, w0, w1, w2,
+                  bw_bytes_per_ms=5e6):
+    """Matches the live-sim cost model with the same policy clamps
+    (ct/dt floor 5 ms, ratio cap 100x). bw_bytes_per_ms default
+    matches the 5 GB/s assumption in gpucompress_compress.cpp."""
+    ct = max(5.0, comp_ms)
+    dt = max(5.0, decomp_ms)
+    r  = min(100.0, ratio) if ratio > 0 else 0.01
+    io_cost = chunk_bytes / (r * bw_bytes_per_ms) if r > 0 else 1e30
+    return w0 * ct + w1 * dt + w2 * io_cost
+
+
+def load_ai_inline_chunks(path, policy, chunk_mb,
+                          nn_mode="nn-rl+exp50",
+                          bw_bytes_per_ms=5e6):
+    """Parse inline_benchmark_chunks.csv into per-group metric lists
+    aligned to match the live-sim chunk CSV schema.
+
+    Returns a dict with keys:
+      cost_mape    list of (|predicted_cost − actual_cost|/actual_cost)*100  (%)
+      regret       list of (nn_pick_cost/oracle_cost − 1)*100                (%)
+      mape_comp, mape_decomp, mape_ratio, mape_psnr
+                   list of per-group MAPEs for the NN-picked row             (%)
+    """
+    out = {k: [] for k in ("cost_mape", "regret",
+                           "mape_comp", "mape_decomp",
+                           "mape_ratio", "mape_psnr")}
+    if not path or not os.path.isfile(path):
+        return out
+
+    chunk_bytes = int(chunk_mb) * 1024 * 1024
+    w0, w1, w2 = _policy_weights(policy)
+
+    # Group rows by (epoch, tensor, chunk_idx)
+    groups = {}
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            try:
+                key = (int(row["epoch"]), row["tensor"], int(row["chunk_idx"]))
+            except (KeyError, ValueError):
+                continue
+            groups.setdefault(key, []).append(row)
+
+    # Sort groups so the series is deterministic across runs
+    for key in sorted(groups.keys(), key=lambda k: (k[0], k[1], k[2])):
+        rows = groups[key]
+        # Compute the actual cost for every row in the group
+        costs = []
+        nn_row = None
+        for r in rows:
+            try:
+                comp_ms   = float(r.get("comp_ms", 0) or 0)
+                decomp_ms = float(r.get("decomp_ms", 0) or 0)
+                ratio     = float(r.get("actual_ratio", 0) or 0)
+            except ValueError:
+                continue
+            c = _compute_cost(comp_ms, decomp_ms, ratio, chunk_bytes,
+                              w0, w1, w2, bw_bytes_per_ms)
+            costs.append((r, c))
+            if r.get("mode", "") == nn_mode and r.get("policy", "") == policy:
+                nn_row = (r, c)
+
+        if nn_row is None or not costs:
+            continue
+
+        nn_r, nn_cost = nn_row
+        oracle_cost = min(c for _, c in costs)
+        if oracle_cost <= 0:
+            continue
+        regret_pct = (nn_cost / oracle_cost - 1.0) * 100.0
+        out["regret"].append(regret_pct)
+
+        # Per-metric MAPE for the NN-picked row
+        try:
+            pred_ct  = float(nn_r.get("predicted_comp_time", 0) or 0)
+            pred_dt  = float(nn_r.get("predicted_decomp_time", 0) or 0)
+            pred_r   = float(nn_r.get("predicted_ratio", 0) or 0)
+            pred_psnr= float(nn_r.get("predicted_psnr", 0) or 0)
+            comp_ms  = float(nn_r.get("comp_ms", 0) or 0)
+            decomp_ms= float(nn_r.get("decomp_ms", 0) or 0)
+            act_r    = float(nn_r.get("actual_ratio", 0) or 0)
+            act_psnr = float(nn_r.get("actual_psnr", 0) or 0)
+        except ValueError:
+            continue
+
+        # Comp-time MAPE (5 ms floor matches the NN clamp)
+        denom_ct = max(comp_ms, 5.0)
+        mape_comp = abs(pred_ct - denom_ct) / denom_ct * 100.0
+        out["mape_comp"].append(min(200.0, mape_comp))
+
+        # Decomp-time MAPE
+        denom_dt = max(decomp_ms, 5.0)
+        mape_decomp = abs(pred_dt - denom_dt) / denom_dt * 100.0
+        out["mape_decomp"].append(min(200.0, mape_decomp))
+
+        # Comp ratio MAPE
+        if act_r > 0:
+            mape_ratio = abs(pred_r - act_r) / act_r * 100.0
+            out["mape_ratio"].append(min(200.0, mape_ratio))
+
+        # PSNR MAPE (only valid if lossy and PSNR actually measured)
+        if pred_psnr > 0 and act_psnr > 0 and math.isfinite(act_psnr):
+            mape_psnr = abs(pred_psnr - act_psnr) / act_psnr * 100.0
+            out["mape_psnr"].append(min(200.0, mape_psnr))
+
+        # Cost MAPE from the NN row's predicted cost (using its own
+        # predicted_comp_time/decomp_time/ratio) vs measured actual cost.
+        nn_predicted_cost = _compute_cost(
+            pred_ct if pred_ct > 0 else comp_ms,
+            pred_dt if pred_dt > 0 else decomp_ms,
+            pred_r if pred_r > 0 else act_r,
+            chunk_bytes, w0, w1, w2, bw_bytes_per_ms)
+        if nn_cost > 0:
+            cost_mape = abs(nn_predicted_cost - nn_cost) / nn_cost * 100.0
+            out["cost_mape"].append(min(200.0, cost_mape))
+
+    return out
 
 
 def plot_line(series, title, ylabel, png_path, csv_path, cap=None):
@@ -225,11 +376,32 @@ def build_for_policy(sc26_dir, policy):
     bar_data = []
     any_workload = False
 
+    chunk_mb = int(os.environ.get("CHUNK_MB", "32"))
+
     for key, label, color in WORKLOADS:
         rdir = os.path.join(sc26_dir, f"{key}_{policy}")
         if not os.path.isdir(rdir):
             continue
         any_workload = True
+
+        if key == "ai":
+            # AI uses inline_benchmark_chunks.csv with a different schema
+            # — compute everything on the fly via load_ai_inline_chunks.
+            ai_path = chunks_csv(rdir, "ai")
+            ai = load_ai_inline_chunks(ai_path, policy, chunk_mb)
+            if ai["cost_mape"]:
+                cost_series.append((label, color, ai["cost_mape"]))
+            if ai["regret"]:
+                regret_series.append((label, color, ai["regret"]))
+            metrics = {
+                "comp":   final_mean(ai["mape_comp"]),
+                "decomp": final_mean(ai["mape_decomp"]),
+                "ratio":  final_mean(ai["mape_ratio"]),
+                "psnr":   final_mean(ai["mape_psnr"]),
+            }
+            bar_data.append((label, color, metrics))
+            continue
+
         cc = chunks_csv(rdir, key)
         rc = ranking_csv(rdir, key)
 

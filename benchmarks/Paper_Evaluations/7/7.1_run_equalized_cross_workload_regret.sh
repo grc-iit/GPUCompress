@@ -307,11 +307,18 @@ run_nyx_sim() {
         return 0
     fi
 
-    # Override parameters for regret evaluation
+    # Override parameters for regret evaluation.
+    # The Sedov deck ships with stop_time=0.01, which terminates the run
+    # around physics step ~187 regardless of max_step. For the cross-workload
+    # sweep we want NYX to emit as many plotfiles as the other workloads, so
+    # override stop_time to a large sentinel (AMReX parses params in order,
+    # last value wins) and let max_step be the controlling bound. Override
+    # via NYX_STOP_TIME if a specific physical stop is needed.
     cat >> "$nyx_work/inputs" <<NYXEOF
 amr.n_cell = $NYX_NCELL $NYX_NCELL $NYX_NCELL
 amr.max_grid_size = $NYX_NCELL
 max_step = $NYX_MAX_STEP
+stop_time = ${NYX_STOP_TIME:-1.0e30}
 amr.plot_int = $NYX_PLOT_INT
 amr.check_int = 0
 nyx.use_gpucompress = 1
@@ -562,10 +569,14 @@ run_ai_sim() {
     note "Running AI training (model=$AI_MODEL epochs=$AI_EPOCHS checkpoints=$AI_CHECKPOINTS)"
     note "  In-situ HDF5 VOL capture via Python ctypes bridge — see scripts/gpucompress_hdf5.py"
 
+    # AI training requires torch+torchvision, which live in the project venv
+    # (system python has neither). Override via AI_PYTHON env var.
+    local ai_python="${AI_PYTHON:-python3}"
+
     GPUCOMPRESS_WEIGHTS="$WEIGHTS" \
     LD_LIBRARY_PATH="$PROJECT_DIR/build:/tmp/hdf5-install/lib:${LD_LIBRARY_PATH:-}" \
     PYTHONPATH="$PROJECT_DIR/scripts:${PYTHONPATH:-}" \
-    python3 "$ai_script" \
+    "$ai_python" "$ai_script" \
         --model "$AI_MODEL" \
         --epochs "$AI_EPOCHS" \
         --checkpoint-epochs "$AI_CHECKPOINTS" \
