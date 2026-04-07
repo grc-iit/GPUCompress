@@ -345,9 +345,9 @@ def cross_validate(csv_paths, n_folds=5, seed=42):
         mape_m = np.mean(all_metrics[name]['mape'])
         mape_s = np.std(all_metrics[name]['mape'])
         tag = ' [lossy-only]' if name in LOSSY_ONLY_OUTPUTS else ''
-        print(f"  {name:<28s}  {mae_m:>6.4f}±{mae_s:.4f}  "
+        print(f"  {name:<28s}  {mae_m:>8.4f}±{mae_s:.4f}  "
               f"{r2_m:>6.4f}±{r2_s:.4f}  "
-              f"{mape_m:>5.1f}±{mape_s:.1f}%{tag}")
+              f"{mape_m:>8.4f}±{mape_s:.4f}%{tag}")
 
 
 if __name__ == '__main__':

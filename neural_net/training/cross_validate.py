@@ -274,9 +274,9 @@ def main():
         mape_mean = np.mean(all_metrics[name]['mape'])
         mape_std = np.std(all_metrics[name]['mape'])
         tag = ' [lossy-only]' if name in LOSSY_ONLY_OUTPUTS else ''
-        print(f"  {name:<28s}  {mae_mean:>6.4f}±{mae_std:.4f}  "
+        print(f"  {name:<28s}  {mae_mean:>8.4f}±{mae_std:.4f}  "
               f"{r2_mean:>6.4f}±{r2_std:.4f}  "
-              f"{mape_mean:>5.1f}±{mape_std:.1f}%{tag}")
+              f"{mape_mean:>8.4f}±{mape_std:.4f}%{tag}")
 
 
 if __name__ == '__main__':

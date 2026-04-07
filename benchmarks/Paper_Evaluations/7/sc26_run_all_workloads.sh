@@ -210,6 +210,22 @@ run_one() {
     # Append timing row (CSV-quote any commas in fields just in case)
     echo "$workload,$policy,$elapsed,$start_iso,$end_iso,$rc,$rdir,$run_log" >> "$TIMING_CSV"
 
+    # Aggregate cross_workload_* artifacts into the top-level csv/ and
+    # figures/ subdirs, prefixed by workload+policy so files don't collide.
+    mkdir -p "$SC26_DIR/figures" "$SC26_DIR/csv"
+    for png in "$rdir"/cross_workload_*.png; do
+        [ -f "$png" ] || continue
+        local base="$(basename "$png")"           # e.g. cross_workload_cost_mape.png
+        local kind="${base#cross_workload_}"      # cost_mape.png
+        cp -f "$png" "$SC26_DIR/figures/${rname}_${kind}"
+    done
+    for csv in "$rdir"/cross_workload_*.csv; do
+        [ -f "$csv" ] || continue
+        local base="$(basename "$csv")"
+        local kind="${base#cross_workload_}"
+        cp -f "$csv" "$SC26_DIR/csv/${rname}_${kind}"
+    done
+
     return $rc
 }
 
@@ -256,6 +272,22 @@ done
 
 SWEEP_END=$(date +%s)
 TOTAL=$((SWEEP_END - SWEEP_START))
+
+# ── Combined cross-workload figures (Figures 1, 2, 3) ───────
+COMBINED_PLOTTER="$SCRIPT_DIR/sc26_combined_plots.py"
+if [ -f "$COMBINED_PLOTTER" ]; then
+    {
+        echo ""
+        echo "============================================================"
+        echo "Building combined cross-workload figures"
+        echo "  Plotter: $COMBINED_PLOTTER"
+        echo "  Policies: ${POLICIES[*]}"
+        echo "============================================================"
+    } | tee -a "$SWEEP_LOG"
+    python3 "$COMBINED_PLOTTER" --sc26-dir "$SC26_DIR" --policies "${POLICIES[@]}" \
+        2>&1 | tee -a "$SWEEP_LOG" || \
+        echo "WARNING: combined plotter failed (see $SWEEP_LOG)" | tee -a "$SWEEP_LOG"
+fi
 
 # ── Final summary ──────────────────────────────────────────
 {

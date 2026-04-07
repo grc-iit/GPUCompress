@@ -97,35 +97,69 @@ x = np.arange(len(labels))
 width = 0.55
 
 
-def _bar_chart(values, errs, ylabel, value_fmt, out_path,
-               color, edge, hatch, ypad):
+# Floor for the log-MAPE chart: any value parsed as <FLOOR is rendered at
+# FLOOR so it's visible (and not log(0)=-inf). The original cv_report.log
+# rounds quality MAPE to 1 decimal, so e.g. mean_abs_err = "0.0%" gets
+# clamped to FLOOR for display only.
+MAPE_FLOOR = 0.05  # percent
+
+
+def _mape_log_chart(values, errs, out_path):
+    capped = [max(v, MAPE_FLOOR) for v in values]
+    # Clamp lower error bars so they don't go below FLOOR on log scale
+    lower_err = [min(e, max(c - MAPE_FLOOR, 0)) for c, e in zip(capped, errs)]
+    upper_err = list(errs)
+
     fig, ax = plt.subplots(figsize=(16, 6))
-    bars = ax.bar(x, values, width, yerr=errs, capsize=4,
+    bars = ax.bar(x, capped, width, yerr=[lower_err, upper_err], capsize=4,
                   label='Neural Network',
-                  color=color, edgecolor=edge, linewidth=1.2, hatch=hatch)
-    ax.set_ylabel(ylabel, fontsize=12)
+                  color='#AEC7E8', edgecolor='#4C72B0', linewidth=1.2, hatch='///')
+    ax.set_yscale('log')
+    ax.set_ylim(bottom=MAPE_FLOOR * 0.5, top=max(capped) * 3.0)
+    ax.set_ylabel('MAPE (%, log scale)', fontsize=12)
     ax.set_xticks(x)
     ax.set_xticklabels(labels, fontsize=9)
     ax.legend(fontsize=11, loc='upper right')
-    for bar in bars:
+
+    for bar, raw in zip(bars, values):
         h = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width()/2, h + ypad,
-                value_fmt.format(h),
-                ha='center', va='bottom', fontsize=8, color=edge)
+        # Show actual value; mark capped bars with a "<" prefix
+        if raw < MAPE_FLOOR:
+            label = f'<{MAPE_FLOOR:.2f}%'
+        else:
+            label = f'{raw:.2f}%' if raw < 10 else f'{raw:.1f}%'
+        ax.text(bar.get_x() + bar.get_width()/2, h * 1.15,
+                label, ha='center', va='bottom', fontsize=9, color='#4C72B0')
+
     plt.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"Saved: {out_path}")
 
 
-# MAPE chart (lower is better)
-_bar_chart(nn_mape, mape_std,
-           ylabel='MAPE (%)', value_fmt='{:.1f}%',
-           out_path='neural_net/weights/cv_comparison.png',
-           color='#AEC7E8', edge='#4C72B0', hatch='///', ypad=1.0)
+def _r2_linear_chart(values, errs, out_path):
+    fig, ax = plt.subplots(figsize=(16, 6))
+    bars = ax.bar(x, values, width, yerr=errs, capsize=4,
+                  label='Neural Network',
+                  color='#C7E9C0', edgecolor='#2CA02C', linewidth=1.2, hatch='\\\\\\')
+    ax.set_ylabel('R² (coefficient of determination)', fontsize=12)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=9)
+    ax.set_ylim(bottom=0, top=1.10)
+    ax.legend(fontsize=11, loc='upper right')
+    for bar in bars:
+        h = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2, h + 0.02,
+                f'{h:.3f}', ha='center', va='bottom', fontsize=9, color='#2CA02C')
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Saved: {out_path}")
 
-# R² chart (higher is better, capped at 1.0)
-_bar_chart(nn_r2, r2_std,
-           ylabel='R² (coefficient of determination)', value_fmt='{:.3f}',
-           out_path='neural_net/weights/cv_r2.png',
-           color='#C7E9C0', edge='#2CA02C', hatch='\\\\\\', ypad=0.02)
+
+# MAPE chart on log y-axis with floor cap so quality bars (PSNR/MAE/SSIM)
+# are visible alongside the much larger timing bars.
+_mape_log_chart(nn_mape, mape_std, 'neural_net/weights/cv_comparison.png')
+
+# R² chart on linear scale (values are already in 0..1 range — readable).
+_r2_linear_chart(nn_r2, r2_std, 'neural_net/weights/cv_r2.png')
