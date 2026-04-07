@@ -99,3 +99,14 @@ if(CUFILE_LIBRARY)
 else()
     message(STATUS "cuFile not found — skipping CLI tools (gpu_compress, gpu_decompress)")
 endif()
+
+# ============================================================
+# Benchmark executable (GPU-based, no cuFile needed)
+# ============================================================
+add_executable(benchmark scripts/benchmark.cu)
+target_include_directories(benchmark PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(benchmark PRIVATE gpucompress CUDA::cudart)
+set_target_properties(benchmark PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+)

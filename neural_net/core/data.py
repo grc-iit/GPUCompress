@@ -23,6 +23,21 @@ INPUT_COLUMNS = ['algorithm', 'quantization', 'shuffle', 'error_bound',
 OUTPUT_COLUMNS = ['compression_time_ms', 'decompression_time_ms',
                   'compression_ratio', 'psnr_db']
 
+# Internal encoded names → inverse transform type
+# 'expm1' = inverse of log1p, 'identity' = no transform
+OUTPUT_INVERSE = {
+    'comp_time_log': ('compression_time_ms', 'expm1'),
+    'decomp_time_log': ('decompression_time_ms', 'expm1'),
+    'ratio_log': ('compression_ratio', 'expm1'),
+    'psnr_clamped': ('psnr_db', 'identity'),
+    'rmse_log': ('rmse', 'expm1'),
+    'max_error_log': ('max_error', 'expm1'),
+    'comp_tp_log': ('compression_throughput_mbps', 'expm1'),
+    'decomp_tp_log': ('decompression_throughput_mbps', 'expm1'),
+    'log_mae': ('mean_abs_err', 'expm1'),
+    'ssim_val': ('ssim', 'identity'),
+}
+
 CONTINUOUS_FEATURES = ['error_bound_enc', 'data_size_enc', 'entropy', 'mad', 'second_derivative']
 
 
@@ -93,6 +108,10 @@ def encode_and_split(df: pd.DataFrame, val_fraction: float = 0.2,
         df['comp_tp_log'] = np.log1p(df['compression_throughput_mbps'].clip(lower=0).fillna(0)).astype(np.float32)
     if 'decompression_throughput_mbps' in df.columns:
         df['decomp_tp_log'] = np.log1p(df['decompression_throughput_mbps'].clip(lower=0).fillna(0)).astype(np.float32)
+    if 'mean_abs_err' in df.columns:
+        df['log_mae'] = np.log1p(df['mean_abs_err'].clip(lower=0).fillna(0)).astype(np.float32)
+    if 'ssim' in df.columns:
+        df['ssim_val'] = df['ssim'].clip(lower=0, upper=1).fillna(1.0).astype(np.float32)
 
     # ---- Split by file ----
     files = sorted(df['file'].unique())
@@ -116,7 +135,7 @@ def encode_and_split(df: pd.DataFrame, val_fraction: float = 0.2,
                                 'entropy', 'mad', 'second_derivative']
 
     output_cols = ['comp_time_log', 'decomp_time_log', 'ratio_log', 'psnr_clamped']
-    for extra in ['rmse_log', 'max_error_log', 'comp_tp_log', 'decomp_tp_log']:
+    for extra in ['rmse_log', 'max_error_log', 'comp_tp_log', 'decomp_tp_log', 'log_mae', 'ssim_val']:
         if extra in df.columns:
             output_cols.append(extra)
 
@@ -233,19 +252,31 @@ def load_from_csv(csv_paths, val_fraction=0.2, seed=42):
 
 
 def inverse_transform_outputs(Y_norm: np.ndarray, y_means: np.ndarray,
-                               y_stds: np.ndarray) -> Dict[str, np.ndarray]:
+                               y_stds: np.ndarray,
+                               output_cols: list = None) -> Dict[str, np.ndarray]:
     """
     Convert normalized model outputs back to original scale.
 
-    Returns dict with:
-        compression_time_ms, decompression_time_ms,
-        compression_ratio, psnr_db
+    Args:
+        output_cols: list of internal column names (e.g. 'comp_time_log').
+                     If None, uses legacy 4-output format.
     """
     Y_raw = Y_norm * y_stds + y_means
 
-    return {
-        'compression_time_ms': np.expm1(Y_raw[:, 0]),   # inverse of log1p
-        'decompression_time_ms': np.expm1(Y_raw[:, 1]),
-        'compression_ratio': np.expm1(Y_raw[:, 2]),
-        'psnr_db': Y_raw[:, 3],                          # was clamped, not logged
-    }
+    if output_cols is None:
+        # Legacy 4-output format
+        return {
+            'compression_time_ms': np.expm1(Y_raw[:, 0]),
+            'decompression_time_ms': np.expm1(Y_raw[:, 1]),
+            'compression_ratio': np.expm1(Y_raw[:, 2]),
+            'psnr_db': Y_raw[:, 3],
+        }
+
+    result = {}
+    for i, col in enumerate(output_cols):
+        raw_name, inv_type = OUTPUT_INVERSE.get(col, (col, 'identity'))
+        if inv_type == 'expm1':
+            result[raw_name] = np.expm1(Y_raw[:, i])
+        else:
+            result[raw_name] = Y_raw[:, i]
+    return result

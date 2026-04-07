@@ -20,7 +20,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import xgboost as xgb
 from neural_net.core.data import inverse_transform_outputs, OUTPUT_COLUMNS, ALGORITHM_NAMES, CONTINUOUS_FEATURES
-from neural_net.training.cross_validate import prepare_fold
 
 # Human-readable labels for features
 FEATURE_LABELS = {
@@ -44,14 +43,17 @@ OUTPUT_LABELS = {
     'psnr_clamped': 'PSNR\n(dB)',
     'rmse_log': 'RMSE',
     'max_error_log': 'Max Abs.\nError',
-    'comp_tp_log': 'Compression\nThroughput',
-    'decomp_tp_log': 'Decompression\nThroughput',
+    'log_mae': 'Pointwise\nError (MAE)',
+    'ssim_val': 'SSIM',
 }
+
+# Outputs excluded from SHAP heatmap
+SHAP_EXCLUDE_OUTPUTS = {'comp_tp_log', 'decomp_tp_log', 'rmse_log', 'max_error_log'}
 
 
 # Feature display order: preprocessors first, then library, then data characteristics
 DISPLAY_FEATURES = [
-    'quant_enc', 'shuffle_enc',          # preprocessors (grouped)
+    'quant_enc', 'error_bound_enc', 'shuffle_enc',  # preprocessors (grouped)
     'algo_aggregate',                     # compression library (aggregated)
     'data_size_enc',                      # data size
     'entropy', 'mad', 'second_derivative', # data characteristics
@@ -95,7 +97,7 @@ def collect_feature_importance(models, val_X, feature_names, output_dir):
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True)
 
-    output_names_ordered = list(models.keys())
+    output_names_ordered = [n for n in models.keys() if n not in SHAP_EXCLUDE_OUTPUTS]
     output_labels = [OUTPUT_LABELS.get(n, n) for n in output_names_ordered]
 
     max_shap_samples = 5000
@@ -105,14 +107,23 @@ def collect_feature_importance(models, val_X, feature_names, output_dir):
     else:
         X_shap = val_X
 
-    # Compute SHAP for all outputs, build heatmap matrix
-    shap_matrix = np.zeros((len(DISPLAY_FEATURES), len(output_names_ordered)))
+    # Compute SHAP for all outputs in parallel (threads to avoid pickling)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    for col, out_name in enumerate(output_names_ordered):
+    def _shap_one(out_name):
         explainer = shap.TreeExplainer(models[out_name])
         sv = explainer.shap_values(X_shap)
-        labels, values = _aggregate_shap(feature_names, sv)
-        shap_matrix[:, col] = values
+        print(f"    SHAP done: {out_name}")
+        return out_name, _aggregate_shap(feature_names, sv)
+
+    shap_matrix = np.zeros((len(DISPLAY_FEATURES), len(output_names_ordered)))
+    name_to_col = {n: i for i, n in enumerate(output_names_ordered)}
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(_shap_one, n) for n in output_names_ordered]
+        for fut in as_completed(futures):
+            out_name, (labels, values) = fut.result()
+            shap_matrix[:, name_to_col[out_name]] = values
 
     # SHAP heatmap
     n_out = len(output_labels)
@@ -130,7 +141,7 @@ def collect_feature_importance(models, val_X, feature_names, output_dir):
             ax.text(j, i, f'{val:.3f}', ha='center', va='center', color=color, fontsize=9)
     cbar = fig.colorbar(im, ax=ax, shrink=0.85)
     cbar.set_label('Mean |SHAP value|', fontsize=11)
-    ax.set_title('SHAP Feature Importance Across Compression Metrics', fontsize=13, pad=12)
+    ax.set_title('')
     ax.set_xlabel('Prediction Target', fontsize=11, labelpad=8)
     ax.set_ylabel('Input Feature', fontsize=11, labelpad=8)
     plt.tight_layout()
@@ -164,6 +175,7 @@ def train_and_evaluate(data):
             learning_rate=0.1,
             early_stopping_rounds=20,
             verbosity=0,
+            n_jobs=4,
         )
         model.fit(train_X, train_Y[:, i],
                   eval_set=[(val_X, val_Y[:, i])],
@@ -216,6 +228,8 @@ def train_and_evaluate(data):
 
 def cross_validate(csv_paths, n_folds=5, seed=42):
     """K-fold CV, split by file."""
+    from neural_net.training.cross_validate import prepare_fold
+    from neural_net.core.data import OUTPUT_INVERSE
     frames = [pd.read_csv(p) for p in csv_paths]
     df = pd.concat(frames, ignore_index=True)
     df = df[df['success'] == True].copy()
@@ -225,7 +239,8 @@ def cross_validate(csv_paths, n_folds=5, seed=42):
     print(f"Unique files: {len(files)}, Folds: {n_folds}")
 
     kf = KFold(n_splits=n_folds, shuffle=True, random_state=seed)
-    all_metrics = {name: {'mae': [], 'r2': [], 'mape': []} for name in OUTPUT_COLUMNS}
+    report_names = None
+    all_metrics = None
 
     for fold, (train_idx, val_idx) in enumerate(kf.split(files)):
         train_files = set(np.array(files)[train_idx])
@@ -235,23 +250,27 @@ def cross_validate(csv_paths, n_folds=5, seed=42):
 
         print(f"\nFold {fold+1}/{n_folds}: train={len(df_train)} val={len(df_val)}")
 
-        train_X, train_Y, val_X, val_Y, y_means, y_stds = prepare_fold(df_train, df_val)
+        train_X, train_Y, val_X, val_Y, y_means, y_stds, output_cols = prepare_fold(df_train, df_val)
+
+        if report_names is None:
+            report_names = [OUTPUT_INVERSE.get(c, (c, 'identity'))[0] for c in output_cols]
+            all_metrics = {name: {'mae': [], 'r2': [], 'mape': []} for name in report_names}
 
         # Train one XGB per output
         val_preds = np.zeros_like(val_Y)
         for i in range(train_Y.shape[1]):
             model = xgb.XGBRegressor(
                 n_estimators=300, max_depth=6, learning_rate=0.1,
-                early_stopping_rounds=20, verbosity=0,
+                early_stopping_rounds=20, verbosity=0, n_jobs=4,
             )
             model.fit(train_X, train_Y[:, i],
                       eval_set=[(val_X, val_Y[:, i])], verbose=False)
             val_preds[:, i] = model.predict(val_X)
 
-        pred_orig = inverse_transform_outputs(val_preds, y_means, y_stds)
-        actual_orig = inverse_transform_outputs(val_Y, y_means, y_stds)
+        pred_orig = inverse_transform_outputs(val_preds, y_means, y_stds, output_cols)
+        actual_orig = inverse_transform_outputs(val_Y, y_means, y_stds, output_cols)
 
-        for name in OUTPUT_COLUMNS:
+        for name in report_names:
             p = pred_orig[name]
             a = actual_orig[name]
             mae = np.mean(np.abs(p - a))
@@ -271,7 +290,7 @@ def cross_validate(csv_paths, n_folds=5, seed=42):
     print(f"{'='*65}")
     print(f"{'Output':<30s}  {'MAE':>10s}  {'R²':>10s}  {'MAPE':>10s}")
     print(f"{'-'*65}")
-    for name in OUTPUT_COLUMNS:
+    for name in report_names:
         mae_m = np.mean(all_metrics[name]['mae'])
         mae_s = np.std(all_metrics[name]['mae'])
         r2_m = np.mean(all_metrics[name]['r2'])

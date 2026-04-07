@@ -20,7 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from neural_net.core.data import encode_and_split, ALGORITHM_NAMES, CONTINUOUS_FEATURES, OUTPUT_COLUMNS
+from neural_net.core.data import encode_and_split, ALGORITHM_NAMES, CONTINUOUS_FEATURES, OUTPUT_COLUMNS, OUTPUT_INVERSE
 from neural_net.core.data import inverse_transform_outputs
 from neural_net.core.model import CompressionPredictor
 
@@ -40,17 +40,26 @@ def prepare_fold(df_train, df_val):
         sub_df['error_bound_enc'] = np.log10(sub_df['error_bound'].clip(lower=1e-7)).astype(np.float32)
         # Data size log2
         sub_df['data_size_enc'] = np.log2(sub_df['original_size'].clip(lower=1)).astype(np.float32)
-        # Output encodings
+        # Core output encodings
         sub_df['comp_time_log'] = np.log1p(sub_df['compression_time_ms'].clip(lower=0)).astype(np.float32)
         sub_df['decomp_time_log'] = np.log1p(sub_df['decompression_time_ms'].clip(lower=0)).astype(np.float32)
         sub_df['ratio_log'] = np.log1p(sub_df['compression_ratio'].clip(lower=0)).astype(np.float32)
         sub_df['psnr_clamped'] = sub_df['psnr_db'].replace([np.inf, -np.inf], 120.0).fillna(120.0).clip(upper=120.0).astype(np.float32)
+        # Extended output encodings
+        if 'mean_abs_err' in sub_df.columns:
+            sub_df['log_mae'] = np.log1p(sub_df['mean_abs_err'].clip(lower=0).fillna(0)).astype(np.float32)
+        if 'ssim' in sub_df.columns:
+            sub_df['ssim_val'] = sub_df['ssim'].clip(lower=0, upper=1).fillna(1.0).astype(np.float32)
 
     algo_cols = [f'alg_{a}' for a in ALGORITHM_NAMES]
     feature_cols = algo_cols + ['quant_enc', 'shuffle_enc',
                                 'error_bound_enc', 'data_size_enc',
                                 'entropy', 'mad', 'second_derivative']
+
     output_cols = ['comp_time_log', 'decomp_time_log', 'ratio_log', 'psnr_clamped']
+    for extra in ['log_mae', 'ssim_val']:
+        if extra in df_train.columns:
+            output_cols.append(extra)
 
     # Normalization from training set
     train_X_raw = df_train[feature_cols].values.astype(np.float32)
@@ -78,10 +87,10 @@ def prepare_fold(df_train, df_val):
     train_Y = (train_Y_raw - y_means) / y_stds
     val_Y = (val_Y_raw - y_means) / y_stds
 
-    return train_X, train_Y, val_X, val_Y, y_means, y_stds
+    return train_X, train_Y, val_X, val_Y, y_means, y_stds, output_cols
 
 
-def train_one_fold(train_X, train_Y, val_X, val_Y, epochs=100, batch_size=4096,
+def train_one_fold(train_X, train_Y, val_X, val_Y, epochs=100, batch_size=512,
                    lr=1e-3, patience=15, hidden_dim=128):
     """Train model on one fold, return best val predictions (normalized)."""
 
@@ -189,8 +198,9 @@ def main():
 
     kf = KFold(n_splits=args.folds, shuffle=True, random_state=args.seed)
 
-    # Collect per-fold metrics
-    all_metrics = {name: {'mae': [], 'r2': [], 'mape': []} for name in OUTPUT_COLUMNS}
+    # First fold to discover output columns
+    output_col_names = None
+    all_metrics = None
 
     for fold_idx, (train_file_idx, val_file_idx) in enumerate(kf.split(files)):
         train_files = set(np.array(files)[train_file_idx])
@@ -205,7 +215,12 @@ def main():
               f"val: {len(df_val)} rows / {len(val_files)} files)")
         print(f"{'='*65}")
 
-        train_X, train_Y, val_X, val_Y, y_means, y_stds = prepare_fold(df_train, df_val)
+        train_X, train_Y, val_X, val_Y, y_means, y_stds, output_cols = prepare_fold(df_train, df_val)
+
+        if output_col_names is None:
+            output_col_names = output_cols
+            report_names = [OUTPUT_INVERSE.get(c, (c, 'identity'))[0] for c in output_cols]
+            all_metrics = {name: {'mae': [], 'r2': [], 'mape': []} for name in report_names}
 
         val_pred_norm, best_loss, last_epoch = train_one_fold(
             train_X, train_Y, val_X, val_Y,
@@ -214,10 +229,10 @@ def main():
         print(f"  Best val loss: {best_loss:.6f} (stopped at epoch {last_epoch})")
 
         # Inverse transform
-        pred_orig = inverse_transform_outputs(val_pred_norm, y_means, y_stds)
-        actual_orig = inverse_transform_outputs(val_Y, y_means, y_stds)
+        pred_orig = inverse_transform_outputs(val_pred_norm, y_means, y_stds, output_cols)
+        actual_orig = inverse_transform_outputs(val_Y, y_means, y_stds, output_cols)
 
-        for name in OUTPUT_COLUMNS:
+        for name in report_names:
             p = pred_orig[name]
             a = actual_orig[name]
             mae = np.mean(np.abs(p - a))
@@ -235,11 +250,11 @@ def main():
 
     # ---- Summary ----
     print(f"\n{'='*65}")
-    print(f"5-FOLD CROSS-VALIDATION SUMMARY")
+    print(f"NN 5-FOLD CROSS-VALIDATION SUMMARY")
     print(f"{'='*65}")
     print(f"{'Output':<30s}  {'MAE':>10s}  {'R²':>10s}  {'MAPE':>10s}")
     print(f"{'-'*65}")
-    for name in OUTPUT_COLUMNS:
+    for name in report_names:
         mae_mean = np.mean(all_metrics[name]['mae'])
         mae_std = np.std(all_metrics[name]['mae'])
         r2_mean = np.mean(all_metrics[name]['r2'])

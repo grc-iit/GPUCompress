@@ -343,9 +343,12 @@ static QualityMetrics compute_quality(const float* orig, const float* decomp,
     // Accumulators for SSIM (global, single-window approximation)
     double sum_x = 0, sum_y = 0, sum_x2 = 0, sum_y2 = 0, sum_xy = 0;
 
+    size_t valid = 0;
     for (size_t i = 0; i < n; ++i) {
         double o = static_cast<double>(orig[i]);
         double d = static_cast<double>(decomp[i]);
+        if (!std::isfinite(o) || !std::isfinite(d)) continue;
+        ++valid;
         double diff = o - d;
         mse += diff * diff;
         sum_abs_err += std::abs(diff);
@@ -357,7 +360,8 @@ static QualityMetrics compute_quality(const float* orig, const float* decomp,
         sum_x2 += o * o; sum_y2 += d * d;
         sum_xy += o * d;
     }
-    double nd = static_cast<double>(n);
+    if (valid == 0) return qm;
+    double nd = static_cast<double>(valid);
     mse /= nd;
 
     qm.max_error = max_err;
@@ -502,9 +506,39 @@ static std::vector<BenchmarkRow> benchmark_file(
     size_t num_elements = file_size / sizeof(float);
     size_t input_size = file_size;
 
-    // Stats are extracted from gpucompress_stats_t after first compression
+    // Compute data statistics directly from raw float data
     double entropy = 0, mad = 0, second_deriv = 0;
-    bool stats_set = false;
+    {
+        // Byte-level Shannon entropy
+        size_t byte_hist[256] = {};
+        const unsigned char* bytes = reinterpret_cast<const unsigned char*>(raw.data());
+        for (size_t i = 0; i < file_size; ++i) byte_hist[bytes[i]]++;
+        double inv_n = 1.0 / static_cast<double>(file_size);
+        for (int b = 0; b < 256; ++b) {
+            if (byte_hist[b] > 0) {
+                double p = byte_hist[b] * inv_n;
+                entropy -= p * std::log2(p);
+            }
+        }
+
+        // Mean Absolute Deviation
+        if (num_elements > 0) {
+            double sum = 0;
+            for (size_t i = 0; i < num_elements; ++i) sum += data[i];
+            double mean = sum / num_elements;
+            double mad_sum = 0;
+            for (size_t i = 0; i < num_elements; ++i) mad_sum += std::abs(data[i] - mean);
+            mad = mad_sum / num_elements;
+        }
+
+        // Mean absolute second derivative
+        if (num_elements > 2) {
+            double sd_sum = 0;
+            for (size_t i = 1; i + 1 < num_elements; ++i)
+                sd_sum += std::abs(static_cast<double>(data[i+1]) - 2.0 * data[i] + data[i-1]);
+            second_deriv = sd_sum / (num_elements - 2);
+        }
+    }
 
     // Allocate GPU buffers
     size_t max_out = gpucompress_max_compressed_size(input_size);
@@ -560,13 +594,6 @@ static std::vector<BenchmarkRow> benchmark_file(
         if (rc == 0 && out_size > 0)
             cudaMemcpy(comp_buf.data(), d_output, out_size, cudaMemcpyDeviceToHost);
 
-        // Extract data stats from first successful compression
-        if (rc == 0 && !stats_set) {
-            entropy = stats.entropy_bits;
-            mad = stats.mad;
-            second_deriv = stats.second_derivative;
-            stats_set = true;
-        }
         row.entropy = entropy;
         row.mad = mad;
         row.second_derivative = second_deriv;
