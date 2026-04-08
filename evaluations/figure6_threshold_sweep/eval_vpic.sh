@@ -14,32 +14,35 @@
 # Total runs: 7 x 7 = 49
 #
 # Usage:
-#   bash benchmarks/Paper_Evaluations/4/threshold_sweep/4.2.1_eval_vpic_threshold_sweep.sh
+#   bash evaluations/figure6_threshold_sweep/eval_vpic.sh
 #
-# Fixed configuration:
-#   VPIC_NX         100         Grid size (NX^3 cells)
-#   CHUNK_MB        2           Chunk size in MB
-#   TIMESTEPS       50          Number of VPIC timesteps
+# Fixed configuration (data target: 25 dumps × ~128 MiB/dump):
+#   VPIC_NX         126         Grid size (NX^3 cells) → (126+2)^3*64 B = 128 MiB/dump
+#   CHUNK_MB        8           Chunk size in MB (16 chunks per dump)
+#   TIMESTEPS       25          Number of VPIC timesteps
 #   VPIC_ERROR_BOUND 0.01       Lossy error bound (0 for lossless)
 #   EXPLORE_K       4           Exploration alternatives
 #   SGD_LR          0.2         SGD learning rate
 #   POLICY          balanced    Cost model policy
 #   DRY_RUN         0           Print commands without running
 # ============================================================
-set -eo pipefail
+set -o pipefail
+# NOTE: do NOT use `set -e` — quota/IO failures on a single cell would
+# abort the entire 49-cell sweep. The for-loop already validates each cell
+# via the benchmark_vpic_deck.csv sentinel and skips broken cells.
 
 command -v bc >/dev/null 2>&1 || { echo "ERROR: bc not found"; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-GPU_DIR="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
-PARENT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+GPU_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+PARENT_DIR="$GPU_DIR/benchmarks/Paper_Evaluations/4"
 
 # ── Parameters recovered from the known-good run ──
 VPIC_BIN="${VPIC_BIN:-$GPU_DIR/benchmarks/vpic-kokkos/vpic_benchmark_deck.Linux}"
 WEIGHTS="${GPUCOMPRESS_WEIGHTS:-$GPU_DIR/neural_net/weights/model.nnwt}"
-VPIC_NX=${VPIC_NX:-100}
-CHUNK_MB=${CHUNK_MB:-2}
-TIMESTEPS=${TIMESTEPS:-50}
+VPIC_NX=${VPIC_NX:-126}         # (126+2)^3 * 64 B = exactly 128 MiB per dump
+CHUNK_MB=${CHUNK_MB:-8}         # 8 MiB chunks → ~16 chunks per dump
+TIMESTEPS=${TIMESTEPS:-15}
 WARMUP_STEPS=${WARMUP_STEPS:-500}
 SIM_INTERVAL=${SIM_INTERVAL:-190}
 VPIC_ERROR_BOUND=${VPIC_ERROR_BOUND:-0.01}
@@ -132,22 +135,30 @@ for pair in "${PAIRS[@]}"; do
             continue
         fi
 
-        GPUCOMPRESS_WEIGHTS="$WEIGHTS" \
-        VPIC_TIMESTEPS=$TIMESTEPS \
-        VPIC_WARMUP_STEPS=$WARMUP_STEPS \
-        VPIC_SIM_INTERVAL=$SIM_INTERVAL \
-        VPIC_POLICIES=$POLICY \
-        VPIC_NX=$VPIC_NX \
-        VPIC_CHUNK_MB=$CHUNK_MB \
-        VPIC_ERROR_BOUND=$VPIC_ERROR_BOUND \
-        VPIC_LR=$SGD_LR \
-        VPIC_MAPE_THRESHOLD=$x1 \
-        VPIC_EXPLORE_THRESH=$x2 \
-        VPIC_EXPLORE_K=$EXPLORE_K \
-        VPIC_VERIFY=0 \
-        VPIC_PHASE=nn-rl+exp50 \
-        VPIC_RESULTS_DIR="$OUT_DIR" \
-        "$VPIC_BIN" 2>&1 | tee "$OUT_DIR/vpic.log" | tail -5
+        # The VPIC deck is known to SIGSEGV in its Kokkos shutdown cleanup
+        # AFTER all CSVs are written (same teardown-only failure the other
+        # sweep scripts handle). Wrap the pipeline in `|| true` so pipefail
+        # doesn't abort the whole for loop on a harmless post-completion
+        # segfault — we validate success via the benchmark_vpic_deck.csv
+        # sentinel immediately below.
+        (
+            GPUCOMPRESS_WEIGHTS="$WEIGHTS" \
+            VPIC_TIMESTEPS=$TIMESTEPS \
+            VPIC_WARMUP_STEPS=$WARMUP_STEPS \
+            VPIC_SIM_INTERVAL=$SIM_INTERVAL \
+            VPIC_POLICIES=$POLICY \
+            VPIC_NX=$VPIC_NX \
+            VPIC_CHUNK_MB=$CHUNK_MB \
+            VPIC_ERROR_BOUND=$VPIC_ERROR_BOUND \
+            VPIC_LR=$SGD_LR \
+            VPIC_MAPE_THRESHOLD=$x1 \
+            VPIC_EXPLORE_THRESH=$x2 \
+            VPIC_EXPLORE_K=$EXPLORE_K \
+            VPIC_VERIFY=0 \
+            VPIC_PHASE=nn-rl+exp50 \
+            VPIC_RESULTS_DIR="$OUT_DIR" \
+            "$VPIC_BIN" > "$OUT_DIR/vpic.log" 2>&1
+        ) || echo "  WARNING: vpic exited non-zero (teardown segfault is harmless if benchmark_vpic_deck.csv present)"
 
         if [ ! -f "$OUT_DIR/benchmark_vpic_deck.csv" ]; then
             echo "  ERROR: VPIC run failed, see $OUT_DIR/vpic.log"
@@ -163,7 +174,7 @@ echo "Results: $SWEEP_DIR"
 echo "============================================================"
 
 # ── Generate plots ──
-PLOT_SCRIPT="$SCRIPT_DIR/4.2.1_plot_threshold_sweep.py"
+PLOT_SCRIPT="$SCRIPT_DIR/plot.py"
 if [ -f "$PLOT_SCRIPT" ]; then
     echo ""
     echo ">>> Generating threshold sweep plots..."

@@ -422,23 +422,31 @@ begin_initialization {
     // Physics params configurable via env vars for data variety tuning.
     // Lower mi_me + wpe_wce = faster reconnection → richer 2D/3D structure.
     // Higher Ti_Te = more free energy → stronger instabilities.
-    //   Defaults (mi_me=5, wpe_wce=1, Ti_Te=5): fast reconnection, ~500 steps for structure
-    //   Slow recon (mi_me=25, wpe_wce=3, Ti_Te=1): ~20k steps for structure
+    //
+    // Compiled-in defaults match the 918fa14 "long-time" Harris-sheet
+    // regime used by the SC paper Section 7.1 sweep:
+    //   mi_me=25  wpe_wce=1  Ti_Te=5
+    // → slow reconnection (~20k steps for full nonlinear phase), but
+    //   clean MAPE-convergence trajectory over 8 benchmark writes.
+    //
+    // For the legacy "original" regime use VPIC_WPE_WCE=3 VPIC_TI_TE=1.
+    // For fast reconnection (~500 steps) use VPIC_MI_ME=5.
     const char* env_mime   = getenv("VPIC_MI_ME");
     const char* env_wpewce = getenv("VPIC_WPE_WCE");
     const char* env_tite   = getenv("VPIC_TI_TE");
-    // Original physics defaults (more diverse data, noisier fields).
-    // For fast reconnection (~500 steps), use VPIC_MI_ME=5 VPIC_WPE_WCE=1 VPIC_TI_TE=5.
     double mi_me   = env_mime   ? atof(env_mime)   : 25;
     double rhoi_L  = 1;
-    double Ti_Te   = env_tite   ? atof(env_tite)   : 1;
-    double wpe_wce = env_wpewce ? atof(env_wpewce) : 3;
+    double Ti_Te   = env_tite   ? atof(env_tite)   : 5;
+    double wpe_wce = env_wpewce ? atof(env_wpewce) : 1;
 
-    // Grid size configurable via VPIC_NX env var (default 200 ≈ 512 MB)
+    // Grid size configurable via VPIC_NX env var.
     // Field data = (nx+2)^3 * 16 * 4 bytes
-    //   128 → ~134 MB    200 → ~520 MB    256 → ~1.1 GB    404 → ~4.0 GB
+    //   128 → ~134 MB    147 → ~200 MB    200 → ~520 MB
+    //   256 → ~1.1 GB    404 → ~4.0 GB
+    // Default 147 matches the 918fa14 SC26 long-time regime
+    // (200 MB/field, 50 chunks at CHUNK_MB=4).
     const char* env_nx = getenv("VPIC_NX");
-    int grid_n = env_nx ? atoi(env_nx) : 200;
+    int grid_n = env_nx ? atoi(env_nx) : 147;
     if (grid_n < 16) grid_n = 16;
 
     double Lx   = 80*L;
@@ -483,19 +491,25 @@ begin_initialization {
     double dt = cfl_req*dg/c;
     if (wpe*dt > wpedt_max) dt = wpedt_max/wpe;
 
-    // Warmup steps and chunk size configurable via environment
-    // Default 500: with slow-reconnection physics (mi_me=25, wpe_wce=3)
-    // the system needs ~500 steps before fields are well-developed.
+    // Warmup steps and chunk size configurable via environment.
+    // Default 500: aligned with deltaRunVPICParameters.md — 500 physics
+    // steps before the first benchmark write so the Harris sheet is
+    // well-developed before we start measuring.
     const char* env_steps = getenv("VPIC_WARMUP_STEPS");
     int warmup = env_steps ? atoi(env_steps) : 500;
     if (warmup < 1) warmup = 1;
 
+    // Default 4 MB: matches 918fa14 regime (200 MB / 4 MB = 50 chunks/write).
     const char* env_chunk = getenv("VPIC_CHUNK_MB");
-    int chunk_mb = env_chunk ? atoi(env_chunk) : 8;
+    int chunk_mb = env_chunk ? atoi(env_chunk) : 4;
     if (chunk_mb < 1) chunk_mb = 1;
 
+    // Default 8: matches the 918fa14 SC26 long-time regime (8 benchmark
+    // writes over the Harris-sheet evolution). Set VPIC_TIMESTEPS=0 to
+    // run the sim through warmup only, without entering the benchmark
+    // loop (legacy "no-bench" mode).
     const char* env_ts = getenv("VPIC_TIMESTEPS");
-    int timesteps = env_ts ? atoi(env_ts) : 0;
+    int timesteps = env_ts ? atoi(env_ts) : 8;
     if (timesteps < 0) timesteps = 0;
 
     // Parse policies: VPIC_POLICIES="balanced,ratio,speed" (default: balanced)
@@ -556,9 +570,11 @@ begin_initialization {
     float explore_thresh = env_et   ? (float)atof(env_et)   : 0.20f;
 
     // Simulation interval: N physics steps between each benchmark write.
-    // Default 190: ensures successive snapshots differ enough for SGD to
-    // see real adaptation pressure. Smaller intervals produce nearly
-    // identical snapshots under slow-reconnection physics.
+    // Default 190: aligned with deltaRunVPICParameters.md — provides
+    // enough physics evolution between dumps under slow-reconnection
+    // physics (mi_me=25, wpe_wce=1, Ti_Te=5) for meaningful data
+    // diversity and real SGD adaptation pressure, while keeping the
+    // per-timestep wall cost tractable on single-GPU sweeps.
     const char* env_sim_int = getenv("VPIC_SIM_INTERVAL");
     int sim_interval = env_sim_int ? atoi(env_sim_int) : 190;
     if (sim_interval < 1) sim_interval = 1;

@@ -2,7 +2,7 @@
 # ============================================================
 # WarpX Exploration Threshold Sweep
 #
-# Mirrors 4.2.1_eval_vpic_threshold_sweep.sh: re-runs warpx.3d once
+# Mirrors eval_vpic.sh: re-runs warpx.3d once
 # per (X1, X2-X1) cell so each configuration trains the online
 # learner on fresh, evolving WarpX LWFA fields. The compression
 # pipeline is driven through the GPUCompress VOL connector
@@ -22,46 +22,54 @@
 #   benchmark_warpx.csv                  (synthesized aggregate)
 #   warpx.log
 #
-# Pair with 4.2.1_plot_threshold_sweep.py to render the heatmaps for
+# Pair with plot.py to render the heatmaps for
 # the paper's "Effect of online learning thresholds" figure.
 #
 # Environment overrides:
-#   CHUNK_MB             4         HDF5 chunk size MB
-#   ERROR_BOUND          0.0       Lossless (0.0). Set >0 for lossy quantization.
-#                                  NOTE: must be 0.0 when gpucompress.verify=1
-#                                  (which the sweep enables) — bitwise verify
-#                                  is incompatible with lossy quantization.
+# Environment overrides (data target: 25 dumps × ~128 MiB/dump):
+#   CHUNK_MB             8         HDF5 chunk size MB
+#   ERROR_BOUND          0.01      Lossy 1% by default (set to 0.0 for lossless).
+#                                  The script auto-flips gpucompress.verify off
+#                                  when ERROR_BOUND > 0 (bitwise verify is
+#                                  incompatible with lossy quantization).
 #   EXPLORE_K            4         Exploration alternatives K
 #   SGD_LR               0.2       SGD learning rate
 #   POLICY               balanced  Cost policy (balanced|ratio|speed)
 #   WARPX_BIN            (auto)    Path to warpx.3d
 #   WARPX_INPUTS         (auto)    LWFA inputs file
-#   WARPX_MAX_STEP       200       Simulation steps per cell
-#   WARPX_DIAG_INT       10        Diagnostics interval
-#   WARPX_NCELL          "32 32 256"  Grid (must be divisible by max_grid_size=32)
+#   WARPX_MAX_STEP       250       Simulation steps per cell (25 dumps at diag=10)
+#   WARPX_DIAG_INT       10        Diagnostics interval → 25 diags per run
+#   WARPX_NCELL          "32 32 96"  Grid; ~132 MiB/dump at default chunks
 #   DRY_RUN              0         Print commands without running
 # ============================================================
-set -eo pipefail
+set -o pipefail
+# NOTE: do NOT use `set -e` — quota/IO failures on a single cell would
+# abort the entire 49-cell sweep. The for-loop already validates each cell
+# via the benchmark_warpx.csv sentinel and skips broken cells.
 
 command -v bc >/dev/null 2>&1 || { echo "ERROR: bc not found"; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-GPU_DIR="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
-PARENT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+GPU_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+PARENT_DIR="$GPU_DIR/benchmarks/Paper_Evaluations/4"
 
 # ── Fixed parameters ──
 WEIGHTS="${GPUCOMPRESS_WEIGHTS:-$GPU_DIR/neural_net/weights/model.nnwt}"
 WARPX_BIN="${WARPX_BIN:-$HOME/sims/warpx/build-gpucompress/bin/warpx.3d}"
 WARPX_INPUTS="${WARPX_INPUTS:-$HOME/sims/warpx/Examples/Physics_applications/laser_acceleration/inputs_base_3d}"
 
-CHUNK_MB=${CHUNK_MB:-4}
-ERROR_BOUND=${ERROR_BOUND:-0.0}
+CHUNK_MB=${CHUNK_MB:-8}
+ERROR_BOUND=${ERROR_BOUND:-0.01}  # lossy 1% by default (matches VPIC/NYX)
 EXPLORE_K=${EXPLORE_K:-4}
 SGD_LR=${SGD_LR:-0.2}
 POLICY=${POLICY:-balanced}
-WARPX_MAX_STEP=${WARPX_MAX_STEP:-200}
+WARPX_MAX_STEP=${WARPX_MAX_STEP:-150}    # 15 dumps at diag_int=10
 WARPX_DIAG_INT=${WARPX_DIAG_INT:-10}
-WARPX_NCELL="${WARPX_NCELL:-32 32 256}"
+WARPX_NCELL="${WARPX_NCELL:-64 64 128}"  # 524288 cells × 40 B/cell ≈ 20 MiB/FAB,
+                                          # ~2.5 chunks per ranking-profiler call so
+                                          # benchmark_warpx_ranking.csv actually populates
+                                          # (smaller grids fall below CHUNK_MB and the
+                                          # profiler early-returns -1 with empty CSV)
 DRY_RUN=${DRY_RUN:-0}
 
 # Policy weights
@@ -153,6 +161,16 @@ for pair in "${PAIRS[@]}"; do
     # the GPUCompress VOL and populates decompression_ms_raw in the
     # chunk-history slots so the per-chunk CSV gets a real mape_decomp
     # value (instead of 0). The threshold sweep always opts in.
+    #
+    # gpucompress.verify=1 (bitwise round-trip check) is only valid in
+    # lossless mode — lossy quantization changes the bits. Auto-disable it
+    # for any nonzero error bound so the same sweep script works in both
+    # regimes.
+    if [ "$ERROR_BOUND" = "0" ] || [ "$ERROR_BOUND" = "0.0" ]; then
+        VERIFY=1
+    else
+        VERIFY=0
+    fi
     (
         cd "$OUT_DIR"
         WARPX_LOG_DIR="$OUT_DIR" \
@@ -173,7 +191,7 @@ for pair in "${PAIRS[@]}"; do
             gpucompress.sgd_mape="$x1" \
             gpucompress.explore_k="$EXPLORE_K" \
             gpucompress.explore_thresh="$x2" \
-            gpucompress.verify=1 \
+            gpucompress.verify=$VERIFY \
             > warpx.log 2>&1
     ) || echo "  WARNING: warpx exited non-zero (teardown segfault is harmless if VOL summary present)"
 
@@ -316,6 +334,11 @@ print(f"  ratio={ratio:.2f}x  write={write_mibps:.0f}MiB/s  "
       f"mape_ratio={avg_mape_ratio:.1f}%  sgd={sgd_fires}  expl={explorations}  chunks={n_chunks}")
 PYEOF
 
+    # ── Per-cell cleanup: delete the bulky AMReX plotfile dir now that
+    #    all metric CSVs have been extracted. CSVs (benchmark_warpx*,
+    #    ranking*, timestep_chunks, gpucompress_vol_summary.txt, warpx.log)
+    #    are preserved.
+    rm -rf "$OUT_DIR/diags" 2>/dev/null
 done
 
 echo ""
@@ -324,11 +347,11 @@ echo "WarpX threshold sweep complete: $TOTAL configurations"
 echo "Results: $SWEEP_DIR/"
 echo ""
 echo "Generate heatmaps:"
-echo "  python3 $SCRIPT_DIR/4.2.1_plot_threshold_sweep.py $SWEEP_DIR"
+echo "  python3 $SCRIPT_DIR/plot.py $SWEEP_DIR"
 echo "============================================================"
 
 # ── Generate plots if matplotlib available ──
-PLOT_SCRIPT="$SCRIPT_DIR/4.2.1_plot_threshold_sweep.py"
+PLOT_SCRIPT="$SCRIPT_DIR/plot.py"
 if [ -f "$PLOT_SCRIPT" ] && python3 -c "import matplotlib" 2>/dev/null; then
     echo ""
     echo ">>> Generating threshold sweep plots..."

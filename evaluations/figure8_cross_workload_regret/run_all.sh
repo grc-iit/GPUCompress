@@ -28,7 +28,7 @@
 # per-workload subdir with the raw ranking + per-chunk CSVs.
 #
 # Usage:
-#   bash benchmarks/Paper_Evaluations/7/sc26_run_all_workloads.sh
+#   bash evaluations/figure8_cross_workload_regret/run_all.sh
 #
 # Optional env overrides:
 #   SC26_DIR=/some/path  (default: $PROJECT_DIR/SC26)
@@ -42,8 +42,8 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-RUNNER="$SCRIPT_DIR/7.1_run_equalized_cross_workload_regret.sh"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+RUNNER="$SCRIPT_DIR/run_one_workload.sh"
 
 [ -f "$RUNNER" ] || { echo "ERROR: runner not found: $RUNNER" >&2; exit 1; }
 
@@ -302,7 +302,7 @@ SWEEP_END=$(date +%s)
 TOTAL=$((SWEEP_END - SWEEP_START))
 
 # ── Combined cross-workload figures (Figures 1, 2, 3) ───────
-COMBINED_PLOTTER="$SCRIPT_DIR/sc26_combined_plots.py"
+COMBINED_PLOTTER="$SCRIPT_DIR/plot.py"
 if [ -f "$COMBINED_PLOTTER" ]; then
     {
         echo ""

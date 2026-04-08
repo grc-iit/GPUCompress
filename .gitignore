@@ -71,3 +71,8 @@ __pycache__/
 # Legacy source (removed from tree)
 GPU_LZ4.cu
 .cache/
+
+# Scratch / local-only
+deleteAfterwards/
+/x
+docs/delta_build_session.md

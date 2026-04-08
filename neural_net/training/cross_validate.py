@@ -107,7 +107,8 @@ def prepare_fold(df_train, df_val, add_size_interactions=False):
 
 def train_one_fold(train_X, train_Y, val_X, val_Y, epochs=100, batch_size=512,
                    lr=1e-3, patience=15, hidden_dim=128, model_variant="shared",
-                   num_hidden_layers=2, head_hidden_dim=64):
+                   num_hidden_layers=2, head_hidden_dim=64,
+                   first_layer_dim=None, last_layer_dim=None):
     """Train model on one fold, return best val predictions (normalized)."""
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -125,7 +126,9 @@ def train_one_fold(train_X, train_Y, val_X, val_Y, epochs=100, batch_size=512,
     model = CompressionPredictor(input_dim=input_dim, hidden_dim=hidden_dim,
                                   output_dim=output_dim, model_variant=model_variant,
                                   num_hidden_layers=num_hidden_layers,
-                                  head_hidden_dim=head_hidden_dim).to(device)
+                                  head_hidden_dim=head_hidden_dim,
+                                  first_layer_dim=first_layer_dim,
+                                  last_layer_dim=last_layer_dim).to(device)
 
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
@@ -206,6 +209,12 @@ def main():
                         help='Used when model-variant=shared')
     parser.add_argument('--head-hidden-dim', type=int, default=64,
                         help='Used when model-variant=split_heads')
+    parser.add_argument('--first-layer-dim', type=int, default=256,
+                        help='Width of the first hidden layer (default 256). '
+                             'Set to 0 to match hidden-dim (uniform-width).')
+    parser.add_argument('--last-layer-dim', type=int, default=256,
+                        help='Width of the last hidden layer before output (default 256). '
+                             'Set to 0 to match hidden-dim (uniform-width).')
     parser.add_argument('--add-size-interactions', action='store_true',
                         help='Add data_size x (algorithm/quant/shuffle) interaction features')
     parser.add_argument('--seed', type=int, default=42)
@@ -216,8 +225,14 @@ def main():
     df = pd.concat(frames, ignore_index=True)
     df = df[df['success'] == True].copy()
     print(f"Loaded {len(df)} successful rows from {len(args.csv)} CSV file(s)")
+    # Resolve 0 → None so the model falls back to hidden_dim (uniform-width)
+    first_layer_dim = args.first_layer_dim if args.first_layer_dim > 0 else None
+    last_layer_dim  = args.last_layer_dim  if args.last_layer_dim  > 0 else None
+
     print(f"Model variant: {args.model_variant}  hidden_dim={args.hidden_dim}  "
-          f"num_hidden_layers={args.num_hidden_layers}  head_hidden_dim={args.head_hidden_dim}")
+          f"num_hidden_layers={args.num_hidden_layers}  head_hidden_dim={args.head_hidden_dim}  "
+          f"first_layer_dim={first_layer_dim or args.hidden_dim}  "
+          f"last_layer_dim={last_layer_dim or args.hidden_dim}")
     print(f"Feature option: add_size_interactions={args.add_size_interactions}")
 
     # Split by file
@@ -259,7 +274,9 @@ def main():
             epochs=args.epochs, hidden_dim=args.hidden_dim,
             model_variant=args.model_variant,
             num_hidden_layers=args.num_hidden_layers,
-            head_hidden_dim=args.head_hidden_dim)
+            head_hidden_dim=args.head_hidden_dim,
+            first_layer_dim=first_layer_dim,
+            last_layer_dim=last_layer_dim)
 
         print(f"  Best val loss: {best_loss:.6f} (stopped at epoch {last_epoch})")
 

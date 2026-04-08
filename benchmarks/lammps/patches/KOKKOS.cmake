@@ -253,7 +253,12 @@ if(PKG_PHONON)
   list(APPEND KOKKOS_PKG_SOURCES ${KOKKOS_PKG_SOURCES_DIR}/third_order_kokkos.cpp)
 endif()
 
-# GPUCompress fix (KOKKOS-only, no base style)
+# GPUCompress fix (KOKKOS-only, no base style).
+# NOTE: lammps_ranking_profiler.cu is NOT listed here — it's built as a
+# separate liblammps_ranking_profiler.so by benchmarks/lammps/build_lammps.sh
+# and linked in via CMAKE_EXE_LINKER_FLAGS (-L$PATCH_DIR -llammps_ranking_profiler).
+# Registering it here triggers cudafe++ internal errors with LAMMPS's
+# C++20 + Kokkos nvcc_wrapper toolchain.
 list(APPEND KOKKOS_PKG_SOURCES ${KOKKOS_PKG_SOURCES_DIR}/fix_gpucompress_kokkos.cpp)
 
 set_property(GLOBAL PROPERTY "KOKKOS_PKG_SOURCES" "${KOKKOS_PKG_SOURCES}")

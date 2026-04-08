@@ -13,7 +13,7 @@
 # SGD learning. Per-chunk CSV + ranking profiler run during simulation.
 #
 # Usage:
-#   bash benchmarks/Paper_Evaluations/7/7.1_run_equalized_cross_workload_regret.sh
+#   bash evaluations/figure8_cross_workload_regret/run_one_workload.sh
 #
 # Overrides:
 #   RUN_NAME=paper_fig7a
@@ -25,7 +25,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_DIR"
 
 # ── Run configuration ─────────────────────────────────────────
@@ -1773,7 +1773,7 @@ write_run_metadata() {
             echo "    AI_CHECKPOINTS=$AI_CHECKPOINTS AI_DATASET=$AI_DATASET \\"
         fi
         echo "    RUN_NAME=$RUN_NAME \\"
-        echo "    bash benchmarks/Paper_Evaluations/7/7.1_run_equalized_cross_workload_regret.sh"
+        echo "    bash evaluations/figure8_cross_workload_regret/run_one_workload.sh"
         echo ""
     } > "$meta"
 
@@ -1843,6 +1843,20 @@ main() {
     plot_cross_workload_mape
     plot_cross_workload_psnr_mape || \
         note "PSNR MAPE plot skipped (no lossy chunks — set ERROR_BOUND > 0)"
+
+    # ── Per-cell cleanup: drop the bulky <workload>_work/ dirs (AMReX
+    #    plotfiles, LAMMPS gpuc_step dumps, NYX/WarpX run trees) now that
+    #    all per-chunk CSVs and ranking data have been extracted into
+    #    <workload>/ and the cross_workload_*.csv aggregates exist. The
+    #    full sc26 sweep (4 workloads × 2 policies = 8 cells) writes
+    #    ~10-15 GiB of plotfiles per run, which would blow the user /u
+    #    quota over 8 cells without cleanup. CSVs + cross_workload plots
+    #    + run logs are preserved.
+    note "cleaning per-cell bulk data dirs (CSVs preserved)"
+    rm -rf "$RESULTS_DIR/nyx_work" "$RESULTS_DIR/warpx_work" "$RESULTS_DIR/lammps_work" 2>/dev/null
+    # Also drop the per-workload <workload>/diags|gpuc_step trees if any
+    # leaked from the simulator side.
+    find "$RESULTS_DIR" -maxdepth 3 -type d \( -name 'diags' -o -name 'gpuc_step_*' \) -exec rm -rf {} + 2>/dev/null
 
     cat <<EOF
 
