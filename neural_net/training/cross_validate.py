@@ -36,20 +36,19 @@ def prepare_fold(df_train, df_val, add_size_interactions=False):
         sub_df['quant_enc'] = (sub_df['quantization'] == 'linear').astype(np.float32)
         # Shuffle
         sub_df['shuffle_enc'] = (sub_df['shuffle'] > 0).astype(np.float32)
-        # Error bound log-scale
-        sub_df['error_bound_enc'] = np.log10(sub_df['error_bound'].clip(lower=1e-7)).astype(np.float32)
-        # Data size log2
-        sub_df['data_size_enc'] = np.log2(sub_df['original_size'].clip(lower=1)).astype(np.float32)
+        sub_df['error_bound_enc'] = sub_df['error_bound'].astype(np.float32)
+        sub_df['data_size_enc'] = sub_df['original_size'].astype(np.float32)
         # Core output encodings
-        sub_df['comp_time_log'] = np.log1p(sub_df['compression_time_ms'].clip(lower=0)).astype(np.float32)
-        sub_df['decomp_time_log'] = np.log1p(sub_df['decompression_time_ms'].clip(lower=0)).astype(np.float32)
+        sub_df['comp_time_log'] = np.log1p(sub_df['compression_time_ms'].clip(lower=1)).astype(np.float32)
+        sub_df['decomp_time_log'] = np.log1p(sub_df['decompression_time_ms'].clip(lower=1)).astype(np.float32)
         sub_df['ratio_log'] = np.log1p(sub_df['compression_ratio'].clip(lower=0)).astype(np.float32)
         sub_df['psnr_clamped'] = sub_df['psnr_db'].replace([np.inf, -np.inf], 120.0).fillna(120.0).clip(upper=120.0).astype(np.float32)
         # Extended output encodings
         if 'mean_abs_err' in sub_df.columns:
             sub_df['log_mae'] = np.log1p(sub_df['mean_abs_err'].clip(lower=0).fillna(0)).astype(np.float32)
         if 'ssim' in sub_df.columns:
-            sub_df['ssim_val'] = sub_df['ssim'].clip(lower=0, upper=1).fillna(1.0).astype(np.float32)
+            ssim_clipped = sub_df['ssim'].clip(lower=0, upper=1).fillna(1.0)
+            sub_df['ssim_nlog'] = (-np.log(1.0 - ssim_clipped + 1e-7)).astype(np.float32)
 
     algo_cols = [f'alg_{a}' for a in ALGORITHM_NAMES]
     feature_cols = algo_cols + ['quant_enc', 'shuffle_enc',
@@ -72,7 +71,7 @@ def prepare_fold(df_train, df_val, add_size_interactions=False):
         feature_cols.extend(interaction_cols)
 
     output_cols = ['comp_time_log', 'decomp_time_log', 'ratio_log', 'psnr_clamped']
-    for extra in ['log_mae', 'ssim_val']:
+    for extra in ['log_mae', 'ssim_nlog']:
         if extra in df_train.columns:
             output_cols.append(extra)
 

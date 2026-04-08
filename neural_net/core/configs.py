@@ -44,8 +44,8 @@ def build_all_config_features(entropy, mad, second_derivative,
                 quant_enc = 1.0 if quant else 0.0
                 shuffle_enc = 1.0 if shuffle > 0 else 0.0
                 eb_val = eb if quant else 1e-7
-                error_bound_enc = math.log10(max(eb_val, 1e-7))
-                data_size_enc = math.log2(max(data_size, 1))
+                error_bound_enc = eb_val
+                data_size_enc = float(data_size)
 
                 feature_vec = algo_features + [
                     quant_enc, shuffle_enc, error_bound_enc,
