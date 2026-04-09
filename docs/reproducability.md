@@ -208,4 +208,157 @@ Only outputs 0–3 are used for action selection (comp_time, decomp_time, ratio,
 | 2 | `hyperparam_study.py` | `results/hyperparam_study.csv` |
 | 3 | `cross_validate.py` | stdout (MAE / R² / MAPE per fold) |
 | 4 | `export_weights.py` | `neural_net/weights/model.nnwt` |
-| 5 | Set `GPUCOMPRESS_NN_WEIGHTS_FILE` | VOL loads model at startup |
+| 5 | `gpucompress_init("model.nnwt")` | VOL loads model at runtime |
+
+---
+
+## VOL Configuration Reference
+
+### VOL Operating Mode
+
+Set `GPUCOMPRESS_VOL_MODE` before opening any HDF5 file.
+
+| Value | Behaviour |
+|-------|-----------|
+| *(unset)* or `release` | Full NN inference + online SGD. Default for production runs. |
+| `bypass` | GPU→CPU passthrough, no compression. Use for baseline I/O throughput measurements. |
+| `trace` | Everything in `release` plus exhaustive per-chunk profiling of all 32 algorithm configs. Writes a per-row CSV. ~32× slower. |
+
+```bash
+export GPUCOMPRESS_VOL_MODE=release   # default
+export GPUCOMPRESS_VOL_MODE=bypass    # baseline
+export GPUCOMPRESS_VOL_MODE=trace     # full profiling
+```
+
+---
+
+### Environment Variables
+
+All variables are read at `gpucompress_init()` time unless noted otherwise.
+
+#### Core
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `GPUCOMPRESS_DEVICE` | int | `0` | CUDA device index. **Mutually exclusive** with `CUDA_VISIBLE_DEVICES` — if both are set, this is ignored with a warning. |
+| `GPUCOMPRESS_WEIGHTS` | path | *(none)* | Path to `.nnwt` weights file. Used by the **H5Z filter** path only; the VOL uses the `gpucompress_init()` argument instead. |
+
+#### Cost Model
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `GPUCOMPRESS_BW_GBPS` | float | `5.0` | Storage bandwidth in GB/s fed into the cost model: `cost = w0·comp_ms + w1·decomp_ms + w2·bytes/(ratio·bw)`. Set to your filesystem's measured write bandwidth. |
+
+#### Online Learning (SGD + Exploration)
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `GPUCOMPRESS_MAPE_LOW_THRESH` | float 0–1 | `0.30` | **X1** — SGD trigger. When cost MAPE exceeds this, a proportional SGD gradient step is applied to the NN weights. |
+| `GPUCOMPRESS_MAPE_HIGH_THRESH` | float 0–1 | `0.50` | **X2** — Exploration trigger. When cost MAPE exceeds this, the chunk is re-compressed with K alternative configs and the best result is used for the SGD update. |
+
+#### Output Paths
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `GPUCOMPRESS_TIMING_OUTPUT` | path | `gpucompress_io_timing.csv` | Two-column CSV written on every `H5Fclose`: `e2e_ms` (H5Fopen→H5Fclose wall time) and `vol_ms` (sum of all H5Dwrite/H5Dread callback times). |
+| `GPUCOMPRESS_TRACE_OUTPUT` | path | `gpucompress_trace.csv` | Per-chunk × per-config profiling CSV. Written only when `GPUCOMPRESS_VOL_MODE=trace`. |
+| `GPUCOMPRESS_RESULTS_DIR` | path | *(cwd)* | Directory for benchmark lifetime summary files (written at process exit by the VOL atexit handler). Falls back to `VPIC_RESULTS_DIR` if unset. |
+
+#### Debugging
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `GPUCOMPRESS_DEBUG_NN` | `1`/`y` | off | Print per-chunk NN inference inputs and outputs to stderr. |
+| `GPUCOMPRESS_DETAILED_TIMING` | `1`/`y` | off | Print per-chunk stage timing breakdown (stats, NN, compression, SGD) to stderr. |
+| `GPUCOMPRESS_VERBOSE` | any non-`0` | off | Enable verbose logging in the **H5Z filter** path (not the VOL). |
+
+---
+
+### C API Configuration
+
+These can be called at any point after `gpucompress_init()` and take effect on the next `H5Dwrite`.
+
+#### Algorithm Selection
+
+```c
+// Switch between NN inference (default) and entropy-based heuristic rules
+gpucompress_set_selection_mode(GPUCOMPRESS_SELECT_NN);        // default
+gpucompress_set_selection_mode(GPUCOMPRESS_SELECT_HEURISTIC);
+```
+
+#### Online Learning
+
+```c
+// Master switch
+gpucompress_enable_online_learning();   // enable SGD
+gpucompress_disable_online_learning();  // disable SGD + exploration
+
+// SGD parameters (X1 threshold, learning rate)
+gpucompress_set_reinforcement(
+    /*enable (ignored)*/ 1,
+    /*learning_rate*/    0.01f,   // default
+    /*mape_threshold*/   0.30f,   // X1: default 30%
+    /*ct_mape (ignored)*/ 0.0f
+);
+
+// Exploration (X2 threshold)
+gpucompress_set_exploration(1);                     // enable
+gpucompress_set_exploration_threshold(0.50);        // X2: default 50%
+gpucompress_set_exploration_k(8);                   // fix K; -1 = dynamic default
+
+// Exhaustive best-config search (ceiling benchmark, ~32× slower, SGD disabled)
+gpucompress_set_best_mode(1);
+```
+
+#### Cost Model
+
+```c
+// Ranking formula: cost = w0*comp_ms + w1*decomp_ms + w2*bytes/(ratio*bw)
+gpucompress_set_ranking_weights(1.0f, 1.0f, 1.0f);   // default
+
+// Override auto-detected storage bandwidth
+gpucompress_set_bandwidth(3.0f);   // 3 GB/s (e.g. NVMe)
+
+// Reject configs with predicted PSNR below floor (lossy only; 0 = disabled)
+gpucompress_set_min_psnr(30.0f);
+```
+
+#### NN Weights
+
+```c
+// Hot-reload weights without restarting
+gpucompress_load_nn("neural_net/weights/model_v2.nnwt");
+
+// Check if NN is active
+int loaded = gpucompress_nn_is_loaded();  // 1 = yes, 0 = LZ4 fallback
+```
+
+---
+
+### Typical Experiment Configurations
+
+```bash
+# Baseline (no compression, pure I/O throughput)
+export GPUCOMPRESS_VOL_MODE=bypass
+export GPUCOMPRESS_TIMING_OUTPUT=results/bypass_timing.csv
+
+# NN inference only (no online learning)
+export GPUCOMPRESS_VOL_MODE=release
+export GPUCOMPRESS_TIMING_OUTPUT=results/nn_timing.csv
+
+# NN + SGD online learning
+export GPUCOMPRESS_VOL_MODE=release
+export GPUCOMPRESS_MAPE_LOW_THRESH=0.30
+export GPUCOMPRESS_TIMING_OUTPUT=results/nn_rl_timing.csv
+
+# NN + SGD + exploration
+export GPUCOMPRESS_VOL_MODE=release
+export GPUCOMPRESS_MAPE_LOW_THRESH=0.30
+export GPUCOMPRESS_MAPE_HIGH_THRESH=0.50
+export GPUCOMPRESS_TIMING_OUTPUT=results/nn_rl_exp_timing.csv
+
+# Full trace (generates per-chunk CSV for analysis)
+export GPUCOMPRESS_VOL_MODE=trace
+export GPUCOMPRESS_TRACE_OUTPUT=results/trace.csv
+export GPUCOMPRESS_TIMING_OUTPUT=results/trace_timing.csv
+```
