@@ -424,6 +424,50 @@ static double _now_ms() {
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
+/* ── Raw bypass mode (GPUCOMPRESS_VOL_BYPASS env var) ──
+ * When enabled, gpu_aware_chunked_write() skips stats+NN inference AND
+ * the nvCOMP compression call. Each chunk still flows through the same
+ * worker+IO pipeline (D→H copy into the pinned pool, push to I/O thread,
+ * native H5Dwrite_chunk) so timings are directly comparable to a
+ * normal compression run: the only thing removed is the NN + nvCOMP
+ * work. Produces a raw-I/O baseline for subtractive "pipeline overhead"
+ * measurement.
+ *
+ * The env var is read exactly once via std::call_once on first access
+ * so subsequent writes see the same mode. */
+static bool s_vol_bypass = false;
+static std::once_flag s_vol_bypass_once;
+
+static inline bool vol_bypass_enabled(void) {
+    std::call_once(s_vol_bypass_once, [](){
+        const char* e = getenv("GPUCOMPRESS_VOL_BYPASS");
+        s_vol_bypass = (e && *e && atoi(e) != 0);
+        if (s_vol_bypass) {
+            fprintf(stderr,
+                "[gpucompress VOL] BYPASS MODE ENABLED — "
+                "NN + nvCOMP skipped; raw D->H copy + native write only.\n");
+        }
+    });
+    return s_vol_bypass;
+}
+
+/* ── Program wall-clock marker ──
+ * Captured at the very first H5VL_gpucompress_register() call — the
+ * earliest app-visible VOL entry point. Subtract the accumulated
+ * g_life_vol_ms at process exit to derive a "compute time" that
+ * represents everything NOT spent inside the VOL pipeline (simulator
+ * physics, AMReX bookkeeping, etc.). Invariant: compute_ms should be
+ * approximately the same across compression and bypass modes for the
+ * same workload config. */
+static double g_prog_start_ms = 0;
+static std::once_flag g_prog_start_once;
+
+static inline void vol_prog_start_mark(void) {
+    std::call_once(g_prog_start_once, [](){
+        g_prog_start_ms = _now_ms();
+    });
+}
+
 static void gpucompress_vol_atexit() {
     if (g_life_writes == 0) return;
 
@@ -439,16 +483,30 @@ static void gpucompress_vol_atexit() {
     double out_mb = g_life_bytes_out / (1024.0 * 1024.0);
     double wr_bw  = (vol_s > 0) ? in_mb / vol_s : 0;
 
+    const bool bypass_mode = vol_bypass_enabled();
+    const char *mode_line = bypass_mode
+        ? "  MODE:               BYPASS (NN + nvCOMP skipped)\n"
+        : "  MODE:               COMPRESSION (NN + nvCOMP on)\n";
+
+    double prog_wall_ms = (g_prog_start_ms > 0) ? (_now_ms() - g_prog_start_ms) : 0.0;
+    double compute_ms   = prog_wall_ms - g_life_vol_ms;
+    if (compute_ms < 0) compute_ms = 0;
+    double prog_wall_s  = prog_wall_ms / 1000.0;
+    double compute_s    = compute_ms / 1000.0;
+
     /* Print to stderr */
     fprintf(stderr,
         "\n========================================\n"
         " GPUCompress VOL — Lifetime Summary\n"
         "========================================\n"
+        "%s"
         "  H5Dwrite calls:    %d (%d chunks)\n"
         "  Data in:            %.1f MiB\n"
         "  Data out:           %.1f MiB (%.2fx ratio)\n"
         "  Write throughput:   %.1f MiB/s\n"
         "----------------------------------------\n"
+        "  Program wall:       %.3f s  (VOL register → process exit)\n"
+        "  Compute (non-VOL):  %.3f s  (program − VOL; mode-invariant)\n"
         "  Total VOL time:     %.3f s  (wall-clock, app blocked)\n"
         "  Disk I/O time:      %.3f s  (actual writes to storage)\n"
         "  Stage 1 (stats+NN): %.3f s  (sequential, main thread)\n"
@@ -457,8 +515,10 @@ static void gpucompress_vol_atexit() {
         "  I/O drain:          %.3f s  (workers done → I/O done)\n"
         "  Setup:              %.3f s\n"
         "========================================\n",
+        mode_line,
         g_life_writes, g_life_chunks,
         in_mb, out_mb, ratio, wr_bw,
+        prog_wall_s, compute_s,
         vol_s, io_s, s1_s, s2_s, drain_s, iodrain_s, setup_s);
 
     /* Write to file */
@@ -470,11 +530,14 @@ static void gpucompress_vol_atexit() {
         fprintf(fp,
             "GPUCompress VOL — Lifetime Summary\n"
             "==================================\n"
+            "bypass_mode,%d\n"
             "h5dwrite_calls,%d\n"
             "total_chunks,%d\n"
             "bytes_in,%zu\n"
             "bytes_out,%zu\n"
             "ratio,%.4f\n"
+            "program_wall_ms,%.2f\n"
+            "compute_ms,%.2f\n"
             "vol_time_ms,%.2f\n"
             "disk_io_ms,%.2f\n"
             "stage1_ms,%.2f\n"
@@ -483,8 +546,10 @@ static void gpucompress_vol_atexit() {
             "io_drain_ms,%.2f\n"
             "setup_ms,%.2f\n"
             "write_mibps,%.1f\n",
+            bypass_mode ? 1 : 0,
             g_life_writes, g_life_chunks,
             g_life_bytes_in, g_life_bytes_out, ratio,
+            prog_wall_ms, compute_ms,
             g_life_vol_ms, g_life_io_ms,
             g_life_s1_ms, g_life_s2_ms,
             g_life_drain_ms, g_life_iodrain_ms,
@@ -541,6 +606,23 @@ H5VL_gpucompress_get_vol_func_timing(double *setup_ms, double *vol_func_ms)
 {
     if (setup_ms)    *setup_ms    = s_setup_ms;
     if (vol_func_ms) *vol_func_ms = s_vol_func_ms;
+}
+
+extern "C" int
+H5VL_gpucompress_is_bypass_mode(void)
+{
+    return vol_bypass_enabled() ? 1 : 0;
+}
+
+extern "C" void
+H5VL_gpucompress_get_program_wall(double *program_ms, double *compute_ms)
+{
+    double now = _now_ms();
+    double pm  = (g_prog_start_ms > 0) ? (now - g_prog_start_ms) : 0.0;
+    double cm  = pm - g_life_vol_ms;
+    if (cm < 0) cm = 0;
+    if (program_ms) *program_ms = pm;
+    if (compute_ms) *compute_ms = cm;
 }
 
 extern "C" void
@@ -1163,6 +1245,14 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
             goto done;
         }
 
+        /* ── Raw bypass mode (GPUCOMPRESS_VOL_BYPASS=1) ──
+         * When enabled, skip stats+NN inference AND nvCOMP entirely. Each
+         * chunk is still iterated, D→H copied via the pinned pool, and
+         * written through the same I/O thread, but the compression kernel
+         * is replaced with a no-op pass-through. Yields a raw-I/O baseline
+         * whose timings are directly comparable to the compression path. */
+        const bool bypass = vol_bypass_enabled();
+
         size_t chunk_elems = 1;
         for (int d = 0; d < ndims; d++) chunk_elems *= (size_t)chunk_dims[d];
         size_t chunk_bytes = chunk_elems * elem_size;
@@ -1341,9 +1431,16 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                         double _w_start = _now_ms();
                         size_t comp_sz = max_comp;
                         gpucompress_stats_t wstats = {};
-                        gpucompress_error_t ce;
+                        gpucompress_error_t ce = GPUCOMPRESS_SUCCESS;
                         int diag_slot = -1;
-                        if (wi.has_inference) {
+                        if (bypass) {
+                            /* Raw pass-through: skip nvCOMP entirely. The D→H
+                             * copy below will move wi.src bytes directly into
+                             * the pinned pool; the I/O thread then writes them
+                             * uncompressed. comp_sz == wi.sz so downstream
+                             * accounting treats bytes_out == bytes_in. */
+                            comp_sz = wi.sz;
+                        } else if (wi.has_inference) {
                             ce = gpucompress_compress_with_action_gpu(
                                 wi.src, wi.sz, d_comp_w[w], &comp_sz, &cfg, &wstats, NULL,
                                 wi.action, wi.predicted_ratio, wi.predicted_comp_time,
@@ -1356,8 +1453,10 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                                 wi.src, wi.sz, d_comp_w[w], &comp_sz, &cfg, &wstats, NULL);
                         }
 
-                        /* Free per-chunk owned buffers after compression completes */
-                        if (wi.d_owned) { cudaFree(wi.d_owned); wi.d_owned = NULL; }
+                        /* Free per-chunk owned buffers after compression completes.
+                         * In bypass mode, defer freeing wi.d_owned until after the
+                         * D→H copy below (since wi.src is the copy source). */
+                        if (wi.d_owned && !bypass) { cudaFree(wi.d_owned); wi.d_owned = NULL; }
                         if (wi.d_stats_copy && !wi.d_stats_ring_managed) { cudaFree(wi.d_stats_copy); wi.d_stats_copy = NULL; }
 
                         if (ce != GPUCOMPRESS_SUCCESS) {
@@ -1381,8 +1480,15 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                             pool_cv.notify_all();
                             break;
                         }
+                        /* Bypass: copy the raw input chunk (wi.src) straight to
+                         * host. Compression: copy the compressor output buffer
+                         * (d_comp_w[w]). Same pinned-pool destination, same
+                         * timing slot, so the D→H latency is directly
+                         * comparable between modes. */
+                        const void* _d2h_src = bypass ? (const void*)wi.src
+                                                      : (const void*)d_comp_w[w];
                         double _t_d2h = _now_ms();
-                        if (cudaMemcpy(hbuf, d_comp_w[w], comp_sz,
+                        if (cudaMemcpy(hbuf, _d2h_src, comp_sz,
                                        cudaMemcpyDeviceToHost) != cudaSuccess) {
                             pool_release(hbuf);
                             worker_err.store((herr_t)-1);
@@ -1391,6 +1497,10 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                             break;
                         }
                         float vol_d2h_ms = (float)(_now_ms() - _t_d2h);
+
+                        /* In bypass mode, wi.d_owned was the source of the D→H
+                         * copy above. It's safe to free now. */
+                        if (bypass && wi.d_owned) { cudaFree(wi.d_owned); wi.d_owned = NULL; }
 
                         IOItem item;
                         item.data = hbuf;
@@ -1456,7 +1566,7 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                 /* Acquire dedicated CompContext for sequential inference (slot 8).
                  * This lets the main thread run stats+inference without racing
                  * with workers, and each chunk sees the latest SGD update. */
-                bool use_seq_inference = (cfg.algorithm == GPUCOMPRESS_ALGO_AUTO);
+                bool use_seq_inference = (cfg.algorithm == GPUCOMPRESS_ALGO_AUTO) && !bypass;
                 CompContext* infer_ctx = nullptr;
                 if (use_seq_inference) {
                     infer_ctx = gpucompress::acquireCompContext();
@@ -3085,6 +3195,11 @@ H5VL_gpucompress_optional(void *obj, H5VL_optional_args_t *args,
 extern "C" hid_t
 H5VL_gpucompress_register(void)
 {
+    /* Capture program start wall-clock on first call — used by the
+     * compute_ms derivation in the lifetime summary and the
+     * H5VL_gpucompress_get_program_wall() getter. */
+    vol_prog_start_mark();
+
     /* H5VLregister_connector is idempotent — multiple calls return the same ID */
     return H5VLregister_connector(&H5VL_gpucompress_g, H5P_DEFAULT);
 }

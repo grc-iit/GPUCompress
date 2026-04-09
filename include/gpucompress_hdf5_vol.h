@@ -114,6 +114,44 @@ void H5VL_gpucompress_get_busy_timing(double *s2_busy_ms, double *s3_busy_ms);
  */
 void H5VL_gpucompress_get_vol_func_timing(double *setup_ms, double *vol_func_ms);
 
+/**
+ * Returns 1 if GPUCOMPRESS_VOL_BYPASS env var was set when the VOL was
+ * first initialized, 0 otherwise.
+ *
+ * In bypass mode the VOL skips stats, NN inference, and nvCOMP entirely.
+ * Each chunk is still routed through the worker + I/O pipeline (pinned-pool
+ * D→H copy → dedicated I/O thread → native H5Dwrite_chunk) so timing
+ * results are directly comparable to a normal compression run. The file
+ * contents end up uncompressed (bytes_out == bytes_in, ratio 1.0).
+ *
+ * Intended as a measurement baseline: run the same workload twice
+ * (compression on, then bypass) and diff gpucompress_vol_summary.txt to
+ * isolate the runtime cost of the NN + compression pipeline vs raw I/O.
+ */
+int  H5VL_gpucompress_is_bypass_mode(void);
+
+/**
+ * Get program wall-clock and derived compute time (ms).
+ *
+ * program_ms: wall-clock from the first H5VL_gpucompress_register() call
+ *             (typically the earliest VOL entry point in the application)
+ *             to the current instant. At process exit this is the full
+ *             "lifetime" of the VOL's visibility to the program.
+ *
+ * compute_ms: program_ms − sum of gpu_aware_chunked_write wall-clocks.
+ *             Isolates "everything not spent inside the VOL pipeline" —
+ *             simulator physics, AMReX bookkeeping, particle push, etc.
+ *             Should be approximately mode-invariant (compression vs
+ *             GPUCOMPRESS_VOL_BYPASS=1) for the same workload config;
+ *             divergence means the VOL is contending with the simulator
+ *             for GPU resources or blocking its critical path.
+ *
+ * Any pointer may be NULL. Both values are also emitted as
+ * `program_wall_ms` and `compute_ms` fields in gpucompress_vol_summary.txt
+ * at process exit.
+ */
+void H5VL_gpucompress_get_program_wall(double *program_ms, double *compute_ms);
+
 /** Release cached VOL pipeline buffers (device + pinned host).
  *  Called automatically by gpucompress_cleanup(). Can also be called
  *  explicitly to free ~1.7GB of cached memory between benchmark phases. */
