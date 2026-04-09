@@ -87,13 +87,7 @@ std::atomic<int>  g_last_nn_original_action{-1};
 std::atomic<int>  g_last_exploration_triggered{0};
 std::atomic<int>  g_last_sgd_fired{0};
 
-gpucompress_chunk_diag_t* g_chunk_history      = nullptr;
-int                       g_chunk_history_cap   = 0;
-std::atomic<int>          g_chunk_history_count{0};
-std::mutex                g_chunk_history_mutex;
-
-std::atomic<int>  g_mgr_cache_hits{0};
-std::atomic<int>  g_mgr_cache_misses{0};
+/* Chunk history and cache stats live in DiagnosticsStore singleton. */
 
 std::mutex        g_sgd_mutex;
 
@@ -292,16 +286,7 @@ extern "C" void gpucompress_cleanup(void) {
         }
         g_initialized.store(false);
         g_ref_count.store(0);
-        /* Free dynamic chunk history */
-        {
-            std::lock_guard<std::mutex> lk(g_chunk_history_mutex);
-            if (g_chunk_history) {
-                free(g_chunk_history);
-                g_chunk_history    = nullptr;
-                g_chunk_history_cap = 0;
-            }
-            g_chunk_history_count.store(0);
-        }
+        /* Chunk history is owned by DiagnosticsStore (singleton, freed at exit). */
     }
 }
 

@@ -19,6 +19,7 @@
 #include "gpucompress.h"
 #include "api/internal.hpp"
 #include "api/gpucompress_state.hpp"
+#include "api/diagnostics_store.hpp"
 #include "compression/compression_factory.hpp"
 #include "compression/compression_header.h"
 #include "preprocessing/byte_shuffle.cuh"
@@ -1025,11 +1026,8 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
         DT_START(_dt_diag);
         int diag_slot = gpucompress::recordChunkDiagnostic(di);
         float dt_diag_record = DT_MS(_dt_diag);
-        /* Post-hoc: write diag_record_ms back (mutex for TSan compliance) */
-        if (g_detailed_timing && diag_slot >= 0 && diag_slot < g_chunk_history_cap) {
-            std::lock_guard<std::mutex> lk(g_chunk_history_mutex);
-            g_chunk_history[diag_slot].diag_record_ms = dt_diag_record;
-        }
+        if (g_detailed_timing && diag_slot >= 0)
+            gpucompress::DiagnosticsStore::instance().setDiagRecordMs(diag_slot, dt_diag_record);
         /* Propagate slot index to caller for VOL timing writeback */
         if (out_diag_slot) *out_diag_slot = diag_slot;
     }

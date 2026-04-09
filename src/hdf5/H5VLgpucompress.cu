@@ -39,6 +39,7 @@
 /* Internal API: split-phase inference + CompContext pool */
 #include "api/internal.hpp"
 #include "api/gpucompress_state.hpp"
+#include "api/diagnostics_store.hpp"
 #include "selection/heuristic.h"
 
 /* gpucompress HDF5 filter ID (must match H5Zgpucompress.h) */
@@ -1409,9 +1410,10 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
 
                         /* Write VOL timing back to chunk diagnostic */
                         if (diag_slot >= 0) {
-                            gpucompress_record_chunk_vol_timing(diag_slot,
+                            auto& store = gpucompress::DiagnosticsStore::instance();
+                            store.recordVolTiming(diag_slot,
                                 vol_pool_ms, vol_d2h_ms, vol_io_wait_ms);
-                            gpucompress_record_chunk_s1_timing(diag_slot,
+                            store.recordS1Timing(diag_slot,
                                 wi.vol_stats_malloc_ms, wi.vol_stats_copy_ms, wi.vol_wq_post_wait_ms);
                         }
 
@@ -2178,7 +2180,7 @@ gpu_aware_chunked_read(H5VL_gpucompress_t *o,
             if (ce != GPUCOMPRESS_SUCCESS) { ret = -1; break; }
             float _decomp_ms = 0.0f;
             cudaEventElapsedTime(&_decomp_ms, decomp_ev_start, decomp_ev_stop);
-            gpucompress_record_chunk_decomp_ms((int)ci, _decomp_ms);
+            gpucompress::DiagnosticsStore::instance().recordDecompMs((int)ci, _decomp_ms);
             VOL_TRACE("    gpucompress_decompress_gpu() → %zuB (%.2f ms)", decomp_size, _decomp_ms);
 
             if (direct_decomp) {
