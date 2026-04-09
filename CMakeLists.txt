@@ -63,6 +63,7 @@ include(cmake/Tests.cmake)         # Unit, NN, regression, perf tests
 include(cmake/HDF5Filter.cmake)    # libH5Zgpucompress.so + H5Z tests
 include(cmake/HDF5Vol.cmake)       # libH5VLgpucompress.so + VOL tests/demos/benchmarks
 include(cmake/Install.cmake)       # Installation rules
+add_subdirectory(synthetic)        # GPU synthetic benchmark generator
 
 # ============================================================
 # Build Summary

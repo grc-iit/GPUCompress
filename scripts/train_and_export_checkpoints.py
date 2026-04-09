@@ -413,7 +413,10 @@ def main():
                         bc["chunk_csv"].write(CHUNK_CSV_HEADER)
 
             for name, tensors in tensor_sets:
-                flat = concat_and_pad_gpu(tensors, target_elements)
+                if hdf5_writer is not None or bench_configs or inline_bench is not None:
+                    flat = concat_and_pad_gpu(tensors, target_elements)
+                else:
+                    flat = None
 
                 if bench_configs:
                     # Multi-config: benchmark same tensor with each config
