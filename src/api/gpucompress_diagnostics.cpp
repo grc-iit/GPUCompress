@@ -74,8 +74,14 @@ extern "C" int gpucompress_get_chunk_diag(int idx, gpucompress_chunk_diag_t *out
 extern "C" void gpucompress_record_chunk_decomp_ms(int idx, float ms) {
     std::lock_guard<std::mutex> lk(g_chunk_history_mutex);
     if (idx >= 0 && idx < g_chunk_history_count.load() && idx < g_chunk_history_cap) {
-        g_chunk_history[idx].decompression_ms = std::max(5.0f, ms);  /* clamped for MAPE */
-        g_chunk_history[idx].decompression_ms_raw = ms;              /* unclamped for breakdown */
+        float clamped = std::max(1.0f, ms);
+        g_chunk_history[idx].decompression_ms     = clamped;  /* clamped for MAPE */
+        g_chunk_history[idx].decompression_ms_raw = ms;       /* unclamped for breakdown */
+        /* Update decomp_time_mape now that actual decomp time is known */
+        float pred_dt = std::max(1.0f, g_chunk_history[idx].predicted_decomp_time);
+        if (pred_dt > 0.0f)
+            g_chunk_history[idx].decomp_time_mape =
+                std::abs(clamped - pred_dt) / clamped;
     }
 }
 
@@ -149,6 +155,12 @@ int recordChunkDiagnostic(const ChunkDiagInput& d)
         h->cost_model_error_pct  = d.cost_model_error_pct;
         h->actual_cost           = d.actual_cost;
         h->predicted_cost        = d.predicted_cost;
+
+        /* Per-statistic MAPE and regret */
+        h->ratio_mape            = d.ratio_mape;
+        h->comp_time_mape        = d.comp_time_mape;
+        h->decomp_time_mape      = d.decomp_time_mape;
+        h->regret                = d.regret;
 
         /* Original config metrics (before exploration swap) */
         h->orig_actual_ratio     = d.orig_actual_ratio;

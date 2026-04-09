@@ -38,7 +38,7 @@ OUTPUT_INVERSE = {
     'ssim_nlog': ('ssim', 'ssim_nlog'),
 }
 
-CONTINUOUS_FEATURES = ['error_bound_enc', 'data_size_enc', 'entropy', 'mad', 'second_derivative']
+CONTINUOUS_FEATURES = ['alg_id', 'error_bound_enc', 'data_size_enc', 'entropy', 'mad', 'second_derivative']
 
 # Quality-of-reconstruction outputs whose values are trivially saturated on
 # lossless rows (PSNR=120, MAE=0, SSIM=1). MAPE/R²/SHAP for these targets
@@ -76,9 +76,9 @@ def encode_and_split(df: pd.DataFrame, val_fraction: float = 0.2,
 
     # ---- Encode inputs ----
 
-    # Algorithm: one-hot
-    for alg in ALGORITHM_NAMES:
-        df[f'alg_{alg}'] = (df['algorithm'] == alg).astype(np.float32)
+    # Algorithm: integer label 0..(N-1)
+    alg_index = {name: i for i, name in enumerate(ALGORITHM_NAMES)}
+    df['alg_id'] = df['algorithm'].map(alg_index).astype(np.float32)
 
     # Quantization: binary
     df['quant_enc'] = (df['quantization'] == 'linear').astype(np.float32)
@@ -136,10 +136,9 @@ def encode_and_split(df: pd.DataFrame, val_fraction: float = 0.2,
     print(f"  Val:   {len(df_val)} rows ({len(val_files)} files)")
 
     # ---- Build feature matrix ----
-    algo_cols = [f'alg_{a}' for a in ALGORITHM_NAMES]
-    feature_cols = algo_cols + ['quant_enc', 'shuffle_enc',
-                                'error_bound_enc', 'data_size_enc',
-                                'entropy', 'mad', 'second_derivative']
+    feature_cols = ['alg_id', 'quant_enc', 'shuffle_enc',
+                    'error_bound_enc', 'data_size_enc',
+                    'entropy', 'mad', 'second_derivative']
 
     output_cols = ['comp_time_log', 'decomp_time_log', 'ratio_log', 'psnr_clamped']
     for extra in ['rmse_log', 'max_error_log', 'comp_tp_log', 'decomp_tp_log', 'log_mae', 'ssim_nlog']:

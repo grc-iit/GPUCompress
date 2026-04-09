@@ -274,6 +274,10 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     float diag_compression_ms   = 0.0f;
     float diag_exploration_ms   = 0.0f;
     float diag_sgd_ms           = 0.0f;
+    double diag_ratio_mape       = 0.0;
+    double diag_comp_time_mape   = 0.0;
+    double diag_decomp_time_mape = 0.0;
+    double diag_regret           = -1.0;  /* -1 = no exploration, no regret available */
 
     gpucompress_algorithm_t algo_to_use;
     unsigned int preproc_to_use = 0;
@@ -428,7 +432,7 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     if (need_timing) {
         cudaEventElapsedTime(&primary_comp_time_ms, ctx->t_start, ctx->t_stop);
     }
-    diag_compression_ms = std::max(5.0f, primary_comp_time_ms);  /* clamped for MAPE */
+    diag_compression_ms = std::max(1.0f, primary_comp_time_ms);  /* clamped for MAPE */
     float diag_compression_ms_raw = primary_comp_time_ms;       /* unclamped for breakdown */
 
     DT_START(_dt_gcs);
@@ -529,13 +533,13 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
         double w0 = static_cast<double>(g_rank_w0);
         double w1 = static_cast<double>(g_rank_w1);
         double w2 = static_cast<double>(g_rank_w2);
-        /* Policy clamps: ct/dt floor at 5ms, ratio cap at 100x. */
-        double pred_dt = std::max(5.0, static_cast<double>(predicted_decomp_time));
-        double pred_ct = std::max(5.0, static_cast<double>(predicted_comp_time));
+        /* Policy clamps: ct/dt floor at 1ms, ratio cap at 100x. */
+        double pred_dt = std::max(1.0, static_cast<double>(predicted_decomp_time));
+        double pred_ct = std::max(1.0, static_cast<double>(predicted_comp_time));
         double pred_r  = std::min(100.0, static_cast<double>(predicted_ratio));
-        double act_ct  = std::max(5.0, static_cast<double>(primary_comp_time_ms));
+        double act_ct  = std::max(1.0, static_cast<double>(primary_comp_time_ms));
         double act_dt  = (primary_decomp_time_ms > 0.0f)
-                       ? std::max(5.0, static_cast<double>(primary_decomp_time_ms)) : pred_dt;
+                       ? std::max(1.0, static_cast<double>(primary_decomp_time_ms)) : pred_dt;
         double act_r   = std::min(100.0, actual_ratio);
 
         actual_cost = w0 * act_ct + w1 * act_dt
@@ -545,10 +549,15 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
         error_pct = (actual_cost > 0.0)
             ? std::abs(actual_cost - predicted_cost) / actual_cost : 0.0;
 
+        /* Per-statistic MAPE (clamped values) */
+        diag_ratio_mape      = (act_r > 0.0)   ? std::abs(act_r   - pred_r)   / act_r   : 0.0;
+        diag_comp_time_mape  = (act_ct > 0.0)  ? std::abs(act_ct  - pred_ct)  / act_ct  : 0.0;
+        diag_decomp_time_mape= (act_dt > 0.0)  ? std::abs(act_dt  - pred_dt)  / act_dt  : 0.0;
+
         // cost = w0*ct + w1*dt + w2*ds/(ratio*bw) — same formula as NN ranking
-        // Policy clamps applied inside: ct/dt floor 5ms, ratio cap 100x.
+        // Policy clamps applied inside: ct/dt floor 1ms, ratio cap 100x.
         auto compute_cost = [&](double ct, double dt, double r) -> double {
-            double c = std::max(5.0, ct), d = std::max(5.0, dt);
+            double c = std::max(1.0, ct), d = std::max(1.0, dt);
             double rc = std::min(100.0, r);
             return w0 * c + w1 * d + ((rc > 0.0) ? w2 * ds / (rc * bw) : 1e30);
         };
@@ -847,6 +856,11 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
                 if (s.stream)      cudaStreamDestroy(s.stream);
             }
 
+            /* Regret: how much worse was the primary vs. the best explored config?
+             * regret = (primary_cost - best_cost) / best_cost  (0 if primary was optimal) */
+            if (best_cost > 0.0)
+                diag_regret = (primary_cost - best_cost) / best_cost;
+
             if (cuda_err != cudaSuccess) return GPUCOMPRESS_ERROR_COMPRESSION;
         }
 
@@ -968,9 +982,13 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
         }
         /* Cost model diagnostics (only valid when online learning enabled) */
         if (g_online_learning_enabled) {
-            di.cost_model_error_pct = static_cast<float>(error_pct);
-            di.actual_cost = static_cast<float>(actual_cost);
-            di.predicted_cost = static_cast<float>(predicted_cost);
+            di.cost_model_error_pct  = static_cast<float>(error_pct);
+            di.actual_cost           = static_cast<float>(actual_cost);
+            di.predicted_cost        = static_cast<float>(predicted_cost);
+            di.ratio_mape            = static_cast<float>(diag_ratio_mape);
+            di.comp_time_mape        = static_cast<float>(diag_comp_time_mape);
+            di.decomp_time_mape      = static_cast<float>(diag_decomp_time_mape);
+            di.regret                = static_cast<float>(diag_regret);
             /* Original config metrics (explored_samples[0] is the primary) */
             if (!explored_samples.empty()) {
                 di.orig_actual_ratio = static_cast<float>(explored_samples[0].ratio);

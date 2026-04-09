@@ -182,9 +182,9 @@ __device__ static void nnForwardPass(
     ratio       = fmaxf(0.1f,  fminf(ratio,        1e5f));
     psnr        = fmaxf(0.0f,  fminf(psnr,         120.0f));
 
-    /* Policy clamps: ct/dt floor at 5ms, ratio cap at 100x. */
-    comp_time   = fmaxf(5.0f, comp_time);
-    decomp_time = fmaxf(5.0f, decomp_time);
+    /* Policy clamps: ct/dt floor at 1ms, ratio cap at 100x. */
+    comp_time   = fmaxf(1.0f, comp_time);
+    decomp_time = fmaxf(1.0f, decomp_time);
     ratio       = fminf(100.0f, ratio);
 
     /* Cost = w0*ct + w1*dt + w2*ds/(ratio*bw).

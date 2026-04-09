@@ -258,6 +258,9 @@ struct ChunkDiagInput {
     bool  h_stats_valid;
     /* Cost model */
     float cost_model_error_pct, actual_cost, predicted_cost;
+    /* Per-statistic MAPE and regret */
+    float ratio_mape, comp_time_mape, decomp_time_mape;
+    float regret;  /* -1.0 if no exploration */
     /* Original config metrics (before exploration swap) */
     float orig_actual_ratio, orig_comp_ms, orig_cost;
     /* Exploration results */

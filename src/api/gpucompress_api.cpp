@@ -79,7 +79,7 @@ cudaStream_t      g_default_stream = nullptr;
 
 std::atomic<bool> g_online_learning_enabled{false};
 std::atomic<bool> g_exploration_enabled{false};
-double            g_exploration_threshold = 0.20;
+double            g_exploration_threshold = 0.50;  /* X2: full exploration trigger (default 50%) */
 int               g_exploration_k_override = -1;
 
 std::atomic<int>  g_last_nn_action{-1};
@@ -104,7 +104,7 @@ bool g_debug_nn = false;
 bool g_detailed_timing = false;
 
 float g_reinforce_lr = 0.01f;
-float g_reinforce_mape_threshold = 0.10f;
+float g_reinforce_mape_threshold = 0.30f;  /* X1: proportional SGD update trigger (default 30%) */
 
 /* ============================================================
  * File-Private State (not shared across translation units)
@@ -317,6 +317,28 @@ extern "C" gpucompress_config_t gpucompress_default_config(void) {
     config.cuda_device = -1;
     config.cuda_stream = nullptr;
     return config;
+}
+
+/* ============================================================
+ * Stats-only API
+ * ============================================================ */
+
+extern "C" gpucompress_error_t gpucompress_compute_stats_gpu(
+    const void* d_input,
+    size_t input_size,
+    double* out_entropy,
+    double* out_mad,
+    double* out_second_deriv
+) {
+    if (!g_initialized.load()) return GPUCOMPRESS_ERROR_NOT_INITIALIZED;
+    if (!d_input || input_size == 0) return GPUCOMPRESS_ERROR_INVALID_INPUT;
+    if (!out_entropy || !out_mad || !out_second_deriv) return GPUCOMPRESS_ERROR_INVALID_INPUT;
+
+    int rc = gpucompress::runStatsOnlyPipeline(
+        d_input, input_size, nullptr,
+        out_entropy, out_mad, out_second_deriv);
+
+    return (rc == 0) ? GPUCOMPRESS_SUCCESS : GPUCOMPRESS_ERROR_CUDA_FAILED;
 }
 
 /* ============================================================
