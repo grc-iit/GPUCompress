@@ -13,11 +13,13 @@
 #include <cstring>
 #include <strings.h>
 #include <cstdio>
+#include <cstdlib>
 #include <cinttypes>
 #include <cmath>
 #include <utility>
 #include <vector>
 #include <algorithm>
+#include "diagnostics_store.hpp"
 #include <chrono>
 #include <unistd.h>
 #include <fcntl.h>
@@ -264,6 +266,7 @@ extern "C" gpucompress_error_t gpucompress_init(const char* weights_path) {
         g_detailed_timing = true;
 
     g_initialized.store(true);
+
     return GPUCOMPRESS_SUCCESS;
 }
 

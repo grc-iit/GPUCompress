@@ -14,8 +14,8 @@
  * The singleton also tracks aggregate I/O time (all modes) and owns the
  * Trace-mode CSV file handle.  The VOL calls:
  *
- *   recordFileOpen()        — from file_create / file_open on success
- *   recordFileClose()       — from file_close before dumpIoTiming()
+ *   recordProcessStart()    — from H5VL_gpucompress_init (once per process)
+ *   recordProcessEnd()      — from H5VL_gpucompress_term (once per process)
  *   accumulateIoMs(ms)      — from dataset_write / dataset_read entry/exit
  *   nextChunkId()           — once per chunk in Trace mode
  *   writeTraceRow(...)      — once per (chunk × config) in Trace mode
@@ -167,24 +167,24 @@ public:
     /* ── End-to-end file timing ────────────────────────────────────── */
 
     /**
-     * Record the wall-clock instant when the HDF5 file was opened (or created).
-     * Also resets total_io_us_ so that vol_ms in the timing CSV reflects only
-     * I/O performed against the current file.
-     * Called from H5VL_gpucompress_file_create and H5VL_gpucompress_file_open.
+     * Record the wall-clock instant when the VOL connector is initialised.
+     * Uses compare-and-swap so only the FIRST call sets the timestamp;
+     * subsequent calls (e.g. from HDF5 probing) are ignored.
      */
-    void recordFileOpen() {
-        total_io_us_.store(0);
-        file_open_us_.store(nowUs());
+    void recordProcessStart() {
+        int64_t expected = 0;
+        int64_t now = nowUs();
+        process_start_us_.compare_exchange_strong(expected, now);
     }
 
     /**
-     * Compute and store the end-to-end duration (file_open → file_close).
-     * Called from H5VL_gpucompress_file_close before dumpIoTiming().
+     * Compute and store end-to-end duration (VOL init → VOL term).
+     * Called once per process from H5VL_gpucompress_term.
      */
-    void recordFileClose() {
-        int64_t open_us = file_open_us_.load();
-        if (open_us == 0) return;          /* no matching open recorded */
-        e2e_us_.store(nowUs() - open_us);
+    void recordProcessEnd() {
+        int64_t start = process_start_us_.load();
+        if (start == 0) return;
+        e2e_us_.store(nowUs() - start);
     }
 
     double totalE2eMs() const {
@@ -199,7 +199,7 @@ public:
      *   e2e_ms,vol_ms
      *   <e2e>,<vol>
      *
-     * e2e_ms  = H5Fcreate/H5Fopen → H5Fclose wall-clock time
+     * e2e_ms  = H5VL_gpucompress_init → H5VL_gpucompress_term wall-clock time
      * vol_ms  = sum of all H5Dwrite / H5Dread callback wall-clock times
      */
     void dumpIoTiming(const char* path) const {
@@ -363,9 +363,9 @@ private:
     /* Aggregate VOL I/O timing — int64 microseconds avoids float CAS */
     std::atomic<int64_t>         total_io_us_{0};
 
-    /* End-to-end file timing */
-    std::atomic<int64_t>         file_open_us_{0};  /* timestamp at H5Fopen/create */
-    std::atomic<int64_t>         e2e_us_{0};        /* close - open duration */
+    /* Process-level e2e timing (VOL init → VOL term) */
+    std::atomic<int64_t>         process_start_us_{0}; /* set by recordProcessStart() */
+    std::atomic<int64_t>         e2e_us_{0};           /* set by recordProcessEnd() */
 
     /* Global chunk ID counter */
     std::atomic<int>             next_chunk_id_{0};

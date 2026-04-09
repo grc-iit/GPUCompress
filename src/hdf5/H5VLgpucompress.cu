@@ -536,6 +536,14 @@ static void gpucompress_vol_atexit() {
         fclose(fp);
         fprintf(stderr, "  Written to: %s\n\n", path);
     }
+
+    /* Also dump IO timing CSV (e2e_ms, vol_ms) */
+    {
+        auto& ds = gpucompress::DiagnosticsStore::instance();
+        ds.recordProcessEnd();
+        const char* timing_path = getenv("GPUCOMPRESS_TIMING_OUTPUT");
+        ds.dumpIoTiming(timing_path ? timing_path : "gpucompress_io_timing.csv");
+    }
 }
 
 /* Wrapper: track and execute cudaMemcpy */
@@ -713,9 +721,20 @@ static herr_t H5VL_gpucompress_init(hid_t /*vipl_id*/) {
         gpucompress::DiagnosticsStore::instance().openTraceFile(
             path ? path : "gpucompress_trace.csv");
     }
+
+    /* Start process-level e2e timer; atexit dumps timing after all writes. */
+    gpucompress::DiagnosticsStore::instance().recordProcessStart();
+    std::atexit([]() {
+        auto& s = gpucompress::DiagnosticsStore::instance();
+        s.recordProcessEnd();
+        const char* path = getenv("GPUCOMPRESS_TIMING_OUTPUT");
+        s.dumpIoTiming(path ? path : "gpucompress_io_timing.csv");
+    });
+
     return 0;
 }
-static herr_t H5VL_gpucompress_term(void)               { return 0; }
+
+static herr_t H5VL_gpucompress_term(void) { return 0; }
 
 /* ============================================================
  * Info callbacks (adapted from H5VLpassthru.c)
@@ -3352,7 +3371,6 @@ H5VL_gpucompress_file_create(const char *name, unsigned flags,
     if (req && *req) *req = new_obj(*req, info->under_vol_id);
     H5Pclose(under_fapl);
     H5VL_gpucompress_info_free(info);
-    if (file) gpucompress::DiagnosticsStore::instance().recordFileOpen();
     return file;
 }
 
@@ -3377,7 +3395,6 @@ H5VL_gpucompress_file_open(const char *name, unsigned flags,
     if (req && *req) *req = new_obj(*req, info->under_vol_id);
     H5Pclose(under_fapl);
     H5VL_gpucompress_info_free(info);
-    if (file) gpucompress::DiagnosticsStore::instance().recordFileOpen();
     return file;
 }
 
@@ -3468,19 +3485,9 @@ H5VL_gpucompress_file_close(void *file, hid_t dxpl_id, void **req)
     if (req && *req) *req = new_obj(*req, o->under_vol_id);
     if (rv >= 0) free_obj(o);
 
-    /* ---- Flush per-mode outputs ---- */
-    auto& store = gpucompress::DiagnosticsStore::instance();
-
-    /* All modes: record end-to-end time then write timing CSV */
-    store.recordFileClose();
-    {
-        const char* timing_path = getenv("GPUCOMPRESS_TIMING_OUTPUT");
-        store.dumpIoTiming(timing_path ? timing_path : "gpucompress_io_timing.csv");
-    }
-
-    /* Trace: flush and close the CSV */
+    /* Trace: flush the CSV on each file close so data is not lost on crash */
     if (s_vol_mode == VOLMode::TRACE) {
-        store.flushTrace();
+        gpucompress::DiagnosticsStore::instance().flushTrace();
     }
 
     return rv;
