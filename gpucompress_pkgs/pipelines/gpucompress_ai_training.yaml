@@ -1,0 +1,21 @@
+name: gpucompress_ai_training
+env: gpucompress
+
+pkgs:
+  - pkg_type: gpucompress_pkgs.gpucompress_ai_training
+    pkg_name: ai_training_benchmark
+    nprocs: 1
+    ppn: 1
+    gpucompress_dir: /opt/GPUCompress
+    nvcomp_lib: /tmp/lib
+    hdf5_lib: /tmp/hdf5-install/lib
+    weights: /opt/GPUCompress/neural_net/weights/model.nnwt
+    model: vit_b_16
+    epochs: 5
+    checkpoint_epochs: "1,3,5"
+    batch_size: 64
+    chunk_mb: 4
+    error_bound: 0.0
+    policies: balanced
+    hdf5_direct: 1
+    results_dir: /tmp/gpucompress_ai_training_results

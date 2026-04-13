@@ -13,6 +13,7 @@ RUN g++ -shared -fPIC \
     -I/opt/GPUCompress/include \
     -I/tmp/hdf5-install/include \
     -I/usr/local/cuda/include \
+    $(mpicc --showme:compile 2>/dev/null || echo '') \
     -L/opt/GPUCompress/build -lgpucompress -lH5VLgpucompress -lH5Zgpucompress \
     -L/tmp/hdf5-install/lib -lhdf5 \
     -L/usr/local/cuda/lib64 -lcudart \
