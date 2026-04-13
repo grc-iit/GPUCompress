@@ -5,7 +5,7 @@
  * Borrows device pointers from LAMMPS KOKKOS views and passes
  * them to gpucompress_compress_gpu(). No simulation logic lives here.
  *
- * Follows the same pattern as vpic_adapter.cu, nyx_adapter.cu, nekrs_adapter.cu.
+ * Follows the same pattern as vpic_adapter.cu and nyx_adapter.cu.
  */
 
 #include <cstdio>

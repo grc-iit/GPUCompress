@@ -11,7 +11,7 @@ GPUCompress replaces static compression choices with a lightweight neural networ
 > **All scientific data flowing through GPUCompress MUST be 32-bit floating point.**
 >
 > This is a hard project-wide rule, not a recommendation. It applies to every simulation
-> integration (VPIC, WarpX, Nyx, LAMMPS, nekRS, Gray-Scott), every benchmark, every dataset,
+> integration (VPIC, WarpX, Nyx, LAMMPS, Gray-Scott), every benchmark, every dataset,
 > and every artifact saved to disk. The pre-trained NN weights, the per-chunk feature
 > extractors (entropy, MAD, 2nd derivative), and the cost model are all calibrated to fp32
 > byte distributions; running them on fp64 input produces a different feature distribution
@@ -22,7 +22,7 @@ GPUCompress replaces static compression choices with a lightweight neural networ
 > - WarpX: build with `-DWarpX_PRECISION=SINGLE -DWarpX_PARTICLE_PRECISION=SINGLE`
 > - AMReX-based codes (Nyx, WarpX): `-DAMReX_PRECISION=SINGLE -DAMReX_PARTICLES_PRECISION=SINGLE`
 > - VPIC: built with `float` field type (default in `vpic_benchmark_deck.cxx`)
-> - LAMMPS / nekRS: dump field data as fp32 (`USE_FP32=1` for nekRS)
+> - LAMMPS: dump field data as fp32
 > - SDRBench / training datasets: `.bin.f32` only
 > - Any new integration: cast to `float` at the GPUCompress boundary if upstream uses `double`
 >
@@ -74,8 +74,7 @@ GPUCompress replaces static compression choices with a lightweight neural networ
 > | Laser–plasma EM | `warpx.3d.MPI.CUDA.SP.PSP.OPMD.EB.QED` | `~/sims/warpx/build-gpucompress/bin/` |
 > | Cosmological hydro | `nyx_HydroTests` | `~/sims/Nyx/build-gpucompress/Exec/HydroTests/` |
 > | Molecular dynamics | `lmp` (LAMMPS w/ Kokkos+gpucompress fix) | `~/sims/lammps/build/` |
-> | Spectral CFD | `nekrs-fp32` | `~/.local/nekrs/bin/` |
-> | Reaction-diffusion | `grayscott_benchmark_pm` | `build/` |
+> > | Reaction-diffusion | `grayscott_benchmark_pm` | `build/` |
 >
 > **What this rules out:**
 >
@@ -427,7 +426,6 @@ GPUCompress provides zero-copy GPU adapters for 5 HPC simulation codes. Each has
 |------------|-------------|-------------------|--------|
 | **VPIC-Kokkos** | Plasma particle-in-cell | Pre-built benchmark binary | [`benchmarks/vpic-kokkos/`](benchmarks/vpic-kokkos/) |
 | **LAMMPS** | Molecular dynamics (Kokkos GPU) | LAMMPS fix + 2 new source files + cmake patch | [`benchmarks/lammps/README.md`](benchmarks/lammps/README.md) |
-| **nekRS** | Spectral-element CFD | Case-level UDF only (zero nekRS source changes) | [`benchmarks/nekrs/README.md`](benchmarks/nekrs/README.md) |
 | **Nyx** | AMReX cosmological hydro | 3 patched source files (`#ifdef` guarded) | [`benchmarks/nyx/README.md`](benchmarks/nyx/README.md) |
 | **WarpX** | Plasma acceleration (AMReX) | Direct adapter API or AMReX bridge | [`benchmarks/warpx/README.md`](benchmarks/warpx/README.md) |
 
@@ -507,7 +505,6 @@ GPUCompress/
 │   ├── gpucompress_hdf5_vol.h  #   HDF5 VOL connector
 │   ├── gpucompress_vpic.h      #   VPIC adapter
 │   ├── gpucompress_lammps.h    #   LAMMPS adapter
-│   ├── gpucompress_nekrs.h     #   nekRS adapter
 │   ├── gpucompress_nyx.h       #   Nyx adapter
 │   ├── gpucompress_warpx.h     #   WarpX adapter
 │   └── gpucompress_grayscott.h #   Gray-Scott adapter
@@ -536,7 +533,6 @@ GPUCompress/
 │   ├── vpic-kokkos/            # VPIC benchmark driver
 │   ├── sdrbench/               # SDRBench (Hurricane, Nyx, CESM) driver
 │   ├── lammps/                 # LAMMPS integration + patches
-│   ├── nekrs/                  # nekRS integration + patches
 │   ├── nyx/                    # Nyx integration + patches
 │   ├── warpx/                  # WarpX integration + patches
 │   ├── slurm/                  # SLURM job scripts for Delta

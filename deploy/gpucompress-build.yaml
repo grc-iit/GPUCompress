@@ -71,16 +71,6 @@ bridge_libraries:
         -Lbuild -lgpucompress -lH5VLgpucompress -lH5Zgpucompress \
         -L${HDF5_ROOT}/lib -lhdf5 -L/usr/local/cuda/lib64 -lcudart \
         -Wl,-rpath,$(pwd)/build -Wl,-rpath,${HDF5_ROOT}/lib
-  nekrs_udf:
-    source: examples/nekrs_gpucompress_udf.cpp
-    output: examples/libnekrs_gpucompress_udf.so
-    build: |
-      g++ -shared -fPIC -o examples/libnekrs_gpucompress_udf.so \
-        examples/nekrs_gpucompress_udf.cpp \
-        -Iinclude -I${HDF5_ROOT}/include -I/usr/local/cuda/include \
-        -Lbuild -lgpucompress -lH5VLgpucompress -lH5Zgpucompress \
-        -L${HDF5_ROOT}/lib -lhdf5 -L/usr/local/cuda/lib64 -lcudart \
-        -Wl,-rpath,$(pwd)/build -Wl,-rpath,${HDF5_ROOT}/lib
 
 environment:
   LD_LIBRARY_PATH: "${GPUC_DIR}/build:${GPUC_DIR}/examples:${HDF5_ROOT}/lib:${NVCOMP_PREFIX}/lib:/usr/local/cuda/lib64"

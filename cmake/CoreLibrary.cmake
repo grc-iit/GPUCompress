@@ -25,7 +25,6 @@ set(LIB_SOURCES
     src/gray-scott/gray_scott_sim.cu
     src/vpic/vpic_adapter.cu
     src/nyx/nyx_adapter.cu
-    src/nekrs/nekrs_adapter.cu
     src/lammps/lammps_adapter.cu
     src/warpx/warpx_adapter.cu
 )

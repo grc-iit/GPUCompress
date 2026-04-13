@@ -4,7 +4,7 @@ GPU-accelerated lossless compression for [LAMMPS](https://github.com/lammps/lamm
 molecular dynamics simulations using the KOKKOS GPU backend. Device pointers from
 Kokkos Views (`atomKK->k_x.view_device().data()`) are passed directly through the
 GPUCompress HDF5 VOL connector without CPU round-trips, following the same zero-copy
-pattern as the VPIC, Nyx, and nekRS integrations.
+pattern as the VPIC and Nyx integrations.
 
 ## Architecture
 
@@ -314,7 +314,7 @@ compress better (up to 1.18x for step 0 positions).
 
 ### Data characteristics
 
-LAMMPS MD data differs from grid-based simulations (Nyx, nekRS, VPIC):
+LAMMPS MD data differs from grid-based simulations (Nyx, VPIC):
 - **Particle data** — positions, velocities, forces are per-atom vectors
 - **High entropy** — after equilibration, values appear near-random
 - **No spatial coherence** — atoms are randomly ordered in memory

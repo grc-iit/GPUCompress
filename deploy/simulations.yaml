@@ -3,7 +3,7 @@
 #        ./run.sh bench <simulation>   -- run benchmark
 #        ./run.sh all                  -- build everything + run all benchmarks
 #
-# Simulations: lammps, nyx, warpx, nekrs, vpic
+# Simulations: lammps, nyx, warpx, vpic
 
 # ============================================================================
 # LAMMPS — Molecular Dynamics (Kokkos GPU backend)
@@ -177,63 +177,6 @@ warpx:
     results_dir: results/warpx
     output_format: "benchmark_warpx_*.csv"
 
-# ============================================================================
-# nekRS — Spectral Element CFD (OCCA GPU backend)
-# ============================================================================
-nekrs:
-  description: "nekRS Taylor-Green vortex with OCCA backend, case-level integration (zero source mods)"
-
-  source:
-    url: https://github.com/Nek5000/nekRS.git
-    branch: master
-    clone_dir: "${SIMS_DIR}/nekRS"
-
-  prerequisites:
-    - gpucompress_core
-    - bridge:nekrs_udf
-
-  extra_dependencies:
-    - "gfortran (Fortran compiler for nekRS)"
-
-  patch:
-    method: copy-case-files
-    note: "nekRS needs zero source modifications; integration is at case level"
-    copy:
-      - src: benchmarks/nekrs/patches/tgv.udf
-        dst: "${NEKRS_CASE_DIR}/tgv.udf"
-      - src: benchmarks/nekrs/patches/tgv.par
-        dst: "${NEKRS_CASE_DIR}/tgv.par"
-      - src: benchmarks/nekrs/patches/udf.cmake
-        dst: "${NEKRS_CASE_DIR}/udf.cmake"
-
-  build:
-    dir: build
-    env:
-      CC: mpicc
-      CXX: mpic++
-      FC: mpif77
-    configure: |
-      cmake -S .. -B . \
-        -DCMAKE_INSTALL_PREFIX=${NEKRS_HOME:-$HOME/.local/nekrs} \
-        -DCMAKE_BUILD_TYPE=RelWithDebInfo
-    compile: cmake --build . --target install -j$(nproc)
-    binary: "${NEKRS_HOME:-$HOME/.local/nekrs}/bin/nekrs-fp32"
-    note: "First run JIT-compiles OCCA kernels (~5-10 min); cached thereafter"
-
-  benchmark:
-    script: benchmarks/nekrs/run_nekrs_benchmark.sh
-    defaults:
-      NP: 2                   # MPI ranks (minimum 2 for nekRS/HYPRE)
-      NUM_STEPS: 20
-      CHECKPOINT_INT: 10
-      USE_FP32: 1             # use fp32 binary for compression benchmarks
-      POLICIES: "balanced,ratio,speed"
-    env:
-      NEKRS_HOME: "${NEKRS_HOME:-$HOME/.local/nekrs}"
-      CASE_DIR: "${NEKRS_CASE_DIR:-$HOME/tgv_gpucompress}"
-      GPUC_DIR: "${GPUC_DIR}"
-    results_dir: results/nekrs
-    output_format: "benchmark_nekrs_*.csv"
 
 # ============================================================================
 # VPIC-Kokkos — Particle-in-Cell Plasma Physics

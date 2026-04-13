@@ -6,8 +6,7 @@
  * KOKKOS views and passes them to gpucompress_compress_gpu().
  * The adapter does NOT own GPU memory — it borrows pointers via attach().
  *
- * Follows the same pattern as gpucompress_vpic.h, gpucompress_nyx.h,
- * and gpucompress_nekrs.h.
+ * Follows the same pattern as gpucompress_vpic.h and gpucompress_nyx.h.
  */
 
 #ifndef GPUCOMPRESS_LAMMPS_H
