@@ -177,7 +177,7 @@ class GpucompressNyxDelta(Application):
         nyx_env = dict(self.mod_env)
         nyx_env['NYX_DUMP_FIELDS'] = '1'
         nyx_env['NYX_DUMP_DIR'] = raw_dir
-        Exec(f'{NYX_BIN} {input_file}', MpiExecInfo(
+        phase1 = Exec(f'{NYX_BIN} {input_file}', MpiExecInfo(
             nprocs=1,
             ppn=1,
             hostfile=self.hostfile,
@@ -190,7 +190,14 @@ class GpucompressNyxDelta(Application):
             gpu=cfg.get('use_gpu', True),
             pipe_stdout=nyx_log,
             pipe_stderr=nyx_log,
-        )).run()
+        ))
+        phase1.run()
+        # Phase 1 (Nyx) may warn-and-continue on non-zero (mirrors Luke's shell
+        # `[ $NYX_STATUS -ne 0 ] && echo WARNING`); the plt* check below is the
+        # real gate.
+        p1_rc = max(phase1.exit_code.values()) if getattr(phase1, 'exit_code', None) else 0
+        if p1_rc != 0:
+            print(f"[gpucompress_nyx_delta] WARNING: Nyx exited {p1_rc} — see {nyx_log}")
 
         # ── Host-side: gather plt* dirs, derive dims, flatten symlinks ───
         plt_dirs = sorted(glob.glob(f'{raw_dir}/plt*'))
@@ -244,7 +251,7 @@ class GpucompressNyxDelta(Application):
 
         bench_env = dict(self.mod_env)
         bench_env['GPUCOMPRESS_DETAILED_TIMING'] = '1'
-        Exec(bench_cmd, MpiExecInfo(
+        phase2 = Exec(bench_cmd, MpiExecInfo(
             nprocs=1,
             ppn=1,
             hostfile=self.hostfile,
@@ -257,7 +264,13 @@ class GpucompressNyxDelta(Application):
             gpu=cfg.get('use_gpu', True),
             pipe_stdout=bench_log,
             pipe_stderr=bench_log,
-        )).run()
+        ))
+        phase2.run()
+        p2_rc = max(phase2.exit_code.values()) if getattr(phase2, 'exit_code', None) else 0
+        if p2_rc != 0:
+            raise RuntimeError(
+                f"generic_benchmark failed (exit {p2_rc}) — see {bench_log}"
+            )
 
     def stop(self):
         pass

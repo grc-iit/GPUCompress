@@ -71,8 +71,7 @@ cmake .. \
     -DCMAKE_CUDA_ARCHITECTURES=##CUDA_ARCH## \
     -DCMAKE_PREFIX_PATH="/tmp/hdf5-install;/opt/nvcomp" \
     -DHDF5_VOL_PREFIX=/tmp/hdf5-install \
-    -DNVCOMP_INCLUDE_DIR=/opt/nvcomp/include \
-    -DNVCOMP_LIB_DIR=/opt/nvcomp/lib
+    -DNVCOMP_PREFIX=/opt/nvcomp
 make -j"${BUILD_JOBS:-4}"
 
 # ── Runtime linker hints ────────────────────────────────────────────────
