@@ -29,10 +29,10 @@ cmake -S . -B build-gpucompress \
     -DCMAKE_C_COMPILER="$(which gcc)" \
     -DCMAKE_CXX_COMPILER="$(which g++)" \
     -DCMAKE_CUDA_HOST_COMPILER="$(which g++)" \
-    "-DCMAKE_CXX_FLAGS=-DAMREX_USE_GPUCOMPRESS -I/opt/GPUCompress/include -I/opt/GPUCompress/examples -I/opt/GPUCompress/benchmarks -I/tmp/hdf5-install/include" \
-    "-DCMAKE_CUDA_FLAGS=-DAMREX_USE_GPUCOMPRESS -I/opt/GPUCompress/include -I/opt/GPUCompress/examples -I/opt/GPUCompress/benchmarks -I/tmp/hdf5-install/include" \
-    "-DCMAKE_EXE_LINKER_FLAGS=-L/tmp/hdf5-install/lib -L/opt/nvcomp/lib -L/opt/GPUCompress/build -Wl,--no-as-needed -lgpucompress -lH5VLgpucompress -lH5Zgpucompress -lhdf5 -lnvcomp -Wl,--as-needed" \
-    "-DCMAKE_SHARED_LINKER_FLAGS=-L/tmp/hdf5-install/lib -lhdf5"
+    "-DCMAKE_CXX_FLAGS=-DAMREX_USE_GPUCOMPRESS -I/opt/GPUCompress/include -I/opt/GPUCompress/examples -I/opt/GPUCompress/benchmarks -I/opt/hdf5-install/include" \
+    "-DCMAKE_CUDA_FLAGS=-DAMREX_USE_GPUCOMPRESS -I/opt/GPUCompress/include -I/opt/GPUCompress/examples -I/opt/GPUCompress/benchmarks -I/opt/hdf5-install/include" \
+    "-DCMAKE_EXE_LINKER_FLAGS=-L/opt/hdf5-install/lib -L/opt/nvcomp/lib -L/opt/GPUCompress/build -Wl,--no-as-needed -lgpucompress -lH5VLgpucompress -lH5Zgpucompress -lhdf5 -lnvcomp -Wl,--as-needed" \
+    "-DCMAKE_SHARED_LINKER_FLAGS=-L/opt/hdf5-install/lib -lhdf5"
 
 cmake --build build-gpucompress --target nyx_HydroTests -j"${BUILD_JOBS:-4}"
 

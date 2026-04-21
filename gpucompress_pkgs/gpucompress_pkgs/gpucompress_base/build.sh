@@ -37,7 +37,7 @@ cp -r nvcomp-linux-x86_64-*/lib/*     /opt/nvcomp/lib/
 rm -rf nvcomp.tar.xz nvcomp-linux-x86_64-*
 
 # ── HDF5 ────────────────────────────────────────────────────────────────
-# Install to /tmp/hdf5-install/ — cmake/HDF5Vol.cmake hard-codes that path
+# Install to /opt/hdf5-install/ — cmake/HDF5Vol.cmake hard-codes that path
 # for discovery of the VOL connector. Matches docker/Dockerfile layout.
 cd /tmp
 curl -sL -o hdf5.tar.gz \
@@ -45,7 +45,7 @@ curl -sL -o hdf5.tar.gz \
 tar xzf hdf5.tar.gz
 mkdir -p hdf5-build && cd hdf5-build
 cmake /tmp/hdf5-##HDF5_VERSION## \
-    -DCMAKE_INSTALL_PREFIX=/tmp/hdf5-install \
+    -DCMAKE_INSTALL_PREFIX=/opt/hdf5-install \
     -DCMAKE_BUILD_TYPE=Release \
     -DBUILD_SHARED_LIBS=ON \
     -DHDF5_BUILD_TOOLS=OFF \
@@ -57,7 +57,7 @@ cmake /tmp/hdf5-##HDF5_VERSION## \
     -DHDF5_BUILD_HL_LIB=ON
 make -j"${BUILD_JOBS:-4}"
 make install
-echo '/tmp/hdf5-install/lib' > /etc/ld.so.conf.d/hdf5.conf
+echo '/opt/hdf5-install/lib' > /etc/ld.so.conf.d/hdf5.conf
 ldconfig
 cd /tmp && rm -rf hdf5.tar.gz hdf5-##HDF5_VERSION## hdf5-build
 
@@ -69,14 +69,14 @@ git submodule update --init --recursive || true
 mkdir -p build && cd build
 cmake .. \
     -DCMAKE_CUDA_ARCHITECTURES=##CUDA_ARCH## \
-    -DCMAKE_PREFIX_PATH="/tmp/hdf5-install;/opt/nvcomp" \
-    -DHDF5_VOL_PREFIX=/tmp/hdf5-install \
+    -DCMAKE_PREFIX_PATH="/opt/hdf5-install;/opt/nvcomp" \
+    -DHDF5_VOL_PREFIX=/opt/hdf5-install \
     -DNVCOMP_PREFIX=/opt/nvcomp
 make -j"${BUILD_JOBS:-4}"
 
 # ── Runtime linker hints ────────────────────────────────────────────────
 cat > /etc/ld.so.conf.d/gpucompress.conf <<'EOF'
-/tmp/hdf5-install/lib
+/opt/hdf5-install/lib
 /opt/nvcomp/lib
 /opt/GPUCompress/build
 EOF
@@ -89,7 +89,7 @@ rm -rf /usr/local/cuda/compat 2>/dev/null || true
 # Propagate LD_LIBRARY_PATH through sshd sessions (for mpirun over ssh inside
 # apptainer instance; reference: builtin/nyx/build.sh:48-53).
 cat >> /etc/ssh/sshd_config <<'EOF'
-SetEnv LD_LIBRARY_PATH=/.singularity.d/libs:/usr/local/cuda/lib64:/tmp/hdf5-install/lib:/opt/nvcomp/lib:/opt/GPUCompress/build
+SetEnv LD_LIBRARY_PATH=/.singularity.d/libs:/usr/local/cuda/lib64:/opt/hdf5-install/lib:/opt/nvcomp/lib:/opt/GPUCompress/build
 SetEnv HDF5_PLUGIN_PATH=/opt/GPUCompress/build
 SetEnv GPUCOMPRESS_WEIGHTS=/opt/GPUCompress/neural_net/weights/model.nnwt
 EOF

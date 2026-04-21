@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # keeps the pipeline-level merge (pipeline.py:1546-1553) idempotent no matter
 # the package order.
 COPY --from=builder /usr/local/                 /usr/local/
-COPY --from=builder /tmp/hdf5-install/          /tmp/hdf5-install/
+COPY --from=builder /opt/hdf5-install/          /opt/hdf5-install/
 COPY --from=builder /opt/                       /opt/
 COPY --from=builder /etc/ld.so.conf.d/          /etc/ld.so.conf.d/
 COPY --from=builder /etc/ssh/sshd_config        /etc/ssh/sshd_config
@@ -28,7 +28,7 @@ RUN mkdir -p /var/run/sshd /root/.ssh \
  && ln -sf /opt/sims/Nyx/build-gpucompress/Exec/HydroTests/nyx_HydroTests /usr/bin/nyx_HydroTests \
  && ldconfig
 
-ENV LD_LIBRARY_PATH=/.singularity.d/libs:/usr/local/cuda/lib64:/tmp/hdf5-install/lib:/opt/nvcomp/lib:/opt/GPUCompress/build
+ENV LD_LIBRARY_PATH=/.singularity.d/libs:/usr/local/cuda/lib64:/opt/hdf5-install/lib:/opt/nvcomp/lib:/opt/GPUCompress/build
 ENV HDF5_PLUGIN_PATH=/opt/GPUCompress/build
 ENV GPUCOMPRESS_WEIGHTS=/opt/GPUCompress/neural_net/weights/model.nnwt
 

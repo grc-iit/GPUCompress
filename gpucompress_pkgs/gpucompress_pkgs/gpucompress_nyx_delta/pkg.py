@@ -37,6 +37,18 @@ NYX_BIN     = '/opt/sims/Nyx/build-gpucompress/Exec/HydroTests/nyx_HydroTests'
 GENERIC_BIN = '/opt/GPUCompress/build/generic_benchmark'
 WEIGHTS     = '/opt/GPUCompress/neural_net/weights/model.nnwt'
 
+# Runtime LD_LIBRARY_PATH — Jarvis's auto-generated %environment sets
+# /opt/<pkg>/install/lib (doesn't exist in our SIF), so we prefix each
+# Exec command with `env LD_LIBRARY_PATH=…` to override at exec time.
+# Mirrors the reference builtin/nyx/pkg.py pattern.
+LD_LIBRARY_PATH = (
+    '/.singularity.d/libs'            # host libcuda.so.1 bound via --nv
+    ':/usr/local/cuda/lib64'          # CUDA runtime libs
+    ':/opt/hdf5-install/lib'          # HDF5 2.0.0
+    ':/opt/nvcomp/lib'                # nvcomp
+    ':/opt/GPUCompress/build'         # libgpucompress + VOL/Filter .so
+)
+
 
 class GpucompressNyxDelta(Application):
 
@@ -177,7 +189,9 @@ class GpucompressNyxDelta(Application):
         nyx_env = dict(self.mod_env)
         nyx_env['NYX_DUMP_FIELDS'] = '1'
         nyx_env['NYX_DUMP_DIR'] = raw_dir
-        phase1 = Exec(f'{NYX_BIN} {input_file}', MpiExecInfo(
+        phase1 = Exec(
+            f'env LD_LIBRARY_PATH={LD_LIBRARY_PATH} {NYX_BIN} {input_file}',
+            MpiExecInfo(
             nprocs=1,
             ppn=1,
             hostfile=self.hostfile,
@@ -251,7 +265,9 @@ class GpucompressNyxDelta(Application):
 
         bench_env = dict(self.mod_env)
         bench_env['GPUCOMPRESS_DETAILED_TIMING'] = '1'
-        phase2 = Exec(bench_cmd, MpiExecInfo(
+        phase2 = Exec(
+            f'env LD_LIBRARY_PATH={LD_LIBRARY_PATH} {bench_cmd}',
+            MpiExecInfo(
             nprocs=1,
             ppn=1,
             hostfile=self.hostfile,
