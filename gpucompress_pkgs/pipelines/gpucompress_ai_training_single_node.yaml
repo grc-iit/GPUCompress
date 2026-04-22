@@ -1,0 +1,78 @@
+# Pipeline: GPUCompress AI-training checkpoint benchmark, single-node on
+# Delta via Apptainer.
+#
+# Mirrors bench_tests/ai_training.sh combined with
+# scripts/train_and_export_checkpoints.py. Defaults match the AI-workload
+# figures referenced in commits 2f50e46 / 16fddfd: ResNet-18 on CIFAR-10
+# with short-horizon batched training and per-epoch checkpoint export, then
+# generic_benchmark replay for ranking / regret / cost data.
+#
+# Usage:
+#   # One-time, on the login node (has network + no GPU needed for build):
+#   jarvis repo add /u/imuradli/GPUCompress/gpucompress_pkgs
+#   jarvis ppl load yaml /u/imuradli/GPUCompress/gpucompress_pkgs/pipelines/gpucompress_ai_training_single_node.yaml
+#   jarvis ppl build
+#
+#   # Per-run, on a GPU compute node:
+#   salloc --account=bekn-delta-gpu --partition=gpuA100x4 \
+#          --nodes=1 --ntasks=1 --gpus=1 --time=01:00:00 --mem=64g
+#   hostname > ~/hostfile_single.txt
+#   jarvis hostfile set ~/hostfile_single.txt
+#   jarvis cd gpucompress_ai_training_delta_single_node
+#   jarvis ppl run
+
+name: gpucompress_ai_training_delta_single_node
+install_manager: container
+
+container_engine: apptainer
+container_base: nvidia/cuda:12.6.0-devel-ubuntu24.04
+container_ssh_port: 2237   # distinct from nyx (2233) / warpx (2235) / lammps (2236)
+container_gpu: true
+
+hostfile: $HOME/hostfile_single.txt
+
+pkgs:
+  # 1. Install HDF5 + nvcomp + GPUCompress into the build image.
+  - pkg_type: gpucompress_pkgs.gpucompress_base
+    pkg_name: gpuc_base
+    cuda_arch: 80
+    hdf5_version: 2.0.0
+    nvcomp_version: 5.1.0.21_cuda12
+    gpucompress_repo: https://github.com/grc-iit/GPUCompress.git
+    gpucompress_ref: main
+    deploy_base: nvidia/cuda:12.6.0-runtime-ubuntu24.04
+
+  # 2. Install the Python ML stack (torch, torchvision, transformers, h5py)
+  #    on top of the base image. Phase 1 runs the training scripts that
+  #    export per-epoch .f32 checkpoints; Phase 2 is generic_benchmark replay.
+  - pkg_type: gpucompress_pkgs.gpucompress_ai_training_delta
+    pkg_name: gpuc_ai_training
+    cuda_arch: 80
+    use_gpu: true
+    deploy_base: nvidia/cuda:12.6.0-runtime-ubuntu24.04
+
+    # ── Model / dataset — matches the paper's AI workload ─────────────
+    model: resnet18
+    dataset: cifar10
+
+    # ── Training (Phase 1) — smoke defaults sized for quick iteration ──
+    # Scale up for paper reproduction: epochs=40,
+    #   checkpoint_epochs="1,5,10,15,20,25,30,35,40",
+    #   max_batches_per_epoch=0 (uncapped).
+    epochs: 5
+    checkpoint_epochs: "1,3,5"
+    batch_size: 64
+    max_batches_per_epoch: 20
+    skip_validate: 1
+    skip_training: 0
+
+    # ── Benchmark configuration (Phase 2) — VOL mode with NN+RL+exp50 ─
+    hdf5_mode: vol
+    phase: nn-rl+exp50
+    policy: balanced
+    error_bound: 0.0
+    chunk_mb: 4
+    verify: 1
+
+    # ── Launch ─────────────────────────────────────────────────────────
+    num_gpus: 1

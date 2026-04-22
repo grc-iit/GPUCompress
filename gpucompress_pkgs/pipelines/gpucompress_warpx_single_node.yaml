@@ -59,4 +59,4 @@ pkgs:
     chunk_mb: 4
     verify: 1
     policy: ratio
-    error_bound: 0.01
+    error_bound: 0.0
