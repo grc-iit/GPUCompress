@@ -9,10 +9,10 @@
 # deck is built against HDF5 + nvcomp + GPUCompress.
 #
 # Usage:
-#   # One-time, on the login node:
+#   # One-time, on the login node — ppl load yaml builds the SIF when
+#   # install_manager=container (no separate `jarvis ppl build` step):
 #   jarvis repo add /u/$USER/GPUCompress/gpucompress_pkgs
 #   jarvis ppl load yaml /u/$USER/GPUCompress/gpucompress_pkgs/pipelines/gpucompress_vpic_single_node_baseline.yaml
-#   jarvis ppl build
 #
 #   # Per-run, on a GPU compute node:
 #   salloc --account="$SLURM_ACCOUNT" --partition=gpuA100x4 \

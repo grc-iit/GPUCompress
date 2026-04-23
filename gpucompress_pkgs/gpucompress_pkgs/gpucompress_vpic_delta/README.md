@@ -46,20 +46,30 @@ echo "$(hostname)" > ~/hostfile_single.txt
 
 ### Phase 1 — Build the SIF (login node, ~15-20 min cold)
 
+`jarvis ppl load yaml <path>` builds the SIF as part of loading when
+`install_manager: container` is set in the YAML (see
+`jarvis_cd/core/pipeline.py` — `_load_from_file` calls
+`_build_pipeline_container()` at line 1024). There is no separate
+`jarvis ppl build` step.
+
 ```bash
 cd /u/$USER/GPUCompress/gpucompress_pkgs
 jarvis repo add /u/$USER/GPUCompress/gpucompress_pkgs 2>/dev/null || true
-jarvis ppl load yaml /u/$USER/GPUCompress/gpucompress_pkgs/pipelines/gpucompress_vpic_single_node.yaml
-jarvis ppl build 2>&1 | tee ~/build_vpic.log
+jarvis ppl load yaml /u/$USER/GPUCompress/gpucompress_pkgs/pipelines/gpucompress_vpic_single_node.yaml 2>&1 | tee ~/build_vpic.log
 
-# Verify
+# Verify the SIF was produced
 ls -la ~/.jarvis-cd/pipelines/gpucompress_vpic_delta_single_node/shared/*.sif
 ```
 
 Expected tail of log:
 ```
-INFO:    Build complete: .../gpucompress_vpic_delta_single_node.sif
+Apptainer SIF ready: .../gpucompress_vpic_delta_single_node.sif
+Loaded pipeline: gpucompress_vpic_delta_single_node
 ```
+
+The build is cached: a subsequent `ppl load yaml` on the same pipeline
+will see `Deploy image '<name>' already exists, skipping build` and
+return in seconds.
 
 ### Phase 2 — Get a GPU node
 
@@ -290,12 +300,14 @@ Change `nx` to a multiple of `nprocs`. Validation happens in
 `pkg.py:_validate()` and blocks the run before any compute.
 
 ### Rebuild from scratch
-If you change source under `/u/$USER/GPUCompress/` or the base image:
+If you change source under `/u/$USER/GPUCompress/` or the base image,
+wipe the cached SIF + apptainer cache and reload — the load step triggers
+a fresh build:
 ```bash
 rm -rf ~/.jarvis-cd/pipelines/gpucompress_vpic_delta_single_node/
+rm -rf ~/.ppi-jarvis/config/pipelines/gpucompress_vpic_delta_single_node/
 apptainer cache clean --force
 jarvis ppl load yaml /u/$USER/GPUCompress/gpucompress_pkgs/pipelines/gpucompress_vpic_single_node.yaml
-jarvis ppl build
 ```
 
 ---

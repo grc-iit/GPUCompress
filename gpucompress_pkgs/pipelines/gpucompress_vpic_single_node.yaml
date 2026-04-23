@@ -1,25 +1,20 @@
 # Pipeline: GPUCompress VPIC single-node on Delta via Apptainer.
 #
-# Mirrors the reference at:
-#   ~/jarvis-cd/builtin/pipelines/portability/delta/vpic_single_node.yaml
-# but chains our custom gpucompress_base + gpucompress_vpic_delta packages so
-# the VPIC benchmark deck is built against HDF5 + nvcomp + GPUCompress.
-#
-# Reproduces bench_tests/vpic.sh (retrievable via
-#   git show 3c66e01:bench_tests/vpic.sh
-# ) — single-phase VPIC Harris-sheet magnetic-reconnection benchmark with
-# GPU compression dispatched inline by the deck binary.
+# Chains gpucompress_base + gpucompress_vpic_delta so the VPIC benchmark
+# deck is built against HDF5 + nvcomp + GPUCompress. Single-phase workload
+# (Harris-sheet magnetic-reconnection) with GPU compression dispatched
+# inline by the deck binary.
 #
 # Usage:
-#   # One-time, on the login node (has network + no GPU needed for build):
-#   jarvis repo add /u/imuradli/GPUCompress/gpucompress_pkgs
-#   jarvis ppl load yaml /u/imuradli/GPUCompress/gpucompress_pkgs/pipelines/gpucompress_vpic_single_node.yaml
-#   jarvis ppl build            # produces ~/.ppi-jarvis/pipelines/<name>/shared/<name>.sif
+#   # One-time, on the login node — ppl load yaml builds the SIF when
+#   # install_manager=container (no separate `jarvis ppl build` step):
+#   jarvis repo add /u/$USER/GPUCompress/gpucompress_pkgs
+#   jarvis ppl load yaml /u/$USER/GPUCompress/gpucompress_pkgs/pipelines/gpucompress_vpic_single_node.yaml
 #
 #   # Per-run, on a GPU compute node:
-#   salloc --account=bekn-delta-gpu --partition=gpuA100x4 \
-#          --nodes=1 --ntasks=4 --gpus=1 --time=02:00:00 --mem=64g
-#   scontrol show hostnames $SLURM_JOB_NODELIST > ~/hostfile_single.txt
+#   salloc --account="$SLURM_ACCOUNT" --partition=gpuA100x4 \
+#          --nodes=1 --ntasks=1 --gpus=1 --time=01:00:00 --mem=64g
+#   hostname > ~/hostfile_single.txt
 #   jarvis hostfile set ~/hostfile_single.txt
 #   jarvis ppl run
 
@@ -61,8 +56,8 @@ pkgs:
     nprocs: 1
     ppn: 1
 
-    # I/O volume — smoke-test defaults from bench_tests/vpic.sh (NX=64,
-    # TIMESTEPS=3, SIM_INT=190, WARMUP=100, CHUNK=4 MB).
+    # I/O volume — smoke-test defaults (NX=64, TIMESTEPS=3, SIM_INT=190,
+    # WARMUP=100, CHUNK=4 MB). Scale up for paper runs.
     nx: 64
     timesteps: 3
     sim_interval: 190

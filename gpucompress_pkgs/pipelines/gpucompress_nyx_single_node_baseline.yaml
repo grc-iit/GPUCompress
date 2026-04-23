@@ -1,20 +1,12 @@
-# Pipeline: GPUCompress Nyx single-node on Delta via Apptainer.
+# Pipeline: GPUCompress Nyx single-node on Delta — NO-COMP BASELINE variant.
+#
+# Identical to gpucompress_nyx_single_node.yaml except hdf5_mode=default
+# (no compression). Use this to measure raw HDF5 I/O bandwidth alongside
+# the adaptive run. Switch between the two by re-running `jarvis ppl load
+# yaml <path>` before `jarvis ppl run`.
 #
 # Chains gpucompress_base + gpucompress_nyx_delta so the Nyx binary is built
 # against HDF5 + nvcomp + GPUCompress.
-#
-# Usage:
-#   # One-time, on the login node — ppl load yaml builds the SIF when
-#   # install_manager=container (no separate `jarvis ppl build` step):
-#   jarvis repo add /u/$USER/GPUCompress/gpucompress_pkgs
-#   jarvis ppl load yaml /u/$USER/GPUCompress/gpucompress_pkgs/pipelines/gpucompress_nyx_single_node.yaml
-#
-#   # Per-run, on a GPU compute node:
-#   salloc --account="$SLURM_ACCOUNT" --partition=gpuA100x4 \
-#          --nodes=1 --ntasks=1 --gpus=1 --time=02:00:00 --mem=64g
-#   hostname > ~/hostfile_single.txt
-#   jarvis hostfile set ~/hostfile_single.txt
-#   jarvis ppl run
 
 name: gpucompress_nyx_delta_single_node
 install_manager: container
@@ -51,9 +43,10 @@ pkgs:
     max_step: 30
     plot_int: 10
 
-    # Benchmark configuration — VOL mode with NN + RL + 50% exploration.
-    hdf5_mode: vol
-    phase: nn-rl+exp50
+    # Benchmark configuration — NO-COMP baseline. Phase is ignored when
+    # mode=default (pkg.py maps to the internal no-comp pseudo-phase).
+    hdf5_mode: default
+    phase: nn-rl+exp50    # ignored in default mode, kept valid for _validate()
     chunk_mb: 4
     verify: 1
     policy: ratio
