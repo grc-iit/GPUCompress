@@ -1,12 +1,12 @@
 # gpucompress_lammps_delta
 
-Jarvis Path-B package that builds **LAMMPS** with the GPUCompress Kokkos
+Jarvis Path-B package that builds **LAMMPS** with the NeuroPress Kokkos
 fix and runs a Lennard-Jones shock-expansion workload inside an Apptainer
 SIF on NCSA Delta A100 nodes.
 
 LAMMPS is a **single-phase** workload (like VPIC, unlike Nyx/WarpX's
 two-phase dump-then-replay): the `fix gpucompress` Kokkos fix writes
-compressed HDF5 in-situ during the MD run through the GPUCompress VOL +
+compressed HDF5 in-situ during the MD run through the NeuroPress VOL +
 filter, producing `gpuc_step_*` output directories. The pkg parses those
 host-side into a per-timestep CSV at the end of the run — no separate
 `generic_benchmark` invocation.
@@ -85,7 +85,7 @@ The build includes:
   because `nvcc_wrapper` + C++20 hits cudafe++ internal errors when it's
   inside `KOKKOS_PKG_SOURCES`
 - The `lmp` binary itself, linked against parallel HDF5, nvcomp, and
-  GPUCompress
+  NeuroPress
 
 Subsequent loads print `Deploy image '<name>' already exists, skipping
 build` and return in seconds.
@@ -171,7 +171,7 @@ reloading.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `hdf5_mode` | `default` | `default` (no-comp baseline: algo=lz4 internally, ratio reported as 1.00) or `vol` (GPUCompress VOL + adaptive algorithm) |
+| `hdf5_mode` | `default` | `default` (no-comp baseline: algo=lz4 internally, ratio reported as 1.00) or `vol` (NeuroPress VOL + adaptive algorithm) |
 | `phase` | `lz4` | `lz4`/`snappy`/`deflate`/`gdeflate`/`zstd`/`ans`/`cascaded`/`bitcomp` (fixed) or `nn`/`nn-rl`/`nn-rl+exp50` (adaptive) |
 | `policy` | `balanced` | NN cost-model policy: `balanced` / `ratio` / `speed` |
 | `error_bound` | `0.0` | Lossy tolerance; `0.0` = lossless |
@@ -237,8 +237,8 @@ rank,phase,timestep,write_ms,ratio,orig_mb,comp_mb,verify
 ### Success indicators
 
 - `Created <4*atoms³> atoms` matching your `atoms` config (e.g. 256000 for atoms=40)
-- `[GPUCompress-LAMMPS] Initialized: algo=<X> policy=<P> verify=1 error_bound=0`
-- `[GPUCompress-LAMMPS] Step <N>: wrote 3 fields (<MB>/rank) algo=<X>` lines (one per dump)
+- `[NeuroPress-LAMMPS] Initialized: algo=<X> policy=<P> verify=1 error_bound=0`
+- `[NeuroPress-LAMMPS] Step <N>: wrote 3 fields (<MB>/rank) algo=<X>` lines (one per dump)
 - `Total wall time: 0:00:0X` at the end of `lammps.log`
 - `Pipeline started successfully` from Jarvis
 - `benchmark_lammps_timesteps.csv` has `timesteps` rows past the header
@@ -316,7 +316,7 @@ sed -i 's/^  phase: no-comp$/  phase: nn-rl/' \
 The sim didn't run long enough to produce any dumps past the warmup
 threshold. Either `warmup_steps` is larger than `timesteps * sim_interval`,
 or `fix gpucompress` never fired. Check `lammps.log` for the
-`[GPUCompress-LAMMPS] Step <N>: wrote 3 fields` lines.
+`[NeuroPress-LAMMPS] Step <N>: wrote 3 fields` lines.
 
 ### Kokkos build error `cudafe++ internal error` or C++20 issues
 The Kokkos build rejects `lammps_ranking_profiler.cu` when it's added to

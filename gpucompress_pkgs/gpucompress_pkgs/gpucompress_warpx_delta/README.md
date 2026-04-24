@@ -1,7 +1,7 @@
 # gpucompress_warpx_delta
 
 Jarvis Path-B package that builds **WarpX** (AMReX-based laser-wakefield
-PIC code) against GPUCompress and runs a Laser Wakefield Acceleration
+PIC code) against NeuroPress and runs a Laser Wakefield Acceleration
 (LWFA) workload inside an Apptainer SIF on NCSA Delta A100 nodes.
 
 WarpX is a **two-phase** workload (like Nyx, unlike VPIC/LAMMPS):
@@ -167,7 +167,7 @@ switch between them by reloading.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `hdf5_mode` | `default` | `default` (no-comp baseline) or `vol` (GPUCompress VOL) |
+| `hdf5_mode` | `default` | `default` (no-comp baseline) or `vol` (NeuroPress VOL) |
 | `phase` | `lz4` | `lz4`/`snappy`/`deflate`/`gdeflate`/`zstd`/`ans`/`cascaded`/`bitcomp` (fixed nvcomp) or `nn`/`nn-rl`/`nn-rl+exp50` (adaptive) |
 | `policy` | `ratio` | NN cost-model weights: `balanced` (w=1,1,1), `ratio` (0,0,1), `speed` (1,1,0). Ratio is recommended for LWFA (fields vary from smooth to turbulent) |
 | `error_bound` | `0.0` | Lossy tolerance; `0.0` = lossless. LWFA typically tolerates `1e-3` — `1e-2` |
@@ -236,7 +236,7 @@ component as a 1-D blob with flat-last indexing — opposite of Nyx's
 
 ### Success indicators
 
-- Phase 1: `[GPUCompress] Raw field dump enabled → <results>/raw_fields`
+- Phase 1: `[NeuroPress] Raw field dump enabled → <results>/raw_fields`
   and `Dumped: <D> diag* directories` where `D = max_step / diag_int`
 - Phase 2: `Benchmark PASSED` printed near the end of `warpx_bench.log`
 - Adaptive runs on the smoke defaults produce lossless ratios ≈ 1.5-4×

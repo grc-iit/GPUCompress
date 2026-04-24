@@ -2,7 +2,7 @@
 
 GPU-accelerated lossless compression for the [Nyx](https://github.com/AMReX-Astro/Nyx)
 AMReX-based cosmological hydrodynamics code. Data flows directly from GPU-resident
-AMReX MultiFab memory through the GPUCompress HDF5 VOL connector without CPU
+AMReX MultiFab memory through the NeuroPress HDF5 VOL connector without CPU
 round-trips, following the same zero-copy pattern as the VPIC-Kokkos integration.
 
 ## Architecture
@@ -30,7 +30,7 @@ H5Dwrite_chunk() --- pre-compressed bytes written to HDF5 file
 
 ## Files
 
-### In GPUCompress (adapter + bridge, no Nyx dependency at build time)
+### In NeuroPress (adapter + bridge, no Nyx dependency at build time)
 
 | File | Description |
 |------|-------------|
@@ -47,7 +47,7 @@ H5Dwrite_chunk() --- pre-compressed bytes written to HDF5 file
 |------|---------------|-------------|
 | `Source/Driver/Nyx.H` | +3 | `static int use_gpucompress;` member declaration |
 | `Source/Driver/Nyx.cpp` | +7 | Static initialization + ParmParse query |
-| `Source/IO/Nyx_output.cpp` | +113 | GPUCompress plotfile write path |
+| `Source/IO/Nyx_output.cpp` | +113 | NeuroPress plotfile write path |
 
 When `AMREX_USE_GPUCOMPRESS` is not defined, all changes are compiled out.
 The modified Nyx source files are provided in `benchmarks/nyx/patches/` for reference.
@@ -58,9 +58,9 @@ The modified Nyx source files are provided in `benchmarks/nyx/patches/` for refe
 - MPI (OpenMPI or MPICH)
 - HDF5 2.x built with parallel MPI support
 - nvCOMP 5.x
-- GPUCompress (libgpucompress.so, libH5VLgpucompress.so, libH5Zgpucompress.so)
+- NeuroPress (libgpucompress.so, libH5VLgpucompress.so, libH5Zgpucompress.so)
 
-## Step 1: Build GPUCompress
+## Step 1: Build NeuroPress
 
 ```bash
 cd /path/to/GPUCompress
@@ -100,13 +100,13 @@ cd Nyx
 # Update AMReX submodule to latest development (required for checkPointNow API)
 cd subprojects/amrex && git checkout development && cd ../..
 
-# Apply GPUCompress patch
+# Apply NeuroPress patch
 git apply /path/to/GPUCompress/benchmarks/nyx/patches/nyx-gpucompress.patch
 ```
 
 Alternatively, manually edit the 3 source files using the copies in `patches/` as reference.
 
-## Step 4: Build Nyx with GPUCompress
+## Step 4: Build Nyx with NeuroPress
 
 Set paths to your installations:
 
@@ -155,7 +155,7 @@ cmake --build . --target nyx_MiniSB -j$(nproc)
 Remove `-DAMReX_PRECISION=SINGLE -DAMReX_PARTICLES_PRECISION=SINGLE` from the
 cmake command above. All other flags remain the same.
 
-## Step 5: Run with GPUCompress
+## Step 5: Run with NeuroPress
 
 For all runs below, first set the library path:
 
@@ -211,7 +211,7 @@ for ALGO in lz4 snappy deflate gdeflate zstd bitcomp cascaded ans auto; do
         amr.plot_int=100 \
         amr.check_int=0 \
         nyx.v=0 amr.v=0 nyx.sum_interval=-1 \
-        2>&1 | grep "GPUCompress"
+        2>&1 | grep "NeuroPress"
     # Check compressed size
     du -sh plt00100_gpuc/
     echo "---"
@@ -234,7 +234,7 @@ for POLICY in speed balanced ratio; do
         amr.plot_int=100 \
         amr.check_int=0 \
         nyx.v=0 amr.v=0 nyx.sum_interval=-1 \
-        2>&1 | grep "GPUCompress"
+        2>&1 | grep "NeuroPress"
     du -sh plt00100_gpuc/
     echo "---"
 done
@@ -321,7 +321,7 @@ All parameters are set via Nyx's standard ParmParse mechanism (input file or com
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `nyx.use_gpucompress` | `0` | Enable GPUCompress for plotfile output |
+| `nyx.use_gpucompress` | `0` | Enable NeuroPress for plotfile output |
 | `nyx.gpucompress_weights` | (none) | Path to NN weights file (.nnwt). Required for `algorithm=auto` |
 | `nyx.gpucompress_algorithm` | `auto` | Compression algorithm: `auto`, `lz4`, `snappy`, `deflate`, `gdeflate`, `zstd`, `ans`, `cascaded`, `bitcomp` |
 | `nyx.gpucompress_policy` | `ratio` | NN ranking policy: `speed` (minimize compress time), `balanced` (equal weights), `ratio` (maximize compression ratio) |
@@ -392,7 +392,7 @@ plt00100_gpuc/
 ```
 
 Each `.h5` file contains a single dataset `"data"` with `n_cells * n_components`
-elements, chunked at 4 MiB, compressed by GPUCompress. The VOL connector stores
+elements, chunked at 4 MiB, compressed by NeuroPress. The VOL connector stores
 per-chunk compression metadata (algorithm, preprocessing, header) inside the
 HDF5 chunk format. Files can be read back using the same VOL connector.
 
@@ -429,7 +429,7 @@ And in `read_params()` after the `AMREX_USE_HDF5` check:
 #endif
 ```
 
-**`Source/IO/Nyx_output.cpp`** -- Add the GPUCompress include and write path
+**`Source/IO/Nyx_output.cpp`** -- Add the NeuroPress include and write path
 at the top of `writePlotFile()`. See `patches/Nyx_output.cpp` for the complete
 modified file.
 
@@ -440,7 +440,7 @@ modified file.
 | `libgpucompress.so.1: cannot open` | LD_LIBRARY_PATH missing | `export LD_LIBRARY_PATH=...` |
 | `undefined reference to gpucompress_init` | CUDA linker order | Use `-Wl,--no-as-needed -lgpucompress ... -Wl,--as-needed` |
 | `undefined reference to H5Dcreate2` | HDF5 not linked to shared libs | Add `-DCMAKE_SHARED_LINKER_FLAGS="-L.../lib -lhdf5"` |
-| `AMReX HDF5 CUDA error 700` | AMReX's own HDF5 writer conflicts with CUDA | Use GPUCompress path (`nyx.use_gpucompress=1`) instead of `nyx.write_hdf5=1`. Do not enable both |
+| `AMReX HDF5 CUDA error 700` | AMReX's own HDF5 writer conflicts with CUDA | Use NeuroPress path (`nyx.use_gpucompress=1`) instead of `nyx.write_hdf5=1`. Do not enable both |
 | `Forcing with device memory not implemented` | DrivenTurbulence forcing not GPU-ready | Use HydroTests (Sedov) or MiniSB instead |
 | AMReX submodule too old | `checkPointNow()` API mismatch | `cd subprojects/amrex && git checkout development` |
 

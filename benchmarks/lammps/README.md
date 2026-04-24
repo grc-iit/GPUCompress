@@ -3,7 +3,7 @@
 GPU-accelerated lossless compression for [LAMMPS](https://github.com/lammps/lammps)
 molecular dynamics simulations using the KOKKOS GPU backend. Device pointers from
 Kokkos Views (`atomKK->k_x.view_device().data()`) are passed directly through the
-GPUCompress HDF5 VOL connector without CPU round-trips, following the same zero-copy
+NeuroPress HDF5 VOL connector without CPU round-trips, following the same zero-copy
 pattern as the VPIC and Nyx integrations.
 
 ## Architecture
@@ -32,7 +32,7 @@ H5Dwrite_chunk() --- pre-compressed bytes written to HDF5 file
 
 ## Files
 
-### In GPUCompress (adapter + bridge, no LAMMPS dependency at build time)
+### In NeuroPress (adapter + bridge, no LAMMPS dependency at build time)
 
 | File | Description |
 |------|-------------|
@@ -59,9 +59,9 @@ The modified and new LAMMPS files are provided in `benchmarks/lammps/patches/`.
 - MPI (OpenMPI or MPICH)
 - HDF5 1.14+ with VOL support (built from source or system package)
 - nvCOMP 5.x
-- GPUCompress (libgpucompress.so, libH5VLgpucompress.so, libH5Zgpucompress.so)
+- NeuroPress (libgpucompress.so, libH5VLgpucompress.so, libH5Zgpucompress.so)
 
-## Step 1: Build GPUCompress
+## Step 1: Build NeuroPress
 
 ```bash
 cd /path/to/GPUCompress
@@ -77,7 +77,7 @@ This produces:
 - `libH5VLgpucompress.so` (HDF5 VOL connector)
 - `libH5Zgpucompress.so` (HDF5 filter plugin)
 
-## Step 2: Build the GPUCompress bridge library
+## Step 2: Build the NeuroPress bridge library
 
 ```bash
 cd /path/to/GPUCompress/examples
@@ -125,7 +125,7 @@ Copy the 2 new source files as above, then manually edit `cmake/Modules/Packages
 
 **Change 1** — After the `PKG_PHONON` block (around line 254), before `set_property(GLOBAL ...)`, add:
 ```cmake
-# GPUCompress fix (KOKKOS-only, no base style)
+# NeuroPress fix (KOKKOS-only, no base style)
 list(APPEND KOKKOS_PKG_SOURCES ${KOKKOS_PKG_SOURCES_DIR}/fix_gpucompress_kokkos.cpp)
 ```
 
@@ -136,7 +136,7 @@ RegisterFixStyle(${KOKKOS_PKG_SOURCES_DIR}/fix_gpucompress_kokkos.h)
 
 A complete reference copy of the modified `KOKKOS.cmake` is provided at `patches/KOKKOS.cmake` for comparison.
 
-## Step 4: Build LAMMPS with KOKKOS + GPUCompress
+## Step 4: Build LAMMPS with KOKKOS + NeuroPress
 
 Set paths:
 
@@ -171,7 +171,7 @@ Change `Kokkos_ARCH_AMPERE80` to match your GPU:
 
 Replace `-DKOKKOS_PREC=SINGLE` with `-DKOKKOS_PREC=DOUBLE` (or omit it — double is the default).
 
-## Step 5: Run with GPUCompress
+## Step 5: Run with NeuroPress
 
 Set the library path:
 
@@ -200,7 +200,7 @@ neigh_modify    every 20 delay 0 check no
 
 fix             1 all nve
 
-# GPUCompress: write compressed positions, velocities, forces every 50 steps
+# NeuroPress: write compressed positions, velocities, forces every 50 steps
 fix             gpuc all gpucompress 50 positions velocities forces
 
 thermo          50
@@ -244,7 +244,7 @@ fix ID group gpucompress N [positions] [velocities] [forces]
 for ALGO in lz4 snappy deflate gdeflate zstd ans cascaded bitcomp auto; do
     rm -rf gpuc_step_*
     GPUCOMPRESS_ALGO=$ALGO ./lmp -k on g 1 -sf kk -in in.melt_gpuc \
-        2>&1 | grep "GPUCompress"
+        2>&1 | grep "NeuroPress"
     echo "=== $ALGO ==="
     du -sh gpuc_step_0000000100/
 done
@@ -257,7 +257,7 @@ for POLICY in speed balanced ratio; do
     rm -rf gpuc_step_*
     GPUCOMPRESS_ALGO=auto GPUCOMPRESS_POLICY=$POLICY \
         ./lmp -k on g 1 -sf kk -in in.melt_gpuc \
-        2>&1 | grep "GPUCompress"
+        2>&1 | grep "NeuroPress"
     echo "=== $POLICY ==="
     du -sh gpuc_step_0000000100/
 done
@@ -335,7 +335,7 @@ gpuc_step_0000000100/
 ```
 
 Each `.h5` file contains a single dataset with `n_atoms * 3` elements, chunked
-at 4 MiB, compressed by GPUCompress. With MPI, each rank writes its local atoms
+at 4 MiB, compressed by NeuroPress. With MPI, each rank writes its local atoms
 as separate files (`rank0000`, `rank0001`, etc.).
 
 ## How it works (zero source changes to LAMMPS core)
@@ -345,7 +345,7 @@ The integration uses LAMMPS's fix system — the standard extension mechanism:
 1. `fix_gpucompress_kokkos.cpp` implements `end_of_step()` hook
 2. On each output step, it calls `atomKK->sync(Device, X_MASK | V_MASK | F_MASK)` to ensure GPU data is current
 3. Extracts raw CUDA pointers via `atomKK->k_x.view_device().data()`
-4. Passes them to the precompiled GPUCompress bridge library
+4. Passes them to the precompiled NeuroPress bridge library
 5. Bridge calls `H5Dwrite()` with the GPU pointer — VOL connector detects CUDA memory and compresses on GPU
 
 The fix is a new KOKKOS-only style (`fix gpucompress`). It requires 2 new source files + 4 lines in the KOKKOS cmake. No existing LAMMPS files are modified beyond the cmake registration.
@@ -358,7 +358,7 @@ The fix is a new KOKKOS-only style (`fix gpucompress`). It requires 2 new source
 | `libgpucompress.so: cannot open` | LD_LIBRARY_PATH missing | `export LD_LIBRARY_PATH=...` |
 | `liblammps_gpucompress_udf.so: cannot open` | Bridge library not found | Build bridge library and set rpath/LD_LIBRARY_PATH |
 | `Not running with KOKKOS!` | Missing `-k on g 1 -sf kk` flags | Always use KOKKOS runtime flags |
-| Segfault at end of run | GPUCompress finalize after CUDA teardown | Fixed in latest version (skip finalize in destructor) |
+| Segfault at end of run | NeuroPress finalize after CUDA teardown | Fixed in latest version (skip finalize in destructor) |
 | Low compression ratios | MD data is inherently high-entropy | Expected for lossless; try lossy with `GPUCOMPRESS_ERROR_BOUND=0.01` |
 
 ## VPIC-Compatible Multi-Phase Benchmark

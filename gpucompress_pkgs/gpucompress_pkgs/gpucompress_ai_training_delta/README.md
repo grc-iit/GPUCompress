@@ -1,7 +1,7 @@
 # gpucompress_ai_training_delta
 
 Jarvis Path-B package that trains a small neural network on Delta A100
-nodes and benchmarks GPUCompress on the exported per-epoch checkpoints.
+nodes and benchmarks NeuroPress on the exported per-epoch checkpoints.
 Runs entirely inside an Apptainer SIF.
 
 AI-training is a **two-phase** workload:
@@ -195,7 +195,7 @@ Script-level constraint enforced in `pkg.py:_validate()`: `gpt2` requires
 
 | Key | Default | Meaning |
 |---|---|---|
-| `hdf5_mode` | `default` | `default` (no-comp baseline) or `vol` (GPUCompress VOL) |
+| `hdf5_mode` | `default` | `default` (no-comp baseline) or `vol` (NeuroPress VOL) |
 | `phase` | `lz4` | `lz4`/`snappy`/`deflate`/`gdeflate`/`zstd`/`ans`/`cascaded`/`bitcomp` (fixed nvcomp) or `nn`/`nn-rl`/`nn-rl+exp50` (adaptive) |
 | `policy` | `balanced` | NN cost-model weights: `balanced` (w=1,1,1), `ratio` (0,0,1), `speed` (1,1,0) |
 | `error_bound` | `0.0` | Lossy tolerance; `0.0` = lossless. Inference deployment typically tolerates `1e-4 – 1e-3` |

@@ -26,7 +26,7 @@ jarvis repo add $HOME/GPUCompress/gpucompress_pkgs
 ```
 
 **Login node — load the pipeline** (builds the SIF on first run; cache
-hit on subsequent loads unless you edit GPUCompress source):
+hit on subsequent loads unless you edit NeuroPress source):
 
 ```bash
 jarvis ppl load yaml $HOME/GPUCompress/evaluations/figure_5/pipeline_<workload>.yaml

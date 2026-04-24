@@ -1,10 +1,10 @@
-# WarpX + GPUCompress Integration Benchmark
+# WarpX + NeuroPress Integration Benchmark
 
 ## Overview
 
 WarpX is a Particle-In-Cell (PIC) plasma simulation built on AMReX.
 This integration compresses WarpX's GPU-resident field data (E, B, J, rho)
-and particle arrays in-situ using GPUCompress, avoiding device-to-host
+and particle arrays in-situ using NeuroPress, avoiding device-to-host
 round-trips.
 
 ## Prerequisites
@@ -14,7 +14,7 @@ round-trips.
 - C++17 compiler
 - MPI (optional, for multi-GPU runs)
 - HDF5 with parallel support (optional, for VOL connector path)
-- nvcomp (already part of GPUCompress build)
+- nvcomp (already part of NeuroPress build)
 
 ## Building WarpX from source
 
@@ -46,7 +46,7 @@ cmake --build build-cuda -j $(nproc)
 
 AMReX and PICSAR are fetched automatically by WarpX's CMake superbuild.
 
-## Building GPUCompress with WarpX adapter
+## Building NeuroPress with WarpX adapter
 
 ```bash
 cd /path/to/GPUCompress
@@ -106,7 +106,7 @@ gpucompress_warpx_bridge::write_field_compressed(
 
 ## Validation
 
-Run a stock WarpX 3D example to verify the build, then attach GPUCompress:
+Run a stock WarpX 3D example to verify the build, then attach NeuroPress:
 
 ```bash
 cd $HOME/src/warpx
@@ -140,7 +140,7 @@ characteristics across timesteps.
 ### How it works
 
 **Phase 1 — Simulation dump:**
-Run WarpX with `WARPX_DUMP_FIELDS=1`. The patched `FlushFormatGPUCompress.cpp`
+Run WarpX with `WARPX_DUMP_FIELDS=1`. The patched `FlushFormatNeuroPress.cpp`
 writes raw `.f32` binary files for each field component (Ex, Ey, Ez, Bx, By,
 Bz, jx, jy, jz, rho) × each FArrayBox at each diagnostic interval. If
 `amrex::Real` is double, values are downcast to float32. The LWFA physics

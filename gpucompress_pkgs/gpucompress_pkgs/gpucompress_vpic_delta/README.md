@@ -1,7 +1,7 @@
 # gpucompress_vpic_delta
 
 Jarvis Path-B package that builds the **VPIC plasma PIC benchmark deck**
-(`vpic_benchmark_deck.Linux`) against GPUCompress and runs it inside an
+(`vpic_benchmark_deck.Linux`) against NeuroPress and runs it inside an
 Apptainer SIF on NCSA Delta A100 nodes.
 
 VPIC is a **single-phase** workload: the benchmark deck runs every selected
@@ -153,7 +153,7 @@ reloading.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `hdf5_mode` | `default` | `default` (no-comp baseline) or `vol` (GPUCompress VOL) |
+| `hdf5_mode` | `default` | `default` (no-comp baseline) or `vol` (NeuroPress VOL) |
 | `phase` | `lz4` | `lz4`/`snappy`/`deflate`/`gdeflate`/`zstd`/`ans`/`cascaded`/`bitcomp` (fixed) or `nn`/`nn-rl`/`nn-rl+exp50` (adaptive) |
 | `policy` | `balanced` | NN cost-model weights: `balanced` (w=1,1,1), `ratio` (0,0,1), `speed` (1,1,0) |
 | `error_bound` | `0.0` | Lossy tolerance; `0.0` = lossless |
@@ -317,7 +317,7 @@ jarvis ppl load yaml /u/$USER/GPUCompress/gpucompress_pkgs/pipelines/gpucompress
 ```
 gpucompress_vpic_delta/
 ├── pkg.py               # Jarvis Application class; start/stop/clean lifecycle
-├── build.sh             # apptainer fakeroot build step (patches VPIC, links GPUCompress)
+├── build.sh             # apptainer fakeroot build step (patches VPIC, links NeuroPress)
 ├── Dockerfile.deploy    # deploy-stage template (COPY /opt + /usr/local, LD_LIBRARY_PATH)
 ├── __init__.py          # empty, required for Python import
 └── README.md            # this file

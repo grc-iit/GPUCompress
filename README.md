@@ -1,14 +1,14 @@
-# GPUCompress
+# NeuroPress
 
 A GPU-accelerated compression library with neural network–driven algorithm selection and online reinforcement learning, designed for HPC in-situ I/O.
 
 ## Key Innovation
 
-GPUCompress replaces static compression choices with a lightweight neural network that evaluates **all 32 compression configurations** (8 algorithms × 2 preprocessing options) in a single GPU kernel (~0.22 ms), selecting the best one per data chunk based on learned data characteristics.  An online SGD loop adapts the model in real time — demonstrated MAPE drops from ~700% to ~10% within 20 timesteps on unseen VPIC plasma data.
+NeuroPress replaces static compression choices with a lightweight neural network that evaluates **all 32 compression configurations** (8 algorithms × 2 preprocessing options) in a single GPU kernel (~0.22 ms), selecting the best one per data chunk based on learned data characteristics.  An online SGD loop adapts the model in real time — demonstrated MAPE drops from ~700% to ~10% within 20 timesteps on unseen VPIC plasma data.
 
 ## Project Rule: Always use float32 (single precision)
 
-> **All scientific data flowing through GPUCompress MUST be 32-bit floating point.**
+> **All scientific data flowing through NeuroPress MUST be 32-bit floating point.**
 >
 > This is a hard project-wide rule, not a recommendation. It applies to every simulation
 > integration (VPIC, WarpX, Nyx, LAMMPS, Gray-Scott), every benchmark, every dataset,
@@ -24,7 +24,7 @@ GPUCompress replaces static compression choices with a lightweight neural networ
 > - VPIC: built with `float` field type (default in `vpic_benchmark_deck.cxx`)
 > - LAMMPS: dump field data as fp32
 > - SDRBench / training datasets: `.bin.f32` only
-> - Any new integration: cast to `float` at the GPUCompress boundary if upstream uses `double`
+> - Any new integration: cast to `float` at the NeuroPress boundary if upstream uses `double`
 >
 > If you find a place in the codebase or in any deploy script that defaults to fp64 or
 > `double`, fix it.
@@ -32,7 +32,7 @@ GPUCompress replaces static compression choices with a lightweight neural networ
 ## Project Rule: Always evaluate against live simulations, never static dataset files
 
 > **Every evaluation pipeline MUST invoke a real simulation binary as part of its
-> own execution. The simulation can either feed data directly into the GPUCompress
+> own execution. The simulation can either feed data directly into the NeuroPress
 > path (live), or dump fields once that the same pipeline then sweeps an evaluator
 > over (cached-dump). What is forbidden is using a pre-existing static archive that
 > was downloaded once and just sits in the repo (e.g. SDRBench Hurricane Isabel,
@@ -52,7 +52,7 @@ GPUCompress replaces static compression choices with a lightweight neural networ
 > **Two acceptable patterns:**
 >
 > - **Live-evaluation pattern.** The evaluation script runs the simulation and the
->   simulation feeds GPUCompress directly via the HDF5 VOL on every diagnostic flush.
+>   simulation feeds NeuroPress directly via the HDF5 VOL on every diagnostic flush.
 >   `4.2.1_eval_vpic_threshold_sweep.sh` and `4.2.1_eval_warpx_threshold_sweep.sh`
 >   work this way.
 > - **Cached-dump pattern.** The evaluation script runs the simulation once,
@@ -107,7 +107,7 @@ GPUCompress replaces static compression choices with a lightweight neural networ
 │   Intercepts H5Dwrite/H5Dread, detects GPU pointers,   │
 │   routes to GPU-native compress/decompress pipeline     │
 ├─────────────────────────────────────────────────────────┤
-│                   GPUCompress C API                      │
+│                   NeuroPress C API                      │
 │   gpucompress_compress_gpu() / gpucompress_decompress() │
 ├────────┬────────┬──────────┬────────────┬───────────────┤
 │ Stats  │   NN   │ Cost     │ Compress/  │   Online      │
@@ -156,8 +156,8 @@ Tested on **Delta** (A100-SXM4-40GB, x86_64, CUDA 12.8, Cray MPICH 8.1.32).
 
 ```bash
 cd /u/$USER
-git clone <repo-url> GPUCompress
-cd GPUCompress
+git clone <repo-url> NeuroPress
+cd NeuroPress
 ```
 
 ### Step 2: Load required modules
@@ -169,7 +169,7 @@ module load gcc-native/13.2 cray-mpich/8.1.32
 
 ### Step 3: Install dependencies and build (on a compute node)
 
-The install script downloads **nvcomp 5.1.0** and **HDF5 2.0.0**, builds GPUCompress, and downloads SDRBench datasets. It must run on a node with a GPU.
+The install script downloads **nvcomp 5.1.0** and **HDF5 2.0.0**, builds NeuroPress, and downloads SDRBench datasets. It must run on a node with a GPU.
 
 ```bash
 # Request an interactive compute node and run the full install
@@ -405,7 +405,7 @@ MPI_NP=2 GPUS_PER_NODE=2 BENCHMARKS=vpic VPIC_NX=160 TIMESTEPS=5 \
 
 ### 5. HDF5 Integration
 
-Use GPUCompress as a transparent HDF5 compression layer:
+Use NeuroPress as a transparent HDF5 compression layer:
 
 ```bash
 # As HDF5 filter plugin
@@ -420,7 +420,7 @@ export HDF5_PLUGIN_PATH=$PWD/build
 
 ## Simulation Integrations
 
-GPUCompress provides zero-copy GPU adapters for 5 HPC simulation codes. Each has detailed deployment instructions (clone, patch, build, run) in its own README:
+NeuroPress provides zero-copy GPU adapters for 5 HPC simulation codes. Each has detailed deployment instructions (clone, patch, build, run) in its own README:
 
 | Simulation | Description | Integration method | README |
 |------------|-------------|-------------------|--------|
@@ -498,7 +498,7 @@ See [`neural_net/docs/TUTORIAL.md`](neural_net/docs/TUTORIAL.md) for the full tr
 ## Project Structure
 
 ```
-GPUCompress/
+NeuroPress/
 ├── include/                    # Public C API headers
 │   ├── gpucompress.h           #   Main API
 │   ├── gpucompress_hdf5.h      #   HDF5 filter
