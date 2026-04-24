@@ -23,7 +23,7 @@ pkgs:
     cuda_arch: 80
     hdf5_version: 2.0.0
     nvcomp_version: 5.1.0.21_cuda12
-    gpucompress_repo: https://github.com/grc-iit/GPUCompress.git
+    gpucompress_repo: https://github.com/grc-iit/NeuroPress.git
     gpucompress_ref: main
     deploy_base: nvidia/cuda:12.6.0-runtime-ubuntu24.04
 

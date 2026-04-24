@@ -27,7 +27,7 @@ class GpucompressBase(Library):
             {'name': 'gpucompress_repo',
              'msg': 'GPUCompress git clone URL',
              'type': str,
-             'default': 'https://github.com/grc-iit/GPUCompress.git'},
+             'default': 'https://github.com/grc-iit/NeuroPress.git'},
             {'name': 'gpucompress_ref',
              'msg': 'GPUCompress git ref (branch | tag | commit)',
              'type': str, 'default': 'main'},
